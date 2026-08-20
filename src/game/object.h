@@ -62,6 +62,7 @@ int obj_erase_object(Object* a1, Rect* a2);
 int obj_inven_free(Inventory* inventory);
 bool obj_action_can_talk_to(Object* obj);
 Object* obj_top_environment(Object* obj);
+bool obj_dude_on_exit_grid();
 void obj_remove_all();
 Object* obj_find_first();
 Object* obj_find_next();

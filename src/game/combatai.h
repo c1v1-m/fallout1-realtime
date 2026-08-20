@@ -49,6 +49,9 @@ int combat_ai_save(DB_FILE* stream);
 int combat_ai_num();
 char* combat_ai_name(int packetNum);
 Object* ai_danger_source(Object* critter);
+// Aggression from this critter's AI packet (AI.TXT). Realtime combat uses it to tell a guard from
+// a civilian; see rt_guard_danger_source in combat_rt.cc.
+int combatai_aggression(Object* critter);
 Object* ai_search_inven(Object* critter, int check_action_points);
 void combat_ai_begin(int critters_count, Object** critters);
 void combat_ai_over();

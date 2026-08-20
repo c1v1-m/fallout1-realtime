@@ -17,7 +17,11 @@ int action_blood(Object* obj, int anim, int delay);
 void show_damage_to_object(Object* a1, int damage, int flags, Object* weapon, bool isFallingBack, int knockbackDistance, int knockbackRotation, int a8, Object* a9, int a10);
 int show_damage_target(Attack* attack);
 int show_damage_extras(Attack* attack);
-void show_damage(Attack* attack, int a2, int a3);
+void show_damage(Attack* attack, int a2, int a3, bool splitDefender = false);
+// Realtime: register the defender's damage reaction as its OWN sequence, from a committed attack
+// snapshot. Called by combat_rt at its (action-frame synchronised) commit point, so the attacker's
+// sequence never carries his victim's death and ends with his own swing. See actions.cc.
+bool action_defender_reaction(Attack* attack);
 int action_attack(Attack* attack);
 int use_an_object(Object* item);
 int a_use_obj(Object* a1, Object* a2, Object* a3);

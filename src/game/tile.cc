@@ -569,6 +569,110 @@ int tile_set_center(int tile, int flags)
     return 0;
 }
 
+// Realtime follow-cam helper. Centers on `tile` exactly like tile_set_center,
+// then shifts the whole rendered view by (offsetX, offsetY) pixels. Both anchor
+// pairs are nudged by the same delta -- tile_offx/y (tiles, grid, objects) and
+// square_offx/y (floor, roof) -- so the ground and everything on it move
+// together with no tearing. combat_rt eases a shrinking offset frame-to-frame
+// so the camera slides into place instead of snapping a whole tile at once.
+// Returns tile_set_center's result (-1 if the tile is out of bounds/blocked, in
+// which case no shift is applied).
+int tile_set_center_offset(int tile, int flags, int offsetX, int offsetY)
+{
+    // Do the centering without refreshing yet -- we refresh once below, after
+    // the pixel shift, so a transition frame costs a single redraw.
+    int rc = tile_set_center(tile, flags & ~TILE_SET_CENTER_REFRESH_WINDOW);
+    if (rc != 0) {
+        return rc;
+    }
+
+    tile_offx += offsetX;
+    tile_offy += offsetY;
+    square_offx += offsetX;
+    square_offy += offsetY;
+
+    // Bounds were computed from the unshifted anchors inside tile_set_center;
+    // recompute so scroll bounds track the shifted view.
+    tile_update_bounds_rect();
+
+    if ((flags & TILE_SET_CENTER_REFRESH_WINDOW) != 0) {
+        tile_refresh_display();
+    }
+
+    return 0;
+}
+
+// Debug overlay: radius (in hex tiles) of a red ring drawn around obj_dude, or 0 for
+// off. Used to visualize a tile distance (e.g. the gunshot-hearing radius) in-world.
+static int tile_dbg_ring_radius = 0;
+
+void tile_debug_ring_set(int radius)
+{
+    tile_dbg_ring_radius = radius > 0 ? radius : 0;
+    tile_refresh_display();
+}
+
+int tile_debug_ring_get()
+{
+    return tile_dbg_ring_radius;
+}
+
+// Draws the debug ring: every hex tile at exactly tile_dist == radius from obj_dude
+// gets a small red marker, so the outline is the TRUE 15-tile hex boundary (what
+// obj_dist / the gunshot check measures), not a screen-space circle. Called from the
+// map refresh AFTER the world is composited, clipped to the dirty rect, so it survives
+// every redraw. Bounded box scan around the dude's grid cell -- cheap enough for a
+// debug tool.
+static void tile_render_debug_ring(Rect* rectToUpdate, int elevation)
+{
+    if (tile_dbg_ring_radius <= 0 || obj_dude == NULL || obj_dude->elevation != elevation) {
+        return;
+    }
+
+    int R = tile_dbg_ring_radius;
+    int center = obj_dude->tile;
+    int col = center % grid_width;
+    int row = center / grid_width;
+    int red = colorTable[31744];
+
+    for (int dr = -R - 1; dr <= R + 1; dr++) {
+        int r2 = row + dr;
+        if (r2 < 0 || r2 >= grid_length) {
+            continue;
+        }
+        for (int dc = -2 * R - 2; dc <= 2 * R + 2; dc++) {
+            int c2 = col + dc;
+            if (c2 < 0 || c2 >= grid_width) {
+                continue;
+            }
+
+            int t = r2 * grid_width + c2;
+            if (!TILE_IS_VALID(t) || tile_dist(center, t) != R) {
+                continue;
+            }
+
+            int sx, sy;
+            if (tile_coord(t, &sx, &sy, elevation) == -1) {
+                continue;
+            }
+            sx += 16; // tile anchor -> approx hex centre
+            sy += 8;
+
+            for (int py = sy - 1; py <= sy + 1; py++) {
+                if (py < rectToUpdate->uly || py > rectToUpdate->lry) {
+                    continue;
+                }
+                for (int px = sx - 1; px <= sx + 1; px++) {
+                    if (px < rectToUpdate->ulx || px > rectToUpdate->lrx) {
+                        continue;
+                    }
+                    buf[py * buf_full + px] = red;
+                }
+            }
+        }
+    }
+}
+
 // 0x49E138
 static void refresh_mapper(Rect* rect, int elevation)
 {
@@ -612,6 +716,7 @@ static void refresh_game(Rect* rect, int elevation)
     square_render_roof(&rectToUpdate, elevation);
     bounds_render(&rectToUpdate, elevation);
     obj_render_post_roof(&rectToUpdate, elevation);
+    tile_render_debug_ring(&rectToUpdate, elevation);
     blit(&rectToUpdate);
 }
 

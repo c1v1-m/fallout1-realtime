@@ -33,6 +33,9 @@ void combat_over_from_load();
 void combat_give_exps(int exp_points);
 int combat_in_range(Object* critter);
 void combat_end();
+// Displays combat.msg #103 ("can't stop fighting yet"). Used by combat_rt's realtime END
+// COMBAT action so it gives the same feedback vanilla's END COMBAT button did.
+void combat_display_cant_end_message();
 void combat_turn_run();
 void combat_end_turn();
 void combat(STRUCT_664980* attack);
@@ -47,6 +50,27 @@ void apply_damage(Attack* attack, bool animated);
 void combat_display(Attack* attack);
 void combat_anim_begin();
 void combat_anim_finished();
+// True while an attack's damage is pending commit (issued but apply_damage not
+// yet run). Used by realtime combat to serialize attacks through main_ctd.
+bool combat_is_attack_pending();
+// Recovery valve for realtime combat's stuck-lock watchdog: forcibly abandons a
+// pending attack whose animation was orphaned, so the lock can release. Never
+// called in the normal attack flow (damage commits through combat_anim_finished).
+void combat_clear_pending_attack();
+// Commits a pending attack's damage now (ammo/display/apply_damage/scr_end_combat),
+// returning true if one was committed. Realtime combat drives this per-attack when
+// the swing animation finishes, since it keeps the warm bit set so the engine's
+// combat_turn_running==0 commit never fires. Does NOT stand the attacker up.
+bool combat_commit_pending_attack();
+// Realtime concurrency: copy the just-computed pending attack out (so the global can be freed
+// immediately and many attacks run at once), and later commit that private copy.
+void combat_take_pending_snapshot(Attack* out, bool* outCallDisplay);
+bool combat_commit_snapshot(const Attack* snap, bool callDisplay);
+// Flag a snapshot lethal when its damage will empty the defender's CURRENT hp but fire-time
+// lethality said otherwise (concurrent attackers each measured against the same stale hp).
+// Returns true if it upgraded the snapshot. Call it BEFORE the defender's reaction is registered,
+// or the death fall is picked from the stale flags and the corpse snaps flat with no fall.
+bool combat_late_lethal_upgrade(Attack* attack);
 int combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool aiming);
 bool combat_to_hit(Object* target, int* accuracy);
 void combat_attack_this(Object* a1);
@@ -54,6 +78,9 @@ void combat_outline_on();
 void combat_outline_off();
 void combat_highlight_change();
 bool combat_is_shot_blocked(Object* a1, int from, int to, Object* a4, int* a5);
+// Localized name of a body part for a given critter (the strings the vanilla called-shot window
+// uses). NULL if the message file has no entry. Used by the gamepad aimed-shot readout.
+char* combat_get_loc_name(Object* critter, int hitLocation);
 int combat_player_knocked_out_by();
 int combat_explode_scenery(Object* a1, Object* a2);
 void combat_delete_critter(Object* obj);

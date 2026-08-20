@@ -115,6 +115,8 @@ int map_load_idx(int map_index);
 int map_load_file(DB_FILE* stream);
 int map_load_in_game(char* fileName);
 int map_leave_map(MapTransition* transition);
+void map_clear_pending_transition();
+bool map_has_pending_transition();
 int map_check_state();
 void map_fix_critter_combat_data();
 int map_save();

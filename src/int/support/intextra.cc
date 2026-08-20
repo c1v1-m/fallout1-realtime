@@ -7,6 +7,7 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/critter.h"
 #include "game/display.h"
@@ -3301,7 +3302,13 @@ static void op_reg_anim_animate_forever(Program* program)
     int anim = programStackPopInteger(program);
     Object* obj = static_cast<Object*>(programStackPopPointer(program));
 
-    if (!isInCombat()) {
+    // The !isInCombat() guard is a turn-based assumption: decorative scenery loops (a spinning
+    // casino billboard, fans, etc.) are started by a map's enter script, which in vanilla runs
+    // while out of combat. In REALTIME the warm combat bit is set on map-enter whenever an
+    // encounter is active (e.g. Gizmo's assassin), so the guard skipped the registration and the
+    // billboard only span after a reload (loaded out of combat). animate_forever is purely
+    // decorative -- no movement, no combat_rt conflict -- so allow it in realtime regardless.
+    if (!isInCombat() || combat_rt_enabled()) {
         if (obj != NULL) {
             register_object_animate_forever(obj, anim, -1);
         } else {

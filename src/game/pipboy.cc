@@ -956,6 +956,29 @@ int load_pipboy(DB_FILE* stream)
     return 0;
 }
 
+// FNV-1a hash of every tracked quest's global-var value. Callers (the autosave trigger in
+// the main loop) poll this and save when it changes -- i.e. on any quest progress/completion
+// -- without having to know per-quest completion thresholds (FO1 has no quest-done event).
+// Keeps the sthreads/holodisk tables encapsulated here. Returns 0 before a game is loaded.
+unsigned int pipboy_quest_state_hash()
+{
+    if (game_global_vars == NULL || num_game_global_vars <= 0) {
+        return 0;
+    }
+
+    unsigned int h = 2166136261u;
+    for (int location = 0; location < QUEST_LOCATION_COUNT; location++) {
+        for (int quest = 0; quest < QUEST_PER_LOCATION_COUNT; quest++) {
+            int gvar = sthreads[location][quest];
+            if (gvar <= 0 || gvar >= num_game_global_vars) {
+                continue;
+            }
+            h = (h ^ (unsigned int)game_global_vars[gvar]) * 16777619u;
+        }
+    }
+    return h;
+}
+
 // 0x4875FC
 static void PipStatus(int a1)
 {

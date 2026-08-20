@@ -60,6 +60,22 @@ static int last_buttons = 0;
 // 0x671F18
 static bool mouse_is_hidden;
 
+// Live predicate: when it returns true the cursor is not drawn (mouse_show erases
+// instead of blitting) but mouse_info / mouse_simulate_input keep running so gamepad
+// input still flows. Distinct from mouse_is_hidden, which gates BOTH drawing and
+// input. Evaluated fresh each call so it self-corrects across every loop. See
+// mouse_set_draw_suppress_hook.
+static MouseDrawSuppressHook* mouse_draw_suppress_hook = NULL;
+
+static bool mouse_draw_suppressed()
+{
+    return mouse_draw_suppress_hook != NULL && mouse_draw_suppress_hook();
+}
+
+// Tracks the suppression edge so the cursor is erased exactly once when drawing is
+// suppressed (then simply not redrawn), without ever touching mouse_is_hidden.
+static bool mouse_draw_prev_suppressed = false;
+
 // 0x671F1C
 static int raw_x;
 
@@ -340,6 +356,30 @@ void mouse_show()
 
     v2 = mouse_buf;
     if (have_mouse) {
+        // Drawing suppressed (gamepad free-play): DON'T draw the cursor, but crucially
+        // do NOT touch mouse_is_hidden. That flag is the game's own hide state, and
+        // mouse_info / mouse_simulate_input gate INPUT on it -- setting it here strands
+        // controller input (face buttons dead, only the separate movement poll left
+        // alive) any time the suppress predicate briefly disagrees with the flag. So we
+        // just erase the cursor ONCE on the suppression edge (win refresh over its rect)
+        // and then no-op each frame; the constantly-refreshing world (which calls
+        // mouse_show, a no-op here) keeps it from reappearing, and moves erase their own
+        // old rect in mouse_simulate_input.
+        if (mouse_draw_suppressed()) {
+            if (!mouse_draw_prev_suppressed) {
+                mouse_draw_prev_suppressed = true;
+                Rect rect;
+                rect.ulx = mouse_x;
+                rect.uly = mouse_y;
+                rect.lrx = mouse_x + mouse_width - 1;
+                rect.lry = mouse_y + mouse_length - 1;
+                win_refresh_all(&rect);
+            }
+            mouse_buf = v2;
+            return;
+        }
+        mouse_draw_prev_suppressed = false;
+
         if (!mouse_blit_trans || !mouse_is_hidden) {
             win_get_mouse_buf(mouse_buf);
             v2 = mouse_buf;
@@ -413,6 +453,19 @@ void mouse_hide()
     }
 }
 
+void mouse_set_draw_suppress_hook(MouseDrawSuppressHook* hook)
+{
+    mouse_draw_suppress_hook = hook;
+}
+
+// External input contributor (e.g. game controller). See mouse_set_input_hook.
+static MouseInputHook* mouse_input_hook = NULL;
+
+void mouse_set_input_hook(MouseInputHook* hook)
+{
+    mouse_input_hook = hook;
+}
+
 // 0x4B4DD8
 void mouse_info()
 {
@@ -420,6 +473,9 @@ void mouse_info()
         return;
     }
 
+    // Genuine game hide (movies/transitions) still gates input off, as in vanilla.
+    // Draw suppression does NOT set mouse_is_hidden, so controller input keeps flowing
+    // with the pointer merely undrawn.
     if (mouse_is_hidden) {
         return;
     }
@@ -511,6 +567,13 @@ void mouse_info()
         x = 0;
         y = 0;
         buttons = last_buttons;
+    }
+
+    // Fold in an external contributor (game controller) after sensitivity/VCR so
+    // its cursor delta and button bits reach the same edge detection and
+    // win_check_all_buttons pass as the real mouse.
+    if (mouse_input_hook != NULL) {
+        mouse_input_hook(&x, &y, &buttons);
     }
 
     mouse_simulate_input(x, y, buttons);

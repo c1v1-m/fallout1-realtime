@@ -62,6 +62,8 @@ void win_get_mouse_buf(unsigned char* a1);
 Window* GNW_find(int win);
 unsigned char* win_get_buf(int win);
 int win_get_top_win(int x, int y);
+int win_get_top_modal();
+int win_get_top_button_centers(int* xs, int* ys, int maxCount);
 int win_width(int win);
 int win_height(int win);
 int win_get_rect(int win, Rect* rect);

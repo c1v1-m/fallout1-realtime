@@ -44,12 +44,24 @@ void intface_disable();
 bool intface_is_enabled();
 void intface_redraw();
 void intface_update_hit_points(bool animate);
+// Frame-loop pump for the non-blocking hit-point counter that intface_update_hit_points(true)
+// starts during realtime combat (the vanilla roll blocks the whole world for ~250ms). Called
+// from combat_rt_update; a no-op when no roll is in flight.
+void intface_hp_roll_tick(float dt);
+// Abandons a roll in flight and snaps the counter to the dude's real hit points. Must be called
+// whenever the value underneath it changes out from under the animation (load, map teardown).
+void intface_hp_roll_cancel();
 void intface_update_ac(bool animate);
 void intface_update_move_points(int actionPoints, int bonusMove);
 int intface_get_attack(int* hitMode, bool* aiming);
 int intface_update_items(bool animated);
 int intface_toggle_items(bool animated);
+// Reloads the active-hand weapon from inventory ammo (controller reload button).
+int intface_reload_weapon();
 int intface_toggle_item_state();
+// True when a toggle would reach a different firing mode. Realtime skips the aiming and reload
+// entries (they change nothing but the icon there), so a single-mode weapon has nothing to cycle.
+bool intface_item_can_toggle_state();
 void intface_use_item();
 int intface_is_item_right_hand();
 int intface_get_current_item(Object** itemPtr);

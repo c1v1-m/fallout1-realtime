@@ -8,6 +8,7 @@
 #include "game/actions.h"
 #include "game/automap.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/critter.h"
 #include "game/elevator.h"
 #include "game/endgame.h"
@@ -587,7 +588,12 @@ static void script_chk_critters()
     // 0x51C7DC
     static int count = 0;
 
-    if (!dialog_active() && !isInCombat()) {
+    // Ambient CRITTER scripts are suspended during a fight so they cannot interfere with it. That
+    // is right, but the test has to be "is a fight happening to the player", not isInCombat():
+    // realtime keeps the combat bit warm while any critter anywhere is still chasing, so this
+    // stopped every NPC's idle script on the whole map, indefinitely. (Note the SCRIPT_PROC_COMBAT
+    // branch below has always been dead code -- this gate excludes the only case that would pick it.)
+    if (!dialog_active() && !combat_rt_under_threat()) {
         ScriptList* scriptList;
         ScriptListExtent* scriptListExtent;
 
@@ -642,7 +648,12 @@ static void script_chk_timed_events()
     now = get_bk_time();
     should_process_queue = false;
 
-    if (!isInCombat()) {
+    // TIMED SCRIPT EVENTS. Vanilla holds the queue during a fight, which is harmless when a fight
+    // is twenty seconds long. Under realtime the combat bit can stay warm for MINUTES because
+    // something is chasing somewhere, and this quietly froze every scripted timer in the game --
+    // the kind of thing that breaks a quest with no visible cause and no way to connect it back.
+    // Bound the stall to an actual fight instead. See combat_rt_under_threat().
+    if (!combat_rt_under_threat()) {
         should_process_queue = true;
     }
 
@@ -986,7 +997,9 @@ int scripts_request_combat(STRUCT_664980* a1)
 // 0x4927D8
 void scripts_request_townmap()
 {
-    if (isInCombat()) {
+    // combat_rt owns combat in realtime mode; the turn-based "can't leave during
+    // combat" rule (which force-quits to the main menu) must not apply.
+    if (isInCombat() && !combat_rt_enabled()) {
         game_user_wants_to_quit = 1;
     }
 
@@ -996,7 +1009,9 @@ void scripts_request_townmap()
 // 0x492800
 void scripts_request_worldmap()
 {
-    if (isInCombat()) {
+    // combat_rt owns combat in realtime mode; the turn-based "can't leave during
+    // combat" rule (which force-quits to the main menu) must not apply.
+    if (isInCombat() && !combat_rt_enabled()) {
         game_user_wants_to_quit = 1;
     }
 

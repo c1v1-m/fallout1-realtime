@@ -7,10 +7,13 @@
 
 #include <algorithm>
 
+#include <SDL.h>
+
 #include "game/automap.h"
 #include "game/bmpdlog.h"
 #include "game/combat.h"
 #include "game/combatai.h"
+#include "game/gamepad_ui.h"
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/display.h"
@@ -46,6 +49,7 @@
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -169,6 +173,95 @@ static const int lsgrphs[LOAD_SAVE_FRM_COUNT] = {
 
 // 0x50595C
 static int slot_cursor = 0;
+
+// Private copies of the red Done/Cancel button art with the gamepad hint letter
+// (A / B) baked in, so GNW_button_refresh draws the letter as part of the button
+// (drawing onto the window buffer doesn't survive -- the refresh re-blits the
+// button over it). Allocated in LSGameStart when a controller is present, freed in
+// LSGameEnd. NULL = no hint (mouse/keyboard, or allocation failed).
+static unsigned char* ls_done_button_up = NULL;
+static unsigned char* ls_cancel_button_up = NULL;
+
+// Gamepad navigation for the load/save slot list. Edge-detected D-pad / left stick
+// step the selection one slot at a time; A confirms, B cancels. Returns a keycode
+// to inject into the modal loop (as if typed) or -1 when the pad produced no edge.
+// gamepad_ui_tick does not run inside these modal loops, so the pad is read directly
+// here (same pattern as the world map), which is how the controller drives the
+// load/save screen without relying on the (now hidden) cursor.
+static int ls_gamepad_keycode()
+{
+    static bool prevUp = false;
+    static bool prevDown = false;
+    static bool prevA = false;
+    static bool prevB = false;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevUp = prevDown = prevA = prevB = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+
+    bool upNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+    bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+    // A -> Enter, B -> Escape: the slot loops map KEY_RETURN to their confirm (500)
+    // and handle KEY_ESCAPE as cancel, and the save-description text-entry loop
+    // (get_input_str2) checks KEY_RETURN / KEY_ESCAPE directly -- so one helper drives
+    // confirm/cancel in every load/save sub-loop.
+    int keyCode = -1;
+    if (upNow && !prevUp) {
+        keyCode = KEY_ARROW_UP;
+    } else if (downNow && !prevDown) {
+        keyCode = KEY_ARROW_DOWN;
+    } else if (aNow && !prevA) {
+        keyCode = KEY_RETURN;
+    } else if (bNow && !prevB) {
+        keyCode = KEY_ESCAPE;
+    }
+
+    prevUp = upNow;
+    prevDown = downNow;
+    prevA = aNow;
+    prevB = bNow;
+
+    return keyCode;
+}
+
+// Auto-hide the load/save cursor for a console feel when a controller is present:
+// it starts hidden and only reappears while the right stick (or the real mouse) is
+// actively moving it, then fades back out after LS_CURSOR_IDLE_MS of no movement.
+// Uses the blank MOUSE_CURSOR_NONE shape rather than mouse_hide(), which would gate
+// the mouse_info hook off and stop the right stick from ever revealing it again.
+// Slot navigation runs separately (ls_gamepad_keycode), so the hidden cursor costs
+// nothing; without a controller the cursor stays always-on (mouse/keyboard use).
+#define LS_CURSOR_IDLE_MS 2000
+
+static void ls_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned int* lastMove)
+{
+    int x;
+    int y;
+    mouse_get_position(&x, &y);
+
+    if (x != *lastX || y != *lastY) {
+        *lastMove = get_time();
+        if (!*shown) {
+            gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+            *shown = true;
+        }
+    } else if (*shown && elapsed_time(*lastMove) >= LS_CURSOR_IDLE_MS) {
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        *shown = false;
+    }
+
+    *lastX = x;
+    *lastY = y;
+}
 
 // 0x505960
 static bool quick_done = false;
@@ -335,6 +428,108 @@ void ResetLoadSave()
     MapDirErase("MAPS\\", "SAV");
 }
 
+// Headless save to an explicit slot (0-based) with a fixed description, no UI. Mirrors
+// the non-interactive body of SaveGame()'s quick-save path. Used by autosave (on location
+// change / quest completion) and the gamepad quick-save combo. Returns 1 on success, -1 on
+// failure. SaveHeader fills the character name / date / map from the live game state, so we
+// only need to point slot_cursor at the slot and set its description label.
+int SaveGameSlot(int slot, const char* description)
+{
+    if (slot < 0 || slot > 9) {
+        return -1;
+    }
+
+    ls_error_code = 0;
+
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    slot_cursor = slot;
+
+    // Pull any existing header (mirrors the quick path), then stamp our own label.
+    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", slot_cursor + 1);
+    strcat(gmpath, "SAVE.DAT");
+    flptr = db_fopen(gmpath, "rb");
+    if (flptr != NULL) {
+        LoadHeader(slot_cursor);
+        db_fclose(flptr);
+    }
+
+    strncpy(LSData[slot_cursor].description, description != NULL ? description : "", LOAD_SAVE_DESCRIPTION_LENGTH - 1);
+    LSData[slot_cursor].description[LOAD_SAVE_DESCRIPTION_LENGTH - 1] = '\0';
+
+    thumbnail_image[1] = NULL;
+    int rc = QuickSnapShot();
+    if (rc == 1) {
+        int saved = SaveSlot();
+        if (saved != -1) {
+            rc = saved;
+        }
+    }
+
+    if (thumbnail_image[1] != NULL) {
+        mem_free(snapshot);
+    }
+
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+
+    return rc != -1 ? 1 : -1;
+}
+
+// Save-slot layout for the auto/quick save scheme (0-based; shown as SLOT01.. on the
+// load screen). The location autosave is a ROTATING RING of 3 slots so the last three
+// visited locations are kept ("Autosave 1/2/3"), not one overwritten slot.
+//   slot 0       = quick save        (SLOT01)
+//   slots 1..3   = location autosave ring "Autosave 1/2/3" (SLOT02..04)
+//   slot 4       = last quest autosave (SLOT05)
+#define QUICKSAVE_SLOT 0
+#define LOCATION_AUTOSAVE_SLOT_FIRST 1
+#define LOCATION_AUTOSAVE_SLOT_COUNT 3
+#define QUEST_AUTOSAVE_SLOT 4
+
+// Set when a savegame was just loaded, so the location-change autosave in the main loop
+// skips the immediate map change a load causes (else loading would instantly autosave over
+// the just-loaded state). Read-and-cleared by LoadSaveConsumeJustLoaded().
+static bool ls_just_loaded = false;
+
+bool LoadSaveConsumeJustLoaded()
+{
+    bool v = ls_just_loaded;
+    ls_just_loaded = false;
+    return v;
+}
+
+// Autosave on entering a new location. Rotates through LOCATION_AUTOSAVE_SLOT_COUNT slots
+// (a ring) so the last few locations are preserved instead of one overwritten slot. The
+// label matches the slot position so "Autosave 1/2/3" stay stable on the load screen; the
+// cursor just picks which one this call overwrites (oldest in rotation). The cursor resets
+// per session (starts at Autosave 1), which is fine -- it still keeps the last 3 in a run.
+int AutoSaveLocation()
+{
+    static int locationCursor = 0;
+
+    int slot = LOCATION_AUTOSAVE_SLOT_FIRST + locationCursor;
+    char description[32];
+    snprintf(description, sizeof(description), "Autosave %d", locationCursor + 1);
+
+    locationCursor = (locationCursor + 1) % LOCATION_AUTOSAVE_SLOT_COUNT;
+
+    return SaveGameSlot(slot, description);
+}
+
+// Autosave on quest progress (its own dedicated slot, separate from location).
+int AutoSaveQuest()
+{
+    return SaveGameSlot(QUEST_AUTOSAVE_SLOT, "Autosave: Quest");
+}
+
+// Quick save to the dedicated quick-save slot (gamepad combo / F-key).
+int QuickSaveGame()
+{
+    return SaveGameSlot(QUICKSAVE_SLOT, "Quick Save");
+}
+
 // 0x46D9C4
 int SaveGame(int mode)
 {
@@ -468,6 +663,18 @@ int SaveGame(int mode)
 
     dbleclkcntr = 24;
 
+    // Cursor auto-hide (controller only): start hidden, reveal on movement.
+    bool lsCursorPad = gamepad_ui_get_controller() != NULL;
+    bool lsCursorShown = true;
+    int lsCursorX = 0;
+    int lsCursorY = 0;
+    unsigned int lsCursorMove = get_time();
+    if (lsCursorPad) {
+        mouse_get_position(&lsCursorX, &lsCursorY);
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        lsCursorShown = false;
+    }
+
     int rc = -1;
     int doubleClickSlot = -1;
     while (rc == -1) {
@@ -479,6 +686,17 @@ int SaveGame(int mode)
         int scrollDirection = LOAD_SAVE_SCROLL_DIRECTION_NONE;
 
         convertMouseWheelToArrowKey(&keyCode);
+
+        {
+            int padKey = ls_gamepad_keycode();
+            if (keyCode == -1 && padKey != -1) {
+                keyCode = padKey;
+            }
+        }
+
+        if (lsCursorPad) {
+            ls_tick_cursor(&lsCursorShown, &lsCursorX, &lsCursorY, &lsCursorMove);
+        }
 
         if (keyCode == KEY_ESCAPE || keyCode == 501 || game_user_wants_to_quit != 0) {
             rc = 0;
@@ -973,6 +1191,18 @@ int LoadGame(int mode)
     win_draw(lsgwin);
     dbleclkcntr = 24;
 
+    // Cursor auto-hide (controller only): start hidden, reveal on movement.
+    bool lsCursorPad = gamepad_ui_get_controller() != NULL;
+    bool lsCursorShown = true;
+    int lsCursorX = 0;
+    int lsCursorY = 0;
+    unsigned int lsCursorMove = get_time();
+    if (lsCursorPad) {
+        mouse_get_position(&lsCursorX, &lsCursorY);
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        lsCursorShown = false;
+    }
+
     int rc = -1;
     int doubleClickSlot = -1;
     while (rc == -1) {
@@ -984,6 +1214,17 @@ int LoadGame(int mode)
         int scrollDirection = 0;
 
         convertMouseWheelToArrowKey(&keyCode);
+
+        {
+            int padKey = ls_gamepad_keycode();
+            if (keyCode == -1 && padKey != -1) {
+                keyCode = padKey;
+            }
+        }
+
+        if (lsCursorPad) {
+            ls_tick_cursor(&lsCursorShown, &lsCursorX, &lsCursorY, &lsCursorMove);
+        }
 
         if (keyCode == KEY_ESCAPE || keyCode == 501 || game_user_wants_to_quit != 0) {
             rc = 0;
@@ -1402,6 +1643,37 @@ static int LSGameStart(int windowType)
 
     int btn;
 
+    // CE: When a controller is present, bake an "A" / "B" hint into a private copy of
+    // the red button art so the player sees which pad button is Done / Cancel. The
+    // letter must be part of the button image (GNW_button_refresh re-blits it every
+    // frame), so we copy the FRM and draw onto the copy -- never onto shared art.
+    unsigned char* doneButtonUp = lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL];
+    unsigned char* cancelButtonUp = lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL];
+    if (gamepad_ui_get_controller() != NULL) {
+        int redW = ginfo[LOAD_SAVE_FRM_RED_BUTTON_NORMAL].width;
+        int redH = ginfo[LOAD_SAVE_FRM_RED_BUTTON_NORMAL].height;
+        int redSize = redW * redH;
+
+        ls_done_button_up = (unsigned char*)mem_malloc(redSize);
+        ls_cancel_button_up = (unsigned char*)mem_malloc(redSize);
+        if (ls_done_button_up != NULL && ls_cancel_button_up != NULL) {
+            memcpy(ls_done_button_up, lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL], redSize);
+            memcpy(ls_cancel_button_up, lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL], redSize);
+
+            int oldHintFont = text_curr();
+            text_font(100);
+            int hintY = (redH - text_height()) / 2;
+            text_to_buf(ls_done_button_up + redW * hintY + (redW - text_width("A")) / 2,
+                "A", redW, redW, colorTable[32767]);
+            text_to_buf(ls_cancel_button_up + redW * hintY + (redW - text_width("B")) / 2,
+                "B", redW, redW, colorTable[32767]);
+            text_font(oldHintFont);
+
+            doneButtonUp = ls_done_button_up;
+            cancelButtonUp = ls_cancel_button_up;
+        }
+    }
+
     btn = win_register_button(lsgwin,
         391,
         349,
@@ -1411,7 +1683,7 @@ static int LSGameStart(int windowType)
         -1,
         -1,
         500,
-        lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL],
+        doneButtonUp,
         lsbmp[LOAD_SAVE_FRM_RED_BUTTON_PRESSED],
         NULL,
         BUTTON_FLAG_TRANSPARENT);
@@ -1428,7 +1700,7 @@ static int LSGameStart(int windowType)
         -1,
         -1,
         501,
-        lsbmp[LOAD_SAVE_FRM_RED_BUTTON_NORMAL],
+        cancelButtonUp,
         lsbmp[LOAD_SAVE_FRM_RED_BUTTON_PRESSED],
         NULL,
         BUTTON_FLAG_TRANSPARENT);
@@ -1473,13 +1745,30 @@ static int LSGameStart(int windowType)
     win_register_button(lsgwin, 55, 87, 230, 353, -1, -1, -1, 502, NULL, NULL, NULL, BUTTON_FLAG_TRANSPARENT);
     text_font(101);
 
+    // The modal loop below reads the pad directly to step slots one at a time; tell
+    // the shared gamepad hook to stop left-stick-snapping the cursor to buttons.
+    gamepad_ui_set_self_nav(true);
+
     return 0;
 }
 
 // 0x46F910
 static int LSGameEnd(int windowType)
 {
+    gamepad_ui_set_self_nav(false);
+
     win_delete(lsgwin);
+
+    // Free the A/B hint button-art copies (win_delete dropped the buttons that
+    // referenced them).
+    if (ls_done_button_up != NULL) {
+        mem_free(ls_done_button_up);
+        ls_done_button_up = NULL;
+    }
+    if (ls_cancel_button_up != NULL) {
+        mem_free(ls_cancel_button_up);
+        ls_cancel_button_up = NULL;
+    }
     text_font(fontsave);
     message_exit(&lsgame_msgfl);
 
@@ -1660,6 +1949,7 @@ static int LoadSlot(int slot)
     }
 
     loadingGame = 0;
+    ls_just_loaded = true; // suppress the immediate location-change autosave in the main loop
 
     return 0;
 }
@@ -2218,6 +2508,13 @@ static int get_input_str2(int win, int doneKeyCode, int cancelKeyCode, char* des
         int keyCode = get_input();
         if ((keyCode & 0x80000000) == 0) {
             v1++;
+        }
+
+        {
+            int padKey = ls_gamepad_keycode();
+            if (keyCode == -1 && padKey != -1) {
+                keyCode = padKey;
+            }
         }
 
         if (keyCode == doneKeyCode || keyCode == KEY_RETURN) {

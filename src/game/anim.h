@@ -111,12 +111,24 @@ typedef struct StraightPathNode {
 void anim_init();
 void anim_reset();
 void anim_exit();
+void anim_debug_table(int* occupied, int* nonReserved, int* curr); // TEMP DIAG
 int register_begin(int a1);
 int register_priority(int a1);
 int register_clear(Object* a1);
+// register_clear variant that ends even a PRIORITIZED sequence (realtime combat; see anim.cc).
+int anim_force_clear(Object* a1);
+// register_clear variant that only ends a sequence in which `a1` still has UNPLAYED work.
+// MUST be used instead of register_clear by anything gated on anim_busy_blocking (see anim.cc).
+int anim_clear_pending(Object* a1);
 int register_end();
 int check_registry(Object* obj);
 int anim_busy(Object* a1);
+// Narrower anim_busy: true only while `a1` still OWES animation work, ignoring descriptions
+// that have already played. Lets the realtime player move on once his own swing is done
+// instead of waiting out his victim's death in the same sequence. See anim.cc.
+int anim_busy_blocking(Object* a1);
+// TEMP DIAG: describe the live sequence holding `a1` busy (see anim.cc). STRIP when done.
+void anim_debug_blocking_dump(Object* a1, char* buf, size_t size);
 int register_object_move_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_move_to_tile(Object* owner, int tile, int elevation, int actionPoints, int delay);
@@ -165,6 +177,24 @@ int anim_hide(Object* object, int animationSequenceIndex);
 int anim_change_fid(Object* obj, int animationSequenceIndex, int fid);
 void anim_stop();
 unsigned int compute_tpf(Object* object, int fid);
+
+// Realtime combat: multiplies the ticks-per-frame of subsequently-registered
+// animations (set just before registering an attack, reset to 1.0 right after)
+// so an attack's animation duration tracks its cooldown. 1.0 = unscaled.
+void anim_set_speed_scale(float scale);
+
+// Movement-only (WALK / RUN) speed multiplier, as a SPEED: 1.0 = stock, higher = faster. Applied on
+// top of anim_set_speed_scale and only to those two animation types.
+void anim_set_move_speed_scale(float scale);
+
+// Per-point AGILITY scaling of the weapon put-away / take-out animations (realtime only).
+// Symmetric curve; 0 = off.
+void anim_set_weapon_swap_stat_factor(float factor);
+
+// Realtime combat: appends `count` steps in `rotation` to obj's in-flight walk/
+// run animation so it keeps walking without restarting the frame cycle. Returns
+// 0 on success or a negative reason code (see definition in anim.cc).
+int anim_extend_move(Object* obj, int rotation, int count);
 
 } // namespace fallout
 

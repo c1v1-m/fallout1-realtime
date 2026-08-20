@@ -1,0 +1,211 @@
+#ifndef FALLOUT_GAME_COMBAT_RT_H_
+#define FALLOUT_GAME_COMBAT_RT_H_
+
+#include "game/object_types.h"
+
+namespace fallout {
+
+// Realtime combat system.
+//
+// Replaces the turn-based combat() interrupt with a per-frame, per-actor state
+// machine. There is no "combat mode" the player enters or leaves: enemies aggro
+// when the player comes within their perception range, act on cooldowns derived
+// from their action points (Agility), and the player moves/attacks freely in
+// realtime. See combat_rt.cc for the design notes.
+//
+// This system REUSES the existing damage pipeline (combat_attack, apply_damage,
+// roll.cc, stat_level) rather than reimplementing it. It keeps the combat
+// subsystem "warm" (the COMBAT_STATE_0x01 in-combat bit set while hostiles are
+// near) so the shared attack/animation/damage code engages, but it never runs
+// the turn scheduler, action-point UI, or end-turn flow.
+
+// Lifecycle.
+void combat_rt_init();
+void combat_rt_exit();
+void combat_rt_reset();
+
+// Per-frame tick. dt is wall-clock seconds since the previous frame. Drives
+// aggro, the NPC state machines, and cooldowns. Safe to call every frame even
+// when no hostiles are present (it early-outs cheaply).
+void combat_rt_update(float dt);
+
+// Routes a player input event (a get_input() key code) to the realtime system:
+// WASD tile movement and mouse-click-to-attack. Returns true if the event was
+// consumed by combat_rt and should not be processed further.
+bool combat_rt_handle_input(int keyCode);
+
+// Polls the gamepad (SDL_GameController) once per frame: left stick -> tile
+// movement, right trigger / A -> attack nearest hostile in range, B -> cancel.
+// Called from combat_rt_update.
+void combat_rt_poll_gamepad();
+
+// True while at least one hostile is engaged (for music/UI hooks later).
+bool combat_rt_active();
+
+// "Is something actually coming for me right now?" -- an engaged, live hostile that is after the
+// player's side AND can perceive him. Use this INSTEAD of isInCombat() for any vanilla rule that
+// meant "you are in a turn-based encounter" (no talking, no script timers, ...): realtime keeps the
+// warm combat bit set for as long as anything anywhere is chasing, which turns those short,
+// bounded restrictions into permanent ones. Falls back to isInCombat() outside realtime.
+bool combat_rt_under_threat();
+
+// True while any critter on the dude's elevation is still playing its death animation. Saving calls
+// anim_stop(), which force-ends every sequence and slams a mid-fall body flat, so an autosave must
+// wait for this to clear.
+bool combat_rt_death_anim_pending();
+
+// Per-critter version of the above: is THIS critter actually fighting the player right now?
+// Use it instead of combat_rt_is_hostile() wherever the question is "should I treat this as an
+// enemy in front of me" -- the hostile flag itself is STICKY and never cleared, so a bystander
+// caught by faction aggro carries it for the rest of the map's life even if it never acts.
+bool combat_rt_is_engaging(Object* obj);
+
+// Manual END COMBAT -- the realtime replacement for vanilla's Enter key / the interface bar's
+// END COMBAT button, both of which live in the dormant turn-based path and are unreachable here.
+// It is NOT an escape hatch: exactly like vanilla's combat_end(), it only succeeds when every
+// live hostile already wants to stop (disengaging, fleeing, or perceiving nobody to fight), and
+// otherwise refuses and prints combat.msg #103 so the player is told WHY. Returns true if combat
+// ended (or was not running).
+bool combat_rt_end_combat();
+
+// True when a hostile the player could hit is within current-weapon range. The
+// gamepad layer uses this to arbitrate the A button: A attacks when this is true,
+// otherwise A is a world/UI interact (left click). Cheap; safe every frame.
+bool combat_rt_hostile_in_attack_range();
+
+// True if this specific critter is currently flagged hostile to the dude.
+bool combat_rt_is_hostile(Object* obj);
+
+// True while a right-stick lock-on target is set. The gamepad layer also treats
+// A as a committed attack (never a UI interact) whenever this is true, so a lock
+// on an out-of-range target still consumes A (it just doesn't fire) instead of
+// falling through to a world click.
+bool combat_rt_has_lock();
+
+// --- L3 aimed-shot wheel support (gamepad_ui drives the body-part overlay). ---
+
+// Whether an aimed shot is possible right now: the dude is in combat, the active
+// weapon supports called shots, and there is a target (the lock-on, else the nearest
+// hostile in range). The gamepad layer gates the body-part wheel on this.
+bool combat_rt_can_aim();
+
+// The critter an aimed shot would currently hit (the lock-on target, else the nearest
+// hostile in range), or NULL. The gamepad layer uses it to show the target's body in the
+// wheel hub.
+Object* combat_rt_aim_target();
+
+// To-hit % for a called shot at `hitLocation` (a HIT_LOCATION_* specific value)
+// against the current aim target, clamped to 0..999. 0 if there is no target. Used to
+// label each wheel segment.
+int combat_rt_aim_chance(int hitLocation);
+
+// Queue an aimed shot at the current target hitting `hitLocation`. Returns true if it
+// was latched (the arbiter fires it on the next eligible frame, paying the aimed AP
+// cost), false if no valid target / the weapon can't aim / the location is invalid.
+bool combat_rt_aimed_attack(int hitLocation);
+
+// Green-highlight (Fallout 3 VATS style) the current aim target while the body-part wheel
+// is up, replacing its combat red outline; the off call restores the exact prior outline.
+// Called by the gamepad layer on aim-wheel open/close. No-op if there is no target.
+void combat_rt_aim_highlight_on();
+void combat_rt_aim_highlight_off();
+
+// Tap-A world loot: if an adjacent corpse or container is next to the dude, stash
+// it (opened by combat_rt_update) and return true so the gamepad layer routes A to
+// looting instead of a walk-click. Safe to call from the input hook (detection
+// only; the loot window is opened later from the main loop).
+bool combat_rt_try_world_loot();
+
+// Hook from combat(): when a critter's script routes an attack on the dude
+// through the turn-based entry point (op_attack -> scripts_request_combat ->
+// combat()), combat() forwards the attacker/defender here before refusing to
+// run. combat_rt uses it as the authoritative "this critter is hostile to the
+// player" signal (genuine hostiles request combat; peaceful NPCs never do).
+void combat_rt_notify_attack(Object* attacker, Object* defender);
+
+// Hook from obj_remove_all() (object.cc) right before a map teardown frees every object.
+// Abandons any in-flight realtime attack and drops all object pointers combat_rt holds
+// (rt_resolving, the actor registry, lock/intent/loot, the engine's pending main_ctd) so a
+// stale attack can't commit against freed memory after a mid-combat map exit. Idempotent.
+void combat_rt_notify_objects_freed();
+
+// Hook from obj_erase_object() (object.cc) right before a SINGLE object is freed (a script
+// destroy, a gibbed/cleaned-up corpse, etc.). If a critter is being freed mid-realtime-combat,
+// clears every dangling whoHitMe pointer that references it (so apply_damage's retaliation
+// check can't dereference freed memory) and drops combat_rt's own pointers to it. No-op outside
+// realtime combat / for non-critter objects.
+void combat_rt_notify_critter_removed(Object* removed);
+
+// Total damage from attacks that are already IN FLIGHT against `defender` (computed and
+// snapshotted, but not yet committed), plus whether one of them is already flagged lethal.
+// combat.cc's check_for_death() calls this so that an attack's DAM_DEAD flag -- which is decided
+// at FIRE time -- accounts for the damage that will land before this attack does. Without it,
+// concurrent attacks each compute "not lethal" against the same stale HP, nobody registers a
+// death animation, and the kill falls into critter_adjust_hits' emergency critter_kill() path.
+// `killClaimed` (may be NULL) reports that another in-flight attack already owns the death, so
+// this one must not register a second death animation. Returns 0 outside realtime.
+int combat_rt_pending_damage_on(Object* defender, bool* killClaimed);
+
+// Defensive guard called from combat_commit_pending_attack() right before apply_damage(): clears
+// a dangling whoHitMe on either attack party so apply_damage's retaliation check
+// (combatai_check_retaliation -> combatai_rating(defender->whoHitMe)) can't dereference a freed
+// Object. Validates the whoHitMe pointer by membership in the live critter list (a scan that
+// never dereferences the candidate) and NULLs it if the referenced critter is gone. Covers any
+// free path that the obj_erase_object hook misses. No-op outside realtime combat.
+void combat_rt_validate_who_hit_me(Object* a, Object* b);
+
+// Called from map_leave_map() / the elevation-change guard when the player leaves a map
+// MID-COMBAT in realtime. Ends realtime combat cleanly (clears the engine warm bit so
+// isInCombat() becomes false and the map transition proceeds) instead of the vanilla
+// "in combat -> game_user_wants_to_quit = 1" path, which boots the player to the main menu.
+void combat_rt_end_for_map_exit();
+
+// Called from map_leave_map() when the player steps onto a map-exit grid IN realtime combat.
+// Arms the escape-hold timer: the player must stay on the exit grid for RT_MAP_EXIT_DELAY
+// seconds of live combat before the map changes (anti-abuse -- no instant flee). combat_rt
+// drives the countdown and performs the transition on expiry; stepping off cancels it.
+void combat_rt_arm_map_exit();
+
+// Route a legacy player-attack request (combat_attack_this / the crosshair mouse path)
+// into the realtime intent system. Calling combat_attack() directly in realtime sets the
+// engine's pending flag without combat_rt's rt_resolving slot, wedging the attack lock
+// until the 2.5s watchdog (a frozen, damage-less swing); this resolves the attack through
+// rt_do_attack instead. Only a hostile combatant in weapon range is attacked (else no-op).
+// Returns true if attack intent was set.
+bool combat_rt_player_attack(Object* target);
+
+// game_trace heartbeat callback: emits one TRACE_STATE snapshot of the realtime combat
+// world (actors, hostiles, dude HP/AP, lock, pending/resolving, anim-table occupancy)
+// plus invariant health-check TRACE_WARNs. Registered with trace_set_snapshot_fn.
+void combat_rt_trace_snapshot();
+
+// True once combat_rt owns combat (between combat_rt_init and combat_rt_exit).
+// The turn-based combat() scheduler checks this and refuses to activate while
+// it is set, so the old combat mode can never take over.
+bool combat_rt_enabled();
+
+// True while the player is actively feeding movement input (within a short grace
+// window of the last WASD/stick step). actions.cc uses this to suppress the dude's
+// enemy-miss dodge while he's moving, so a miss never interrupts his movement.
+bool combat_rt_dude_moving();
+
+// True while the critter is in its anti-stunlock flinch-immunity window (see combat_rt.cc).
+bool combat_rt_flinch_immune(Object* obj);
+
+// True when this attacker's weapon still counts as SHOULDERED from a recent shot, so action_ranged
+// should SKIP the ANIM_POINT raise. The raise is a per-shot 0.43 s tax when you fire continuously,
+// so it is paid once per burst rather than once per round -- see the long note in combat_rt.cc.
+// Governed by cfg `ranged_point_hold` (< 0 never raises, 0 raises every shot, > 0 = the hold).
+bool combat_rt_weapon_is_up(Object* attacker);
+
+// The player's realtime action-point pool and its cap (the dude's max AP). The
+// interface bar's AP indicator reads these so the bulbs reflect the real pool
+// (which paces attacks) instead of the engine combat.ap that combat_rt keeps
+// maxed for free movement. Both clamp safely before the first update frame.
+int combat_rt_player_ap();
+int combat_rt_player_max_ap();
+bool combat_rt_spend_ap(int cost);
+
+} // namespace fallout
+
+#endif /* FALLOUT_GAME_COMBAT_RT_H_ */

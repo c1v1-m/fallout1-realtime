@@ -94,6 +94,10 @@ void gmouse_3d_disable_modes();
 int gmouse_3d_modes_are_enabled();
 void gmouse_3d_set_mode(int a1);
 int gmouse_3d_get_mode();
+// Forces the crosshair to-hit indicator (reticle + accuracy %) for a specific
+// target this frame, regardless of cursor stillness. Used by the controller
+// lock-on, which glues the cursor to a moving target.
+void gmouse_3d_show_to_hit(Object* target);
 void gmouse_3d_toggle_mode();
 void gmouse_3d_refresh();
 int gmouse_3d_set_fid(int fid);
@@ -102,6 +106,13 @@ void gmouse_3d_reset_fid();
 void gmouse_3d_on();
 void gmouse_3d_off();
 bool gmouse_3d_is_on();
+// Hide/show the red iso MOVE cursor object for gamepad free-play (input-safe: cursor
+// object only, not the low-level mouse pipeline).
+void gmouse_set_move_cursor_hidden(bool hidden);
+bool gmouse_move_cursor_is_hidden();
+// Hides every iso cursor, crosshair included (gmouse_set_move_cursor_hidden deliberately lets a
+// crosshair through). Used while the gamepad body-part aim picker is drawing on the target.
+void gmouse_set_cursor_suppressed(bool suppressed);
 Object* object_under_mouse(int objectType, bool a2, int elevation);
 int gmouse_3d_build_pick_frame(int x, int y, int menuItem, int width, int height);
 int gmouse_3d_pick_frame_hot(int* a1, int* a2);

@@ -225,6 +225,54 @@ void handleWindowSizeChanged()
     createRenderer(screenGetWidth(), screenGetHeight());
 }
 
+// Alt+Enter runtime toggle between fullscreen and a window (bound in input.cc's SDL pump).
+//
+// The game's INTERNAL resolution never changes -- that stays whatever f1_res.ini set up
+// (SCR_WIDTH/SCR_HEIGHT/SCALE_2X); only the presentation does. SDL posts a SIZE_CHANGED right
+// after, which runs handleWindowSizeChanged() and rebuilds the renderer at the same logical size,
+// so nothing else needs touching. Going back to fullscreen uses BORDERLESS desktop fullscreen
+// rather than the exclusive mode-set the game boots with: no video mode change, so the flip is
+// instant and alt-tab stays well behaved.
+//
+// Leaving fullscreen also RESIZES the window: it was created at width*scale x height*scale, which
+// for a config matched to the monitor (e.g. 2560x1440) is a "window" exactly as big as the screen,
+// with its title bar off the top. So size it to ~80% of the desktop, keeping the aspect ratio,
+// and center it.
+void svga_toggle_fullscreen()
+{
+    if (gSdlWindow == NULL) {
+        return;
+    }
+
+    bool wasFullscreen = (SDL_GetWindowFlags(gSdlWindow) & SDL_WINDOW_FULLSCREEN) != 0;
+    SDL_SetWindowFullscreen(gSdlWindow, wasFullscreen ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+
+    if (!wasFullscreen) {
+        return; // now fullscreen -- nothing to size
+    }
+
+    SDL_Rect bounds;
+    if (SDL_GetDisplayUsableBounds(SDL_GetWindowDisplayIndex(gSdlWindow), &bounds) != 0) {
+        return;
+    }
+
+    int w = screenGetWidth();
+    int h = screenGetHeight();
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    int targetH = bounds.h * 4 / 5;
+    int targetW = (int)((double)targetH * w / h);
+    if (targetW > bounds.w * 4 / 5) {
+        targetW = bounds.w * 4 / 5;
+        targetH = (int)((double)targetW * h / w);
+    }
+
+    SDL_SetWindowSize(gSdlWindow, targetW, targetH);
+    SDL_SetWindowPosition(gSdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+}
+
 void renderPresent()
 {
     SDL_UpdateTexture(gSdlTexture, NULL, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);

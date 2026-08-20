@@ -5,9 +5,12 @@
 
 #include <algorithm>
 
+#include <SDL.h>
+
 #include "game/art.h"
 #include "game/editor.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gsound.h"
 #include "game/message.h"
 #include "game/wordwrap.h"
@@ -123,6 +126,61 @@ int flgids2[FILE_DIALOG_FRM_COUNT] = {
 };
 
 // 0x41BE70
+// Gamepad support for the modal message / yes-no box (dialog_out): A confirms
+// (KEY_RETURN -> Yes/OK), B cancels (KEY_ESCAPE -> No). Read directly and edge-
+// detected, because these boxes often pop up over a screen that set self_nav (main
+// menu, options), which suppresses the shared A-as-click -- so the cursor path can't
+// reach the Yes/No buttons. Returns an injected keycode or -1.
+
+// Set by dialog_out just before its loop starts: the FIRST poll of a new box must adopt whatever
+// the pad is holding as the baseline instead of reading it as a fresh press.
+//
+// ⚠️ WITHOUT THIS, EVERY CONFIRMATION ANSWERED ITSELF. The press that picks "Exit Game" in the
+// pause menu is still physically down when game_quit_with_confirm() puts the "are you sure?" box on
+// screen; prevA was stale-false from some earlier box, so that same unreleased A rose-edged
+// instantly into KEY_RETURN = Yes. The player never saw a question -- "áčko při výběru exit game
+// přeskočí i potvrzení a hned souhlasí". Exactly the trap gpui_inventory_a documents for windows
+// opened by a held A; this box is another window opened by a held A.
+static bool dialog_pad_prime = false;
+
+static int dialog_gamepad_keycode()
+{
+    static bool prevA = false;
+    static bool prevB = false;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevA = false;
+        prevB = false;
+        dialog_pad_prime = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+    if (dialog_pad_prime) {
+        // First poll of this box: adopt the live state, emit nothing. A button carried in from the
+        // press that OPENED the box now has to be released and pressed again to answer it.
+        dialog_pad_prime = false;
+        prevA = aNow;
+        prevB = bNow;
+        return -1;
+    }
+
+    int keyCode = -1;
+    if (aNow && !prevA) {
+        keyCode = KEY_RETURN;
+    } else if (bNow && !prevB) {
+        keyCode = KEY_ESCAPE;
+    }
+
+    prevA = aNow;
+    prevB = bNow;
+    return keyCode;
+}
+
 int dialog_out(const char* title, const char** body, int bodyLength, int x, int y, int titleColor, const char* a8, int bodyColor, int flags)
 {
     MessageList messageList;
@@ -457,11 +515,22 @@ int dialog_out(const char* title, const char** body, int bodyLength, int x, int 
 
     win_draw(win);
 
+    // Re-baseline the pad edge detector for THIS box (see dialog_pad_prime): the button that opened
+    // it is usually still held, and must not be read as the answer.
+    dialog_pad_prime = true;
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+
+        if (keyCode == -1) {
+            int padKey = dialog_gamepad_keycode();
+            if (padKey != -1) {
+                keyCode = padKey;
+            }
+        }
 
         if (keyCode == 500) {
             rc = 1;

@@ -8,7 +8,13 @@
 
 namespace fallout {
 
-#define AUDIO_ENGINE_SOUND_BUFFERS 8
+// CE: The mixer's total simultaneous voices, shared by music, speech, and all sound
+// effects -- every playing Sound claims one buffer. The vanilla 8 was sized for
+// turn-based combat (one attack at a time). Realtime combat_rt fires many attacks at
+// once (each ranged shot queues fire + ammo-flying + hit SFX), so 8 saturated and later
+// gunshots were silently dropped ("only one shot was audible"). Raised to give the
+// effect cache (SOUND_EFFECTS_MAX_COUNT) real headroom above music/speech. Runtime-only.
+#define AUDIO_ENGINE_SOUND_BUFFERS 32
 
 struct AudioEngineSoundBuffer {
     bool active;

@@ -323,6 +323,20 @@ static AiPacket* ai_cap(Object* obj)
     return &(cap[0]);
 }
 
+// How willing this critter's AI packet is to fight, straight out of AI.TXT. Exported so realtime
+// combat can tell a GUARD from a shopkeeper without a table of its own: the vanilla data already
+// draws that line and draws it well -- Loser 1, Cow 5, Careful/Peasant/Player 10, Guard 20, then a
+// clear jump to Guard Humorous 33, Guard Quiet 55, Shady Sands Guard 60, Bouncer 70, Raider 80.
+// See rt_guard_danger_source.
+int combatai_aggression(Object* critter)
+{
+    if (critter == NULL || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+        return 0;
+    }
+
+    return ai_cap(critter)->aggression;
+}
+
 // 0x424B40
 static int ai_magic_hands(Object* critter, Object* item, int num)
 {

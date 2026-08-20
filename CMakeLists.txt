@@ -58,6 +58,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/combat_defs.h"
     "src/game/combat.cc"
     "src/game/combat.h"
+    "src/game/combat_rt.cc"
+    "src/game/combat_rt.h"
     "src/game/combatai.cc"
     "src/game/combatai.h"
     "src/game/config.cc"
@@ -81,6 +83,14 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/game_vars.h"
     "src/game/game.cc"
     "src/game/game.h"
+    "src/game/game_trace.cc"
+    "src/game/game_trace.h"
+    "src/game/gamepad_ui.cc"
+    "src/game/gamepad_ui.h"
+    "src/game/interact_prompt.cc"
+    "src/game/interact_prompt.h"
+    "src/game/radial_wheel.cc"
+    "src/game/radial_wheel.h"
     "src/game/gconfig.cc"
     "src/game/gconfig.h"
     "src/game/gdebug.cc"
@@ -291,7 +301,16 @@ endif()
 if(WIN32)
     target_link_libraries(${EXECUTABLE_NAME}
         winmm
+        dbghelp
     )
+endif()
+
+# Emit a PDB even for Release so the game_trace crash handler can resolve symbolic
+# stack frames (function + file:line). /Zi adds debug info, /DEBUG generates the PDB,
+# and /OPT:REF,ICF restore the size optimizations that /DEBUG otherwise disables.
+if(MSVC)
+    target_compile_options(${EXECUTABLE_NAME} PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(${EXECUTABLE_NAME} PRIVATE $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
 endif()
 
 if (WIN32)

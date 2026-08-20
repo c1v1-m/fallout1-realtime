@@ -5,11 +5,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <SDL.h>
+
 #include "game/art.h"
 #include "game/bmpdlog.h"
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gmouse.h"
 #include "game/graphlib.h"
 #include "game/gsound.h"
@@ -36,6 +39,7 @@
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/rect.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
@@ -626,6 +630,259 @@ static unsigned char free_perk;
 static unsigned char first_skill_list;
 
 // 0x42C40C
+// ---------------------------------------------------------------------------
+// Gamepad navigation for the character editor (creation mode).
+//
+// The editor is a dense mouse-driven screen; on a controller it was unusable. This layers a
+// focus model over the three interactive columns -- SPECIAL stats, tag skills, and traits --
+// driving the SAME `info_line` "selected row" the mouse path already uses, so the existing
+// highlight rendering (PrintBasicStat/ListSkills/ListTraits color the info_line row) shows the
+// controller focus for free. Actions are injected as the screen's OWN button event codes via
+// GNW_add_input_buffer, so the existing handlers (StatButton/TagSkillSelect/TraitSelect/...) run
+// unchanged. Mapping:
+//   D-pad Up/Down (or left stick) . move focus within the current column
+//   LB / RB ....................... switch column (Stats -> Skills -> Traits -> Stats)
+//   D-pad Left/Right .............. Stats: decrement/increment the stat; Traits: switch column
+//   A ............................. Stats: increment; Skills: tag/untag; Traits: toggle
+//   X ............................. open the Gender window (itself controller-navigable)
+//   Start ......................... Done            B ... Cancel / Back
+// Name/Age/Options stay mouse+keyboard only (text entry / non-essential), so we don't map a pad
+// button to them -- opening a sub-window with no pad support would trap a controller-only player.
+enum {
+    CE_GROUP_STATS = 0,
+    CE_GROUP_SKILLS,
+    CE_GROUP_TRAITS,
+    CE_GROUP_COUNT,
+};
+
+// info_line of the first trait row (traits occupy info_line 82..97: 0..7 left column, 8..15 right).
+#define CE_FIRST_TRAIT 82
+
+static int ce_pad_group;
+static int ce_stat_sel;  // 0..6
+static int ce_skill_sel; // 0..SKILL_COUNT-1
+static int ce_trait_sel; // 0..15 (column = /8, row = %8)
+
+static bool ce_prev_up;
+static bool ce_prev_down;
+static bool ce_prev_left;
+static bool ce_prev_right;
+static bool ce_prev_lb;
+static bool ce_prev_rb;
+static bool ce_prev_a;
+static bool ce_prev_b;
+static bool ce_prev_x;
+static bool ce_prev_start;
+
+// Point info_line at the currently focused row and repaint every column so the highlight moves.
+static void ce_refresh_focus()
+{
+    switch (ce_pad_group) {
+    case CE_GROUP_STATS:
+        info_line = ce_stat_sel;
+        break;
+    case CE_GROUP_SKILLS:
+        info_line = ce_skill_sel + EDITOR_FIRST_SKILL;
+        break;
+    case CE_GROUP_TRAITS:
+        info_line = ce_trait_sel + CE_FIRST_TRAIT;
+        break;
+    }
+
+    PrintBasicStat(RENDER_ALL_STATS, 0, 0);
+    ListTraits();
+    ListSkills(0);
+    ListDrvdStats();
+    DrawInfoWin();
+    win_draw(edit_win);
+}
+
+// D-pad step. dx: -1 left / +1 right, dy: -1 up / +1 down (only one non-zero per call).
+static void ce_pad_move(int dx, int dy)
+{
+    if (ce_pad_group == CE_GROUP_STATS) {
+        if (dy != 0) {
+            ce_stat_sel = (ce_stat_sel + 7 + (dy > 0 ? 1 : -1)) % 7;
+            ce_refresh_focus();
+            gsound_play_sfx_file("ib1p1xx1");
+        } else {
+            // Decrement (510+i) / increment (503+i) the focused SPECIAL stat, then a release code
+            // (518) so StatButton's held-repeat loop applies exactly one step.
+            GNW_add_input_buffer((dx > 0 ? 503 : 510) + ce_stat_sel);
+            GNW_add_input_buffer(518);
+        }
+    } else if (ce_pad_group == CE_GROUP_SKILLS) {
+        if (dy != 0) {
+            ce_skill_sel = (ce_skill_sel + SKILL_COUNT + (dy > 0 ? 1 : -1)) % SKILL_COUNT;
+            // ⚠️ KEEP THE ENGINE'S OWN CURSOR IN STEP. skill_cursor is what SliderBtn's +/- act on,
+            // and it is otherwise only ever set by CLICKING a skill row (the mouse-Y mapping further
+            // down this file). The pad never clicks, so it stayed pinned at 0 -- every point you
+            // managed to spend went into the first skill regardless of what was highlighted.
+            skill_cursor = ce_skill_sel;
+            ce_refresh_focus();
+            gsound_play_sfx_file("ib1p1xx1");
+        } else {
+            // LEFT/RIGHT SPEND AND REFUND SKILL POINTS -- this did nothing at all before, so on a
+            // controller there was simply NO WAY to raise a skill on level-up: D-pad only walked the
+            // list and A sends TagSkillSelect, which the engine ignores outside character creation
+            // (`glblmode == 1`). "Navigace skills stojí za hovno" was, underneath, "the screen does
+            // not work".
+            //
+            // 521 / 523 are the same codes the +/- buttons emit and SliderBtn already handles them
+            // (as does the keyboard's arrow keys). SliderBtn owns the accept/refuse messages, the
+            // unspent-points check and the can't-go-below-starting-value rule, so none of that is
+            // reimplemented here.
+            skill_cursor = ce_skill_sel;
+            GNW_add_input_buffer(dx > 0 ? 521 : 523);
+        }
+    } else {
+        int col = ce_trait_sel / 8;
+        int row = ce_trait_sel % 8;
+        if (dy != 0) {
+            row = (row + 8 + (dy > 0 ? 1 : -1)) % 8;
+        } else {
+            col = (dx > 0) ? 1 : 0;
+        }
+        ce_trait_sel = col * 8 + row;
+        ce_refresh_focus();
+        gsound_play_sfx_file("ib1p1xx1");
+    }
+}
+
+// A button: act on the focused row via its own event code.
+static void ce_pad_activate()
+{
+    switch (ce_pad_group) {
+    case CE_GROUP_STATS:
+        GNW_add_input_buffer(503 + ce_stat_sel); // increment
+        GNW_add_input_buffer(518);
+        break;
+    case CE_GROUP_SKILLS:
+        // TagSkillSelect is a CREATION-only action -- the engine ignores 536+ outside glblmode, so
+        // on the character sheet A has to do the thing that screen is actually for: spend a point.
+        // Same 521 the +/- button and the keyboard arrows emit, so SliderBtn owns the refusals.
+        if (glblmode) {
+            GNW_add_input_buffer(536 + ce_skill_sel);
+        } else {
+            skill_cursor = ce_skill_sel;
+            GNW_add_input_buffer(521);
+        }
+        break;
+    case CE_GROUP_TRAITS:
+        GNW_add_input_buffer(555 + ce_trait_sel); // TraitSelect
+        break;
+    }
+}
+
+static void ce_pad_poll(SDL_GameController* pad)
+{
+    SDL_GameControllerUpdate();
+
+    bool up = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+    bool down = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+    bool left = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) < -16000;
+    bool right = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+        || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
+    bool lb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    bool rb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+    bool a = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+    bool start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+
+    if (up && !ce_prev_up) {
+        ce_pad_move(0, -1);
+    } else if (down && !ce_prev_down) {
+        ce_pad_move(0, 1);
+    }
+
+    if (left && !ce_prev_left) {
+        ce_pad_move(-1, 0);
+    } else if (right && !ce_prev_right) {
+        ce_pad_move(1, 0);
+    }
+
+    // Column cycling is CREATION-only: on the character sheet stats and traits are read-only, so
+    // moving focus there would just be a way to get stuck somewhere that ignores every button.
+    if (glblmode) {
+        if (rb && !ce_prev_rb) {
+            ce_pad_group = (ce_pad_group + 1) % CE_GROUP_COUNT;
+            ce_refresh_focus();
+            gsound_play_sfx_file("ib1p1xx1");
+        } else if (lb && !ce_prev_lb) {
+            ce_pad_group = (ce_pad_group + CE_GROUP_COUNT - 1) % CE_GROUP_COUNT;
+            ce_refresh_focus();
+            gsound_play_sfx_file("ib1p1xx1");
+        }
+    }
+
+    if (a && !ce_prev_a) {
+        ce_pad_activate();
+    } else if (b && !ce_prev_b) {
+        GNW_add_input_buffer(KEY_ESCAPE);
+    } else if (x && !ce_prev_x && glblmode) {
+        GNW_add_input_buffer(520); // Gender window -- creation only; the sheet can't change sex
+    } else if (start && !ce_prev_start) {
+        GNW_add_input_buffer(500); // Done
+    }
+
+    ce_prev_up = up;
+    ce_prev_down = down;
+    ce_prev_left = left;
+    ce_prev_right = right;
+    ce_prev_lb = lb;
+    ce_prev_rb = rb;
+    ce_prev_a = a;
+    ce_prev_b = b;
+    ce_prev_x = x;
+    ce_prev_start = start;
+}
+
+// Prime edge-detection so a button still held from the previous screen (e.g. the A that picked
+// "New Game") does not fire on the first frame.
+static void ce_pad_prime(SDL_GameController* pad)
+{
+    SDL_GameControllerUpdate();
+    ce_prev_up = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+    ce_prev_down = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
+    ce_prev_left = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
+    ce_prev_right = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+    ce_prev_lb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    ce_prev_rb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+    ce_prev_a = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    ce_prev_b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    ce_prev_x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+    ce_prev_start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+}
+
+// Auto-hide the editor cursor (controller only): hidden by default, revealed while the mouse
+// moves, re-hidden after idle. Same pattern as the options / load-save screens.
+#define CE_CURSOR_IDLE_MS 2000
+
+static void ce_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned int* lastMove)
+{
+    int x;
+    int y;
+    mouse_get_position(&x, &y);
+
+    if (x != *lastX || y != *lastY) {
+        *lastMove = get_time();
+        if (!*shown) {
+            gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+            *shown = true;
+        }
+    } else if (*shown && elapsed_time(*lastMove) >= CE_CURSOR_IDLE_MS) {
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        *shown = false;
+    }
+
+    *lastX = x;
+    *lastY = y;
+}
+
 int editor_design(bool isCreationMode)
 {
     char* messageListItemText;
@@ -653,9 +910,46 @@ int editor_design(bool isCreationMode)
         }
     }
 
+    // Controller navigation. ⚠️ THIS USED TO BE `glblmode ? ... : NULL` -- i.e. character CREATION
+    // only, so the character SHEET (the D-pad-hold screen, editor_design(false)) had no pad
+    // navigation at all and the only way to touch a skill was to drag the cursor over an 18-row
+    // list with the stick. That is the "skills se vybírají těžce v char.sheetu" report; the answer
+    // is not to tune anything but to give that screen the stepping the creation screen already has.
+    //
+    // The two screens are NOT the same, which is why the original was gated: the sheet has skill
+    // sliders and no trait/stat editing. So outside creation the focus is pinned to the SKILLS
+    // column (ce_pad_group is forced below and the LB/RB column cycle is suppressed) and A spends a
+    // point instead of tagging -- see ce_pad_activate.
+    SDL_GameController* cePad = gamepad_ui_get_controller();
+    bool ceCursorShown = true;
+    int ceCursorX = 0;
+    int ceCursorY = 0;
+    unsigned int ceCursorMove = get_time();
+    if (cePad != NULL) {
+        // The sheet has only one editable column, so start (and stay) on it. Creation still opens
+        // on stats, where you spend your character points first.
+        ce_pad_group = glblmode ? CE_GROUP_STATS : CE_GROUP_SKILLS;
+        ce_stat_sel = 0;
+        ce_skill_sel = 0;
+        ce_trait_sel = 0;
+        // Keep the engine's own cursor in step from the very first frame: skill_cursor is what
+        // SliderBtn's +/- act on, and it is otherwise only ever moved by CLICKING a row.
+        skill_cursor = ce_skill_sel;
+        ce_pad_prime(cePad);
+        ce_refresh_focus();
+        mouse_get_position(&ceCursorX, &ceCursorY);
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        ceCursorShown = false;
+    }
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
+
+        if (cePad != NULL) {
+            ce_pad_poll(cePad);
+            ce_tick_cursor(&ceCursorShown, &ceCursorX, &ceCursorY, &ceCursorMove);
+        }
 
         frame_time = get_time();
         int keyCode = get_input();
@@ -763,6 +1057,10 @@ int editor_design(bool isCreationMode)
 
         renderPresent();
         sharedFpsLimiter.throttle();
+    }
+
+    if (cePad != NULL) {
+        gmouse_set_cursor(MOUSE_CURSOR_ARROW);
     }
 
     if (rc == 0) {
@@ -3276,8 +3574,54 @@ static void SexWindow()
     int savedGender = stat_level(obj_dude, STAT_GENDER);
     win_set_button_rest_state(btns[savedGender], 1, 0);
 
+    // Controller: D-pad Left = male, Right = female, A/Start = confirm, B = cancel. Prime the
+    // edge state from the current pad so the A/X that opened this window doesn't fire immediately.
+    SDL_GameController* sexPad = gamepad_ui_get_controller();
+    bool sexPrevLeft = false;
+    bool sexPrevRight = false;
+    bool sexPrevA = false;
+    bool sexPrevB = false;
+    if (sexPad != NULL) {
+        SDL_GameControllerUpdate();
+        sexPrevLeft = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
+        sexPrevRight = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+        sexPrevA = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_A) != 0
+            || SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_START) != 0;
+        sexPrevB = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_B) != 0;
+    }
+
     while (true) {
         sharedFpsLimiter.mark();
+
+        if (sexPad != NULL) {
+            SDL_GameControllerUpdate();
+            bool l = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+                || SDL_GameControllerGetAxis(sexPad, SDL_CONTROLLER_AXIS_LEFTX) < -16000;
+            bool r = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+                || SDL_GameControllerGetAxis(sexPad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
+            bool aBtn = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_A) != 0
+                || SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_START) != 0;
+            bool bBtn = SDL_GameControllerGetButton(sexPad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+            if (l && !sexPrevLeft) {
+                win_set_button_rest_state(btns[0], 1, 0);
+                GNW_add_input_buffer(501);
+            } else if (r && !sexPrevRight) {
+                win_set_button_rest_state(btns[1], 1, 0);
+                GNW_add_input_buffer(502);
+            }
+
+            if (aBtn && !sexPrevA) {
+                GNW_add_input_buffer(500);
+            } else if (bBtn && !sexPrevB) {
+                GNW_add_input_buffer(KEY_ESCAPE);
+            }
+
+            sexPrevLeft = l;
+            sexPrevRight = r;
+            sexPrevA = aBtn;
+            sexPrevB = bBtn;
+        }
 
         frame_time = get_time();
 

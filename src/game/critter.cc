@@ -703,6 +703,66 @@ int critter_heal_hours(Object* critter, int hours)
 }
 
 // 0x428220
+// Finds a death frame for `critter` that actually HAS art, preferring `anim`.
+//
+// Vanilla picks one single-frame death fid, and if it is missing falls back to
+// ANIM_FALL_BACK_BLOOD_SF -- which it then uses WITHOUT checking. When that fallback is missing
+// too, obj_change_fid points the corpse at art that does not exist and it renders as nothing: the
+// invisible body. Two things make a proto miss it: death art commonly exists only for weapon
+// animation code 0 (the critter must drop its weapon pose to die), and a few protos have only
+// explode-to-nothing death art (Gizmo -- see is_explode_death_pid in actions.cc). Note art_id
+// itself validates NOTHING for the SF death anims: its art_exists probing only covers
+// ANIM_FALL_BACK..ANIM_FALL_FRONT_BLOOD, and even there it only varies the rotation, never the
+// weapon code. So the check has to happen here.
+//
+// Order: the requested anim first (so a caller's explicit choice wins), then the SF death frames
+// from most to least ordinary, and for each one the critter's own weapon code before code 0.
+// Returns -1 if the proto has no usable death art at all.
+static int critter_death_fid(Object* critter, int anim)
+{
+    static const int fallback_anims[] = {
+        ANIM_FALL_BACK_BLOOD_SF,
+        ANIM_FALL_FRONT_BLOOD_SF,
+        ANIM_FALL_BACK_SF,
+        ANIM_FALL_FRONT_SF,
+        ANIM_BIG_HOLE_SF,
+        ANIM_CHARRED_BODY_SF,
+        ANIM_CHUNKS_OF_FLESH_SF,
+        ANIM_EXPLODED_TO_NOTHING_SF,
+        ANIM_MELTED_TO_NOTHING_SF,
+        ANIM_ELECTRIFIED_TO_NOTHING_SF,
+        ANIM_BURNED_TO_NOTHING_SF,
+    };
+
+    int frmId = critter->fid & 0xFFF;
+    int weaponCode = (critter->fid & 0xF000) >> 12;
+    int rotation = critter->rotation + 1;
+
+    int candidates[1 + sizeof(fallback_anims) / sizeof(fallback_anims[0])];
+    int candidateCount = 0;
+    candidates[candidateCount++] = anim;
+    for (size_t index = 0; index < sizeof(fallback_anims) / sizeof(fallback_anims[0]); index++) {
+        candidates[candidateCount++] = fallback_anims[index];
+    }
+
+    for (int index = 0; index < candidateCount; index++) {
+        for (int pass = 0; pass < 2; pass++) {
+            int code = pass == 0 ? weaponCode : 0;
+            if (pass == 1 && weaponCode == 0) {
+                break;
+            }
+
+            int fid = art_id(OBJ_TYPE_CRITTER, frmId, candidates[index], code, rotation);
+            obj_fix_violence_settings(&fid);
+            if (art_exists(fid)) {
+                return fid;
+            }
+        }
+    }
+
+    return -1;
+}
+
 void critter_kill(Object* critter, int anim, bool refresh_window)
 {
     int elevation = critter->elevation;
@@ -726,7 +786,14 @@ void critter_kill(Object* critter, int anim, bool refresh_window)
             }
 
             if (back) {
-                fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_FALL_BACK_SF, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
+                // Same unchecked-fallback hole as the standing branch below: vanilla takes
+                // FALL_BACK_SF on faith. Resolve it through the art-validating search instead, so a
+                // proto without that exact (anim, weapon-code) frame settles into a real corpse
+                // rather than an invisible one.
+                fid = critter_death_fid(critter, ANIM_FALL_BACK_SF);
+                if (fid == -1) {
+                    fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_FALL_BACK_SF, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
+                }
             }
 
             shouldChangeFid = true;
@@ -741,9 +808,10 @@ void critter_kill(Object* critter, int anim, bool refresh_window)
             anim = LAST_SF_DEATH_ANIM;
         }
 
-        fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, anim, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
-        obj_fix_violence_settings(&fid);
-        if (!art_exists(fid)) {
+        fid = critter_death_fid(critter, anim);
+        if (fid == -1) {
+            // The proto has no death art at all -- keep vanilla's complaint and its (broken but
+            // harmless-here) guess, since there is nothing valid left to choose.
             debug_printf("\nError: Critter Kill: Can't match fid!");
 
             fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_FALL_BACK_BLOOD_SF, (critter->fid & 0xF000) >> 12, critter->rotation + 1);

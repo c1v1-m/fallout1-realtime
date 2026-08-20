@@ -8,6 +8,7 @@
 #include "game/anim.h"
 #include "game/art.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/config.h"
 #include "game/critter.h"
 #include "game/cycle.h"
@@ -1066,28 +1067,167 @@ void intface_redraw()
     refresh_box_bar_win();
 }
 
+// Last hit points rendered in interface.
+//
+// Used to animate changes. Also the value the non-blocking roll below is currently
+// showing, which is why it is file scope and not a function-local static like vanilla.
+//
+// 0x505614
+static int last_points = 0;
+
+// Last color used to render hit points in interface.
+//
+// Used to animate changes.
+//
+// 0x505618
+static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
+
+// NON-BLOCKING HIT-POINT COUNTER (realtime combat).
+//
+// Vanilla's animated counter rolls the digits inside intface_rotate_numbers' own
+// `while (previousValue != value)` loop, which calls block_for_tocks() and pumps the mouse
+// but NEVER process_bk -- so the entire world (AI, movement, projectiles, combat_rt) stops
+// for ~250ms on every hit the dude takes. Harmless in turn-based, where nothing else is
+// moving; in realtime it was the "time freezes when I get hit, smooth on a miss" freeze,
+// and the roll was simply switched off there.
+//
+// This is the same animation stepped from the frame loop instead: one point per tick, each
+// step drawn through the *static* (delay 0) path of intface_rotate_numbers. Same look,
+// nothing blocks.
+//
+// Vanilla spends ~250ms on the whole roll no matter how big the change is
+// (delay = 250 / (diff + 1) per step); keeping that means a scratch and a shotgun blast
+// take the same time to read.
+#define HP_ROLL_TOTAL_SECONDS (0.25f)
+
+// A long frame (a modal loop closing, a hitch) must neither burn the whole roll in a single
+// tick nor spin: steps per tick are capped and the leftover time is dropped.
+#define HP_ROLL_MAX_STEPS_PER_TICK (32)
+
+static bool hp_roll_active = false;
+static int hp_roll_target = 0;
+static float hp_roll_step_seconds = 0.0f;
+static float hp_roll_accum = 0.0f;
+
+// The color thresholds vanilla applies at 25% / 50% of max HP. Evaluated per intermediate
+// value, which reproduces for free what vanilla does by splitting the roll into colored
+// segments (the v1[]/v2[] pairs in intface_update_hit_points).
+static int intface_hp_points_color(int hp)
+{
+    int maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+
+    if (hp < (int)((double)maxHp * 0.25)) {
+        return INTERFACE_NUMBERS_COLOR_RED;
+    } else if (hp < (int)((double)maxHp * 0.5)) {
+        return INTERFACE_NUMBERS_COLOR_YELLOW;
+    } else {
+        return INTERFACE_NUMBERS_COLOR_WHITE;
+    }
+}
+
+// Start -- or re-target -- the non-blocking roll. Re-targeting mid-roll is the common case
+// in realtime (a second hit lands while the first is still rolling) and must NOT restart
+// from the old value, or the counter would visibly jump backwards.
+static void intface_hp_roll_start()
+{
+    if (interfaceWindow == -1 || obj_dude == NULL) {
+        return;
+    }
+
+    hp_roll_target = critter_get_hits(obj_dude);
+
+    if (hp_roll_target == last_points) {
+        // Nothing to roll (damage fully absorbed, heal for 0). Any roll already in flight is
+        // left alone -- it is heading here anyway.
+        return;
+    }
+
+    hp_roll_step_seconds = HP_ROLL_TOTAL_SECONDS / (float)(abs(hp_roll_target - last_points) + 1);
+
+    if (!hp_roll_active) {
+        hp_roll_accum = 0.0f;
+        hp_roll_active = true;
+    }
+}
+
+// Frame-loop pump for the roll above. Called from combat_rt_update, so it inherits the same
+// pause rules as the rest of the combat model (a radial wheel holds it still too).
+void intface_hp_roll_tick(float dt)
+{
+    if (!hp_roll_active) {
+        return;
+    }
+
+    if (interfaceWindow == -1 || obj_dude == NULL) {
+        hp_roll_active = false;
+        return;
+    }
+
+    hp_roll_accum += dt;
+
+    int budget = HP_ROLL_MAX_STEPS_PER_TICK;
+    bool changed = false;
+    while (hp_roll_accum >= hp_roll_step_seconds && last_points != hp_roll_target && budget > 0) {
+        hp_roll_accum -= hp_roll_step_seconds;
+        last_points += hp_roll_target > last_points ? 1 : -1;
+        budget -= 1;
+        changed = true;
+    }
+
+    if (budget == 0) {
+        hp_roll_accum = 0.0f;
+    }
+
+    if (changed) {
+        last_points_color = intface_hp_points_color(last_points);
+        intface_rotate_numbers(473, 40, last_points, last_points, last_points_color, 0);
+    }
+
+    if (last_points == hp_roll_target) {
+        hp_roll_active = false;
+    }
+}
+
+// Drop a roll in flight and snap the counter to the truth. Anything that invalidates the
+// value underneath it -- a load, a map teardown, a new game -- must land here, or a stale
+// target would keep painting over the real hit points.
+void intface_hp_roll_cancel()
+{
+    if (!hp_roll_active) {
+        return;
+    }
+
+    hp_roll_active = false;
+    hp_roll_accum = 0.0f;
+
+    if (interfaceWindow != -1 && obj_dude != NULL) {
+        intface_update_hit_points(false);
+    }
+}
+
 // Render hit points.
 //
 // 0x4545A8
 void intface_update_hit_points(bool animate)
 {
-    // Last hit points rendered in interface.
-    //
-    // Used to animate changes.
-    //
-    // 0x505614
-    static int last_points = 0;
-
-    // Last color used to render hit points in interface.
-    //
-    // Used to animate changes.
-    //
-    // 0x505618
-    static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
-
     if (interfaceWindow == -1) {
         return;
     }
+
+    // Realtime combat: hand the animation to the frame-loop roll above instead of the
+    // blocking one below. Gated on combat_rt_active() (a fight is actually live) rather than
+    // on the realtime mode flag, because the roll only ticks from combat_rt_update -- a
+    // stimpak taken inside the inventory's own modal loop would otherwise sit frozen
+    // mid-roll until that screen closed.
+    if (animate && combat_rt_active()) {
+        intface_hp_roll_start();
+        return;
+    }
+
+    // Something authoritative is setting the value (a load, a level-up, the cancel above):
+    // whatever was in flight is stale.
+    hp_roll_active = false;
+    hp_roll_accum = 0.0f;
 
     int hp = critter_get_hits(obj_dude);
     int maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
@@ -1095,14 +1235,7 @@ void intface_update_hit_points(bool animate)
     int red = (int)((double)maxHp * 0.25);
     int yellow = (int)((double)maxHp * 0.5);
 
-    int color;
-    if (hp < red) {
-        color = INTERFACE_NUMBERS_COLOR_RED;
-    } else if (hp < yellow) {
-        color = INTERFACE_NUMBERS_COLOR_YELLOW;
-    } else {
-        color = INTERFACE_NUMBERS_COLOR_WHITE;
-    }
+    int color = intface_hp_points_color(hp);
 
     int v1[4];
     int v2[3];
@@ -1185,6 +1318,14 @@ void intface_update_move_points(int actionPoints, int bonusMove)
 
     if (interfaceWindow == -1) {
         return;
+    }
+
+    // Under realtime combat the engine combat.ap is held maxed so movement stays
+    // free, so it can't drive the bar. Override every caller with the real RT pool
+    // (and no bonus-move bulbs) so the indicator shows AP being spent/regenerated.
+    if (combat_rt_enabled()) {
+        actionPoints = combat_rt_player_ap();
+        bonusMove = 0;
     }
 
     buf_to_buf(movePointBackground, 90, 5, 90, interfaceBuffer + 14 * 640 + 316, 640);
@@ -1371,6 +1512,68 @@ int intface_toggle_items(bool animated)
 }
 
 // 0x454C28
+// Is `action` a mode this weapon can actually be switched INTO?
+//
+// ⚠️ REALTIME DROPS THE AIMING AND RELOAD ENTRIES (2026-08-10). Under combat_rt they are steps in
+// the cycle that change nothing but the icon:
+//   * AIMING -- combat_rt's rt_player_hit_mode() reads intface_get_attack() but DISCARDS its
+//     `aiming` output, and every `aiming` in the attack path is derived from the chosen HIT
+//     LOCATION instead (`loc != HIT_LOCATION_UNCALLED`), which only the LB on-body picker sets. So
+//     an aiming entry yields the identical hit mode, the same AP cost and the same uncalled hit.
+//     The real aimed shot is the picker; this was its dead turn-based twin.
+//   * RELOAD -- intface_get_attack() returns -1 for it, so combat_rt falls back to the primary
+//     attack and you simply keep firing. Reloading has its own binding.
+// Turn-based keeps all of them: there the interface flag IS how you aim.
+static bool intface_item_action_available(InterfaceItemState* itemState, int action)
+{
+    bool realtime = combat_rt_enabled();
+
+    switch (action) {
+    case INTERFACE_ITEM_ACTION_PRIMARY:
+        // Always reachable -- this is what makes the cycle below terminate.
+        return true;
+    case INTERFACE_ITEM_ACTION_PRIMARY_AIMING:
+        return !realtime && item_w_called_shot(obj_dude, itemState->primaryHitMode);
+    case INTERFACE_ITEM_ACTION_SECONDARY:
+        return itemState->secondaryHitMode != HIT_MODE_PUNCH
+            && itemState->secondaryHitMode != HIT_MODE_KICK
+            && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE;
+    case INTERFACE_ITEM_ACTION_SECONDARY_AIMING:
+        return !realtime
+            && itemState->secondaryHitMode != HIT_MODE_PUNCH
+            && itemState->secondaryHitMode != HIT_MODE_KICK
+            && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE
+            && item_w_called_shot(obj_dude, itemState->secondaryHitMode);
+    case INTERFACE_ITEM_ACTION_RELOAD:
+        return !realtime && item_w_max_ammo(itemState->item) != item_w_curr_ammo(itemState->item);
+    default:
+        return false;
+    }
+}
+
+// Would a toggle actually land on a DIFFERENT mode? Realtime drops the aiming/reload entries, so a
+// plain single-mode weapon has nothing to switch to -- the caller can refuse audibly instead of
+// playing a confirmation for a cycle that changes nothing.
+bool intface_item_can_toggle_state()
+{
+    if (interfaceWindow == -1) {
+        return false;
+    }
+
+    InterfaceItemState* itemState = &(itemButtonItems[itemCurrentItem]);
+    if (itemState->isWeapon == 0) {
+        return false;
+    }
+
+    for (int action = INTERFACE_ITEM_ACTION_USE; action < INTERFACE_ITEM_ACTION_COUNT; action++) {
+        if (action != itemState->action && intface_item_action_available(itemState, action)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 int intface_toggle_item_state()
 {
     if (interfaceWindow == -1) {
@@ -1384,39 +1587,13 @@ int intface_toggle_item_state()
         bool done = false;
         while (!done) {
             itemState->action++;
-            switch (itemState->action) {
-            case INTERFACE_ITEM_ACTION_PRIMARY:
-                done = true;
-                break;
-            case INTERFACE_ITEM_ACTION_PRIMARY_AIMING:
-                if (item_w_called_shot(obj_dude, itemState->primaryHitMode)) {
-                    done = true;
-                }
-                break;
-            case INTERFACE_ITEM_ACTION_SECONDARY:
-                if (itemState->secondaryHitMode != HIT_MODE_PUNCH
-                    && itemState->secondaryHitMode != HIT_MODE_KICK
-                    && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE) {
-                    done = true;
-                }
-                break;
-            case INTERFACE_ITEM_ACTION_SECONDARY_AIMING:
-                if (itemState->secondaryHitMode != HIT_MODE_PUNCH
-                    && itemState->secondaryHitMode != HIT_MODE_KICK
-                    && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE
-                    && item_w_called_shot(obj_dude, itemState->secondaryHitMode)) {
-                    done = true;
-                }
-                break;
-            case INTERFACE_ITEM_ACTION_RELOAD:
-                if (item_w_max_ammo(itemState->item) != item_w_curr_ammo(itemState->item)) {
-                    done = true;
-                }
-                break;
-            case INTERFACE_ITEM_ACTION_COUNT:
+            if (itemState->action == INTERFACE_ITEM_ACTION_COUNT) {
+                // Wrap: ++ on the next pass takes USE to PRIMARY, which is always available, so
+                // the loop can never spin forever however many entries are skipped.
                 itemState->action = INTERFACE_ITEM_ACTION_USE;
-                break;
+                continue;
             }
+            done = intface_item_action_available(itemState, itemState->action);
         }
     }
 
@@ -1470,7 +1647,15 @@ void intface_use_item()
     } else if (proto_action_can_use(ptr->item->pid)) {
         if (isInCombat()) {
             int actionPointsRequired = item_mp_cost(obj_dude, ptr->secondaryHitMode, false);
-            if (actionPointsRequired <= obj_dude->data.critter.combat.ap) {
+            // Realtime holds the engine combat.ap maxed, so charge combat_rt's pool
+            // instead (using an item in a fight costs AP just like vanilla). Free out
+            // of combat; refuses when the pool can't afford it.
+            if (combat_rt_enabled()) {
+                if (combat_rt_spend_ap(actionPointsRequired)) {
+                    obj_use_item(obj_dude, ptr->item);
+                    intface_update_items(false);
+                }
+            } else if (actionPointsRequired <= obj_dude->data.critter.combat.ap) {
                 obj_use_item(obj_dude, ptr->item);
                 intface_update_items(false);
                 if (actionPointsRequired > obj_dude->data.critter.combat.ap) {
@@ -1976,6 +2161,25 @@ static void intface_change_fid_animate(int previousWeaponAnimationCode, int weap
         return;
     }
 
+    // REALTIME: DO NOT BLOCK. The loop below is vanilla's -- it pumps get_input() and renderPresent()
+    // until the put-away/take-out animation finishes, but it never runs the game update, so the
+    // whole world stands still for the length of the swap ("při přepínání zbraní je svět zamrzlej").
+    // Turn-based could afford that; realtime cannot -- enemies stop mid-stride and stop shooting
+    // while you change guns.
+    //
+    // Returning here just leaves the animation registered: the main loop plays it, and the two
+    // registered callbacks (intface_redraw_items_callback / intface_change_fid_callback) still fire
+    // at their points in the sequence, the second one clearing intface_fid_is_changing. Nothing
+    // reads that flag except this loop, so dropping the loop costs nothing.
+    //
+    // The interface/mouse disable and the wait cursor are skipped WITH the loop on purpose: they
+    // exist to make the frozen frames safe to look at. Un-frozen there is nothing to protect
+    // against, and combat_rt already refuses to fire while anim_busy(obj_dude) holds -- which it
+    // does for the whole swap.
+    if (combat_rt_enabled()) {
+        return;
+    }
+
     bool interfaceBarWasEnabled = intfaceEnabled;
 
     intface_disable();
@@ -2134,6 +2338,19 @@ static int intface_destroy_end_combat_button()
 // 0x456064
 static void intface_draw_ammo_lights(int x, int ratio)
 {
+    // The ammo-light bar is 70 pixels tall, so `ratio` is a 0..70 fill level. If a caller passes
+    // an out-of-range value -- e.g. a stale/garbage weapon in itemButtonItems yielding a bad
+    // current/max ratio -- the fill loops below step `dest += 640` per row past the end (ratio<0
+    // makes the first loop run >70 times; ratio>70 makes the second run long), writing off the
+    // interface window buffer and corrupting the heap (an ACCESS_VIOLATION caught under page heap
+    // during a gamepad weapon-swap mid-combat). Clamp defensively -- ratio is always meant to be
+    // within [0, 70], so this can never alter a legitimate draw.
+    if (ratio < 0) {
+        ratio = 0;
+    } else if (ratio > 70) {
+        ratio = 70;
+    }
+
     if ((ratio & 1) != 0) {
         ratio -= 1;
     }
@@ -2181,6 +2398,38 @@ static int intface_item_reload()
     intface_update_items(false);
 
     if (!v0) {
+        return -1;
+    }
+
+    const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_READY, itemButtonItems[itemCurrentItem].item, HIT_MODE_RIGHT_WEAPON_PRIMARY, NULL);
+    gsound_play_sfx_file(sfx);
+
+    return 0;
+}
+
+// Public entry for the controller reload button: reloads the active-hand weapon
+// from available inventory ammo (no-op if it isn't a reloadable weapon or there
+// is no matching ammo). Returns 0 if it reloaded, -1 otherwise.
+//
+// Deliberately does NOT call intface_toggle_item_state() the way intface_item_reload
+// does: that engine path is entered with the item's action already cycled onto
+// RELOAD and uses the toggle to step back off it, but a direct reload would have
+// the toggle just advance the firing mode (single/burst/aimed) as a side effect.
+// Reloading must not change the selected attack mode.
+int intface_reload_weapon()
+{
+    if (interfaceWindow == -1) {
+        return -1;
+    }
+
+    bool reloaded = false;
+    while (item_w_try_reload(obj_dude, itemButtonItems[itemCurrentItem].item) != -1) {
+        reloaded = true;
+    }
+
+    intface_update_items(false);
+
+    if (!reloaded) {
         return -1;
     }
 

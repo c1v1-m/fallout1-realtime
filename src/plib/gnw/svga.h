@@ -28,6 +28,7 @@ void svga_exit();
 int screenGetWidth();
 int screenGetHeight();
 void handleWindowSizeChanged();
+void svga_toggle_fullscreen();
 void renderPresent();
 
 } // namespace fallout

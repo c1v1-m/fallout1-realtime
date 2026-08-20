@@ -1130,6 +1130,57 @@ int win_get_top_win(int x, int y)
     return -1;
 }
 
+// Returns the id of the topmost visible modal (exclusive) window, or -1 if none
+// is open. Used to tell whether a menu/dialog has control (vs. normal gameplay).
+int win_get_top_modal()
+{
+    for (int index = num_windows - 1; index >= 0; index--) {
+        Window* w = window[index];
+        if ((w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+
+        if ((w->flags & WINDOW_MODAL) != 0) {
+            return w->id;
+        }
+    }
+
+    return -1;
+}
+
+// Fills xs/ys with the SCREEN-space centers of the enabled, non-hidden buttons
+// of the topmost visible window that has any, up to maxCount, and returns the
+// count (0 if none). Button rects are window-relative (see win_check_all_buttons
+// offsetting by the window origin), so each center is offset by the window's
+// position. Used for controller menu/dialog item snapping -- the topmost
+// buttoned window is the interactive list (menu buttons, dialogue replies).
+int win_get_top_button_centers(int* xs, int* ys, int maxCount)
+{
+    for (int index = num_windows - 1; index >= 0; index--) {
+        Window* w = window[index];
+        if ((w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+
+        int count = 0;
+        for (Button* b = w->buttonListHead; b != NULL && count < maxCount; b = b->next) {
+            if ((b->flags & BUTTON_FLAG_DISABLED) != 0) {
+                continue;
+            }
+
+            xs[count] = w->rect.ulx + (b->rect.ulx + b->rect.lrx) / 2;
+            ys[count] = w->rect.uly + (b->rect.uly + b->rect.lry) / 2;
+            count++;
+        }
+
+        if (count > 0) {
+            return count;
+        }
+    }
+
+    return 0;
+}
+
 // 0x4C39D0
 int win_width(int win)
 {

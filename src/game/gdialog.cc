@@ -4,16 +4,21 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <SDL.h>
+
 #include "game/actions.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
 #include "game/intface.h"
+#include "game/interact_prompt.h"
 #include "game/item.h"
 #include "game/lip_sync.h"
 #include "game/message.h"
@@ -513,6 +518,13 @@ static CacheEntry* dialogue_redbut_Key1;
 // 0x58DAB8
 static int dialogue_bids[3];
 
+// CE: private copies of the small red button art with a "Y" / "X" hint baked in, used
+// for the dialogue barter / ask-about buttons when a controller is present (the letter
+// must live in the button image -- GNW_button_refresh re-blits it every frame -- so we
+// never draw on the shared art). Freed in talk_to_destroy_dialogue_win.
+static unsigned char* gd_barter_hint_up = NULL;
+static unsigned char* gd_ask_hint_up = NULL;
+
 // 0x58DAC4
 static int talkOldFont;
 
@@ -591,12 +603,25 @@ bool dialog_active()
     return dialog_state_fix != 0;
 }
 
+// True while the dialogue is in BARTER (trade) mode -- dialogue_state 4, set when
+// barter_inventory opens. The controller UI hides the pointer during ordinary reply
+// selection but must keep it here, since bartering means pointing at items to trade.
+bool dialog_is_bartering()
+{
+    return dialogue_state == 4;
+}
+
 // 0x43DE28
 void gdialog_enter(Object* target, int a2)
 {
     gdDialogWentOff = false;
 
-    if (isInCombat()) {
+    // Vanilla refused a conversation during a turn-based encounter -- you cannot start talking in
+    // the middle of someone's turn. Realtime has no turns, and its combat bit stays warm for as
+    // long as ANY critter anywhere is chasing, so this guard had quietly become "you may never
+    // talk to anyone while a fight is going on somewhere on the map" -- silently, with no message.
+    // Ask the narrow question instead: is somebody actually coming for me?
+    if (combat_rt_under_threat()) {
         return;
     }
 
@@ -637,6 +662,12 @@ void gdialog_enter(Object* target, int a2)
             return;
         }
     }
+
+    // Tear down the gamepad interact prompt (floating "talk" hand + outline on a nearby
+    // NPC like a companion). It's driven from gamepad_ui_tick, which stops running once
+    // this conversation takes over its own modal loop -- so without this its last frame
+    // would linger on screen over the talking head. (Idempotent when nothing is shown.)
+    interact_prompt_reset();
 
     gdCenterTile = tile_center_tile;
     gdBarterMod = 0;
@@ -1257,6 +1288,209 @@ int gDialogSayMessage()
 }
 
 // 0x43EBD8
+// CE: Gamepad shortcuts inside a conversation. The dialogue loop already has keyboard
+// shortcuts B = barter and A = ask-about (talk_to_pressed_barter / _about), but the on-
+// screen buttons are mouse-only (keyCode -1), so a controller player couldn't reach
+// trade easily. Map Y -> B (barter) and X -> A (ask about) by injecting those keycodes.
+// Read SDL directly with edge detection -- gamepad_ui_tick doesn't run in this modal
+// loop. (Y/X are otherwise free during a conversation: gpui_button_shortcuts bails on
+// dialog_active(), and the A-router only clicks the selected reply.)
+static int gdialog_gamepad_keycode()
+{
+    static bool prevY = false;
+    static bool prevX = false;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevY = false;
+        prevX = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+    bool yNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
+    bool xNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+
+    int keyCode = -1;
+    if (yNow && !prevY) {
+        keyCode = KEY_LOWERCASE_B; // barter / trade
+    } else if (xNow && !prevX) {
+        keyCode = KEY_LOWERCASE_A; // ask me about
+    }
+
+    prevY = yNow;
+    prevX = xNow;
+    return keyCode;
+}
+
+// CE: Universal gamepad cancel for the dialogue-family sub-screens (barter has its own;
+// this covers the "ask about" and review windows, both of which close on KEY_ESCAPE).
+// B or BACK -> ESCAPE. Separate edge state from gdialog_gamepad_keycode so a Y/X press
+// that opened a sub-screen can't also register as a cancel there.
+static int gdialog_gamepad_cancel_key()
+{
+    static bool prevB = false;
+    static bool prevBack = false;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevB = false;
+        prevBack = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool backNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0;
+
+    int keyCode = -1;
+    if ((bNow && !prevB) || (backNow && !prevBack)) {
+        keyCode = KEY_ESCAPE;
+    }
+
+    prevB = bNow;
+    prevBack = backNow;
+    return keyCode;
+}
+
+// CE: console-style reply selection with a controller -- the highlighted option (tracked by
+// the left-stick snap, gpui_menu_snap, whose cursor motion fires each option button's hover ->
+// gDialogProcessHighlight) already reads like the main menu; the only jarring part is the visible
+// pointer. So blank it (MOUSE_CURSOR_NONE, NOT mouse_hide() -- that would gate mouse_info off and
+// stop the right stick from ever revealing it), and bring it back only while the mouse/right stick
+// is actively moving it, fading out again after GD_CURSOR_IDLE_MS. Same pattern as load/save's
+// ls_tick_cursor. Selection is unaffected: the snap still moves the (invisible) cursor and A still
+// clicks the hovered option.
+#define GD_CURSOR_IDLE_MS 2000
+
+static void gdialog_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned int* lastMove)
+{
+    int x;
+    int y;
+    mouse_get_position(&x, &y);
+
+    if (x != *lastX || y != *lastY) {
+        *lastMove = get_time();
+        if (!*shown) {
+            gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+            *shown = true;
+        }
+    } else if (*shown && elapsed_time(*lastMove) >= GD_CURSOR_IDLE_MS) {
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        *shown = false;
+    }
+
+    *lastX = x;
+    *lastY = y;
+}
+
+// Minimum gap between two accepted reply selections. Guards against one press being read as two
+// answers across consecutive reply sets -- a mistake with no undo, since the conversation has
+// already advanced. Well under deliberate reply pacing.
+#define GDIALOG_REPLY_LOCKOUT_MS 250
+
+// CE: index-based reply navigation for a controller -- the "like the main menu" selection.
+// D-pad / left-stick up/down moves the highlighted option (gDialogProcessHighlight/UnHighlight),
+// with NO pointer involved: the caller engages gamepad_ui_set_self_nav, which suppresses the
+// shared left-stick cursor snap and A-as-click so they don't fight this. A confirms the current
+// option by returning its select keycode (49 + index -- exactly what clicking the option button
+// yields, decoded as option = keyCode - 49 in gDialogProcess). Edge + auto-repeat; SDL read
+// directly since gamepad_ui_tick doesn't run in this modal loop. `*sel` is owned by the caller
+// (reset to 0 per option set so the first reply starts highlighted).
+static int gdialog_gamepad_reply_nav(int* sel)
+{
+    static bool prevUp = false;
+    static bool prevDown = false;
+    static bool prevA = false;
+    static bool aArmed = false;
+    static bool navArmed = false;
+    static unsigned int lastStep = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL || gdNumOptions <= 0) {
+        prevUp = false;
+        prevDown = false;
+        prevA = false;
+        aArmed = false;
+        navArmed = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+    Sint16 ly = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+    bool upNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0 || ly < -16000;
+    bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0 || ly > 16000;
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+
+    // Neutral-first latch, same idea as the world map's wm_stick_armed. This loop is entered with
+    // whatever the player was physically holding when the conversation opened -- A from the interact
+    // press (or a swing), the stick from running up to the NPC -- and the prev* edge state starts
+    // false, so a HELD input reads as a fresh press: A instantly confirmed reply 0 and a held stick
+    // scrolled the highlight on entry. Whether it fired depended purely on what was down in that one
+    // frame, which is what made it intermittent. Require each control to be seen released once
+    // before it may act; re-armed per option set via the gdNumOptions reset above, so a held A can
+    // still never chain through two replies.
+    if (!aNow) {
+        aArmed = true;
+    }
+
+    if (!upNow && !downNow) {
+        navArmed = true;
+    }
+
+    unsigned int now = get_time();
+
+    // Step on the press edge immediately, then auto-repeat while held.
+    int dir = 0;
+    bool repeat = elapsed_time(lastStep) >= 130;
+    if (!navArmed) {
+        dir = 0;
+    } else if ((upNow && !prevUp) || (upNow && repeat)) {
+        dir = -1;
+    } else if ((downNow && !prevDown) || (downNow && repeat)) {
+        dir = 1;
+    }
+
+    if (dir != 0) {
+        int newSel = *sel + dir;
+        if (newSel < 0) {
+            newSel = gdNumOptions - 1; // wrap
+        } else if (newSel >= gdNumOptions) {
+            newSel = 0;
+        }
+        if (newSel != *sel) {
+            gDialogProcessUnHighlight(*sel);
+            gDialogProcessHighlight(newSel);
+            *sel = newSel;
+        }
+        lastStep = now;
+    }
+
+    // ⚠️ HARD LOCKOUT AFTER A SELECTION, on top of the arming above. The arming only guarantees A
+    // was released between two presses -- it cannot stop the NEXT reply set from being answered by
+    // a press that arrives milliseconds later, whether that is a fast double-tap, controller switch
+    // bounce, or any other path that injects a select. The player saw one press take two replies
+    // ("zmáčknul jsem áčko a vybrala se i další odpověď"), which is unrecoverable: the conversation
+    // has already moved on and there is no undo. A quarter second is far below deliberate reply
+    // pacing and far above any of those.
+    static unsigned int lastSelect = 0;
+
+    int keyCode = -1;
+    if (aArmed && aNow && !prevA && *sel >= 0 && *sel < gdNumOptions
+        && elapsed_time(lastSelect) >= GDIALOG_REPLY_LOCKOUT_MS) {
+        keyCode = 49 + *sel; // select this option (gDialogProcess: option = keyCode - 49)
+        lastSelect = get_time();
+        // Force a fresh release before anything can be picked again, so the very press that
+        // answered this node cannot also answer the next one.
+        aArmed = false;
+    }
+
+    prevUp = upNow;
+    prevDown = downNow;
+    prevA = aNow;
+    return keyCode;
+}
+
 static int gDialogProcess()
 {
     if (gdReenterLevel == 0) {
@@ -1280,10 +1514,46 @@ static int gDialogProcess()
     int pageIndex = 0;
     int pageOffsets[10];
     pageOffsets[0] = 0;
+
+    // Controller reply selection: drive it like the main menu -- the pointer is hidden and a
+    // highlighted option is moved by the D-pad/stick (gdialog_gamepad_reply_nav). self_nav tells
+    // the shared mouse hook to stop snapping the cursor / clicking on A so it doesn't fight that.
+    // Barter keeps its pointer (it means pointing at items to trade).
+    bool gdCursorController = gamepad_ui_get_controller() != NULL && !dialog_is_bartering();
+    bool gdCursorShown = !gdCursorController;
+    int gdCursorX = -1;
+    int gdCursorY = -1;
+    unsigned int gdCursorMove = get_time();
+    int gdReplySel = 0;
+    if (gdCursorController) {
+        mouse_get_position(&gdCursorX, &gdCursorY);
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        gamepad_ui_set_self_nav(true);
+        if (gdNumOptions > 0) {
+            gDialogProcessHighlight(0); // start with the first reply highlighted
+        }
+    }
+
     for (;;) {
         sharedFpsLimiter.mark();
 
         int keyCode = get_input();
+
+        if (gdCursorController) {
+            gdialog_tick_cursor(&gdCursorShown, &gdCursorX, &gdCursorY, &gdCursorMove);
+            int navKey = gdialog_gamepad_reply_nav(&gdReplySel);
+            if (keyCode == -1 && navKey != -1) {
+                keyCode = navKey;
+            }
+        }
+
+        // CE: fold in the gamepad barter/ask shortcuts (Y/X) when no real key fired.
+        if (keyCode == -1) {
+            int padKey = gdialog_gamepad_keycode();
+            if (padKey != -1) {
+                keyCode = padKey;
+            }
+        }
 
         convertMouseWheelToArrowKey(&keyCode);
 
@@ -1397,6 +1667,16 @@ static int gDialogProcess()
 
         renderPresent();
         sharedFpsLimiter.throttle();
+    }
+
+    // Release the controller reply-nav state, but only at the OUTERMOST dialogue level
+    // (gdReenterLevel is still 1 here, decremented just below): a nested reply set must
+    // leave self_nav / the hidden pointer engaged for the level that entered it, or the
+    // outer loop would resume with the cursor snapping and A clicking again. Leaving the
+    // pointer visible afterwards matters -- a blanked cursor must never outlive the dialogue.
+    if (gdCursorController && gdReenterLevel == 1) {
+        gamepad_ui_set_self_nav(false);
+        gmouse_set_cursor(MOUSE_CURSOR_ARROW);
     }
 
     gdReenterLevel -= 1;
@@ -2257,6 +2537,11 @@ static int gdialog_review()
 
         int keyCode = get_input();
 
+        // CE: B / BACK cancels the review window.
+        if (keyCode == -1) {
+            keyCode = gdialog_gamepad_cancel_key();
+        }
+
         if (keyCode == KEY_ESCAPE) {
             break;
         }
@@ -3039,6 +3324,55 @@ static int talk_to_create_dialogue_win()
         return -1;
     }
 
+    // CE: with a controller, bake "Y" (barter) / "X" (ask about) into private copies of
+    // the button art so the player sees which pad button opens each (matches the pad
+    // shortcuts in gDialogProcess). Free any stale copies first (create is paired with a
+    // destroy, so no live button references them here).
+    unsigned char* barterUp = normal;
+    unsigned char* askUp = normal;
+    if (gamepad_ui_get_controller() != NULL) {
+        if (gd_barter_hint_up != NULL) {
+            mem_free(gd_barter_hint_up);
+            gd_barter_hint_up = NULL;
+        }
+        if (gd_ask_hint_up != NULL) {
+            mem_free(gd_ask_hint_up);
+            gd_ask_hint_up = NULL;
+        }
+
+        CacheEntry* redKey;
+        Art* redArt = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 96, 0, 0, 0), &redKey);
+        if (redArt != NULL) {
+            int redW = art_frame_width(redArt, 0, 0);
+            int redH = art_frame_length(redArt, 0, 0);
+            unsigned char* redData = art_frame_data(redArt, 0, 0);
+            int redSize = redW * redH;
+
+            gd_barter_hint_up = (unsigned char*)mem_malloc(redSize);
+            gd_ask_hint_up = (unsigned char*)mem_malloc(redSize);
+            if (gd_barter_hint_up != NULL && gd_ask_hint_up != NULL && redData != NULL) {
+                memcpy(gd_barter_hint_up, redData, redSize);
+                memcpy(gd_ask_hint_up, redData, redSize);
+
+                int oldFont = text_curr();
+                text_font(101);
+                int hintY = (redH - text_height()) / 2;
+                if (hintY < 0) {
+                    hintY = 0;
+                }
+                text_to_buf(gd_barter_hint_up + redW * hintY + (redW - text_width("Y")) / 2,
+                    "Y", redW, redW, colorTable[32767]);
+                text_to_buf(gd_ask_hint_up + redW * hintY + (redW - text_width("X")) / 2,
+                    "X", redW, redW, colorTable[32767]);
+                text_font(oldFont);
+
+                barterUp = gd_barter_hint_up;
+                askUp = gd_ask_hint_up;
+            }
+            art_ptr_unlock(redKey);
+        }
+    }
+
     // BARTER/TRADE
     dialogue_bids[0] = win_register_button(dialogueWindow,
         593,
@@ -3049,7 +3383,7 @@ static int talk_to_create_dialogue_win()
         -1,
         -1,
         -1,
-        normal,
+        barterUp,
         pressed,
         NULL,
         BUTTON_FLAG_TRANSPARENT);
@@ -3068,7 +3402,7 @@ static int talk_to_create_dialogue_win()
         -1,
         -1,
         -1,
-        normal,
+        askUp,
         pressed,
         0,
         BUTTON_FLAG_TRANSPARENT);
@@ -3117,6 +3451,16 @@ static void talk_to_destroy_dialogue_win()
 
     for (int index = 0; index < 3; index++) {
         win_delete_button(dialogue_bids[index]);
+    }
+
+    // CE: free the controller Y/X hint art copies now the buttons using them are gone.
+    if (gd_barter_hint_up != NULL) {
+        mem_free(gd_barter_hint_up);
+        gd_barter_hint_up = NULL;
+    }
+    if (gd_ask_hint_up != NULL) {
+        mem_free(gd_ask_hint_up);
+        gd_ask_hint_up = NULL;
     }
 
     art_ptr_unlock(dialogue_redbut_Key1);
@@ -3821,7 +4165,13 @@ static void about_loop()
     while (1) {
         sharedFpsLimiter.mark();
 
-        if (about_process_input(get_input()) == -1) {
+        // CE: B / BACK cancels the ask-about window (it's otherwise keyboard text entry).
+        int input = get_input();
+        if (input == -1) {
+            input = gdialog_gamepad_cancel_key();
+        }
+
+        if (about_process_input(input) == -1) {
             break;
         }
 

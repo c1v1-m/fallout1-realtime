@@ -8,6 +8,7 @@
 #include "game/automap.h"
 #include "game/bmpdlog.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/critter.h"
 #include "game/cycle.h"
@@ -15,6 +16,7 @@
 #include "game/editor.h"
 #include "game/endgame.h"
 #include "game/fontmgr.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gdialog.h"
 #include "game/gmemory.h"
@@ -305,6 +307,12 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
         return -1;
     }
 
+    combat_rt_init();
+
+    // Always-on controller UI layer (cursor / click / later menu nav). Shares
+    // its controller handle with combat_rt.
+    gamepad_ui_init();
+
     debug_printf(">combat_init\t");
 
     if (automap_init() != 0) {
@@ -380,6 +388,7 @@ void game_reset()
     ResetLoadSave();
     gdialog_reset();
     combat_reset();
+    combat_rt_reset();
     game_user_wants_to_quit = 0;
     automap_reset();
     init_options_menu();
@@ -390,6 +399,8 @@ void game_exit()
 {
     tile_disable_refresh();
     message_exit(&misc_message_file);
+    gamepad_ui_exit();
+    combat_rt_exit();
     combat_exit();
     gdialog_exit();
     scr_game_exit();
@@ -537,11 +548,16 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         break;
     case KEY_UPPERCASE_A:
     case KEY_LOWERCASE_A:
-        if (intface_is_enabled()) {
-            if (!isInCombatMode) {
-                combat(NULL);
-            }
-        }
+        // Realtime combat (combat_rt) replaces the turn-based combat() trigger.
+        // 'A' is now consumed by combat_rt_handle_input() for movement before it
+        // reaches here; the old "enter combat mode" call is intentionally gone.
+        break;
+    case KEY_RETURN:
+        // END COMBAT, on vanilla's own key. In the turn-based game this reached
+        // combat_end() through combat_input(); that path is dormant under realtime, so
+        // route it to combat_rt, which applies the identical "does every enemy want to
+        // stop?" test and prints the same refusal message when one does not.
+        combat_rt_end_combat();
         break;
     case KEY_UPPERCASE_N:
     case KEY_LOWERCASE_N:

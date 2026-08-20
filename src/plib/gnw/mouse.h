@@ -31,6 +31,14 @@ namespace fallout {
 extern ScreenTransBlitFunc* mouse_blit_trans;
 extern ScreenBlitFunc* mouse_blit;
 
+// Optional input contributor folded into mouse_info() each frame, before the
+// state is handed to mouse_simulate_input. Lets an external device (e.g. a game
+// controller) add cursor delta (dx/dy, in pixels) and OR-in button bits
+// (MOUSE_STATE_*), so synthetic movement and clicks flow through the same edge
+// detection + button-check cycle as the real mouse. NULL = no contributor.
+typedef void MouseInputHook(int* dx, int* dy, int* buttons);
+void mouse_set_input_hook(MouseInputHook* hook);
+
 int GNW_mouse_init();
 void GNW_mouse_exit();
 void mouse_get_shape(unsigned char** buf, int* width, int* length, int* full, int* hotx, int* hoty, char* trans);
@@ -39,6 +47,14 @@ int mouse_get_anim(unsigned char** frames, int* num_frames, int* width, int* len
 int mouse_set_anim_frames(unsigned char* frames, int num_frames, int start_frame, int width, int length, int hotx, int hoty, char trans, int speed);
 void mouse_show();
 void mouse_hide();
+// Predicate consulted every frame: when it returns true the cursor is NOT drawn
+// (mouse_show erases instead of blitting) but input still flows -- unlike mouse_hide,
+// which also gates mouse_info / mouse_simulate_input off and would kill controller
+// input. Evaluated live inside mouse_show/mouse_info, so it works in every loop
+// (main, menu, world map) and self-corrects the instant its condition changes. Used
+// to hide the pointer during gamepad free-play. NULL = never suppress.
+typedef bool MouseDrawSuppressHook();
+void mouse_set_draw_suppress_hook(MouseDrawSuppressHook* hook);
 void mouse_info();
 void mouse_simulate_input(int delta_x, int delta_y, int buttons);
 bool mouse_in(int left, int top, int right, int bottom);

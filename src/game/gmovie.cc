@@ -5,6 +5,7 @@
 
 #include "game/cycle.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -190,7 +191,7 @@ int gmovie_play(int game_movie, int game_movie_flags)
     int v11 = 0;
     int buttons;
     do {
-        if (!moviePlaying() || game_user_wants_to_quit || get_input() != -1) {
+        if (!moviePlaying() || game_user_wants_to_quit || get_input() != -1 || gamepad_ui_skip_pressed()) {
             break;
         }
 

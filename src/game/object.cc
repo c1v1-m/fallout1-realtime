@@ -8,10 +8,13 @@
 #include "game/anim.h"
 #include "game/art.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
+#include "game/game_trace.h"
 #include "game/critter.h"
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
+#include "game/interact_prompt.h"
 #include "game/item.h"
 #include "game/light.h"
 #include "game/map.h"
@@ -1472,7 +1475,13 @@ int obj_move_to_tile(Object* obj, int tile, int elevation, Rect* rect)
             map_set_elevation(elevation);
             tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
             if (isInCombat()) {
-                game_user_wants_to_quit = 1;
+                // Realtime: changing elevation (stairs/lift) mid-combat must not boot the
+                // player to the menu -- end combat cleanly instead (see combat_rt_end_for_map_exit).
+                if (combat_rt_enabled()) {
+                    combat_rt_end_for_map_exit();
+                } else {
+                    game_user_wants_to_quit = 1;
+                }
             }
         }
     } else {
@@ -1853,6 +1862,15 @@ int obj_turn_off(Object* object, Rect* rect)
         }
     }
 
+    // DIAG (vanishing-sprite hunt): a critter being HIDDEN (its sprite stops drawing though the
+    // object still exists) is one way an enemy "just disappears." Record which one, where, and the
+    // call path that hid it. Rare in normal play, so this is a strong signal; strip once resolved.
+    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
+        trace_event(TRACE_FLOW, "obj-hide", "pid=%d id=%d tile=%d fid=%08x dude=%d",
+            object->pid, object->id, object->tile, object->fid, object == obj_dude ? 1 : 0);
+        trace_backtrace("obj-hide");
+    }
+
     object->flags |= OBJECT_HIDDEN;
 
     if ((object->outline & OUTLINE_TYPE_MASK) != 0) {
@@ -1919,6 +1937,18 @@ int obj_toggle_flat(Object* object, Rect* rect)
         return -1;
     }
 
+    // DIAG (render-depth hunt): OBJECT_FLAT draws an object with the FLOOR (as "background"). A
+    // critter flagged flat while it is still standing / mid-death animation renders behind the
+    // scenery -- the "dying animation shows as background / background comes to the foreground"
+    // report. Log which critter, its dead state, and the call path that flattened it.
+    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
+        trace_event(TRACE_FLOW, "obj-flat", "pid=%d id=%d tile=%d fid=%08x -> %s dead=%d x=%d y=%d",
+            object->pid, object->id, object->tile, object->fid,
+            (object->flags & OBJECT_FLAT) == 0 ? "FLAT" : "unflat",
+            (object->data.critter.combat.results & DAM_DEAD) != 0 ? 1 : 0, object->x, object->y);
+        trace_backtrace("obj-flat");
+    }
+
     if (rect != NULL) {
         obj_bound(object, rect);
 
@@ -1964,6 +1994,21 @@ int obj_erase_object(Object* object, Rect* rect)
     if (object == NULL) {
         return -1;
     }
+
+    // DIAG (vanishing-sprite hunt): a critter being ERASED (removed from the world entirely) is
+    // the other way an enemy "just disappears." Record which one, where, and the call path that
+    // erased it. Rare, so a strong signal; strip once resolved.
+    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
+        trace_event(TRACE_FLOW, "obj-erase", "pid=%d id=%d tile=%d fid=%08x dude=%d",
+            object->pid, object->id, object->tile, object->fid, object == obj_dude ? 1 : 0);
+        trace_backtrace("obj-erase");
+    }
+
+    // Realtime combat may hold pointers to this object (the actor registry, the engine's
+    // pending attack) and other live critters may reference it via whoHitMe. Clear them BEFORE
+    // it's freed below, so a stale retaliation commit can't crash on freed memory. No-op
+    // outside realtime / for non-critters.
+    combat_rt_notify_critter_removed(object);
 
     gmouse_remove_item_outline(object);
 
@@ -2047,12 +2092,45 @@ Object* obj_top_environment(Object* object)
     return owner;
 }
 
+// True if obj_dude is currently standing on a map-exit grid (the MISC objects, pids
+// 0x5000010..0x5000017, that trigger map_leave_map on entry -- same condition as the
+// exit-grid check in obj_move_to_tile). Used by the realtime escape-delay: the player
+// must hold position on an exit grid for a few seconds of combat before the map changes.
+bool obj_dude_on_exit_grid()
+{
+    if (obj_dude == NULL) {
+        return false;
+    }
+
+    ObjectListNode* node = objectTable[obj_dude->tile];
+    while (node != NULL) {
+        Object* obj = node->obj;
+        if (obj->elevation == obj_dude->elevation
+            && FID_TYPE(obj->fid) == OBJ_TYPE_MISC
+            && obj->pid >= 0x5000010 && obj->pid <= 0x5000017) {
+            return true;
+        }
+        node = node->next;
+    }
+
+    return false;
+}
+
 // 0x47CE78
 void obj_remove_all()
 {
     ObjectListNode* node;
     ObjectListNode* prev;
     ObjectListNode* next;
+
+    // Realtime combat may be holding pointers into the objects we're about to free (a
+    // mid-combat map exit). Tell it to abandon any in-flight attack + drop those pointers
+    // BEFORE they dangle, so a stale commit can't crash on freed memory.
+    combat_rt_notify_objects_freed();
+
+    // Drop the contextual interaction prompt's cached target/overlay before the objects it points
+    // at are freed (its per-frame rescan would otherwise dereference a freed object).
+    interact_prompt_reset();
 
     scr_remove_all();
 

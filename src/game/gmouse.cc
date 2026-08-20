@@ -7,8 +7,10 @@
 #include "game/actions.h"
 #include "game/art.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/critter.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gsound.h"
 #include "game/intface.h"
@@ -242,6 +244,22 @@ static int gmouse_3d_modes_enabled = 1;
 
 // 0x505394
 static int gmouse_3d_current_mode = GAME_MOUSE_MODE_MOVE;
+
+// When true the MOVE cursor object (obj_mouse) is kept turned OFF so the red iso "walk"
+// cursor isn't drawn -- used to hide the pointer during gamepad free-play. This works
+// purely through the game's cursor OBJECT (obj_mouse), never the low-level mouse pipeline
+// (mouse_show / mouse_info / mouse_simulate_input), so it can NEVER affect input. Only the
+// plain MOVE cursor is affected; aim / crosshair / skill cursors still show. Driven from
+// gamepad_ui_tick. See gmouse_set_move_cursor_hidden.
+static bool gmouse_move_cursor_hidden = false;
+
+// Suppresses EVERY iso cursor, crosshair included -- unlike gmouse_move_cursor_hidden, which
+// deliberately lets an aim/crosshair cursor through. Set while the gamepad's body-part aim picker
+// owns the target: that picker draws its own outline and label on the critter, and the crosshair
+// art (a big red reticle with the to-hit % blitted into it) sits right on top of the body it is
+// asking the player to read. Same reliability trick as the flag above -- the guard lives inside
+// gmouse_3d_on(), which gmouse_bk_process calls every frame to re-show the cursor.
+static bool gmouse_cursor_suppressed = false;
 
 // 0x505398
 static int gmouse_3d_mode_nums[GAME_MOUSE_MODE_COUNT] = {
@@ -679,7 +697,11 @@ void gmouse_bk_process()
                             primaryAction = GAME_MOUSE_ACTION_MENU_ITEM_ROTATE;
                         } else {
                             if (obj_action_can_talk_to(target)) {
-                                if (isInCombat()) {
+                                // Under threat, not merely "combat warm" -- see
+                                // combat_rt_under_threat(). Realtime holds the combat bit set
+                                // while anything anywhere is chasing, which stripped TALK out of
+                                // the action menu for minutes at a time.
+                                if (combat_rt_under_threat()) {
                                     primaryAction = GAME_MOUSE_ACTION_MENU_ITEM_LOOK;
                                 } else {
                                     primaryAction = GAME_MOUSE_ACTION_MENU_ITEM_TALK;
@@ -918,7 +940,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                         }
                     } else {
                         if (obj_action_can_talk_to(target)) {
-                            if (isInCombat()) {
+                            if (combat_rt_under_threat()) {
                                 if (obj_examine(obj_dude, target) == -1) {
                                     obj_look_at(obj_dude, target);
                                 }
@@ -972,7 +994,14 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                             : HIT_MODE_LEFT_WEAPON_PRIMARY;
 
                         int actionPointsRequired = item_mp_cost(obj_dude, hitMode, false);
-                        if (actionPointsRequired <= obj_dude->data.critter.combat.ap) {
+                        // Realtime holds engine combat.ap maxed, so charge combat_rt's
+                        // pool instead (using an item on a world object mid-fight costs
+                        // AP like vanilla). Free out of combat; refuses when unaffordable.
+                        if (combat_rt_enabled()) {
+                            if (combat_rt_spend_ap(actionPointsRequired)) {
+                                action_use_an_item_on_object(obj_dude, target, weapon);
+                            }
+                        } else if (actionPointsRequired <= obj_dude->data.critter.combat.ap) {
                             if (action_use_an_item_on_object(obj_dude, target, weapon) != -1) {
                                 int actionPoints = obj_dude->data.critter.combat.ap;
                                 if (actionPointsRequired > actionPoints) {
@@ -1002,8 +1031,16 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
             || gmouse_3d_current_mode == GAME_MOUSE_MODE_USE_REPAIR) {
             Object* target = object_under_mouse(-1, 1, map_elevation);
             if (target == NULL || action_use_skill_on(obj_dude, target, gmouse_skill_table[gmouse_3d_current_mode - FIRST_GAME_MOUSE_MODE_SKILL]) != -1) {
-                gmouse_set_cursor(MOUSE_CURSOR_NONE);
-                gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
+                // Vanilla disarms the skill cursor after one application (mouse play re-arms it
+                // from the skilldex in two clicks). A pad has no such shortcut -- re-arming means
+                // L3, aim the ring, release, then aim the cursor again -- so a skill armed FROM THE
+                // PAD stays armed and can be applied again immediately, which is what a failed
+                // lockpick attempt already did by accident and what the player asked for on the
+                // rest. It is cancelled explicitly with B (gamepad_ui), so it cannot strand you.
+                if (!gamepad_ui_skill_cursor_sticky()) {
+                    gmouse_set_cursor(MOUSE_CURSOR_NONE);
+                    gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
+                }
             }
             return;
         }
@@ -1029,7 +1066,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                     actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_ROTATE;
                 } else {
                     if (obj_action_can_talk_to(target)) {
-                        if (!isInCombat()) {
+                        if (!combat_rt_under_threat()) {
                             actionMenuItems[actionMenuItemsCount++] = GAME_MOUSE_ACTION_MENU_ITEM_TALK;
                         }
                     } else {
@@ -1071,6 +1108,10 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
 
                     int v33 = mouseY;
                     int actionIndex = 0;
+                    // Tell the gamepad layer this hold-drag popup is up so the
+                    // left stick feeds mouse-Y motion to navigate it (this menu
+                    // is custom-drawn, not GNW buttons).
+                    gamepad_ui_set_action_popup_active(true);
                     while ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) == 0) {
                         sharedFpsLimiter.mark();
 
@@ -1078,6 +1119,22 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
 
                         if (game_user_wants_to_quit != 0) {
                             actionMenuItems[actionIndex] = 0;
+                        }
+
+                        // D-pad up/down steps the highlighted action directly --
+                        // more precise than the analog stick. Confirm is A
+                        // (left-button up, which ends this loop).
+                        int dpad = gamepad_ui_action_popup_dpad();
+                        if (dpad < 0 && actionIndex > 0) {
+                            actionIndex -= 1;
+                            if (gmouse_3d_highlight_menu_frame(actionIndex) == 0) {
+                                tile_refresh_rect(&v43, map_elevation);
+                            }
+                        } else if (dpad > 0 && actionIndex < actionMenuItemsCount - 1) {
+                            actionIndex += 1;
+                            if (gmouse_3d_highlight_menu_frame(actionIndex) == 0) {
+                                tile_refresh_rect(&v43, map_elevation);
+                            }
                         }
 
                         int v48;
@@ -1100,6 +1157,7 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                         renderPresent();
                         sharedFpsLimiter.throttle();
                     }
+                    gamepad_ui_set_action_popup_active(false);
 
                     map_enable_bk_processes();
 
@@ -1366,6 +1424,38 @@ int gmouse_3d_get_mode()
     return gmouse_3d_current_mode;
 }
 
+// Draws the crosshair to-hit indicator (reticle + accuracy %, or a red X when
+// the shot is impossible) for an explicit target, bypassing the hover-stillness
+// gate the normal crosshair path in gmouse_bk_process waits on. The controller
+// lock-on calls this every frame so the % shows even while the player or target
+// move and the glued cursor is never "still". No-op if the 3D mouse is off.
+void gmouse_3d_show_to_hit(Object* target)
+{
+    if (target == NULL || !gmouse_3d_is_on()) {
+        return;
+    }
+
+    int color;
+    int accuracy;
+    char formattedAccuracy[8];
+    if (combat_to_hit(target, &accuracy)) {
+        snprintf(formattedAccuracy, sizeof(formattedAccuracy), "%d%%", accuracy);
+        color = colorTable[32767];
+    } else {
+        snprintf(formattedAccuracy, sizeof(formattedAccuracy), " %c ", 'X');
+        color = colorTable[31744];
+    }
+
+    if (gmouse_3d_build_to_hit_frame(formattedAccuracy, color) == 0) {
+        Rect tmp;
+        int fid = art_id(OBJ_TYPE_INTERFACE, 284, 0, 0, 0);
+        // NOTE: Uninline.
+        if (gmouse_3d_set_flat_fid(fid, &tmp) == 0) {
+            tile_refresh_rect(&tmp, map_elevation);
+        }
+    }
+}
+
 // 0x444608
 void gmouse_3d_toggle_mode()
 {
@@ -1470,6 +1560,21 @@ void gmouse_3d_on()
         return;
     }
 
+    // Free-play cursor hidden: keep the iso cursor object OFF. gmouse_bk_process calls this
+    // every frame to re-show it, so the guard lives here to reliably win against that. Both
+    // exploration cursors are suppressed -- MOVE (walk) and ARROW (the look/action cursor
+    // RB toggles to) -- but an aim/crosshair/skill cursor still turns on so the player can
+    // see where they point.
+    if (gmouse_cursor_suppressed) {
+        return;
+    }
+
+    if (gmouse_move_cursor_hidden
+        && (gmouse_3d_current_mode == GAME_MOUSE_MODE_MOVE
+            || gmouse_3d_current_mode == GAME_MOUSE_MODE_ARROW)) {
+        return;
+    }
+
     int v2 = 0;
 
     Rect rect1;
@@ -1560,6 +1665,55 @@ void gmouse_3d_off()
 bool gmouse_3d_is_on()
 {
     return (obj_mouse_flat->flags & OBJECT_HIDDEN) == 0;
+}
+
+// Hide/show the red iso MOVE cursor (obj_mouse) for gamepad free-play. Idempotent. On
+// hide, turns the iso cursor off now (and the gmouse_3d_on guard keeps the per-frame
+// re-show from bringing it back); on show, turns it back on. Cursor object only -- never
+// touches the low-level mouse pipeline, so controller input is unaffected.
+void gmouse_set_move_cursor_hidden(bool hidden)
+{
+    if (gmouse_move_cursor_hidden == hidden) {
+        return;
+    }
+
+    gmouse_move_cursor_hidden = hidden;
+
+    if (!gmouse_initialized) {
+        return;
+    }
+
+    if (hidden) {
+        gmouse_3d_off();
+    } else {
+        gmouse_3d_on();
+    }
+}
+
+bool gmouse_move_cursor_is_hidden()
+{
+    return gmouse_move_cursor_hidden;
+}
+
+// Hide/show EVERY iso cursor including the crosshair (see gmouse_cursor_suppressed). Idempotent,
+// cursor objects only -- the low-level mouse pipeline is untouched, so input keeps working.
+void gmouse_set_cursor_suppressed(bool suppressed)
+{
+    if (gmouse_cursor_suppressed == suppressed) {
+        return;
+    }
+
+    gmouse_cursor_suppressed = suppressed;
+
+    if (!gmouse_initialized) {
+        return;
+    }
+
+    if (suppressed) {
+        gmouse_3d_off();
+    } else {
+        gmouse_3d_on();
+    }
 }
 
 // 0x444958

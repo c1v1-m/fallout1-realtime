@@ -14,11 +14,16 @@
 #include <stddef.h>
 
 #include "game/amutex.h"
+#include "game/anim.h"
 #include "game/art.h"
+#include "game/combat_rt.h"
 #include "game/credits.h"
 #include "game/cycle.h"
 #include "game/endgame.h"
+#include "game/combat.h"
 #include "game/game.h"
+#include "game/game_trace.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
@@ -27,6 +32,7 @@
 #include "game/mainmenu.h"
 #include "game/map.h"
 #include "game/object.h"
+#include "game/pipboy.h"
 #include "game/options.h"
 #include "game/palette.h"
 #include "game/proto.h"
@@ -34,6 +40,7 @@
 #include "game/scripts.h"
 #include "game/select.h"
 #include "game/selfrun.h"
+#include "game/tile.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
 #include "plib/color/color.h"
@@ -41,6 +48,7 @@
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/kb.h"
 #include "plib/gnw/intrface.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
@@ -227,6 +235,11 @@ static bool main_init_system(int argc, char** argv)
         return false;
     }
 
+    // Flight recorder: open the trace log + install the crash handler now that config
+    // is loaded. combat_rt provides the heartbeat snapshot (realtime state + health checks).
+    trace_init();
+    trace_set_snapshot_fn(combat_rt_trace_snapshot);
+
     // NOTE: Uninline.
     main_selfrun_init();
 
@@ -248,6 +261,8 @@ static void main_exit_system()
 
     // NOTE: Uninline.
     main_selfrun_exit();
+
+    trace_shutdown();
 
     game_exit();
 
@@ -319,21 +334,146 @@ static void main_game_loop()
 
     scr_enable();
 
+    unsigned int rtLastTime = get_time();
+
     while (game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
 
+        // Realtime combat delta-time tick.
+        unsigned int rtNow = get_time();
+        float rtDelta = (rtNow - rtLastTime) / 1000.0f;
+        rtLastTime = rtNow;
+
+        // Cap the delta. A modal loop (inventory, options, a yes/no dialog) does NOT tick
+        // combat_rt, so on resume rtDelta would be the whole time spent in there -- which
+        // dumps a huge AP-regen catch-up in one frame (refunding the inventory / reload AP
+        // cost -- "AP regenerates while I'm in the inventory") and lurches other dt timers.
+        // Clamp it to a few frames so time effectively pauses while a menu is open.
+        if (rtDelta > 0.25f) {
+            rtDelta = 0.25f;
+        }
+
         int keyCode = get_input();
-        game_handle_input(keyCode, false);
+
+        // Debug: F11 toggles a red ring at 15 hex tiles around the dude (the gunshot-
+        // hearing distance, so you can see how far that reaches in-world).
+        if (keyCode == KEY_F11) {
+            tile_debug_ring_set(tile_debug_ring_get() > 0 ? 0 : 15);
+        }
+
+        // Route input to realtime combat first (WASD movement, click-to-attack);
+        // anything it doesn't consume falls through to normal handling.
+        bool rtConsumed = combat_rt_handle_input(keyCode);
+        if (keyCode != -1) {
+            trace_event(TRACE_INPUT, "key", "code=%d rt=%d", keyCode, rtConsumed ? 1 : 0);
+        }
+        if (!rtConsumed) {
+            game_handle_input(keyCode, false);
+        }
+
+        combat_rt_update(rtDelta);
+
+        // While the debug ring is up, force a full refresh when the dude changes tile
+        // so the ring follows cleanly instead of ghosting (partial dirty-rect refreshes
+        // would leave trails of the old ring behind).
+        if (tile_debug_ring_get() > 0 && obj_dude != NULL) {
+            static int ringPrevTile = -1;
+            if (obj_dude->tile != ringPrevTile) {
+                ringPrevTile = obj_dude->tile;
+                tile_refresh_display();
+            }
+        }
+
+        // Flight-recorder pump: frame counter, heartbeat snapshot, coalesce ageing.
+        trace_tick(rtDelta);
+
+        // Gamepad overlays that touch GNW windows (the LB skill wheel) run here, at a
+        // safe frame-tick point outside the input/mouse hook, to avoid re-entrant
+        // windowing during win_check_all_buttons.
+        gamepad_ui_tick();
 
         scripts_check_state();
 
         map_check_state();
 
+        // Autosave on entering a new location. Done here -- a safe point with the map fully
+        // settled, outside the map-load machinery (saving re-enters map saving, so doing it
+        // mid-load would be re-entrant). Suppressed on the map change a savegame load causes
+        // (LoadSaveConsumeJustLoaded) and while in combat; the first map of a session only
+        // seeds the tracker.
+        {
+            bool justLoaded = LoadSaveConsumeJustLoaded();
+
+            // ⚠️ NEVER SAVE WHILE SOMEONE IS STILL FALLING. SaveGameSlot -> map_save_in_game ->
+            // anim_stop() ends every animation sequence and force-flattens anyone mid-death
+            // (show_death via anim_set_end), so an autosave landing in the second after a kill
+            // destroys the fall -- both bodies just drop. See combat_rt_death_anim_pending().
+            bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending();
+
+            // The triggers below are LATCHED rather than acted on immediately: the condition that
+            // fires them (map changed / quest hash moved) is a one-shot edge, and the old code
+            // consumed that edge before testing canAutosave -- so any autosave that came due during
+            // combat, or now during a death fall, was silently thrown away and never happened. Now
+            // the edge sets a pending flag and the save runs on the first frame it legitimately can.
+            static bool autosave_pending_location = false;
+            static bool autosave_pending_quest = false;
+
+            static int autosave_last_map = -1;
+            int curMap = map_get_index_number();
+            if (curMap >= 0 && curMap != autosave_last_map) {
+                bool first = autosave_last_map == -1;
+                autosave_last_map = curMap;
+                if (!first && !justLoaded) {
+                    autosave_pending_location = true;
+                }
+            }
+
+            // Quest progress change. FO1 has no "quest completed" event, so we hash every
+            // quest's global var and autosave whenever the hash changes (any milestone /
+            // completion). Seeded silently on first sight and right after a load so neither
+            // triggers a save. obj_dude gate also keeps the hash off the menu.
+            static unsigned int autosave_last_quest = 0;
+            static bool autosave_quest_seeded = false;
+            if (obj_dude != NULL) {
+                unsigned int curQuest = pipboy_quest_state_hash();
+                if (!autosave_quest_seeded || justLoaded) {
+                    autosave_last_quest = curQuest;
+                    autosave_quest_seeded = true;
+                } else if (curQuest != autosave_last_quest) {
+                    autosave_last_quest = curQuest;
+                    autosave_pending_quest = true;
+                }
+            }
+
+            // Run at most ONE autosave per frame, location first (it is the coarser checkpoint).
+            // A pending save just waits here until the fight is over and the bodies have landed.
+            if (autosave_pending_location) {
+                if (canAutosave) {
+                    autosave_pending_location = false;
+                    AutoSaveLocation();
+                }
+            } else if (autosave_pending_quest) {
+                if (canAutosave) {
+                    autosave_pending_quest = false;
+                    AutoSaveQuest();
+                }
+            }
+        }
+
         if (main_game_paused != 0) {
             main_game_paused = 0;
         }
 
-        if ((obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        // Trigger the death scene only once the dude is dead/knocked out AND his
+        // death/knockout animation has finished. Under combat_rt the lethal hit is
+        // committed at swing-connect, so DAM_DEAD is set while the death animation
+        // is still only queued in the attacker's sequence; bailing the instant the
+        // flag appears skipped the animation entirely (dude just stood there, then
+        // the death-scene fade). Waiting for anim_busy(obj_dude)==0 lets the death
+        // animation play out first. Turn-based is unaffected: its damage commits at
+        // sequence-end, where the dude is already idle.
+        if ((obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
+            && anim_busy(obj_dude) == 0) {
             main_show_death_scene = 1;
             game_user_wants_to_quit = 2;
         }

@@ -6,11 +6,14 @@
 
 #include <algorithm>
 
+#include <SDL.h>
+
 #include "game/art.h"
 #include "game/combat.h"
 #include "game/combatai.h"
 #include "game/cycle.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/graphlib.h"
@@ -29,6 +32,7 @@
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -278,6 +282,53 @@ static bool mouse_3d_was_on;
 // 0x661E6C
 static int optnwin;
 
+// Button ids for the option rows (Save/Load/Preferences/Exit/Done), so the gamepad
+// nav can highlight the selected one by swapping its up-image to the "on" (yellow)
+// FRM via win_register_button_image (which survives GNW_button_refresh, unlike drawing
+// into the window buffer).
+#define OPTIONS_MENU_COUNT (OPTIONS_WINDOW_BUTTONS_COUNT / 2)
+static int optnbtn[OPTIONS_MENU_COUNT];
+
+// Show option `sel` highlighted (its "on" FRM as the resting image) and the rest
+// normal. Controller-nav only; harmless for mouse users (never called then).
+static void options_gamepad_highlight(int sel)
+{
+    for (int i = 0; i < OPTIONS_MENU_COUNT; i++) {
+        if (optnbtn[i] == -1) {
+            continue;
+        }
+        unsigned char* up = (i == sel) ? opbtns[i * 2 + 1] : opbtns[i * 2];
+        win_register_button_image(optnbtn[i], up, opbtns[i * 2 + 1], NULL, true);
+    }
+}
+
+// Auto-hide the options cursor (controller only): hidden by default, revealed while
+// the right stick / mouse moves it, re-hidden after idle. Blank MOUSE_CURSOR_NONE
+// shape, not mouse_hide() (which would gate the input hook). Same pattern as the
+// main menu / load-save screens.
+#define OPTIONS_CURSOR_IDLE_MS 2000
+
+static void options_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned int* lastMove)
+{
+    int x;
+    int y;
+    mouse_get_position(&x, &y);
+
+    if (x != *lastX || y != *lastY) {
+        *lastMove = get_time();
+        if (!*shown) {
+            gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+            *shown = true;
+        }
+    } else if (*shown && elapsed_time(*lastMove) >= OPTIONS_CURSOR_IDLE_MS) {
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        *shown = false;
+    }
+
+    *lastX = x;
+    *lastY = y;
+}
+
 // 0x661E70
 static int prfwin;
 
@@ -377,6 +428,15 @@ static PreferenceDescription btndat[PREF_COUNT] = {
     { 2, 0, 374, 451, 0, 0, { 207, 218, 0, 0 }, 0, GAME_CONFIG_MOUSE_SENSITIVITY_KEY, 1.0, 2.5, NULL },
 };
 
+// True only while the options/pause menu (do_options) is up. Lets the controller
+// layer toggle it closed with the same button that opened it.
+static bool options_open = false;
+
+bool options_is_open()
+{
+    return options_open;
+}
+
 // 0x481328
 int do_options()
 {
@@ -385,9 +445,74 @@ int do_options()
         return -1;
     }
 
+    options_open = true;
+
+    // Gamepad navigation: highlight the selected option row and move it with the
+    // D-pad / left stick, confirm with A, close with B -- the same feel as the main
+    // menu, so the in-game menu is controller-driven without the jumpy snap cursor.
+    SDL_GameController* optnPad = gamepad_ui_get_controller();
+    int optnSel = 0;
+    bool optnPrevUp = false;
+    bool optnPrevDown = false;
+    bool optnPrevA = false;
+    bool optnPrevB = false;
+    bool optnCursorShown = true;
+    int optnCursorX = 0;
+    int optnCursorY = 0;
+    unsigned int optnCursorMove = get_time();
+    if (optnPad != NULL) {
+        gamepad_ui_set_self_nav(true);
+        options_gamepad_highlight(optnSel);
+        win_draw(optnwin);
+        mouse_get_position(&optnCursorX, &optnCursorY);
+        gmouse_set_cursor(MOUSE_CURSOR_NONE);
+        optnCursorShown = false;
+    }
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
+
+        if (optnPad != NULL) {
+            // Re-assert after a sub-screen (Save/Load/Preferences run their own loops
+            // and clear self_nav / restore the cursor on exit).
+            gamepad_ui_set_self_nav(true);
+
+            SDL_GameControllerUpdate();
+            bool upNow = SDL_GameControllerGetButton(optnPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+                || SDL_GameControllerGetAxis(optnPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+            bool downNow = SDL_GameControllerGetButton(optnPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+                || SDL_GameControllerGetAxis(optnPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+            bool aNow = SDL_GameControllerGetButton(optnPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool bNow = SDL_GameControllerGetButton(optnPad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+            if (upNow && !optnPrevUp) {
+                optnSel = (optnSel + OPTIONS_MENU_COUNT - 1) % OPTIONS_MENU_COUNT;
+                options_gamepad_highlight(optnSel);
+                win_draw(optnwin);
+                gsound_play_sfx_file("ib1p1xx1");
+            } else if (downNow && !optnPrevDown) {
+                optnSel = (optnSel + 1) % OPTIONS_MENU_COUNT;
+                options_gamepad_highlight(optnSel);
+                win_draw(optnwin);
+                gsound_play_sfx_file("ib1p1xx1");
+            }
+
+            if (aNow && !optnPrevA) {
+                // Trigger the highlighted row via its button event code (500 + index),
+                // reusing the switch below (Save/Load/Preferences/Exit/Done).
+                GNW_add_input_buffer(500 + optnSel);
+            } else if (bNow && !optnPrevB) {
+                GNW_add_input_buffer(KEY_ESCAPE);
+            }
+
+            optnPrevUp = upNow;
+            optnPrevDown = downNow;
+            optnPrevA = aNow;
+            optnPrevB = bNow;
+
+            options_tick_cursor(&optnCursorShown, &optnCursorX, &optnCursorY, &optnCursorMove);
+        }
 
         int keyCode = get_input();
         bool showPreferences = false;
@@ -459,7 +584,14 @@ int do_options()
         sharedFpsLimiter.throttle();
     }
 
+    if (optnPad != NULL) {
+        gamepad_ui_set_self_nav(false);
+        gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    }
+
     OptnEnd();
+
+    options_open = false;
 
     return rc;
 }
@@ -571,6 +703,7 @@ static int OptnStart()
         text_to_buf(opbtns[index + 1] + ginfo[OPTIONS_WINDOW_FRM_BUTTON_ON].width * textY + textX, text, ginfo[OPTIONS_WINDOW_FRM_BUTTON_ON].width, ginfo[OPTIONS_WINDOW_FRM_BUTTON_ON].width, colorTable[14723]);
 
         int btn = win_register_button(optnwin, 13, buttonY, ginfo[OPTIONS_WINDOW_FRM_BUTTON_ON].width, ginfo[OPTIONS_WINDOW_FRM_BUTTON_ON].height, -1, -1, -1, index / 2 + 500, opbtns[index], opbtns[index + 1], NULL, 32);
+        optnbtn[index / 2] = btn;
         if (btn != -1) {
             win_register_button_sound_func(btn, gsound_lrg_butt_press, gsound_lrg_butt_release);
         }

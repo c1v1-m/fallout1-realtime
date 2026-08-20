@@ -1,15 +1,21 @@
 #include "game/anim.h"
 
+#include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <SDL.h> // TEMP: walk-speed diagnosis logger
 
 #include "game/art.h"
 #include "game/combat.h"
 #include "game/combat_defs.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -35,9 +41,19 @@
 
 namespace fallout {
 
-#define ANIMATION_SEQUENCE_LIST_CAPACITY 21
+// Realtime-combat capacity bump: the originals (21 / 16) were sized for turn-based
+// play, where only a handful of objects animate at once. Realtime combat (combat_rt)
+// runs every actor concurrently -- a 30+ critter brawl has all of them moving/chasing
+// at the same time, each consuming one anim_set sequence AND one sad (active-playback)
+// slot, plus per-attack swing/fire, projectile, and death sequences. The 16-slot sad
+// list was the tighter bottleneck: once full, anim_animate() returns -1 so the engine
+// SILENTLY drops attack/death animations (combat_attack still commits the damage), which
+// looked like "enemies hit me with no animation / corpses appear without a death fall".
+// 64 comfortably exceeds the ~32-actor fights seen in play-tests with headroom. These
+// are runtime-only arrays (never serialized), so enlarging them is safe.
+#define ANIMATION_SEQUENCE_LIST_CAPACITY 64
 #define ANIMATION_DESCRIPTION_LIST_CAPACITY 40
-#define ANIMATION_SAD_LIST_CAPACITY 16
+#define ANIMATION_SAD_LIST_CAPACITY 64
 
 #define ANIMATION_SEQUENCE_FORCED 0x01
 
@@ -264,6 +280,9 @@ static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, 
 static int anim_move_straight_to_tile(Object* obj, int tile, int elevation, int anim, int animationSequenceIndex, int flags);
 static void object_move(int index);
 static void object_straight_move(int index);
+static float walk_dir_slowdown(Object* object, int rotation);
+static float run_speed_scale(Object* object, int rotation);
+static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* frameY);
 static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int flags);
 static void object_anim_compact();
 static int anim_turn_towards(Object* obj, int delta, int animationSequenceIndex);
@@ -303,11 +322,82 @@ static PathNode child[2000];
 static int curr_anim_counter;
 
 // 0x4134B0
+// Per-stat scaling of ATTACK animation speed (realtime combat only). Loaded once from
+// config at anim_init. Non-attack anims use anim_speed_scale; attack anims instead use a
+// multiplier derived purely from the attacker's SPECIAL stat: melee by STRENGTH, ranged
+// by PERCEPTION. multiplier = 1 - (stat - 5) * anim_attack_stat_factor, clamped to
+// ANIM_ATTACK_SPEED_MIN..MAX. See compute_tpf().
+static float anim_attack_stat_factor = 0.09f;
+#define ANIM_ATTACK_SPEED_MIN 0.30f
+#define ANIM_ATTACK_SPEED_MAX 2.0f
+
+// The curve is ASYMMETRIC around the average (2026-08-10, on request: "bigger differences between
+// 5 and 10"). Every stat curve in this build is linear and centred on 5, so each point buys the
+// same amount and pushing a stat from 5 to 10 feels like nothing in particular.
+//
+// Attack-animation speed is the one place we can afford to exaggerate that, precisely BECAUSE it
+// is cosmetic: the AP pool paces the attacks (the animation is ~14% of a cycle, measured), so a
+// dramatic curve here buys a visibly faster gunslinger WITHOUT touching throughput or balance.
+// Above-average is steepened by this; below-average keeps the plain factor, so a weak character is
+// not punished twice over. At the default 0.09 that is stat 5 -> 1.00, 7 -> 0.73, 10 -> 0.325 --
+// a 3.1x spread from average to maxed, where the symmetric curve gave only 1.8x.
+// ANIM_ATTACK_SPEED_MIN was lowered from 0.4 to make room: at 0.4 the clamp bit from stat ~8 up
+// and 8/9/10 all animated identically, which is exactly the flat top this is meant to remove.
+#define ANIM_ATTACK_STAT_HIGH_BIAS 1.5f
+
 void anim_init()
 {
     anim_in_init = true;
     anim_reset();
     anim_in_init = false;
+
+    // Global animation-speed multiplier from config (gconfig_init ran first). This
+    // is the one snappiness lever: compute_tpf scales every animation's tpf by it,
+    // symmetrically for the dude and all NPCs (no obj_dude exclusion). Clamped so a
+    // bad cfg value can't stall (too high) or near-freeze (~0) the animation system.
+    double animSpeed = 1.0;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ANIM_SPEED_KEY, &animSpeed);
+    if (animSpeed < 0.1) {
+        animSpeed = 0.1;
+    } else if (animSpeed > 3.0) {
+        animSpeed = 3.0;
+    }
+    anim_set_speed_scale((float)animSpeed);
+
+    // Movement-only speed (WALK / RUN). A SPEED, so higher = faster. Clamped either side of 1.0:
+    // below ~0.3 a chase would never close, above ~3 the sprite skates across tiles faster than the
+    // art can read.
+    double moveSpeed = 1.0;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOVE_SPEED_KEY, &moveSpeed);
+    if (moveSpeed < 0.3) {
+        moveSpeed = 0.3;
+    } else if (moveSpeed > 3.0) {
+        moveSpeed = 3.0;
+    }
+    anim_set_move_speed_scale((float)moveSpeed);
+
+    // Weapon-swap speed by AGILITY. Same clamp range as the attack curve; 0 disables.
+    double swapFactor = 0.09;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_WEAPON_SWAP_STAT_FACTOR_KEY, &swapFactor);
+    if (swapFactor < 0.0) {
+        swapFactor = 0.0;
+    } else if (swapFactor > 0.3) {
+        swapFactor = 0.3;
+    }
+    anim_set_weapon_swap_stat_factor((float)swapFactor);
+
+    // Per-stat attack-animation speed factor (realtime only). Attack anims ignore the
+    // global anim_speed above and are driven purely by the attacker's STR (melee) /
+    // PE (ranged). Floored at 0 (no negative scaling) and capped so the spread stays
+    // sane; the final per-attack multiplier is additionally clamped in compute_tpf.
+    double attackStatFactor = 0.09;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ANIM_ATTACK_STAT_FACTOR_KEY, &attackStatFactor);
+    if (attackStatFactor < 0.0) {
+        attackStatFactor = 0.0;
+    } else if (attackStatFactor > 0.3) {
+        attackStatFactor = 0.3;
+    }
+    anim_attack_stat_factor = (float)attackStatFactor;
 }
 
 // 0x4134D0
@@ -372,6 +462,30 @@ int register_begin(int requestOptions)
     curr_anim_counter = 0;
 
     return 0;
+}
+
+// TEMP DIAG (realtime attack-not-animating): report the animation table state so
+// combat_rt can log, at the instant an attack registers, whether it hit a FULL table
+// (occupied == ANIMATION_SEQUENCE_LIST_CAPACITY -> reserved register_begin returns -1)
+// or registered over a LEAKED open transaction (curr != -1 -> register_begin returns -1
+// for a different reason). occupied/nonReserved mirror anim_free_slot's occupancy test.
+// STRIP with the rest of the temp loggers.
+void anim_debug_table(int* occupied, int* nonReserved, int* curr)
+{
+    int occ = 0;
+    int nr = 0;
+    for (int i = 0; i < ANIMATION_SEQUENCE_LIST_CAPACITY; i++) {
+        AnimationSequence* s = &(anim_set[i]);
+        if (s->field_0 != -1000 || (s->flags & ANIM_SEQ_ACCUMULATING) != 0 || (s->flags & ANIM_SEQ_0x20) != 0) {
+            occ++;
+            if (!(s->flags & ANIM_SEQ_RESERVED)) {
+                nr++;
+            }
+        }
+    }
+    if (occupied != NULL) *occupied = occ;
+    if (nonReserved != NULL) *nonReserved = nr;
+    if (curr != NULL) *curr = curr_anim_set;
 }
 
 // 0x413630
@@ -444,6 +558,100 @@ int register_clear(Object* a1)
 
         if ((animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0) {
             return -2;
+        }
+
+        anim_set_end(animationSequenceIndex);
+
+        return 0;
+    }
+
+    return -1;
+}
+
+// register_clear() for callers that are only allowed to interrupt work `a1` still OWES.
+//
+// ⚠️ WHY THIS EXISTS. register_clear above ends the FIRST live sequence that mentions a1 at
+// all -- including one where a1's only description has ALREADY played and the sequence has
+// moved on to animating somebody else. In vanilla that is harmless: nothing runs while a
+// sequence is playing. In realtime it is a trap, because anim_busy_blocking() deliberately
+// frees the player to walk while his victim's death is still running in the sequence that
+// also contains his (spent) swing. A plain register_clear on the next direction change would
+// then end THAT sequence and freeze the corpse mid-fall -- the "body stuck in the air" bug.
+//
+// So this variant applies the same already-played skip as anim_busy_blocking and only ever
+// ends a sequence where a1 genuinely still has something left to animate.
+int anim_clear_pending(Object* a1)
+{
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        int animationDescriptionIndex;
+        for (animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            if (animationSequence->animationIndex >= 0 && animationDescriptionIndex < animationSequence->animationIndex) {
+                continue;
+            }
+
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (a1 != animationDescription->owner || animationDescription->kind == 11) {
+                continue;
+            }
+
+            break;
+        }
+
+        if (animationDescriptionIndex == animationSequence->length) {
+            continue;
+        }
+
+        if ((animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0) {
+            return -2;
+        }
+
+        anim_set_end(animationSequenceIndex);
+
+        return 0;
+    }
+
+    return -1;
+}
+
+// Like register_clear, but ends the owning sequence even when it is PRIORITIZED (which
+// register_clear refuses with -2). Realtime combat uses this on an attack's DEFENDER: in
+// turn-based you can't be attacked mid-swing, but in realtime an attacker (incl. an enemy
+// striking the busy player) must be able to register its hit on a target that is in its own
+// prioritized attack swing -- otherwise the attack just fails and "enemies never hit me while
+// I'm attacking." The cut swing's damage is already safe (combat_rt snapshots it before the
+// animation), so only the animation is interrupted -- a hit staggers your swing, as it should.
+// Returns 0 if a sequence was ended, -1 if the object owned none.
+int anim_force_clear(Object* a1)
+{
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        int animationDescriptionIndex;
+        for (animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            // NO already-played skip here, deliberately. This function's job is "free `a1` so a new
+            // animation can be registered for it", and the thing that decides that is
+            // check_registry -- which counts SPENT descriptions too. A skip here made the two
+            // disagree: a defender holding only a spent description could not be cleared, yet
+            // check_registry still refused its death fall, so 6 of 7 kills settled straight to a
+            // static corpse with no fall. Keep these two in lockstep.
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (a1 != animationDescription->owner || animationDescription->kind == 11) {
+                continue;
+            }
+
+            break;
+        }
+
+        if (animationDescriptionIndex == animationSequence->length) {
+            continue;
         }
 
         anim_set_end(animationSequenceIndex);
@@ -542,6 +750,16 @@ int check_registry(Object* obj)
 
         if (animationSequenceIndex != curr_anim_set && animationSequence->field_0 != -1000) {
             for (int animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+                // NOTE (2026-08-09): an "already played descriptions don't veto a new registration"
+                // skip was tried here to fix "I kill a rat and can't move until it stops twitching".
+                // It DOES fix that -- the player owns a spent description for as long as the corpse
+                // is falling, and every new animation he registers, above all a walk, is refused
+                // right here. But it REVERTED: allowing an object into two live sequences at once
+                // breaks invariants all over this module. It produced, in order, the interface stuck
+                // disabled with the hourglass, the player unable to attack, and finally enemies
+                // frozen mid-dodge and therefore unhittable (traced: rat at anim=13 frame=3 for 5 s,
+                // its dodge description started and never completing, 45 x attack-fail defBusy=-1).
+                // Do not re-apply without solving the sad/sequence ownership model first.
                 AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
                 if (obj == animationDescription->owner && animationDescription->kind != 11) {
                     if ((animationSequence->flags & ANIM_SEQ_INSIGNIFICANT) == 0) {
@@ -589,6 +807,117 @@ int anim_busy(Object* a1)
     }
 
     return 0;
+}
+
+// True (-1) only while `obj` still has UNPLAYED work in a live sequence.
+//
+// anim_busy() answers the wider question "does any live sequence mention obj at all", and it
+// counts descriptions that have ALREADY been played. Vanilla packs a whole attack into ONE
+// sequence -- attacker's swing, projectile flight, defender's reaction, attacker's trailing
+// cleanup -- so once the player kills something, anim_busy keeps reporting him busy for the
+// entire death fall of his victim, long after his own swing finished. Turn-based never notices
+// (the turn is over anyway); under realtime it reads as "I killed the rat and now I have to
+// stand still until it finishes bleeding out before I can move".
+//
+// Descriptions before the sequence's animationIndex have already played and so cannot be what
+// obj is still waiting on. animationIndex == -1 means the sequence has not started yet, so
+// everything in it is still pending.
+//
+// This is ONLY safe to gate realtime player movement on when paired with anim_clear_pending()
+// -- see the warning there.
+//
+// exceptSequenceIndex lets a sequence ask "is this object busy ELSEWHERE?" while excluding
+// itself; pass -1 for the plain question. anim_set_end needs it (see its dude_stand guard).
+static int anim_busy_blocking_ex(Object* a1, int exceptSequenceIndex)
+{
+    if (curr_anim_counter >= ANIMATION_DESCRIPTION_LIST_CAPACITY || a1 == NULL) {
+        return 0;
+    }
+
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequenceIndex == curr_anim_set || animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        if (animationSequenceIndex == exceptSequenceIndex) {
+            continue;
+        }
+
+        for (int animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            // Already played -- not something obj is waiting on.
+            if (animationSequence->animationIndex >= 0 && animationDescriptionIndex < animationSequence->animationIndex) {
+                continue;
+            }
+
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (a1 != animationDescription->owner) {
+                continue;
+            }
+
+            if (animationDescription->kind == ANIM_KIND_CALLBACK) {
+                continue;
+            }
+
+            if (animationSequence->length == 1 && animationDescription->anim == ANIM_STAND) {
+                continue;
+            }
+
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+int anim_busy_blocking(Object* a1)
+{
+    return anim_busy_blocking_ex(a1, -1);
+}
+
+// TEMP DIAG. Dump the first live sequence that reports `a1` busy, so a "why can't I move"
+// report can name the exact description holding him. Format per description:
+//   #<idx><D|o><kind>/<anim>/d<delay>   -- D = owned by a1, o = owned by someone else
+// plus the sequence's two cursors: ai = animationIndex (descriptions COMPLETED), f0 = field_0
+// (next description to START). STRIP once the stall is understood.
+void anim_debug_blocking_dump(Object* a1, char* buf, size_t size)
+{
+    if (buf == NULL || size == 0) {
+        return;
+    }
+    buf[0] = '\0';
+    if (a1 == NULL) {
+        return;
+    }
+
+    for (int s = 0; s < ANIMATION_SEQUENCE_LIST_CAPACITY; s++) {
+        AnimationSequence* seq = &(anim_set[s]);
+        if (s == curr_anim_set || seq->field_0 == -1000) {
+            continue;
+        }
+
+        bool mentionsA1 = false;
+        for (int i = 0; i < seq->length; i++) {
+            if (seq->animations[i].owner == a1) {
+                mentionsA1 = true;
+                break;
+            }
+        }
+        if (!mentionsA1) {
+            continue;
+        }
+
+        size_t used = (size_t)snprintf(buf, size, "seq=%d ai=%d f0=%d len=%d",
+            s, seq->animationIndex, seq->field_0, seq->length);
+        for (int i = 0; i < seq->length && used < size - 1; i++) {
+            AnimationDescription* d = &(seq->animations[i]);
+            used += (size_t)snprintf(buf + used, size - used, " #%d%c%d/%d/d%d",
+                i, d->owner == a1 ? 'D' : 'o', d->kind, d->anim, d->delay);
+        }
+        return;
+    }
+
+    snprintf(buf, size, "no-seq");
 }
 
 // 0x413A3C
@@ -1684,14 +2013,33 @@ static int anim_set_end(int animationSequenceIndex)
                         }
 
                         if (k == animationSequence->animationIndex) {
-                            for (int m = 0; m < curr_sad; m++) {
-                                if (sad[m].obj == owner) {
-                                    sad[m].field_20 = -1000;
-                                    break;
+                            // Is another live sequence driving this owner right now? Then this
+                            // ending sequence must keep its hands off him entirely -- both the sad
+                            // kill just below and the force-stand after it would tear down the
+                            // animation that OTHER sequence is running.
+                            bool ownerBusyElsewhere = anim_busy_blocking_ex(owner, animationSequenceIndex) != 0;
+
+                            if (!ownerBusyElsewhere) {
+                                for (int m = 0; m < curr_sad; m++) {
+                                    if (sad[m].obj == owner) {
+                                        sad[m].field_20 = -1000;
+                                        break;
+                                    }
                                 }
                             }
 
-                            if ((animationSequence->flags & ANIM_SEQ_NO_STAND) == 0 && !critter_is_prone(owner)) {
+                            // ...but NOT if another live sequence is currently driving this
+                            // owner. dude_stand force-stands the object and kills its first
+                            // sad -- an in-flight WALK sad -- freezing locomotion until the
+                            // next step is issued (the same trap action_suppress_miss_dodge
+                            // documents). That used to be unreachable for an attacker, who
+                            // could not act until his own attack sequence ended; now that
+                            // anim_busy_blocking lets the realtime player walk off as soon as
+                            // his swing is spent, his victim's death sequence ends WHILE he is
+                            // walking and would otherwise stop him dead in his tracks.
+                            if ((animationSequence->flags & ANIM_SEQ_NO_STAND) == 0
+                                && !critter_is_prone(owner)
+                                && !ownerBusyElsewhere) {
                                 dude_stand(owner, owner->rotation, -1);
                             }
                         }
@@ -2436,6 +2784,19 @@ static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, 
     sad_entry->anim = anim;
 
     sad_entry->field_1C = make_path(obj, obj->tile, tile, sad_entry->rotations, a5);
+
+    // TEMP DIAG (walk-in-place hunt, 2026-08-10). combat_rt's [FLOW/walk-seg] measures the wrong
+    // stage: register_object_move_to_tile only QUEUES the move, so its rc=0 says "queued", not
+    // "reachable" -- the real routing is this make_path, and a 0-step result kills the move right
+    // here. That is the last unknown in the id=1798 case (animates a walk, tile never changes,
+    // alone on the tile, destination a valid 3 tiles away, registration fine).
+    // Critters in realtime only, so the town's script-driven wandering doesn't drown the log.
+    // STRIP with the other walk diags once this is understood.
+    if (combat_rt_enabled() && FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER) {
+        trace_event(TRACE_FLOW, "make-path", "id=%d pid=%d from=%d to=%d steps=%d anim=%d",
+            obj->id, obj->pid, obj->tile, tile, sad_entry->field_1C, anim);
+    }
+
     if (sad_entry->field_1C == 0) {
         sad_entry->field_20 = -1000;
         return -1;
@@ -2568,8 +2929,22 @@ static void object_move(int index)
     if (sad_entry->field_20 == -2000) {
         obj_move_to_tile(object, object->tile, object->elevation, &dirty);
 
-        obj_set_frame(object, 0, &temp);
-        rect_min_bound(&dirty, &temp, &dirty);
+        // Realtime NPC walk continuity: a chasing NPC steps ONE tile at a time (rt_step_toward),
+        // so each tile begins a FRESH walk sad. Resetting the leg frame to 0 every tile drops the
+        // tail of the cycle whenever the art crosses a tile in fewer frames than it has -- the
+        // "NPC walk skips frames / looks choppy (and reads as faster)" report. Keep the current
+        // leg frame instead so the cycle runs continuously across tiles. Safe because the body
+        // translation is handled independently by walk_smooth_offset (below), decoupled from the
+        // frame; and all of a critter's walk facings share a frame count, so the preserved index
+        // stays valid (clamped after the fid swap just in case). The dude already moves
+        // continuously via anim_extend_move, and turn-based is untouched: both reset to 0 as before.
+        bool rtWalkContinuous = combat_rt_enabled() && object != obj_dude
+            && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && sad_entry->anim == ANIM_WALK;
+
+        if (!rtWalkContinuous) {
+            obj_set_frame(object, 0, &temp);
+            rect_min_bound(&dirty, &temp, &dirty);
+        }
 
         obj_set_rotation(object, sad_entry->rotations[0], &temp);
         rect_min_bound(&dirty, &temp, &dirty);
@@ -2578,10 +2953,25 @@ static void object_move(int index)
         obj_change_fid(object, fid, &temp);
         rect_min_bound(&dirty, &temp, &dirty);
 
+        if (rtWalkContinuous) {
+            CacheEntry* walkHandle;
+            Art* walkArt = art_ptr_lock(object->fid, &walkHandle);
+            if (walkArt != NULL) {
+                int frameCount = art_frame_max_frame(walkArt);
+                art_ptr_unlock(walkHandle);
+                if (frameCount > 0 && object->frame >= frameCount) {
+                    obj_set_frame(object, object->frame % frameCount, &temp);
+                    rect_min_bound(&dirty, &temp, &dirty);
+                }
+            }
+        }
+
         sad_entry->field_20 = 0;
     } else {
         obj_inc_frame(object, &dirty);
     }
+
+    int rotation = sad_entry->rotations[sad_entry->field_20];
 
     int frameX;
     int frameY;
@@ -2596,10 +2986,47 @@ static void object_move(int index)
         frameY = 0;
     }
 
+    // Realtime combat: smooth the PLAYER's walk so the per-frame sprite advance is
+    // constant within each tile, instead of the uneven per-frame offsets baked into
+    // the walk art. The female walk art has uneven X-deltas on the E/W axis, and the
+    // realtime follow-cam (it scrolls the world by -obj->x) turns that into a full-
+    // screen horizontal judder. We override the raw delta with a constant-velocity
+    // step toward off_tile, so obj->x marches linearly to the tile boundary and lands
+    // exactly on it (tile crossings stay seamless, walk speed per tile is unchanged
+    // because the ramp spans the art's own frames-per-tile). The walk frames still
+    // cycle for the leg animation -- only the body translation is evened out. Applied to
+    // EVERY critter in realtime (not just the dude): NPC walk art lurches the same way --
+    // the radscorpion's NW facing front-loads its motion in big jumps and reads as "fast"
+    // even though its per-tile time is normal -- so smoothing the within-tile motion fixes
+    // that. Turn-based keeps the original art-driven motion.
+    if (combat_rt_enabled() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && sad_entry->anim == ANIM_WALK) {
+        walk_smooth_offset(object, rotation, &frameX, &frameY);
+    }
+
     obj_offset(object, frameX, frameY, &temp);
     rect_min_bound(&dirty, &temp, &dirty);
 
-    int rotation = sad_entry->rotations[sad_entry->field_20];
+    // Realtime combat: normalize this NPC walk step so every facing crosses a tile
+    // at the same (slowest) cadence, correcting per-direction art speed asymmetry.
+    // compute_tpf can't do this (it runs before the path/direction is known), so it
+    // is applied here per step where the actual rotation is set. The scheduler re-
+    // reads ticksPerFrame each tick, so updating it mid-sad takes effect. Player and
+    // turn-based combat are untouched.
+    if (combat_rt_enabled() && object != obj_dude && sad_entry->anim == ANIM_WALK) {
+        float scale = walk_dir_slowdown(object, rotation);
+        if (scale > 1.0f) {
+            sad_entry->ticksPerFrame = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale);
+        }
+    } else if (combat_rt_enabled() && sad_entry->anim == ANIM_RUNNING) {
+        // Run speed: art variance out, Agility in -- and unlike the walk branch this DOES include
+        // the dude, so the rule is the same for everyone. Both directions are allowed here (the
+        // stat has to be able to make you faster, not just slower), bounded by run_speed_scale's
+        // clamps, with a floor of 1 tick so a fast runner can never hit a zero frame duration.
+        float scale = run_speed_scale(object, rotation);
+        unsigned int tpf = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale);
+        sad_entry->ticksPerFrame = tpf > 0 ? tpf : 1;
+    }
+
     int y = off_tile[1][rotation];
     int x = off_tile[0][rotation];
     if ((x > 0 && x <= object->x) || (x < 0 && x >= object->x) || (y > 0 && y <= object->y) || (y < 0 && y >= object->y)) {
@@ -2636,7 +3063,14 @@ static void object_move(int index)
             rect_min_bound(&dirty, &temp, &dirty);
 
             int v17 = 0;
-            if (isInCombat() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
+            // In realtime combat, movement is free (combat_rt runs its own AP pool for attacks
+            // and never charges movement to it). The turn-based per-tile combat.ap deduction below
+            // would otherwise truncate any move once combat.ap hits 0 -- which combat_rt hides for
+            // the hostiles it manages by topping their combat.ap up each step, but NOT for
+            // bystanders it doesn't drive: a fleeing/wandering Shady Sands townsperson has ap 0, so
+            // its script-issued walk gets cut to a single tile and it "walks in place" forever.
+            // Skipping the deduction entirely under combat_rt lets every critter's move play out.
+            if (isInCombat() && !combat_rt_enabled() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
                 int v18 = critter_compute_ap_from_distance(object, 1);
                 if (combat_free_move < v18) {
                     int ap = object->data.critter.combat.ap;
@@ -3323,6 +3757,485 @@ static int check_gravity(int tile, int elevation)
 }
 
 // 0x4180CC
+// Global animation-speed multiplier applied to ticks-per-frame (compute_tpf). tpf is a per-frame
+// DURATION, so this is inverted: 1.0 = unscaled, LOWER = faster (0.8 plays ~25% quicker).
+//
+// Set ONCE at startup from the cfg `anim_speed` preference (anim_init) and never varied at
+// runtime -- anim_set_speed_scale has that one call site. Applies to every NON-attack animation
+// (movement, idle, hit-reacts, knockdown, standup, death), symmetrically for the dude and NPCs.
+// ATTACK animations never see this: they take the earlier branch in compute_tpf and are driven by
+// the attacker's SPECIAL instead (melee=STR, ranged=PE, throw=AGI, via anim_attack_stat_factor).
+static float anim_speed_scale = 1.0f;
+
+void anim_set_speed_scale(float scale)
+{
+    anim_speed_scale = scale;
+}
+
+// MOVEMENT-only speed, applied in compute_tpf on top of anim_speed_scale and expressed as a SPEED
+// (1.0 = stock, 1.5 = half again as fast) rather than a duration, so the cfg number reads the way
+// the request does. Only WALK and RUN see it -- idle, reactions, knockdown and death keep whatever
+// anim_speed says. Symmetric for the dude and NPCs, which is what stops it from silently becoming a
+// kiting buff; see the note at the call site.
+static float move_speed_scale = 1.0f;
+
+void anim_set_move_speed_scale(float scale)
+{
+    move_speed_scale = scale;
+}
+
+// Per-point AGILITY scaling of the weapon put-away / take-out animations (realtime only).
+// Duration multiplier = 1 - (AGI - 5) * this, SYMMETRIC -- see the note at the call site in
+// compute_tpf for why this one must not get the asymmetric treatment the attack anims have.
+// 0 = off.
+static float anim_weapon_swap_stat_factor = 0.0f;
+
+void anim_set_weapon_swap_stat_factor(float factor)
+{
+    anim_weapon_swap_stat_factor = factor;
+}
+
+// --- Realtime-combat per-direction NPC walk-speed normalization. ---
+//
+// Some critter walk .frm assets advance the sprite a different number of pixels
+// per frame depending on facing, so at a fixed ticks-per-frame the critter
+// crosses a tile faster in some directions than others (the radscorpion's NW art
+// is ~2.5x faster than its E/W art). In turn-based combat this is invisible, but
+// under realtime combat_rt it lets a critter outrun the player on one diagonal.
+// We normalize every NPC walk direction to that critter's OWN slowest direction
+// so it walks at a single, even, slow cadence -- realtime only; the turn-based
+// path and the player are left untouched.
+//
+// The per-direction "frames to cross one tile" is derived from the art at runtime
+// (mirroring object_move's pixel-accumulation crossing test against off_tile), so
+// this auto-corrects ANY critter with the same art asymmetry, not just
+// radscorpions. The 6-direction result is cached per walk-art set.
+
+struct WalkSpeedProfile {
+    int key; // walk-art identity (type/frmId/weapon), rotation-independent; -1 = empty
+    float framesPerTile[ROTATION_COUNT];
+    float maxFramesPerTile;
+};
+
+#define WALK_PROFILE_CACHE_SIZE 32
+static WalkSpeedProfile walk_profile_cache[WALK_PROFILE_CACHE_SIZE];
+static int walk_profile_cache_next = 0;
+static bool walk_profile_cache_inited = false;
+
+// Frames the walk art takes to advance one tile in `rotation`, by replaying
+// object_move's per-frame hot-offset accumulation against off_tile. Returns 0 if
+// the art is missing or yields no net movement (nothing to normalize).
+static float walk_frames_per_tile(Object* object, int rotation, int anim)
+{
+    int fid = art_id(FID_TYPE(object->fid), object->fid & 0xFFF, anim, (object->fid & 0xF000) >> 12, rotation + 1);
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art == NULL) {
+        return 0.0f;
+    }
+
+    int frameCount = art_frame_max_frame(art);
+    int targetX = off_tile[0][rotation];
+    int targetY = off_tile[1][rotation];
+
+    int ax = 0;
+    int ay = 0;
+    int crossings = 0;
+    int frames = 0;
+    int maxFrames = frameCount > 0 ? frameCount * 16 : 0;
+
+    while (frames < maxFrames && crossings < 8) {
+        int hx = 0;
+        int hy = 0;
+        art_frame_hot(art, frames % frameCount, rotation, &hx, &hy);
+        ax += hx;
+        ay += hy;
+        frames++;
+
+        if ((targetX > 0 && targetX <= ax) || (targetX < 0 && targetX >= ax)
+            || (targetY > 0 && targetY <= ay) || (targetY < 0 && targetY >= ay)) {
+            ax -= targetX;
+            ay -= targetY;
+            crossings++;
+        }
+    }
+
+    art_ptr_unlock(handle);
+
+    if (crossings == 0) {
+        return 0.0f;
+    }
+
+    return (float)frames / (float)crossings;
+}
+
+// `anim` selects which locomotion art is profiled: ANIM_WALK or ANIM_RUNNING. It is part of the
+// cache key, so a critter's walk and run profiles coexist.
+static WalkSpeedProfile* walk_profile_get(Object* object, int anim)
+{
+    if (!walk_profile_cache_inited) {
+        for (int i = 0; i < WALK_PROFILE_CACHE_SIZE; i++) {
+            walk_profile_cache[i].key = -1;
+        }
+        walk_profile_cache_inited = true;
+    }
+
+    int type = FID_TYPE(object->fid);
+    int frmId = object->fid & 0xFFF;
+    int weapon = (object->fid & 0xF000) >> 12;
+    int key = (anim << 26) | (type << 22) | (weapon << 16) | frmId;
+
+    for (int i = 0; i < WALK_PROFILE_CACHE_SIZE; i++) {
+        if (walk_profile_cache[i].key == key) {
+            return &walk_profile_cache[i];
+        }
+    }
+
+    // Miss: derive the 6-direction profile from the art and cache it (ring buffer).
+    WalkSpeedProfile* p = &walk_profile_cache[walk_profile_cache_next];
+    walk_profile_cache_next = (walk_profile_cache_next + 1) % WALK_PROFILE_CACHE_SIZE;
+    p->key = key;
+    p->maxFramesPerTile = 0.0f;
+    for (int d = 0; d < ROTATION_COUNT; d++) {
+        float fpt = walk_frames_per_tile(object, d, anim);
+        p->framesPerTile[d] = fpt;
+        if (fpt > p->maxFramesPerTile) {
+            p->maxFramesPerTile = fpt;
+        }
+    }
+    return p;
+}
+
+// Multiplier (>= 1.0) that slows an NPC's walk step in `rotation` so that one tile
+// takes the SAME wall-clock time as the PLAYER's walk -- not just the critter's own
+// slowest facing. Equalizing only a critter's own directions (the old behavior) left
+// a critter whose walk art is uniformly fast (no per-facing asymmetry) untouched, so
+// in realtime combat it out-walked the player chasing him. Now we match the dude's
+// tile-crossing time directly: no enemy can out-walk you. 1.0 = no change (and we only
+// ever SLOW, never speed a slow enemy up -- see the >1.0 guard at the call site).
+//
+// Tile-crossing time ~ framesPerTile * ticksPerFrame, where ticksPerFrame (compute_tpf)
+// folds in the art fps, the realtime anim_speed lever, and the combat-speed bonus that
+// vanilla adds to NPC (but not player) walks -- the very thing that made enemies fast.
+// Taking the ratio against the dude cancels the common factors and corrects the rest.
+// TEMP walk-speed diagnosis: logs one line per (object,rotation) change to rt_walk.log
+// next to the exe (truncate per run). STRIP once the radscorpion NW speed is confirmed.
+static void walk_log(const char* fmt, ...)
+{
+    static FILE* f = NULL;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        char* base = SDL_GetBasePath();
+        char path[1024];
+        snprintf(path, sizeof(path), "%srt_walk.log", base != NULL ? base : "");
+        if (base != NULL) {
+            SDL_free(base);
+        }
+        f = fopen(path, "w");
+    }
+    if (f == NULL) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
+
+static float walk_dir_slowdown(Object* object, int rotation)
+{
+    if (rotation < 0 || rotation >= ROTATION_COUNT) {
+        return 1.0f;
+    }
+    if (object == obj_dude || obj_dude == NULL) {
+        return 1.0f; // never rescale the player against himself
+    }
+
+    WalkSpeedProfile* np = walk_profile_get(object, ANIM_WALK);
+    float nfpt = np->framesPerTile[rotation];
+    if (nfpt <= 0.0f) {
+        return 1.0f;
+    }
+
+    // Player reference: his SLOWEST facing = the base walk-speed feel to match.
+    WalkSpeedProfile* dp = walk_profile_get(obj_dude, ANIM_WALK);
+    float dfpt = dp->maxFramesPerTile;
+    if (dfpt <= 0.0f) {
+        return 1.0f;
+    }
+
+    int npcFid = art_id(FID_TYPE(object->fid), object->fid & 0xFFF, ANIM_WALK,
+        (object->fid & 0xF000) >> 12, rotation + 1);
+    int dudeFid = art_id(FID_TYPE(obj_dude->fid), obj_dude->fid & 0xFFF, ANIM_WALK,
+        (obj_dude->fid & 0xF000) >> 12, rotation + 1);
+    float npcTpf = (float)compute_tpf(object, npcFid);
+    float dudeTpf = (float)compute_tpf(obj_dude, dudeFid);
+    if (npcTpf <= 0.0f) {
+        return 1.0f;
+    }
+
+    float npcCross = nfpt * npcTpf;
+    float dudeCross = dfpt * dudeTpf;
+    if (npcCross <= 0.0f) {
+        return 1.0f;
+    }
+
+    // Reference tile-crossing time to slow THIS facing toward: the SLOWER of the player's
+    // slowest facing and THIS critter's OWN slowest facing. The dude term keeps a uniformly-
+    // fast critter from out-walking the player; the own-slowest term evens the critter's own
+    // directions so no single facing (e.g. a humanoid's SE) darts ahead of its other facings
+    // -- the per-direction asymmetry that the player-only reference left uncorrected when a
+    // critter's facings straddle the dude's speed (some faster, some slower). We still only
+    // ever SLOW (the >1.0 guard at the call site), so the slower reference is always safe.
+    float ownCross = np->maxFramesPerTile * npcTpf;
+    float refCross = dudeCross > ownCross ? dudeCross : ownCross;
+
+    // USER LEVER for "how fast NPCs walk": cfg [preferences] key rt_npc_walk_speed. It scales the
+    // NPC's target tile-crossing time relative to the player: 1.0 = match the player (default),
+    // 1.3 = 30% slower (so you can outrun/kite them), etc. Read once and cached. Clamped to >= 1.0
+    // because the >1.0 guard at the call site only ever SLOWS an NPC (it never speeds a slow one
+    // up), and capped at 4.0 for sanity. Set it in fallout.cfg to tune enemy walk speed live.
+    static float rt_npc_walk_speed = -1.0f;
+    if (rt_npc_walk_speed < 0.0f) {
+        double v = 1.0;
+        config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, "rt_npc_walk_speed", &v);
+        rt_npc_walk_speed = v < 1.0 ? 1.0f : (v > 4.0 ? 4.0f : (float)v);
+    }
+    refCross *= rt_npc_walk_speed;
+
+    float scale = refCross / npcCross;
+
+    // TEMP: log each new (object,rotation) so we can see whether NW gets normalized.
+    static int wl_pid = -1;
+    static int wl_rot = -1;
+    if (object->pid != wl_pid || rotation != wl_rot) {
+        wl_pid = object->pid;
+        wl_rot = rotation;
+        walk_log("pid=%d rot=%d | nfpt=%.1f npcCross=%.0f | dudeCross=%.0f ownMaxFpt=%.1f ownCross=%.0f refCross=%.0f | scale=%.2f finalTpf=%.1f",
+            object->pid, rotation, nfpt, npcCross, dudeCross, np->maxFramesPerTile, ownCross,
+            refCross, scale, npcTpf * (scale > 1.0f ? scale : 1.0f));
+    }
+
+    return scale;
+}
+
+// Multiplier on a RUN step's ticks-per-frame: < 1.0 runs faster, > 1.0 slower. Applies to EVERY
+// runner including the dude (unlike walk_dir_slowdown, which never rescales the player).
+//
+// WHY THIS EXISTS: until NPCs started running, nothing normalized ANIM_RUNNING -- walk_dir_slowdown
+// and the smoothing are both gated on ANIM_WALK. So run speed was decided purely by how many frames
+// the artist happened to draw per tile in that critter's run art: measured from a trace, most
+// humanoids ran ~5.1 tiles/s (matching the dude) while one art managed ~8.5, i.e. 70% faster than
+// the player for no reason the player could see or counter. Two layers fix that:
+//
+//   1. ART NORMALIZATION -- take the dude's run cadence (his slowest facing) as the neutral
+//      baseline and even out each critter's own facings too, exactly like the walk path. This
+//      strips the accidental variance without touching anything intentional.
+//   2. AGILITY -- then scale that baseline by the runner's AGI, so speed says something about the
+//      CHARACTER: `mult = 1 - (AGI - 5) * factor`, the same idiom as the SPECIAL-driven attack
+//      animation speed (anim_attack_stat_factor). AGI 5 = baseline, higher = faster, lower =
+//      slower. Endurance already governs how LONG you can sprint (the AP drain), so the pair reads
+//      as AGI = speed, EN = stamina, with no overlap.
+//
+// Lever: cfg [preferences] run_agility_factor (default 0.04 => roughly +-20% across AGI 1..10).
+// Set it to 0 to keep the art normalization but drop the stat influence entirely.
+static float run_speed_scale(Object* object, int rotation)
+{
+    if (rotation < 0 || rotation >= ROTATION_COUNT || object == NULL || obj_dude == NULL) {
+        return 1.0f;
+    }
+
+    WalkSpeedProfile* np = walk_profile_get(object, ANIM_RUNNING);
+    float nfpt = np->framesPerTile[rotation];
+    if (nfpt <= 0.0f) {
+        return 1.0f; // no run art / no net movement -- nothing to scale
+    }
+
+    int npcFid = art_id(FID_TYPE(object->fid), object->fid & 0xFFF, ANIM_RUNNING,
+        (object->fid & 0xF000) >> 12, rotation + 1);
+    float npcTpf = (float)compute_tpf(object, npcFid);
+    if (npcTpf <= 0.0f) {
+        return 1.0f;
+    }
+
+    float npcCross = nfpt * npcTpf; // this facing's tile-crossing time
+    if (npcCross <= 0.0f) {
+        return 1.0f;
+    }
+
+    // Baseline: the slower of {the dude's slowest run facing, this critter's own slowest}. The
+    // dude term stops a fast art from outrunning the player for free; the own term evens the
+    // critter's own directions. For the dude himself the two are the same profile, so he simply
+    // gets his own facings evened -- then the stat below moves him as a whole.
+    WalkSpeedProfile* dp = walk_profile_get(obj_dude, ANIM_RUNNING);
+    int dudeFid = art_id(FID_TYPE(obj_dude->fid), obj_dude->fid & 0xFFF, ANIM_RUNNING,
+        (obj_dude->fid & 0xF000) >> 12, rotation + 1);
+    float dudeTpf = (float)compute_tpf(obj_dude, dudeFid);
+    float dudeCross = dp->maxFramesPerTile * dudeTpf;
+    float ownCross = np->maxFramesPerTile * npcTpf;
+    float refCross = dudeCross > ownCross ? dudeCross : ownCross;
+    if (refCross <= 0.0f) {
+        return 1.0f;
+    }
+
+    static float run_agility_factor = -1.0f;
+    if (run_agility_factor < 0.0f) {
+        double v = 0.04;
+        config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, "run_agility_factor", &v);
+        run_agility_factor = v < 0.0 ? 0.0f : (v > 0.15 ? 0.15f : (float)v);
+    }
+
+    float statMult = 1.0f - (stat_level(object, STAT_AGILITY) - 5) * run_agility_factor;
+    if (statMult < 0.6f) statMult = 0.6f;
+    if (statMult > 1.6f) statMult = 1.6f;
+
+    float scale = refCross * statMult / npcCross;
+    if (scale < 0.5f) scale = 0.5f; // sanity rails; the stat clamp above is the real limit
+    if (scale > 4.0f) scale = 4.0f;
+
+    // TEMP DIAG ("who runs how fast"): one line per (pid, rotation) change. Reading run speed out
+    // of the STATE heartbeat is hopeless -- runs are short bursts, so a 1/s sample gives 1-2 data
+    // points per critter and the fast arts may not even appear. This prints the ACTUAL numbers the
+    // scaler used: crossMs is the tile-crossing time BEFORE scaling and finalMs after, so
+    // finalMs is directly comparable BETWEEN critters (lower = faster). STRIP once run speed is
+    // confirmed.
+    static int rl_pid = -1;
+    static int rl_rot = -1;
+    if (object->pid != rl_pid || rotation != rl_rot) {
+        rl_pid = object->pid;
+        rl_rot = rotation;
+        trace_event(TRACE_ANIM, "run-speed",
+            "pid=%d%s rot=%d agi=%d fpt=%.1f crossMs=%.0f dudeCross=%.0f ownCross=%.0f statMult=%.2f scale=%.2f finalMs=%.0f",
+            object->pid, object == obj_dude ? " DUDE" : "", rotation,
+            stat_level(object, STAT_AGILITY), nfpt, npcCross, dudeCross, ownCross,
+            statMult, scale, npcCross * scale);
+    }
+
+    return scale;
+}
+
+// --- Realtime walk smoothing (variant A), per-object for all critters. ---
+//
+// Each walking critter (the dude AND chasing NPCs) gets a linear within-tile ramp so
+// obj->x/y advance at constant velocity across each tile instead of following the art's
+// uneven per-frame hot offsets. Those raw offsets make some critters lurch in big jumps on
+// certain facings (the radscorpion's NW art front-loads its motion), which reads as "fast"
+// even when the per-tile time is normal. A small pointer-keyed cache holds the few
+// concurrent walkers; a slot self-resets on a new tile / direction, so a slot reused after
+// its object was freed can't carry stale state.
+struct WalkSmoothState {
+    Object* obj;
+    int rot;
+    float fracX;
+    float fracY;
+};
+#define WALK_SMOOTH_SLOTS 16
+static WalkSmoothState walk_smooth_state[WALK_SMOOTH_SLOTS];
+
+static WalkSmoothState* walk_smooth_slot(Object* object)
+{
+    for (int i = 0; i < WALK_SMOOTH_SLOTS; i++) {
+        if (walk_smooth_state[i].obj == object) {
+            return &walk_smooth_state[i];
+        }
+    }
+    for (int i = 0; i < WALK_SMOOTH_SLOTS; i++) {
+        if (walk_smooth_state[i].obj == NULL) {
+            walk_smooth_state[i].obj = object;
+            walk_smooth_state[i].rot = -1;
+            return &walk_smooth_state[i];
+        }
+    }
+    static int ev = 0; // all slots busy: evict via a rotating cursor
+    WalkSmoothState* s = &walk_smooth_state[ev];
+    ev = (ev + 1) % WALK_SMOOTH_SLOTS;
+    s->obj = object;
+    s->rot = -1;
+    return s;
+}
+
+// Overrides this frame's (frameX, frameY) walk delta with a constant-velocity step so the
+// object marches linearly to the tile boundary. The ramp spans n = the art's own
+// frames-per-tile for this facing, so the per-tile duration (walk speed) is unchanged --
+// only the within-tile motion is evened, killing the lurch. No-op if the art can't be
+// measured, so motion never breaks.
+static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* frameY)
+{
+    if (rotation < 0 || rotation >= ROTATION_COUNT) {
+        return;
+    }
+
+    float fpt = walk_frames_per_tile(object, rotation, ANIM_WALK);
+    if (fpt < 1.0f) {
+        return;
+    }
+
+    int n = (int)(fpt + 0.5f);
+    if (n < 1) {
+        n = 1;
+    }
+
+    int ox = off_tile[0][rotation];
+    int oy = off_tile[1][rotation];
+
+    WalkSmoothState* s = walk_smooth_slot(object);
+    if (rotation != s->rot || (object->x == 0 && object->y == 0)) {
+        s->rot = rotation;
+        s->fracX = 0.0f;
+        s->fracY = 0.0f;
+    }
+
+    s->fracX += (float)ox / n;
+    s->fracY += (float)oy / n;
+
+    *frameX = (int)lroundf(s->fracX) - object->x;
+    *frameY = (int)lroundf(s->fracY) - object->y;
+}
+
+// Extends an in-flight normal (non-straight) move animation for `obj` by
+// appending `count` more steps in `rotation`, without restarting the sad. The
+// walk cycle keeps advancing from its current frame because no new sad is
+// created and field_20 (the current step index) is untouched -- only the path
+// (rotations[]/field_1C) and destination (field_24) grow. Returns 0 on
+// success, or a negative reason code:
+//   -1  no sad belongs to obj
+//   -2  obj's sad is already finished (field_20 == -1000)
+//   -3  obj's sad is a straight move (knockback etc.), not a walk/run
+//   -4  rotations[] capacity would overflow
+int anim_extend_move(Object* obj, int rotation, int count)
+{
+    for (int i = 0; i < curr_sad; i++) {
+        AnimationSad* sad_entry = &(sad[i]);
+        if (sad_entry->obj != obj) {
+            continue;
+        }
+
+        if (sad_entry->field_20 == -1000) {
+            return -2;
+        }
+
+        if ((sad_entry->flags & ANIM_SAD_STRAIGHT) != 0) {
+            return -3;
+        }
+
+        if (sad_entry->field_1C + count > 3200) {
+            return -4;
+        }
+
+        for (int j = 0; j < count; j++) {
+            sad_entry->rotations[sad_entry->field_1C + j] = (unsigned char)rotation;
+        }
+        sad_entry->field_1C += count;
+        sad_entry->field_24 = tile_num_in_direction(sad_entry->field_24, rotation, count);
+        return 0;
+    }
+
+    return -1;
+}
+
 unsigned int compute_tpf(Object* object, int fid)
 {
     int fps;
@@ -3349,7 +4262,100 @@ unsigned int compute_tpf(Object* object, int fid)
         }
     }
 
-    return 1000 / fps;
+    if (fps <= 0) {
+        fps = 10;
+    }
+
+    unsigned int tpf = 1000 / fps;
+
+    // Realtime combat: ATTACK animations are excluded from the global anim_speed_scale
+    // and driven purely by the attacker's SPECIAL -- each attack category by its own stat:
+    // melee (swing/thrust/punch/kick) by STRENGTH, ranged (fire) by PERCEPTION, throw
+    // (grenade/spear/knife) by AGILITY. These anim types only occur during an attack, so
+    // FID_ANIM_TYPE alone classifies them with no weapon lookup. Symmetric: object is the
+    // attacker, so a high-PE enemy fires fast and a strong enemy swings fast too. This is
+    // purely animation duration -- hit chance, AP cost, and damage are untouched.
+    int animType = FID_ANIM_TYPE(fid);
+    bool isMeleeAttack = animType == ANIM_THROW_PUNCH || animType == ANIM_KICK_LEG
+        || animType == ANIM_THRUST_ANIM || animType == ANIM_SWING_ANIM;
+    bool isRangedAttack = animType == ANIM_FIRE_SINGLE || animType == ANIM_FIRE_BURST
+        || animType == ANIM_FIRE_CONTINUOUS;
+    bool isThrowAttack = animType == ANIM_THROW_ANIM;
+
+    if (combat_rt_enabled() && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+        && (isMeleeAttack || isRangedAttack || isThrowAttack)) {
+        int stat = isMeleeAttack ? STAT_STRENGTH : (isThrowAttack ? STAT_AGILITY : STAT_PERCEPTION);
+        // Asymmetric: above-average points are worth more than below-average ones, so investing
+        // past 5 actually shows. See ANIM_ATTACK_STAT_HIGH_BIAS.
+        int delta = stat_level(object, stat) - 5;
+        float factor = delta > 0 ? anim_attack_stat_factor * ANIM_ATTACK_STAT_HIGH_BIAS
+                                 : anim_attack_stat_factor;
+        float mult = 1.0f - delta * factor;
+        if (mult < ANIM_ATTACK_SPEED_MIN) {
+            mult = ANIM_ATTACK_SPEED_MIN;
+        } else if (mult > ANIM_ATTACK_SPEED_MAX) {
+            mult = ANIM_ATTACK_SPEED_MAX;
+        }
+        tpf = (unsigned int)(tpf * mult);
+        if (tpf < 1) {
+            tpf = 1;
+        }
+    } else if (anim_speed_scale != 1.0f) {
+        // Non-attack anims (movement, idle, reactions, death) keep the global lever.
+        tpf = (unsigned int)(tpf * anim_speed_scale);
+        if (tpf < 1) {
+            tpf = 1;
+        }
+    }
+
+    // WALK ONLY, on top of whatever the above decided. anim_speed is the whole-game snappiness lever
+    // and moves idle, reactions and death falls with it; this one touches nothing but the walk.
+    //
+    // Expressed as a SPEED (1.5 = half again as fast), not a duration, because that is how the
+    // request is phrased -- so it divides rather than multiplies.
+    //
+    // ⚠️ RUN IS DELIBERATELY EXCLUDED. It was in here at first and the run came out "super fast":
+    // the run art is already roughly twice the walk, so the same multiplier lands on a much bigger
+    // number and reads as a sprint. Walking is what wanted the nudge; running was already fine.
+    //
+    // ⚠️ SYMMETRIC ON PURPOSE. It applies to the dude AND every NPC, which is what keeps
+    // walk_dir_slowdown honest: that function equalises an NPC's tile-crossing time against the
+    // DUDE's and only ever SLOWS, never speeds up. Speeding the player alone would put every enemy
+    // permanently behind him and quietly turn kiting into a free win.
+    if (move_speed_scale != 1.0f && animType == ANIM_WALK) {
+        tpf = (unsigned int)(tpf / move_speed_scale);
+        if (tpf < 1) {
+            tpf = 1;
+        }
+    }
+
+    // WEAPON SWAP by AGILITY (realtime only). Putting a weapon away and drawing another is hand
+    // work, so Agility owns it -- the same stat that already sets the AP pool and its refill rate.
+    // Together those are the three faces of "how fast do you operate".
+    //
+    // ⚠️ SYMMETRIC (no high bias), unlike the attack-animation curve just above, and the difference
+    // is the whole point. An attack animation is COSMETIC -- the cooldown paces the fight, so
+    // exaggerating the top end buys a look and nothing else. A swap animation holds anim_busy, so
+    // for its whole duration you cannot attack: it IS throughput, and an exaggerated curve here
+    // would be hidden combat power. That is exactly the mistake made on 2026-08-10, when the
+    // animation bias was copied onto the attack cooldown and the player felt it as "attacks at
+    // Strength 10 are maybe too fast".
+    if (anim_weapon_swap_stat_factor > 0.0f && combat_rt_enabled()
+        && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+        && (animType == ANIM_TAKE_OUT || animType == ANIM_PUT_AWAY)) {
+        float mult = 1.0f - (stat_level(object, STAT_AGILITY) - 5) * anim_weapon_swap_stat_factor;
+        if (mult < ANIM_ATTACK_SPEED_MIN) {
+            mult = ANIM_ATTACK_SPEED_MIN;
+        } else if (mult > ANIM_ATTACK_SPEED_MAX) {
+            mult = ANIM_ATTACK_SPEED_MAX;
+        }
+        tpf = (unsigned int)(tpf * mult);
+        if (tpf < 1) {
+            tpf = 1;
+        }
+    }
+
+    return tpf;
 }
 
 } // namespace fallout

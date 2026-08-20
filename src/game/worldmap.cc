@@ -1,8 +1,11 @@
 #include "game/worldmap.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
+
+#include <SDL.h>
 
 #include "game/anim.h"
 #include "game/art.h"
@@ -14,6 +17,7 @@
 #include "game/cycle.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
@@ -54,6 +58,12 @@ namespace fallout {
 #define WM_WINDOW_HEIGHT 480
 
 #define WM_WORLDMAP_WIDTH 1400
+// WorldTerraTable is 30 rows of 50 world units; the click path's max target Y
+// works out to the same bound.
+#define WM_WORLDMAP_HEIGHT 1500
+
+// How far ahead of the party a left-stick steer projects its travel target.
+#define WM_STICK_TRAVEL_LOOKAHEAD 50
 
 #define LOCATION_MARKER_WIDTH 5
 #define LOCATION_MARKER_HEIGHT 5
@@ -1012,6 +1022,10 @@ int world_map(WorldMapContext ctx)
     soundUpdate();
 
     is_moving = 0;
+    // Left stick must read neutral once before it steers, so a stick still held forward from
+    // the map we just left (the exit-grid walk) doesn't auto-travel the party the instant the
+    // world map opens. Armed below the first frame the stick is in its deadzone.
+    int wm_stick_armed = 0;
     reselect = 0;
     dropbtn = 1;
     wmap_mile = 0;
@@ -1155,6 +1169,30 @@ int world_map(WorldMapContext ctx)
             time = get_time();
             input = get_input();
             mouseGetPositionInWindow(world_win, &mouse_x, &mouse_y);
+
+            // Gamepad A: enter the location the party is currently standing on -- the
+            // same as clicking a town tab while already inside that town's circle
+            // (mirrors the entering_city handoff at the input >= 500 branch below).
+            // Edge-detected so a held A fires once; a no-op when not on a known site.
+            {
+                static bool wmPrevA = false;
+                SDL_GameController* wmPad = gamepad_ui_get_controller();
+                bool wmANow = false;
+                if (wmPad != NULL) {
+                    SDL_GameControllerUpdate();
+                    wmANow = SDL_GameControllerGetButton(wmPad, SDL_CONTROLLER_BUTTON_A) != 0;
+                }
+                if (wmANow && !wmPrevA) {
+                    int wmHere = InCity(world_xpos, world_ypos);
+                    if (wmHere != -1) {
+                        entering_city = wmHere;
+                        is_entering_city = 1;
+                        should_redraw = 0;
+                        is_moving = 0;
+                    }
+                }
+                wmPrevA = wmANow;
+            }
 
             mouse_dx = abs(mouse_x - (world_xpos - viewport_x + 22));
             mouse_dy = abs(mouse_y - (world_ypos - viewport_y + 20));
@@ -1418,6 +1456,42 @@ int world_map(WorldMapContext ctx)
                 }
 
                 should_redraw = 1;
+            }
+
+            // Left stick steers travel like character movement: project a
+            // destination a short distance ahead of the party in the stick
+            // direction and (re)start movement toward it each frame the stick is
+            // held. Releasing the stick lets the party coast to that last target
+            // and stop. SDL's stick Y and world Y both point down, so no flip.
+            float stick_x;
+            float stick_y;
+            if (!gamepad_ui_get_left_stick(&stick_x, &stick_y)) {
+                // Stick is neutral -- arm it so subsequent pushes steer. This is also what
+                // gates out a hold carried over from the previous map (see wm_stick_armed init).
+                wm_stick_armed = 1;
+            } else if (wm_stick_armed) {
+                float stick_mag = sqrtf(stick_x * stick_x + stick_y * stick_y);
+                int steer_x = world_xpos + (int)(stick_x / stick_mag * WM_STICK_TRAVEL_LOOKAHEAD);
+                int steer_y = world_ypos + (int)(stick_y / stick_mag * WM_STICK_TRAVEL_LOOKAHEAD);
+
+                if (steer_x < 0) {
+                    steer_x = 0;
+                } else if (steer_x > WM_WORLDMAP_WIDTH - 1) {
+                    steer_x = WM_WORLDMAP_WIDTH - 1;
+                }
+
+                if (steer_y < 0) {
+                    steer_y = 0;
+                } else if (steer_y > WM_WORLDMAP_HEIGHT - 1) {
+                    steer_y = WM_WORLDMAP_HEIGHT - 1;
+                }
+
+                target_xpos = steer_x;
+                target_ypos = steer_y;
+                autofollow = 1;
+                is_moving = 1;
+                world_move_init();
+                is_moving_to_town = InCity(target_xpos, target_ypos) != -1;
             }
 
             if (is_moving) {

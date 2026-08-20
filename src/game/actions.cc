@@ -5,11 +5,13 @@
 
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/config.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/game_trace.h" // TEMP DIAG (fire-timing): proj-path
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -170,6 +172,15 @@ int action_blood(Object* obj, int anim, int delay)
     return bloodyAnim;
 }
 
+// These critter protos have ONLY explode-to-nothing death art -- every normal death frame is
+// missing, so a non-explode death renders as an invisible "blank" corpse. pick_death hardcodes
+// their explode; this shared predicate lets the realtime death paths force it consistently
+// (standing AND prone) so they always take the valid explode instead of settling into a blank body.
+static bool is_explode_death_pid(int pid)
+{
+    return pid == 16777239 || pid == 16777265 || pid == 16777266;
+}
+
 // 0x4105EC
 static int pick_death(Object* attacker, Object* defender, int damage, int damage_type, int anim, bool hit_from_front)
 {
@@ -179,8 +190,13 @@ static int pick_death(Object* attacker, Object* defender, int damage, int damage
 
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY, &violence_level);
 
-    if (defender->pid == 16777239 || defender->pid == 16777266 || defender->pid == 16777265) {
-        return check_death(defender, ANIM_EXPLODED_TO_NOTHING, VIOLENCE_LEVEL_NORMAL, hit_from_front);
+    if (is_explode_death_pid(defender->pid)) {
+        // In realtime, force the explode regardless of the violence-level setting: a low-gore
+        // config would otherwise fail the VIOLENCE_LEVEL_NORMAL gate and fall this back to a normal
+        // death frame the proto has no art for -- an invisible blank corpse. VIOLENCE_LEVEL_NONE
+        // makes check_death take the explode whenever its art exists. Turn-based keeps vanilla.
+        return check_death(defender, ANIM_EXPLODED_TO_NOTHING,
+            combat_rt_enabled() ? VIOLENCE_LEVEL_NONE : VIOLENCE_LEVEL_NORMAL, hit_from_front);
     }
 
     if (attacker == obj_dude) {
@@ -359,13 +375,39 @@ void show_damage_to_object(Object* defender, int damage, int flags, Object* weap
                     sfx_name = gsnd_build_character_sfx_name(defender, anim, CHARACTER_SOUND_EFFECT_UNUSED);
                     register_object_play_sfx(defender, sfx_name, delay);
 
-                    register_object_animate(defender, anim, 0);
+                    // Realtime drives the light hit-react as the defender's OWN animation
+                    // sequence (combat_rt_update, at commit), decoupled from this attacker's
+                    // swing. That lets several attackers stagger one target concurrently
+                    // (latest-wins) without clearing a flinch cutting anyone's swing -- the
+                    // "my shot had no animation" bug. Knockdown/death/fire above still play
+                    // here (they own the whole reaction). Turn-based unchanged.
+                    if (!combat_rt_enabled()) {
+                        register_object_animate(defender, anim, 0);
+                    }
                 }
             }
         }
     } else {
         if ((flags & DAM_DEAD) != 0 && (defender->data.critter.combat.results & DAM_DEAD) == 0) {
-            anim = action_blood(defender, anim, delay);
+            if (combat_rt_enabled() && is_explode_death_pid(defender->pid)) {
+                // This proto has only explode-to-nothing death art; a prone (settle-in-place) death
+                // would leave a blank invisible body. Register its valid explode death here so it
+                // vanishes cleanly and drops its items (show_death below handles the item drop for
+                // the EXPLODED_TO_NOTHING anim), instead of a blank corpse.
+                anim = check_death(defender, ANIM_EXPLODED_TO_NOTHING, VIOLENCE_LEVEL_NONE, hit_from_front);
+                sfx_name = gsnd_build_character_sfx_name(defender, anim, CHARACTER_SOUND_EFFECT_DIE);
+                register_object_play_sfx(defender, sfx_name, delay);
+                register_object_animate(defender, anim, 0);
+            } else if (!combat_rt_enabled()) {
+                // Realtime concurrent-hit fix: under focus-fire a critter is often knocked
+                // down by one hit and killed by the next before it can stand. It is already
+                // prone here (the knockdown fall registered above by the earlier commit is on
+                // screen), so action_blood -- which registers a fresh FALL_BACK_BLOOD -- would
+                // make it fall a SECOND time (~2s of "double fall" jank; trace: anim 20 then 34).
+                // Skip the bloody re-fall in realtime and let it die where it lies; show_death
+                // (below) still settles the corpse. Turn-based keeps the blood animation.
+                anim = action_blood(defender, anim, delay);
+            }
         } else {
             return;
         }
@@ -480,11 +522,156 @@ int show_damage_extras(Attack* attack)
     return 0;
 }
 
-// 0x410FD8
-void show_damage(Attack* attack, int a2, int delay)
+// --- REALTIME: the defender's reaction runs as its OWN animation sequence. ---
+//
+// anim_busy(obj) reports "busy" for any live sequence that holds a description OWNED by obj --
+// including descriptions that already finished playing -- so an actor stays busy for as long as
+// the whole sequence exists, not just his own part of it. Vanilla packs an entire attack into one
+// sequence: the attacker's swing, then the defender's hit/death reaction, then the attacker's
+// trailing ANIM_UNPOINT. Turn-based doesn't care (the turn is over anyway), but in realtime it
+// pins the shooter in place for the whole death fall of whoever he just killed -- "the dude just
+// stands there waiting for the death animation to finish". Splitting the defender out ends the
+// attacker's sequence with his own swing, so he can walk off and shoot someone else while the
+// corpse is still dropping.
+//
+// Only the melee/ranged ATTACK paths split. The explosion paths leave it alone: their "attacker"
+// is the explosion object, not a critter waiting to move.
+// DISABLED -- the split breaks HIT TIMING, which is far more noticeable than what it fixed.
+//
+// An animation sequence plays its descriptions IN ORDER. Vanilla's single sequence is therefore
+// also the synchronisation: attacker's swing, then the projectile's flight, and only then the
+// defender's reaction -- the target flinches when the bullet ARRIVES. Splitting the defender into
+// its own sequence starts that reaction immediately and in parallel, so the target reacts the
+// instant the trigger is pulled, while the gunshot SFX (registered inside the ATTACKER's sequence,
+// at its action frame) still plays on its own schedule. The player reported exactly both halves of
+// that: "they react before I manage to hit them" and "I hit them and THEN the gunshot plays."
+// Passing the action frame as a delay does not rescue it -- the delay is relative to the start of
+// the new sequence, not to where the attacker's sequence has got to, and projectile flight time
+// depends on distance.
+//
+// The problem it was solving is real (anim_busy keeps the shooter locked for the whole of his
+// victim's death fall). The correct fix is to register the defender's reaction from combat_rt's
+// COMMIT point, which is already action-frame synchronised, instead of at fire time -- a bigger
+// change that needs its own trace verification. The machinery below is deliberately kept intact
+// for that follow-up; flipping this to combat_rt_enabled() re-enables it.
+// 2026-08-09: RE-ENABLED for realtime, with the timing fixed the way the note above prescribes.
+// The split itself was never the problem -- the CALL SITE was. It used to fire right after the
+// attacker's register_end(), i.e. at trigger-pull, so the target reacted before the bullet arrived.
+// It is now driven from combat_rt's COMMIT point (action_defender_reaction), which is already
+// action-frame synchronised: the reaction registers at the instant the blow lands, which is exactly
+// what vanilla's single ordered sequence achieved -- only now the defender's fall lives in the
+// DEFENDER's own sequence, so the attacker's sequence ends with his swing and he is free to move
+// instead of waiting out his victim's death ("I have to wait for the rat to bleed out").
+static bool action_split_defender_anim()
 {
-    bool hit_from_front;
+    return combat_rt_enabled();
+}
 
+// The defender half of show_damage, split out so it can be registered either inline (vanilla,
+// inside the attacker's sequence) or standalone (realtime, see show_damage_defender_split).
+static void show_damage_to_defender(Attack* attack, int a2, int delay)
+{
+    bool hit_from_front = is_hit_from_front(attack->attacker, attack->defender);
+
+    // fid 33554933 keeps the caller's animation code instead of deriving one from the weapon.
+    int weaponAnim = attack->attacker->fid == 33554933
+        ? a2
+        : item_w_anim(attack->attacker, attack->hitMode);
+
+    show_damage_to_object(attack->defender,
+        attack->defenderDamage,
+        attack->defenderFlags,
+        attack->weapon,
+        hit_from_front,
+        attack->defenderKnockback,
+        tile_dir(attack->attacker->tile, attack->defender->tile),
+        weaponAnim,
+        attack->attacker,
+        delay);
+}
+
+// Realtime counterpart of the inline defender block: register the reaction as a standalone
+// sequence, exactly the way show_damage_target / show_damage_extras already do. MUST be called
+// after the attacker's register_end(); register_begin cannot nest.
+//
+// Error handling matches those two (the return is ignored): if no sequence slot is free the
+// reaction simply doesn't animate. That is not a correctness hole -- combat_rt commits the damage
+// from its own in-flight snapshot, not from this callback.
+static bool show_damage_defender_split(Attack* attack, int a2, int delay)
+{
+    if ((attack->attackerFlags & DAM_HIT) == 0
+        || attack->defender == NULL
+        || FID_TYPE(attack->defender->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    // show_damage zeroes the delay once it has spent it on the extras ping; mirror that so a
+    // burst that clips several critters reacts on the same beat it did before the split.
+    for (int index = 0; index < attack->extrasLength; index++) {
+        if (FID_TYPE(attack->extras[index]->fid) == OBJ_TYPE_CRITTER) {
+            delay = 0;
+            break;
+        }
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_priority(1);
+    show_damage_to_defender(attack, a2, delay);
+    // Report whether the sequence actually took. It does NOT when the defender is still held by a
+    // live sequence of its own (check_registry refuses) -- e.g. killed mid-swing. The caller needs
+    // to know: a death whose fall never registered has to fall back to settling a static corpse.
+    return register_end() == 0;
+}
+
+// Public entry for combat_rt: register the defender's damage reaction (its fall / knockdown /
+// death, the weapon-drop callbacks and the show_death corpse settle) as the DEFENDER's OWN
+// sequence, at the moment the attack COMMITS. Realtime only -- turn-based keeps everything in the
+// attacker's one ordered sequence.
+//
+// Called from the commit pass, which is action-frame synchronised, so this replaces vanilla's
+// ordering-by-sequence with ordering-by-commit-time and the reaction still lands with the blow.
+// Returns true if the reaction sequence registered. False means the defender was too busy to take
+// it (see show_damage_defender_split) and a lethal hit will need the static-corpse fallback.
+bool action_defender_reaction(Attack* attack)
+{
+    if (attack == NULL || !combat_rt_enabled()) {
+        return false;
+    }
+
+    Object* defender = attack->defender;
+    if (defender == NULL || FID_TYPE(defender->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    if ((attack->attackerFlags & DAM_HIT) == 0) {
+        // MISS -> the cosmetic dodge, which action_suppress_miss_dodge no longer registers inline.
+        // Its own sequence, so it can never block the attacker (or be blocked BY him), and timed
+        // from the commit so the target ducks as the blow arrives rather than at the trigger pull.
+        // Skipped for a prone or already-busy defender: it is pure decoration, never worth cutting
+        // something real (a swing, a fall) to play.
+        if (critter_is_prone(defender) || anim_busy(defender) != 0) {
+            return false;
+        }
+
+        register_begin(ANIMATION_REQUEST_RESERVED);
+        register_priority(1);
+        const char* sfx = gsnd_build_character_sfx_name(defender, ANIM_DODGE_ANIM, CHARACTER_SOUND_EFFECT_UNUSED);
+        register_object_play_sfx(defender, sfx, 0);
+        register_object_animate(defender, ANIM_DODGE_ANIM, 0);
+        return register_end() == 0;
+    }
+
+    // a2 only matters for the fid == 33554933 special case (the caller's own animation code);
+    // every realtime attack derives the weapon animation from the attacker's hit mode instead.
+    return show_damage_defender_split(attack, 0, 0);
+}
+
+// 0x410FD8
+//
+// splitDefender: realtime attack paths pass true to SKIP the defender's reaction here, having it
+// registered separately after register_end() instead. See action_split_defender_anim.
+void show_damage(Attack* attack, int a2, int delay, bool splitDefender)
+{
     for (int index = 0; index < attack->extrasLength; index++) {
         Object* object = attack->extras[index];
         if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
@@ -500,32 +687,11 @@ void show_damage(Attack* attack, int a2, int delay)
             show_damage_to_object(attack->attacker, attack->attackerDamage, attack->attackerFlags, attack->weapon, 1, 0, 0, a2, attack->attacker, -1);
         }
     } else {
-        if (attack->defender != NULL) {
-            hit_from_front = is_hit_from_front(attack->attacker, attack->defender);
-
+        // Skipped under splitDefender: the caller registers this on its own sequence right after
+        // its register_end(), so the attacker isn't held busy by the defender's death fall.
+        if (attack->defender != NULL && !splitDefender) {
             if (FID_TYPE(attack->defender->fid) == OBJ_TYPE_CRITTER) {
-                if (attack->attacker->fid == 33554933) {
-                    show_damage_to_object(attack->defender,
-                        attack->defenderDamage,
-                        attack->defenderFlags,
-                        attack->weapon,
-                        hit_from_front,
-                        attack->defenderKnockback,
-                        tile_dir(attack->attacker->tile, attack->defender->tile),
-                        a2,
-                        attack->attacker, delay);
-                } else {
-                    show_damage_to_object(attack->defender,
-                        attack->defenderDamage,
-                        attack->defenderFlags,
-                        attack->weapon,
-                        hit_from_front,
-                        attack->defenderKnockback,
-                        tile_dir(attack->attacker->tile, attack->defender->tile),
-                        item_w_anim(attack->attacker, attack->hitMode),
-                        attack->attacker,
-                        delay);
-                }
+                show_damage_to_defender(attack, a2, delay);
             }
         }
 
@@ -543,12 +709,60 @@ int action_attack(Attack* attack)
     }
 
     if (register_clear(attack->defender) == -2) {
-        return -1;
+        // The defender is in a PRIORITIZED sequence -- almost always its OWN attack swing.
+        // Turn-based can't reach here (you can't be attacked mid-swing), but realtime can, and
+        // failing the attack means "enemies can't hit me while I'm attacking" (and vice versa).
+        if (combat_rt_enabled()) {
+            // A LIGHT hit registers NO reaction animation on the defender in realtime (the
+            // hit-react is suppressed below in show_damage_to_object), so nothing needs the
+            // defender's animation slot -- force-clearing its swing anyway made that swing vanish
+            // with no anim/sound even though its AP/damage still committed (the "shadow attack").
+            // Leave a committed-to swing running; the hit's damage lands regardless (combat_rt
+            // snapshots it) and the hit SFX still plays from the attacker's sequence. This matches
+            // rt_play_hit_react's swing-protection ("commit to your swing when hit mid-attack").
+            // Only a HEAVY reaction (knockdown / death / fire) actually plays a defender animation
+            // that must own the slot, so for that we still force-end the swing so the fall plays.
+            // BUT never force-clear a defender that is already DYING / knocked down / dead: its
+            // prioritized sequence is then its own death/knockdown -- NOT a swing -- and that
+            // sequence carries the show_death callback. anim_force_clear flushes pending callbacks,
+            // so cutting it runs show_death EARLY, mid-fall, before the body's sub-tile offset
+            // settles -- which flats the corpse (drawn as background) and strands it floating in the
+            // air (the "dying animation shows as background / corpse in the air" bug, confirmed by
+            // the obj-flat backtrace). Let a dying/prone defender's sequence finish on its own; the
+            // incoming hit's damage still commits via combat_rt's snapshot.
+            if ((attack->defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0
+                && !critter_is_prone(attack->defender)
+                && (attack->defender->data.critter.combat.results & DAM_DEAD) == 0) {
+                anim_force_clear(attack->defender);
+            }
+        } else {
+            return -1;
+        }
     }
 
     for (int index = 0; index < attack->extrasLength; index++) {
         if (register_clear(attack->extras[index]) == -2) {
-            return -1;
+            // ⚠️ SAME TRAP AS THE DEFENDER ABOVE, ONE LOOP LOWER -- and it survived the 2026-08-09
+            // fix because that fix only touched the defender line. `extras` are the OTHER critters
+            // caught in a BURST/cone, so in realtime this read as: "somebody standing near your
+            // target is mid-animation, therefore your burst does not happen at all". Silently. In a
+            // crowded room that is most of the time.
+            //
+            // MEASURED (trace_2026-08-15_155257, the Skum Pitt raid): 18 x
+            // `WARN/attack-fail DUDE->... rc=-1 atkBusy=0 atkBlk=0 oor=0` in one 18 s fight, in
+            // bursts of 5-7 inside a tenth of a second, with a 10mm SMG at dist=6 of range=20 --
+            // the attacker free, the target in reach, and the shot dropped anyway. That is the
+            // "guards just stood there and hardly anyone was shooting" report from the player's own
+            // side of it.
+            //
+            // Skipping is safe for the same reason it is for the defender: show_damage_extras opens
+            // its OWN register_begin/register_end per extra, so an extra that keeps its current
+            // sequence simply does not play a reaction -- and its damage still lands, because
+            // combat_rt snapshots the whole computed attack rather than reading it back off the
+            // animation.
+            if (!combat_rt_enabled()) {
+                return -1;
+            }
         }
     }
 
@@ -558,6 +772,42 @@ int action_attack(Attack* attack)
     } else {
         return action_ranged(attack, anim);
     }
+}
+
+// True if the defender is mid-locomotion in realtime combat, so its purely-cosmetic
+// miss-dodge must be suppressed. Registering ANIM_DODGE_ANIM onto a walking/running
+// actor leaves a second competing sad, and when the attack sequence ends anim_set_end
+// force-stands the owner (dude_stand) and kills its first sad -- the in-flight WALK
+// sad -- freezing locomotion until the next step is issued, for the dude and NPCs
+// alike. A miss does no damage or state change, so dropping the dodge for a moving
+// target is free; stationary targets still dodge (harmless "you missed" feedback).
+static bool action_suppress_miss_dodge(Object* defender)
+{
+    if (!combat_rt_enabled()) {
+        return false;
+    }
+
+    // ALWAYS, in realtime. The dodge is the only thing a MISS registers on the defender, and it is
+    // registered INSIDE THE ATTACKER'S sequence -- which has two costs, both measured:
+    //
+    //  1. Registering it needs the defender's animation slot, and check_registry refuses while the
+    //     defender is busy. That failure is not local: it aborts the WHOLE attack (register_end ->
+    //     action_melee -> combat_attack all return -1), so the attacker never even swings and the
+    //     input is silently eaten. 53 of the player's attempts died this way in one fight.
+    //  2. Worse in the other direction: it puts the DEFENDER into the attacker's prioritized
+    //     sequence, so while a rat's swing at you is still running, YOUR next attack is refused by
+    //     action_attack's `register_clear(attacker) == -2`. Measured: 87 of 87 refusals were
+    //     exactly that shape (atkBusy=-1 atkBlk=0) -- the block was on the player's side, put there
+    //     by the enemy's attack.
+    //
+    // So the dodge follows the damage reaction out of the attacker's sequence: combat_rt registers
+    // it on the DEFENDER's own sequence at the commit point (action_defender_reaction), where it is
+    // also correctly timed to the blow instead of to the trigger pull.
+    // (The old per-case suppressions -- mid-locomotion, flinch-immunity window, the dude's
+    // between-steps backstop -- are all subsumed: the inline dodge is gone entirely, and the
+    // split version in action_defender_reaction re-checks prone/busy before it plays.)
+    (void)defender;
+    return true;
 }
 
 // 0x4111C4
@@ -572,6 +822,8 @@ static int action_melee(Attack* attack, int anim)
     int flag;
     const char* sfx_name;
     char sfx_name_temp[16];
+
+    bool splitDefender = action_split_defender_anim();
 
     register_begin(ANIMATION_REQUEST_RESERVED);
     register_priority(1);
@@ -616,9 +868,16 @@ static int action_melee(Attack* attack, int anim)
 
         register_object_animate(attack->attacker, anim, 0);
         register_object_play_sfx(attack->attacker, sfx_name_temp, v17);
-        show_damage(attack, anim, 0);
+        show_damage(attack, anim, 0, splitDefender);
     } else {
-        if (attack->defender->data.critter.combat.results & 0x03) {
+        // Skip the defender's dodge (play only the attacker's swing) when the
+        // defender is already prone, OR -- in realtime combat -- when it's mid-
+        // locomotion (dude or NPC): a miss does nothing, so it must not interrupt
+        // the walk with a dodge (which the engine's end-of-sequence stand-up would
+        // turn into a freeze). Suppressed here at the source (not cancelled after it
+        // starts) so repeated misses never stutter the walk.
+        if ((attack->defender->data.critter.combat.results & 0x03)
+            || action_suppress_miss_dodge(attack->defender)) {
             register_object_play_sfx(attack->attacker, sfx_name_temp, -1);
             register_object_animate(attack->attacker, anim, 0);
         } else {
@@ -658,6 +917,12 @@ static int action_melee(Attack* attack, int anim)
         return -1;
     }
 
+    // NOT registered here. Firing it now would put the reaction on screen at trigger-pull, ahead
+    // of the blow -- the exact bug that got the split disabled. combat_rt calls
+    // action_defender_reaction() at its commit point instead. (splitDefender is only ever true
+    // under combat_rt, so the turn-based path already registered the reaction inline.)
+    (void)splitDefender;
+
     show_damage_extras(attack);
 
     return 0;
@@ -668,6 +933,8 @@ static int action_ranged(Attack* attack, int anim)
 {
     Object* neighboors[6];
     memset(neighboors, 0, sizeof(neighboors));
+
+    bool splitDefender = action_split_defender_anim();
 
     register_begin(ANIMATION_REQUEST_RESERVED);
     register_priority(1);
@@ -699,7 +966,24 @@ static int action_ranged(Attack* attack, int anim)
         if (damageType == DAMAGE_TYPE_EXPLOSION || damageType == DAMAGE_TYPE_PLASMA || damageType == DAMAGE_TYPE_EMP) {
             isGrenade = true;
         }
-    } else {
+    } else if (!combat_rt_enabled() || !combat_rt_weapon_is_up(attack->attacker)) {
+        // RAISING the weapon. It is a turn-based ceremony: vanilla fires once per turn, so
+        // raise -> fire -> lower reads as one complete action. Fire CONTINUOUSLY and it becomes a
+        // per-shot tax -- MEASURED (trace_2026-08-10_183532, 85 attacks) at 0.45 s (10mm Pistol) /
+        // 0.56 s (Hunting Rifle) before the swing pose even starts, against 0.02 s for melee. Half
+        // a second of nothing visible, and no commit-timing change can fix it because it all
+        // happens BEFORE the shot exists.
+        //
+        // Cut outright on 2026-08-10; restored 2026-08-15 as a PER-BURST cost instead of a
+        // per-shot one, once the attack cooldown had grown enough to hide it. combat_rt_weapon_is_-
+        // up is true while the shooter has fired recently, so the raise plays on the opening shot
+        // of an engagement and is skipped for the follow-ups.
+        //
+        // ⚠️ THROUGHPUT IS UNAFFECTED EITHER WAY, and that is what made this affordable: the
+        // cooldown clock starts when the swing REGISTERS (rt_note_attack_fired, called right after
+        // rt_do_attack), so the animation and the cooldown run concurrently. At the player's ~1.98 s
+        // cooldown the whole raise/fire/lower sequence fits inside with room to spare. What the
+        // raise costs is LATENCY from press to damage, never rate of fire.
         register_object_animate(attack->attacker, ANIM_POINT, -1);
     }
 
@@ -760,6 +1044,15 @@ static int action_ranged(Attack* attack, int anim)
                     register_object_move_straight_to_tile(projectile, attack->defender->tile, attack->defender->elevation, ANIM_WALK, 0);
                     actionFrame = make_straight_path(projectile, projectileOrigin, attack->defender->tile, NULL, NULL, 32) - 1;
                     v24 = attack->defender->tile;
+
+                    // TEMP DIAG (fire-timing, 2026-08-10): how many steps the projectile flies.
+                    // combat_rt's [COMBAT/fire-time] can see when the SWING ended and when the hit
+                    // committed, but not how that gap splits between the flight and the UNPOINT
+                    // tail. This is the missing half. STRIP with the fire-time diag.
+                    if (combat_rt_enabled()) {
+                        trace_event(TRACE_COMBAT, "proj-path", "steps=%d pid=%d",
+                            actionFrame, weapon != NULL ? weapon->pid : -1);
+                    }
                 } else {
                     register_object_move_straight_to_tile(projectile, attack->tile, attack->defender->elevation, ANIM_WALK, 0);
                     actionFrame = 0;
@@ -837,7 +1130,10 @@ static int action_ranged(Attack* attack, int anim)
             } else {
                 if ((attack->attackerFlags & DAM_HIT) == 0) {
                     Object* defender = attack->defender;
-                    if ((defender->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) == 0) {
+                    // Same realtime suppression as the melee miss path: don't dodge
+                    // (which would stutter the walk) while the defender is moving.
+                    if ((defender->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) == 0
+                        && !action_suppress_miss_dodge(defender)) {
                         register_object_animate(defender, ANIM_DODGE_ANIM, actionFrame);
                         l56 = true;
                     }
@@ -846,7 +1142,8 @@ static int action_ranged(Attack* attack, int anim)
         }
     }
 
-    show_damage(attack, anim, actionFrame);
+    int defenderDelay = actionFrame;
+    show_damage(attack, anim, actionFrame, splitDefender);
 
     if ((attack->attackerFlags & DAM_HIT) == 0) {
         combatai_msg(attack->defender, attack, AI_MESSAGE_TYPE_MISS, -1);
@@ -884,6 +1181,25 @@ static int action_ranged(Attack* attack, int anim)
                 register_object_change_fid(attack->attacker, fid, -1);
             }
         } else {
+            // ⚠️ RESTORED IN REALTIME 2026-08-10 -- the reason it was dropped has gone stale.
+            //
+            // It used to be skipped because it is registered AFTER the defender's reaction, so it
+            // was the attacker's LAST pending description and kept the shooter owing animation
+            // work right through his victim's death fall ("I killed the rat and can't move until
+            // it stops twitching"). **That premise died when the defender's reaction moved out of
+            // the attacker's sequence** (action_defender_reaction, 2026-08-09): the attacker's
+            // sequence now holds only his own shot, so this is a short tail, not a death fall.
+            //
+            // And it earns its keep: it is the ONLY transition from the fire animation's last
+            // frame (weapon up) back to the idle pose. Without it anim_set_end -> dude_stand snaps
+            // between the two in one frame, which is the "the animation cuts off oddly at the end"
+            // the player reported the moment ANIM_POINT was removed.
+            //
+            // So the pairing is deliberate and asymmetric: the RAISE stays dropped (half a second
+            // of dead time BEFORE the shot, fixing nothing), the LOWER comes back (a tail AFTER
+            // the shot, which is exactly where the eye needs the transition). To stop that tail
+            // delaying the damage, combat_rt no longer waits for the whole sequence on a
+            // projectile attack -- it commits when the FIRING POSE ends (see poseEnded there).
             register_object_animate(attack->attacker, ANIM_UNPOINT, -1);
         }
     }
@@ -902,6 +1218,10 @@ static int action_ranged(Attack* attack, int anim)
 
         return -1;
     }
+
+    // Deferred to combat_rt's commit point -- see the matching note in action_melee.
+    (void)splitDefender;
+    (void)defenderDelay;
 
     show_damage_extras(attack);
 

@@ -7,11 +7,13 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/art.h"
+#include "game/combat_rt.h"
 #include "game/combatai.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/elevator.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -75,7 +77,9 @@ static void combat_display_hit(char* dest, size_t size, Object* critter_obj, int
 static void combat_display_flags(char* a1, int flags, Object* a3);
 static void combat_standup(Object* a1);
 static void print_tohit(unsigned char* dest, int dest_pitch, int a3);
-static char* combat_get_loc_name(Object* critter, int hitLocation);
+// Exported (combat.h) for the gamepad aimed-shot readout, so it names body parts with the game's
+// own per-critter strings instead of a hardcoded English list.
+char* combat_get_loc_name(Object* critter, int hitLocation);
 static void draw_loc_off(int a1, int a2);
 static void draw_loc_on(int a1, int a2);
 static void draw_loc(int eventCode, int color);
@@ -2126,6 +2130,19 @@ void combat_end()
     combat_state |= COMBAT_STATE_0x08;
 }
 
+// Prints combat.msg #103 -- the "you can't break off yet" line vanilla's END COMBAT button
+// shows (twice above) when some critter still refuses to stop fighting. Exported so the
+// realtime END COMBAT action in combat_rt gives the player the SAME feedback, in the game's
+// own wording and language, instead of silently doing nothing.
+void combat_display_cant_end_message()
+{
+    MessageListItem messageListItem;
+    messageListItem.num = 103;
+    if (message_search(&combat_message_file, &messageListItem)) {
+        display_print(messageListItem.text);
+    }
+}
+
 // 0x420698
 void combat_turn_run()
 {
@@ -2376,6 +2393,21 @@ static bool combat_should_end()
 // 0x420B20
 void combat(STRUCT_664980* attack)
 {
+    // Realtime combat (combat_rt) owns combat now. The turn-based scheduler must
+    // never activate, regardless of which legacy path requested it (script
+    // attack opcodes via scripts_check_state, combat_attack_this, the interface,
+    // etc.) - this is the single chokepoint that guarantees the combat window /
+    // COMBAT_STATE_0x02 / blocking turn loop can't take over and freeze input.
+    // Before refusing, forward the attacker/defender to combat_rt: a script
+    // requesting an attack on the dude is the authoritative hostility signal it
+    // uses to aggro genuine enemies (peaceful NPCs never request combat).
+    if (combat_rt_enabled()) {
+        if (attack != NULL) {
+            combat_rt_notify_attack(attack->attacker, attack->defender);
+        }
+        return;
+    }
+
     if (attack == NULL
         || (attack->attacker == NULL || attack->attacker->elevation == map_elevation)
         || (attack->defender == NULL || attack->defender->elevation == map_elevation)) {
@@ -2873,6 +2905,30 @@ static int compute_attack(Attack* attack)
     } else {
         if (item_w_max_ammo(attack->weapon) > 0) {
             attack->ammoQuantity = 1;
+        }
+    }
+
+    // Realtime-only passive Luck dodge: when an attack WOULD land a normal hit, the
+    // defender gets a separate save = Luck x 1% to negate it. On a successful save the
+    // would-be hit is downgraded to an ordinary miss -- the existing ROLL_FAILURE path
+    // takes over, so the engine plays ANIM_DODGE_ANIM on the defender (and already
+    // suppresses that dodge for a walking/running actor via action_suppress_miss_dodge,
+    // so a procced dodge can never freeze a moving dodger). This runs BEFORE the switch,
+    // so no DAM_HIT / crit / damage effects have been applied yet -- the to-hit math
+    // (determine_to_hit / roll_check) is untouched, this only adds a post-hit save.
+    // Symmetric by construction: compute_attack is the shared path for the dude and
+    // every NPC, so a high-Luck enemy dodges the dude's blows too. Bursts are EXCLUDED
+    // (one save must not negate a whole spray) and so are criticals (ROLL_SUCCESS only;
+    // a crit lands). AoE/explosion extras resolve separately below and stay undodgeable.
+    if (combat_rt_enabled()
+        && roll == ROLL_SUCCESS
+        && anim != ANIM_FIRE_BURST
+        && anim != ANIM_FIRE_CONTINUOUS
+        && attack->defender != NULL
+        && FID_TYPE(attack->defender->fid) == OBJ_TYPE_CRITTER) {
+        int luck = stat_level(attack->defender, STAT_LUCK);
+        if (luck > 0 && roll_random(1, 100) <= luck) {
+            roll = ROLL_FAILURE;
         }
     }
 
@@ -3545,7 +3601,38 @@ static void check_for_death(Object* object, int damage, int* flags)
 {
     if (object == NULL || object->pid != 16777224) {
         if (damage > 0) {
-            if (critter_get_hits(object) - damage <= 0) {
+            int hits = critter_get_hits(object);
+
+            // REALTIME CONCURRENCY. This runs at FIRE time (compute_attack -> death_checks), but
+            // combat_rt lets several attacks be in flight on one defender at once, each sitting in
+            // its snapshot list for up to RT_RESOLVE_MAX_SECONDS while the others commit. Judging
+            // lethality against the defender's CURRENT hp therefore under-counts: two attacks that
+            // are individually survivable but jointly lethal both compute "not dead", so NEITHER
+            // registers a death animation here, and apply_damage's set_new_results never sets
+            // DAM_DEAD -- which drops the killing blow into critter_adjust_hits' emergency
+            // critter_kill(-1) path. That path is meant for un-animated deaths (radiation, script
+            // damage): it snaps to a single-frame corpse, flags OBJECT_FLAT immediately, and never
+            // clears the victim's animation sequence. Reached mid-fight it produced all three
+            // reported death bugs at once -- an art-less blank corpse, a body drawn into the floor
+            // layer (wall over it), and a corpse left floating because a queued hit-react kept
+            // driving its sub-tile offset. Subtracting the in-flight damage restores the invariant
+            // turn-based got for free: these flags describe the hp the defender will have WHEN THIS
+            // ATTACK LANDS, so the blow that actually kills is the one flagged DAM_DEAD, registers
+            // the real death animation, and settles the corpse through show_death as vanilla does.
+            //
+            // killClaimed: an in-flight attack is already flagged lethal and owns the death
+            // animation. Flagging a second one makes the defender play two death falls, so leave
+            // this attack un-flagged -- apply_damage skips it once DAM_DEAD is set, and
+            // combat_commit_snapshot's late-lethal net covers the case where it commits first.
+            if (combat_rt_enabled()) {
+                bool killClaimed = false;
+                hits -= combat_rt_pending_damage_on(object, &killClaimed);
+                if (killClaimed) {
+                    return;
+                }
+            }
+
+            if (hits - damage <= 0) {
                 *flags |= DAM_DEAD;
             }
         }
@@ -3578,7 +3665,22 @@ static void set_new_results(Object* critter, int flags)
         queue_remove_this(critter, EVENT_TYPE_KNOCKOUT);
 
         int endurance = stat_level(critter, STAT_ENDURANCE);
-        queue_add(10 * (35 - 3 * endurance), critter, NULL, EVENT_TYPE_KNOCKOUT);
+        int koTicks = 10 * (35 - 3 * endurance); // vanilla: (35 - 3*EN) game-SECONDS unconscious
+
+        // Realtime combat: game time flows in real seconds, so the vanilla 5-32s knockout is
+        // dead air -- in turn-based it was spread across the player's turns (you kept acting),
+        // but here you just stand and wait for the only enemy to come to. Compress it hard: keep
+        // the Endurance shape but make it a brief stun (~1/6, floored so it's still visibly a
+        // knockout), so a downed enemy is back up in a couple of seconds. Turn-based unchanged.
+        // (The player can also finish a knocked-out enemy now -- see rt_is_targetable.)
+        if (combat_rt_enabled()) {
+            koTicks /= 6;
+            if (koTicks < 10) {
+                koTicks = 10; // ~1s minimum
+            }
+        }
+
+        queue_add(koTicks, critter, NULL, EVENT_TYPE_KNOCKOUT);
     }
 
     if (critter == obj_dude && (flags & DAM_CRIP_ARM_ANY) != 0) {
@@ -4060,6 +4162,181 @@ static void combat_display_flags(char* dest, int flags, Object* critter)
 }
 
 // 0x42344C
+// True from the moment an attack is issued (combat_attack) until its damage has
+// been committed (apply_damage in combat_anim_finished). Realtime combat uses
+// this to serialize attacks: only one may be resolving through the single global
+// main_ctd at a time, so a second attack can't overwrite the first's pending
+// result. Unlike combat_turn_running this is attack-specific (movement never sets
+// it), so it doesn't block attacking while moving.
+bool combat_is_attack_pending()
+{
+    return combat_cleanup_enabled;
+}
+
+// Recovery valve for realtime combat's stuck-lock watchdog. Forcibly clears the
+// pending-attack bookkeeping (combat_cleanup_enabled / combat_turn_running) when
+// an orphaned/leaked animation sequence has wedged the attack lock permanently ON
+// (apply_damage normally runs only when combat_turn_running drains to 0, which a
+// never-ending sequence prevents). This does NOT run in the normal attack flow --
+// damage commits through combat_anim_finished as usual -- so the main_ctd
+// serialization / death-crash fix is untouched. It only abandons a damage
+// application that can no longer complete, so the game stops freezing.
+void combat_clear_pending_attack()
+{
+    combat_cleanup_enabled = false;
+    combat_turn_running = 0;
+}
+
+// Commits the pending attack's damage immediately -- the same ammo / display /
+// apply_damage / scr_end_combat cleanup that combat_anim_finished runs when
+// combat_turn_running drains to 0 -- and returns true if there was one to commit.
+// Realtime combat keeps the warm bit set continuously, so that counter never
+// drains and the engine's lazy commit never fires; combat_rt calls this itself
+// when the attacker's swing animation completes. It deliberately does NOT stand
+// the attacker back up (combat_anim_finished does that for the turn-based path,
+// and combat_rt stands actors up non-blocking in its own pass -- combat_standup
+// would call the blocking combat_turn_run loop, which can't be re-entered from
+// the realtime frame update). The single-attack-at-a-time invariant (one pending
+// attack resolves before the next is issued) guarantees this is never re-entered
+// while another apply_damage is in flight, which is exactly the main_ctd
+// death-crash serialization -- so that fix is preserved, not bypassed.
+bool combat_commit_pending_attack()
+{
+    if (!combat_cleanup_enabled) {
+        return false;
+    }
+
+    combat_cleanup_enabled = false;
+
+    Object* weapon = item_hit_with(main_ctd.attacker, main_ctd.hitMode);
+    if (weapon != NULL) {
+        if (item_w_max_ammo(weapon) > 0) {
+            int ammoQuantity = item_w_curr_ammo(weapon);
+            item_w_set_curr_ammo(weapon, ammoQuantity - main_ctd.ammoQuantity);
+
+            if (main_ctd.attacker == obj_dude) {
+                intface_update_ammo_lights();
+            }
+        }
+    }
+
+    if (combat_call_display) {
+        combat_display(&main_ctd);
+        combat_call_display = false;
+    }
+
+    // Guard the realtime damage commit against a dangling whoHitMe on either party: apply_damage
+    // -> combatai_check_retaliation -> combatai_rating(defender->whoHitMe) crashes if that critter
+    // was freed mid-fight. No-op outside realtime.
+    combat_rt_validate_who_hit_me(main_ctd.attacker, main_ctd.defender);
+
+    // animated=true asks for the dude's HP-bar counter to roll digit-by-digit; it drives
+    // nothing else (damage/death are unaffected). It used to be forced off under combat_rt
+    // because the vanilla roll runs in a BLOCKING loop (block_for_tocks, no process_bk) that
+    // froze the whole realtime world for ~250ms on every hit taken. It is back on because
+    // intface_update_hit_points now routes to the non-blocking, frame-loop-stepped roll
+    // while a realtime fight is live (see intface_hp_roll_tick) and only uses the blocking
+    // one outside combat, where nothing is moving anyway.
+    apply_damage(&main_ctd, true);
+
+    Object* attacker = main_ctd.attacker;
+    if (attacker == obj_dude && combat_highlight == 2) {
+        combat_outline_on();
+    }
+
+    if (scr_end_combat()) {
+        if ((obj_dude->data.critter.combat.results & DAM_KNOCKED_OUT) != 0) {
+            if (attacker->data.critter.combat.team == obj_dude->data.critter.combat.team) {
+                combat_ending_guy = obj_dude->data.critter.combat.whoHitMe;
+            } else {
+                combat_ending_guy = attacker;
+            }
+        }
+    }
+
+    combat_ctd_init(&main_ctd, main_ctd.attacker, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+
+    return true;
+}
+
+// Realtime concurrency support. combat_attack() computes one attack into the single global
+// main_ctd and sets the pending flag; the classic flow then holds that global until the damage
+// commits, which serializes attacks one-at-a-time (a turn-based feel under realtime). These two
+// helpers let combat_rt take a private COPY of the just-computed attack and free the global
+// immediately, so many attacks can be in flight at once and each commits from its own copy.
+
+// Copy the just-computed pending attack (main_ctd + the display flag) out for combat_rt to own.
+void combat_take_pending_snapshot(Attack* out, bool* outCallDisplay)
+{
+    if (out != NULL) {
+        *out = main_ctd;
+    }
+    if (outCallDisplay != NULL) {
+        *outCallDisplay = combat_call_display != 0;
+    }
+}
+
+// Commit a previously-snapshotted attack: restore it into the global ctd and run the normal
+// committer (ammo, combat-log display, the whoHitMe guard, apply_damage, end-combat checks).
+// Safe because combat_attack() -- the only writer of main_ctd -- never runs between combat_rt's
+// commit pass and its attack-arbiter within a frame, so the global is free to borrow here.
+bool combat_commit_snapshot(const Attack* snap, bool callDisplay)
+{
+    if (snap == NULL) {
+        return false;
+    }
+    main_ctd = *snap;
+    combat_call_display = callDisplay ? 1 : 0;
+    combat_cleanup_enabled = true;
+
+    // LATE-LETHAL NET, second line of defence. combat_rt applies this to the snapshot BEFORE it
+    // registers the defender's reaction (that is where it has to happen -- see the function), so by
+    // the time we get here the flag is normally already set and this is a no-op. It stays for any
+    // caller that commits a snapshot without going through that path.
+    combat_late_lethal_upgrade(&main_ctd);
+
+    return combat_commit_pending_attack();
+}
+
+// LATE-LETHAL NET (realtime only). check_for_death decides DAM_DEAD at FIRE time, and
+// combat_rt_pending_damage_on keeps that honest for the common case -- but commit order is not fire
+// order (each in-flight attack commits on its own swing/connect/cap), so when several attackers
+// focus ONE defender the blow that lands can be one that measured "not lethal" against hp that a
+// sibling attack has since eaten. Reaching apply_damage without DAM_DEAD is what hands the kill to
+// critter_adjust_hits' emergency critter_kill(-1) (see check_for_death). Flag it here instead:
+// set_new_results then owns the death and critter_kill is not reached.
+//
+// ⚠️ TIMING IS THE WHOLE POINT (2026-08-10). This used to run inside combat_commit_snapshot, i.e.
+// AFTER combat_rt had already chosen the defender's reaction from the un-upgraded flags. So the
+// victim was handed a light hit-react (or nothing) instead of a death fall, the commit killed it a
+// beat later with nothing queued, and the corpse reap snapped it straight to the static death frame
+// -- dead, flat, no fall, in one frame. Trace 2026-08-10: Ian (id=18076) was focus-fired by three
+// hostiles (683/687/1224, 17 attacks); the killing blow logged `late-lethal dmg=6 hp=1` and
+// `corpse-reap stuck=0 animWas=0` in the SAME frame, and he sat on ANIM_FALL_BACK_SF frame 0 for
+// the rest of the log. Call this while the reaction can still be picked from the result.
+bool combat_late_lethal_upgrade(Attack* attack)
+{
+    if (attack == NULL || !combat_rt_enabled()) {
+        return false;
+    }
+
+    Object* defender = attack->defender;
+    if (defender != NULL
+        && FID_TYPE(defender->fid) == OBJ_TYPE_CRITTER
+        && defender->pid != 16777224
+        && attack->defenderDamage > 0
+        && (attack->defenderFlags & DAM_DEAD) == 0
+        && (defender->data.critter.combat.results & DAM_DEAD) == 0
+        && critter_get_hits(defender) - attack->defenderDamage <= 0) {
+        attack->defenderFlags |= DAM_DEAD;
+        trace_event(TRACE_WARN, "late-lethal", "pid=%d dmg=%d hp=%d",
+            defender->pid, attack->defenderDamage, critter_get_hits(defender));
+        return true;
+    }
+
+    return false;
+}
+
 void combat_anim_begin()
 {
     if (++combat_turn_running == 1 && obj_dude == main_ctd.attacker) {
@@ -4083,45 +4360,26 @@ void combat_anim_finished()
         game_ui_enable();
     }
 
-    if (combat_cleanup_enabled) {
-        combat_cleanup_enabled = false;
+    // Under realtime combat, combat_rt is the SOLE committer: it commits each
+    // attack (combat_commit_pending_attack) the moment the swing animation ends
+    // and releases its single hit-resolution slot at that same instant. If we
+    // ALSO committed here whenever combat_turn_running happened to dip to 0, two
+    // committers would race -- this one would clear combat_cleanup_enabled (and so
+    // open combat_rt's attack lock) while combat_rt still believes the attack is
+    // in flight, letting the next combat_attack start and clobber the shared
+    // main_ctd before the previous result was consumed. That is exactly the
+    // one-attack-at-a-time serialization the death-crash fix depends on, so under
+    // combat_rt we defer the commit (and standup) to it entirely and only keep the
+    // turn_running / UI bookkeeping above.
+    if (combat_rt_enabled()) {
+        return;
+    }
 
-        Object* weapon = item_hit_with(main_ctd.attacker, main_ctd.hitMode);
-        if (weapon != NULL) {
-            if (item_w_max_ammo(weapon) > 0) {
-                int ammoQuantity = item_w_curr_ammo(weapon);
-                item_w_set_curr_ammo(weapon, ammoQuantity - main_ctd.ammoQuantity);
-
-                if (main_ctd.attacker == obj_dude) {
-                    intface_update_ammo_lights();
-                }
-            }
-        }
-
-        if (combat_call_display) {
-            combat_display(&main_ctd);
-            combat_call_display = false;
-        }
-
-        apply_damage(&main_ctd, true);
-
-        Object* attacker = main_ctd.attacker;
-        if (attacker == obj_dude && combat_highlight == 2) {
-            combat_outline_on();
-        }
-
-        if (scr_end_combat()) {
-            if ((obj_dude->data.critter.combat.results & DAM_KNOCKED_OUT) != 0) {
-                if (attacker->data.critter.combat.team == obj_dude->data.critter.combat.team) {
-                    combat_ending_guy = obj_dude->data.critter.combat.whoHitMe;
-                } else {
-                    combat_ending_guy = attacker;
-                }
-            }
-        }
-
-        combat_ctd_init(&main_ctd, main_ctd.attacker, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
-
+    // Capture the attacker before the commit re-inits main_ctd; the standup is
+    // then run here (turn-based path only -- combat_rt commits via
+    // combat_commit_pending_attack directly and stands actors up in its own pass).
+    Object* attacker = main_ctd.attacker;
+    if (combat_commit_pending_attack()) {
         if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
             if ((attacker->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_DEAD | DAM_LOSE_TURN)) == 0) {
                 // NOTE: Uninline.
@@ -4172,7 +4430,7 @@ static void print_tohit(unsigned char* dest, int destPitch, int accuracy)
 }
 
 // 0x423740
-static char* combat_get_loc_name(Object* critter, int hitLocation)
+char* combat_get_loc_name(Object* critter, int hitLocation)
 {
     MessageListItem messageListItem;
     messageListItem.num = 1000 + 10 * art_alias_num(critter->fid & 0xFFF) + hitLocation;
@@ -4475,6 +4733,17 @@ bool combat_to_hit(Object* target, int* accuracy)
 void combat_attack_this(Object* a1)
 {
     if (a1 == NULL) {
+        return;
+    }
+
+    // Realtime owns the dude's attacks. This legacy path (reached via the crosshair
+    // mouse click in gmouse, or the RT-trigger raw click) would call combat_attack()
+    // directly, which sets the pending flag WITHOUT combat_rt's rt_resolving slot --
+    // the realtime commit/cap can't fire, so the attack lock wedges ON until the 2.5s
+    // watchdog force-clears it (a frozen swing that deals no damage). Route the request
+    // into combat_rt's intent system, which resolves it through the normal realtime path.
+    if (combat_rt_enabled()) {
+        combat_rt_player_attack(a1);
         return;
     }
 

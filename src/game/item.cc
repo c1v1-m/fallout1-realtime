@@ -1336,7 +1336,7 @@ int item_w_reload(Object* weapon, Object* ammo)
 int item_w_range(Object* critter, int hit_mode)
 {
     Object* weapon;
-    Proto* proto;
+    Proto* proto = NULL;
     int range;
     int max_range;
 
@@ -1347,7 +1347,13 @@ int item_w_range(Object* critter, int hit_mode)
         return 1;
     }
 
-    proto_ptr(weapon->pid, &proto);
+    // Vanilla ignores this return code and dereferences proto below -- a guaranteed crash on any
+    // failed proto load (ACCESS_VIOLATION reading the maxRange field off NULL, seen on map exit
+    // when a re-entrant proto read made proto_ptr fail; root-fixed in gamepad_ui.cc, but the
+    // deref site is here). Fall back to melee range rather than crash.
+    if (proto_ptr(weapon->pid, &proto) == -1 || proto == NULL) {
+        return 1;
+    }
 
     if (hit_mode == HIT_MODE_LEFT_WEAPON_PRIMARY || hit_mode == HIT_MODE_RIGHT_WEAPON_PRIMARY) {
         range = proto->item.data.weapon.maxRange1;

@@ -1106,7 +1106,17 @@ void GNW95_process_message()
             break;
         case SDL_KEYDOWN:
         case SDL_KEYUP:
-            if (!kb_is_disabled()) {
+            // Alt+Enter = windowed/fullscreen, the shortcut everyone expects. Handled here in the
+            // SDL pump, ahead of the keyboard queue, so it works from EVERY loop (gameplay, menus,
+            // dialogue, the character editor -- each runs its own get_input loop) and no in-game
+            // binding is spent on it. Both the down and the up are swallowed so a stray ENTER can't
+            // reach whatever screen is open. The persistent default still lives in f1_res.ini
+            // (WINDOWED); this is a runtime flip and is not saved.
+            if (e.key.keysym.sym == SDLK_RETURN && (e.key.keysym.mod & KMOD_ALT) != 0) {
+                if (e.type == SDL_KEYDOWN) {
+                    svga_toggle_fullscreen();
+                }
+            } else if (!kb_is_disabled()) {
                 keyboardData.key = e.key.keysym.scancode;
                 keyboardData.down = (e.key.state & SDL_PRESSED) != 0;
                 GNW95_process_key(&keyboardData);

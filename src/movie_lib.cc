@@ -99,7 +99,7 @@ static void _nfPkDecomp(unsigned char* buf, unsigned char* a2, int a3, int a4, i
 
 static constexpr uint16_t loadUInt16LE(const uint8_t* b);
 static constexpr uint32_t loadUInt32LE(const uint8_t* b);
-static uint8_t getOffset(uint16_t v);
+static int getOffset(uint16_t v);
 
 // 0x51EBD8
 static int dword_51EBD8 = 0;
@@ -2802,7 +2802,12 @@ constexpr uint32_t loadUInt32LE(const uint8_t* b)
     return (b[3] << 24) | (b[2] << 16) | (b[1] << 8) | b[0];
 }
 
-uint8_t getOffset(uint16_t v)
+// The block motion offset: a signed low-byte X component plus a row component from
+// dword_51F018 (built as multiples of the frame stride _mveBW, i.e. hundreds/thousands of
+// bytes, positive or negative). The result is a full signed byte offset into the frame buffer
+// (used as `dest + v10`), so it MUST be a wide signed int -- returning uint8_t here truncated
+// the vertical motion to 0..255, copying blocks from the wrong place = video artifacts.
+int getOffset(uint16_t v)
 {
     return static_cast<int8_t>(v & 0xFF) + dword_51F018[v >> 8];
 }

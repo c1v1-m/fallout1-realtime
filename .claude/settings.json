@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash",
+      "PowerShell",
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(//c/Users/MS/Documents/GameDev/fallout1-ce/**)",
+      "Write(//c/Users/MS/Documents/GameDev/fallout1-ce/**)",
+      "Edit(//c/Users/MS/.claude/projects/C--Users-MS-Documents-GameDev-fallout1-ce/memory/**)",
+      "Write(//c/Users/MS/.claude/projects/C--Users-MS-Documents-GameDev-fallout1-ce/memory/**)",
+      "Edit(//c/Users/MS/AppData/Local/Temp/claude/**)",
+      "Write(//c/Users/MS/AppData/Local/Temp/claude/**)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(rm -rf:*)",
+      "PowerShell(Remove-Item *)",
+      "WebFetch",
+      "WebSearch"
+    ]
+  }
+}

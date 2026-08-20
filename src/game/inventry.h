@@ -49,6 +49,25 @@ extern CacheEntry* ikey[OFF_59E7BC_COUNT];
 void inven_set_dude(Object* obj, int pid);
 void inven_reset_dude();
 void handle_inventory();
+bool inven_is_open();
+// True while any inventory window (normal/use-on/loot/barter) is open, and the
+// type of the topmost one (-1 when none). Used by the gamepad layer to route A.
+bool inven_any_open();
+int inven_current_window_type();
+// True if the cursor is over either loot item panel; lets the gamepad layer tell
+// a quick-take (over a panel) from a button click such as Done (elsewhere).
+bool inven_loot_cursor_over_panel();
+// True if the cursor is over the normal/use-on inventory item list; lets the
+// gamepad layer tell a quick equip/use from a button click such as Done.
+bool inven_normal_cursor_over_list();
+bool inven_equip_under_cursor(int hand);
+// Controller shortcut: WEAR the inventory-list armor under the cursor (the armor
+// body slot), swapping out any currently-worn armor back to the list. Returns
+// false (no-op) unless the normal inventory is open with armor under the cursor.
+bool inven_wear_under_cursor();
+// Controller A-tap quick action for the player's own inventory list: use drugs/
+// usables, wear armor, otherwise equip into a free hand. See inventry.cc.
+bool inven_gamepad_quick_normal();
 bool setup_inventory(int inventoryWindowType);
 void exit_inventory(bool a1);
 void display_inventory(int a1, int a2, int inventoryWindowType);
@@ -82,7 +101,10 @@ void inven_obj_examine_func(Object* critter, Object* item);
 void inven_action_cursor(int eventCode, int inventoryWindowType);
 int loot_container(Object* a1, Object* a2);
 int inven_steal_container(Object* a1, Object* a2);
-int move_inventory(Object* a1, int a2, Object* a3, bool a4);
+// gpQuantity: 0 = normal mouse drag-and-drop transfer (pick up, drag, release on
+// the other panel). >0 = controller quick transfer of exactly that many units to
+// the opposite panel with no drag gesture (used by the gamepad loot quick-take).
+int move_inventory(Object* a1, int a2, Object* a3, bool a4, int gpQuantity = 0);
 void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5);
 void container_enter(int a1, int a2);
 void container_exit(int keyCode, int inventoryWindowType);

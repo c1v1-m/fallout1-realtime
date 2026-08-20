@@ -4,8 +4,11 @@
 namespace fallout {
 
 // The maximum number of sound effects that can be loaded and played
-// simultaneously.
-#define SOUND_EFFECTS_MAX_COUNT 4
+// simultaneously. CE: raised from the vanilla 4 -- realtime combat_rt has many
+// critters attacking at once and a single ranged shot queues up to three effects
+// (fire + ammo-flying + hit), so 4 overflowed and concurrent gunshots went silent.
+// Must stay below AUDIO_ENGINE_SOUND_BUFFERS (which also serves music + speech).
+#define SOUND_EFFECTS_MAX_COUNT 16
 
 int sfxc_init(int cache_size, const char* effectsPath);
 void sfxc_exit();

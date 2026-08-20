@@ -8,6 +8,7 @@
 #include "game/anim.h"
 #include "game/automap.h"
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/editor.h"
@@ -1221,6 +1222,22 @@ static int map_age_dead_critters()
 }
 
 // 0x475160
+// Cancel a queued map transition (map_state) without performing it. Used by the realtime
+// escape-delay when the player steps off the exit grid before the hold timer elapses, so the
+// pending destination doesn't silently fire later when combat ends.
+void map_clear_pending_transition()
+{
+    memset(&map_state, 0, sizeof(map_state));
+}
+
+// True while a map transition is stored but not yet performed (map_check_state runs it, but only
+// once combat is over). Lets the realtime escape timer notice a destination that was queued while
+// combat happened to be cold and would otherwise sit there forever -- see rt_update_map_exit.
+bool map_has_pending_transition()
+{
+    return map_state.map != 0;
+}
+
 int map_leave_map(MapTransition* transition)
 {
     if (transition == NULL) {
@@ -1234,7 +1251,18 @@ int map_leave_map(MapTransition* transition)
     }
 
     if (isInCombat()) {
-        game_user_wants_to_quit = 1;
+        // Realtime lets the player flee a map mid-combat. Instead of the vanilla quit-to-menu
+        // guard (which can't fire in turn-based -- you can't reach an exit grid during combat
+        // -- but boots a realtime player to the menu), ARM the escape delay: the player must
+        // hold position on the exit grid for RT_MAP_EXIT_DELAY seconds of live combat before
+        // the transition happens (anti-abuse -- no instant escape). combat_rt drives the timer
+        // and, on expiry, ends combat so map_check_state (gated on !isInCombat()) loads the
+        // destination; map_state is already stored above and held until then.
+        if (combat_rt_enabled()) {
+            combat_rt_arm_map_exit();
+        } else {
+            game_user_wants_to_quit = 1;
+        }
     }
 
     return 0;
@@ -1318,9 +1346,15 @@ void map_fix_critter_combat_data()
             continue;
         }
 
-        if (object->data.critter.combat.whoHitMeCid == -1) {
-            object->data.critter.combat.whoHitMe = NULL;
-        }
+        // whoHitMe / whoHitMeCid are a UNION (object_types.h): on x64 the pointer is 8 bytes but
+        // the cid is 4, so a loaded critter whose saved whoHitMeCid != -1 has only the LOW 4 bytes
+        // set from disk -- the HIGH 4 bytes are stale, leaving whoHitMe a garbage pointer (e.g.
+        // 0x1_0000001f) that crashes apply_damage's retaliation (combatai_rating) in realtime.
+        // The original only NULLed the cid==-1 case. who-hit-me is meaningless out of combat (it
+        // is re-established when combat starts), so NULL the 8-byte pointer unconditionally here
+        // to guarantee no corrupt pointer survives the load. (NULLing the pointer also makes the
+        // cid read back as 0; the next save rewrites it to -1 via the whoHitMe==NULL path.)
+        object->data.critter.combat.whoHitMe = NULL;
     }
 }
 

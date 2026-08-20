@@ -165,6 +165,64 @@ static char sfx_file_name[13];
 // 0x595562
 static char background_fname_requested[COMPAT_MAX_PATH];
 
+// --- CONCURRENT-SFX LIMITER ---
+//
+// Fallout plays every sound effect at full volume and never mixes them down, because turn-based
+// combat resolves ONE attack at a time -- the situation this exists for simply cannot arise there.
+// Realtime does it constantly: measured in trace_2026-08-15_235539, 15 of 43 attacks started within
+// 50 ms of the previous one and 22 within 0.15 s, each contributing a weapon sfx plus a hit sfx.
+// The result is not a repeated sound, it is AMPLITUDE SUMMING -- two to four near-identical
+// transients stacking into one loud crack. That is the "HLASITÝ ZVUK se často přehrával" report.
+//
+// ⚠️ WE REMOVED VANILLA'S ACCIDENTAL LIMITER. The original mixer had 8 voices
+// (AUDIO_ENGINE_SOUND_BUFFERS), which quietly dropped anything past the eighth -- crude, but it
+// capped the pile-up. We raised it to 32 to fix the opposite complaint ("only one shot was
+// audible"), which removed the cap along with the bug. This puts a deliberate, gentler one back.
+//
+// ⚠️ IT COUNTS SOUNDS ACTUALLY STARTED, NOT gsound_active_effect_counter. That counter is
+// incremented at LOAD time, and animation sounds are loaded when the sequence is REGISTERED --
+// well before they play -- so during a busy fight it is inflated by queued sounds that are still
+// silent, and ducking against it would attenuate lone shots for no reason. A ring of recent start
+// times measures exactly what is being complained about: how many sounds hit the ear at once.
+#define GSOUND_SFX_BURST_WINDOW_MS 120u
+#define GSOUND_SFX_BURST_FREE 2 // this many overlap at full volume; ducking starts above it
+#define GSOUND_SFX_RECENT_MAX 32
+static unsigned int gsound_sfx_recent[GSOUND_SFX_RECENT_MAX];
+static int gsound_sfx_recent_next = 0;
+// Strength of the duck (cfg sfx_burst_duck). 0 = off, restoring the old behaviour exactly.
+static float gsound_sfx_burst_duck = 0.25f;
+
+// Registers this play and quietens it in proportion to how many others just started.
+static void gsound_sfx_limit(Sound* sound)
+{
+    unsigned int now = get_time();
+
+    int overlapping = 0;
+    for (int i = 0; i < GSOUND_SFX_RECENT_MAX; i++) {
+        // Unsigned subtraction, so this stays correct across the tick counter wrapping.
+        if (gsound_sfx_recent[i] != 0 && now - gsound_sfx_recent[i] < GSOUND_SFX_BURST_WINDOW_MS) {
+            overlapping++;
+        }
+    }
+
+    gsound_sfx_recent[gsound_sfx_recent_next] = now;
+    gsound_sfx_recent_next = (gsound_sfx_recent_next + 1) % GSOUND_SFX_RECENT_MAX;
+
+    if (sound == NULL || gsound_sfx_burst_duck <= 0.0f || overlapping <= GSOUND_SFX_BURST_FREE) {
+        return;
+    }
+
+    // 1 / (1 + excess * strength): monotonic, never reaches zero, and easy to reason about from the
+    // cfg number alone. At the default 0.25 -- 3 overlapping = 0.80, 5 = 0.57, 8 = 0.40.
+    float scale = 1.0f / (1.0f + (overlapping - GSOUND_SFX_BURST_FREE) * gsound_sfx_burst_duck);
+
+    // SCALES the volume the caller already computed rather than replacing it -- that value carries
+    // the per-object distance attenuation from gsound_compute_relative_volume, and overwriting it
+    // would make every sound equally close.
+    int volume = soundGetVolume(sound);
+    soundVolume(sound, (int)(volume * scale));
+}
+
 // 0x4475A0
 int gsound_init()
 {
@@ -249,6 +307,11 @@ int gsound_init()
 
     add_bk_process(gsound_bkg_proc);
     gsound_initialized = true;
+
+    // Concurrent-SFX limiter strength -- see gsound_sfx_limit. 0 restores vanilla mixing exactly.
+    double burstDuck = 0.25;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_BURST_DUCK_KEY, &burstDuck);
+    gsound_sfx_burst_duck = burstDuck < 0.0 ? 0.0f : (burstDuck > 1.0 ? 1.0f : (float)burstDuck);
 
     // SOUNDS
     bool sounds = 0;
@@ -1149,6 +1212,7 @@ int gsound_play_sfx_file_volume(const char* a1, int a2)
         return -1;
     }
 
+    gsound_sfx_limit(v1);
     soundPlay(v1);
 
     return 0;
@@ -1326,6 +1390,8 @@ int gsnd_anim_sound(Sound* sound, void* a2)
         return 0;
     }
 
+    // The main combat path: every weapon report, hit and death cry is an animation-registered sfx.
+    gsound_sfx_limit(sound);
     soundPlay(sound);
 
     return 0;
@@ -1621,6 +1687,7 @@ int gsound_play_sfx_file(const char* name)
         return -1;
     }
 
+    gsound_sfx_limit(sound);
     soundPlay(sound);
 
     return 0;
@@ -2072,7 +2139,7 @@ static int gsound_get_music_path(char** out_value, const char* key)
 // 0x449C7C
 static void gsound_check_active_effects()
 {
-    if (gsound_active_effect_counter < 0 || gsound_active_effect_counter > 4) {
+    if (gsound_active_effect_counter < 0 || gsound_active_effect_counter > SOUND_EFFECTS_MAX_COUNT) {
         if (gsound_debug) {
             debug_printf("WARNING: %d active effects.\n", gsound_active_effect_counter);
         }

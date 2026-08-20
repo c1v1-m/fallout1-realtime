@@ -23,6 +23,12 @@ void InitLoadSave();
 void ResetLoadSave();
 int SaveGame(int mode);
 int LoadGame(int mode);
+// Headless saves for the auto/quick save scheme (slots 0,1=autosave ping-pong, 2=quick).
+int SaveGameSlot(int slot, const char* description);
+int AutoSaveLocation();
+int AutoSaveQuest();
+int QuickSaveGame();
+bool LoadSaveConsumeJustLoaded();
 int isLoadingGame();
 void KillOldMaps();
 int MapDirErase(const char* path, const char* a2);

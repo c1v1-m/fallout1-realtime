@@ -26,8 +26,14 @@ void tile_enable_refresh();
 void tile_refresh_rect(Rect* rect, int elevation);
 void tile_refresh_display();
 int tile_set_center(int tile, int flags);
+int tile_set_center_offset(int tile, int flags, int offsetX, int offsetY);
 void tile_toggle_roof(int a1);
 int tile_roof_visible();
+// Debug overlay: draw a red ring at the given hex-tile radius around obj_dude (0 = off)
+// to visualize a tile distance in-world. See tile_render_debug_ring.
+void tile_debug_ring_set(int radius);
+int tile_debug_ring_get();
+
 int tile_coord(int tile, int* x, int* y, int elevation);
 int tile_num(int x, int y, int elevation, bool ignoreBounds = false);
 int tile_dist(int a1, int a2);

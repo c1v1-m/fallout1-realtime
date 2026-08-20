@@ -17,6 +17,8 @@ typedef void(PipboyRenderProc)(int a1);
 
 int pipboy(int intent);
 void pip_init();
+// Hash of all quest global-var values; changes on any quest progress (for autosave).
+unsigned int pipboy_quest_state_hash();
 int save_pipboy(DB_FILE* stream);
 int load_pipboy(DB_FILE* stream);
 
