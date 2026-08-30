@@ -112,6 +112,12 @@ int combat_rt_aim_chance(int hitLocation);
 // cost), false if no valid target / the weapon can't aim / the location is invalid.
 bool combat_rt_aimed_attack(int hitLocation);
 
+// Why an aimed shot is impossible right now, as a short player-facing phrase -- or NULL when it is
+// possible. Several of the reasons are VANILLA rules the player cannot see from the interface bar
+// (Fast Shot forbids called shots outright; burst and continuous modes cannot be aimed; neither can
+// flame, explosive or EMP damage), so a silent refusal is indistinguishable from a broken button.
+const char* combat_rt_aim_refusal();
+
 // Green-highlight (Fallout 3 VATS style) the current aim target while the body-part wheel
 // is up, replacing its combat red outline; the off call restores the exact prior outline.
 // Called by the gamepad layer on aim-wheel open/close. No-op if there is no target.

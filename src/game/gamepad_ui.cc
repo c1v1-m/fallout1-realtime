@@ -7,6 +7,7 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/critter.h"
+#include "game/display.h"
 #include "game/art.h"
 #include "game/automap.h"
 #include "game/combat.h"
@@ -76,18 +77,47 @@ static float gpui_stick_deadzone = GPUI_STICK_DEADZONE;
 #define GPUI_AIM_TRIGGER_PRESS 12000   // ~37% pull to engage
 #define GPUI_AIM_TRIGGER_RELEASE 6000  // ~18% pull to let go
 
-// Schmitt trigger over an analog axis: latches on above `press`, releases only below `release`.
-// `state` is the caller's own latch, so each gesture keeps its own and they cannot interfere.
-static bool gpui_trigger_held(SDL_GameController* pad, SDL_GameControllerAxis axis, bool* state)
+// How long the axis must STAY low before the latch drops.
+//
+// ⚠️ HYSTERESIS ON THE VALUE IS NOT ENOUGH, BECAUSE THE BAD READINGS ARE ZERO. The axis
+// intermittently reports a hard 0 for a frame while the trigger is physically held: measured in
+// trace_2026-08-30_234101, 14 of 33 release transitions read exactly 0 and were immediately
+// followed by a fresh press at 20000-30000. No value threshold can survive that -- 0 is below any
+// release level you pick -- so the latch dropped and re-armed several times a second, each phantom
+// press restamping lbDownTime, and the 220 ms hold window never elapsed. Zero aimed shots fired in
+// that whole session. This is the second time the same symptom had a different cause; the first
+// really was dither around a single threshold.
+//
+// A release therefore has to persist. 60 ms is about four frames -- long enough to swallow a
+// dropped reading, far too short to notice when letting go on purpose.
+#define GPUI_TRIGGER_RELEASE_MS 60
+
+// "Not currently low", as a timestamp sentinel. Not 0: get_time() can legitimately BE 0.
+#define GPUI_TRIGGER_NOT_LOW 0xFFFFFFFFu
+
+// Schmitt trigger over an analog axis, with a debounced release. `state` and `lowAt` are the
+// caller's own, so each gesture keeps its own pair and they cannot interfere.
+static bool gpui_trigger_held(SDL_GameController* pad, SDL_GameControllerAxis axis,
+    bool* state, unsigned int* lowAt)
 {
     int v = SDL_GameControllerGetAxis(pad, axis);
+
     if (*state) {
         if (v < GPUI_AIM_TRIGGER_RELEASE) {
-            *state = false;
+            if (*lowAt == GPUI_TRIGGER_NOT_LOW) {
+                *lowAt = get_time();
+            } else if (get_time() - *lowAt >= GPUI_TRIGGER_RELEASE_MS) {
+                *state = false;
+            }
+        } else {
+            // Back above the release level -- whatever that dip was, it was not a release.
+            *lowAt = GPUI_TRIGGER_NOT_LOW;
         }
     } else if (v > GPUI_AIM_TRIGGER_PRESS) {
         *state = true;
+        *lowAt = GPUI_TRIGGER_NOT_LOW;
     }
+
     return *state;
 }
 
@@ -4588,7 +4618,8 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     // "joystick ani dpad vubec nereaguje". A per-frame flag must never depend on which branch ran.
     gpui_aim_gesture = false;
     static bool lbLatch = false;
-    bool lbNow = gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, &lbLatch);
+    static unsigned int lbLatchLowAt = GPUI_TRIGGER_NOT_LOW;
+    bool lbNow = gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, &lbLatch, &lbLatchLowAt);
     bool lbEdge = lbNow && !prevLb;
     bool lbReleased = !lbNow && prevLb;
     prevLb = lbNow;
@@ -4657,6 +4688,25 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     if (lbEdge) {
         lbDownTime = get_time();
         gpui_aim_canceled = false; // a fresh press starts a fresh aim
+
+        // ⚠️ SAY WHY, RATHER THAN DO NOTHING. `blocked` folds in combat_rt_can_aim(), and three of
+        // its reasons are vanilla rules that are invisible on the interface bar -- Fast Shot bans
+        // called shots for the whole game, burst and continuous modes cannot be aimed, and neither
+        // can flame/explosive/EMP. Refusing in silence is indistinguishable from a dead button, and
+        // that is exactly how it was read: the trigger was held for 900 ms and 650 ms, cleanly, and
+        // nothing happened, twice in a row.
+        //
+        // Once per PRESS, never per frame: this runs at frame rate while the trigger is down.
+        if (blocked) {
+            const char* why = combat_rt_aim_refusal();
+            gsound_play_sfx_file("iisxxxx1");
+            if (why != NULL && !gamepad_ui_menu_active() && !inven_any_open()) {
+                // display_print takes char*, so copy rather than cast the const away.
+                char msg[96];
+                snprintf(msg, sizeof(msg), "%s", why);
+                display_print(msg);
+            }
+        }
     }
 
     // The stick belongs to the aim for as long as the trigger is down and the aim is still live.
@@ -4932,11 +4982,12 @@ static void gpui_trace_buttons(SDL_GameController* pad)
     // from a boolean. Uses the same hysteresis as the gesture, so the log shows what it saw.
     {
         static bool prevTrig[2] = { false, false };
+        static unsigned int trigLowAt[2] = { GPUI_TRIGGER_NOT_LOW, GPUI_TRIGGER_NOT_LOW };
         const SDL_GameControllerAxis axes[2] = { SDL_CONTROLLER_AXIS_TRIGGERLEFT, SDL_CONTROLLER_AXIS_TRIGGERRIGHT };
         const char* names[2] = { "LT", "RT" };
         for (int t = 0; t < 2; t++) {
             bool was = prevTrig[t];
-            bool now = gpui_trigger_held(pad, axes[t], &prevTrig[t]);
+            bool now = gpui_trigger_held(pad, axes[t], &prevTrig[t], &trigLowAt[t]);
             if (now != was) {
                 trace_event(TRACE_INPUT, "trig", "%s %s raw=%d", names[t], now ? "down" : "up",
                     SDL_GameControllerGetAxis(pad, axes[t]));

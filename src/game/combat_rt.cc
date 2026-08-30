@@ -16,6 +16,7 @@
 #include "game/config.h"
 #include "game/critter.h"
 #include "game/display.h"
+#include "game/trait.h"
 #include "game/game.h"
 #include "game/game_trace.h"
 #include "game/gdialog.h" // dialog_active, for the post-conversation NPC hold
@@ -6990,6 +6991,39 @@ int combat_rt_aim_chance(int hitLocation)
         chance = 999;
     }
     return chance;
+}
+
+// See the header. Ordered so the most specific answer wins: a weapon that can never be aimed is
+// worth saying before "no target", because the player can act on it.
+const char* combat_rt_aim_refusal()
+{
+    if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {
+        return "You can't aim right now.";
+    }
+
+    int hitMode = rt_player_hit_mode();
+
+    if (!item_w_called_shot(obj_dude, hitMode)) {
+        // ⚠️ THREE VERY DIFFERENT CAUSES LAND HERE and the player can fix two of them, so do not
+        // collapse them into one message. Fast Shot is permanent (a character trait), the firing
+        // MODE is one press of B away, and the damage type is a matter of picking another weapon.
+        if (trait_level(TRAIT_FAST_SHOT)) {
+            return "Fast Shot: you can never make a called shot.";
+        }
+
+        int anim = item_w_anim(obj_dude, hitMode);
+        if (anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS) {
+            return "You can't aim a burst. Switch firing mode with B.";
+        }
+
+        return "This weapon can't be aimed.";
+    }
+
+    if (rt_aim_target() == NULL) {
+        return "Nothing in range to aim at.";
+    }
+
+    return NULL;
 }
 
 bool combat_rt_aimed_attack(int hitLocation)
