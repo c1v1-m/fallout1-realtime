@@ -432,6 +432,10 @@ typedef struct RtActor {
     int diag_mode;
     int diag_range;
     int diag_dist;
+    // TEMP DIAG (walk sem-a-tam, 2026-08-31): which MOVER ran last, so the chase line is emitted on
+    // a change of branch instead of every frame. -1 = nothing logged yet. STRIP with chase-move.
+    int diag_mover;
+
     // TEMP DIAG for the ping-pong (2026-08-28): pid of whatever refused the STRAIGHT step, so the
     // blocker line is emitted on change instead of every frame. -2 = nothing logged yet.
     int diag_blocker;
@@ -3495,6 +3499,34 @@ static bool rt_shot_blocked(Object* npc, Object* target, int hitMode)
 // Returns TRUE if a move was actually registered, FALSE if the engine could not build a path
 // to the target. The caller uses that to give up on an UNREACHABLE target -- see the
 // no_path_since handling in RT_CHASE.
+// TEMP DIAG (STRIP with chase-move). WHICH of the two chase movers ran, emitted only when the
+// branch CHANGES.
+//
+// ⚠️ THE ONE FACT THE PING-PONG TRACES NEVER CARRIED. step-blocker already says WHAT refused the
+// straight step and chase-why says the distance and range, but neither says which mover actually
+// executed -- and the whole symptom is the two disagreeing frame to frame. The player sees a
+// critter close, back off, close again; the log shows make-path alternating between a long route to
+// him and a short one sideways, with no way to tell which branch produced which.
+//
+// Three previous attempts to fix the movement layer were reverted for making engagement worse, each
+// one guessing at the cause. This is the measurement that has to come first.
+//
+// mover: 1 = rt_step_toward (straight, one hop), 2 = rt_advance_to_target because the SHOT is
+// blocked, 3 = rt_advance_to_target because the straight STEP is blocked.
+static void rt_note_chase_move(RtActor* a, Object* npc, int mover, int blockerPid, int stepDest)
+{
+    if (a->diag_mover == mover) {
+        return;
+    }
+    a->diag_mover = mover;
+
+    trace_event(TRACE_FLOW, "chase-move",
+        "id=%d pid=%d mover=%d tile=%d step=%d blk=%d tgt=%d dist=%d t=%.2f",
+        npc->id, npc->pid, mover, npc->tile, stepDest, blockerPid,
+        a->target != NULL ? a->target->tile : -1,
+        a->target != NULL ? obj_dist(npc, a->target) : -1, rt_clock);
+}
+
 static bool rt_advance_to_target(Object* npc, Object* target)
 {
     // Movement spends the engine combat.ap per tile while the warm bit is set; top it
@@ -4527,6 +4559,7 @@ static void rt_refresh_registry()
             a->diag_range = prev->diag_range;
             a->diag_dist = prev->diag_dist;
             a->diag_blocker = prev->diag_blocker;
+            a->diag_mover = prev->diag_mover;
             a->osc_tile = prev->osc_tile;
             a->osc_prev_tile = prev->osc_prev_tile;
             a->osc_since = prev->osc_since;
@@ -4606,6 +4639,7 @@ static void rt_refresh_registry()
             a->diag_range = -1;
             a->diag_dist = -1;
             a->diag_blocker = -2;
+            a->diag_mover = -1;
             // ⚠️ `fresh` is an UNINITIALISED stack array and every field is assigned by hand, so a
             // field added to RtActor without a line here holds garbage. That is exactly what
             // happened to the balance counters: an NPC that joined after the fight started never
@@ -5534,6 +5568,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 // just stand -- path AROUND the obstacle to get an angle. A plain step
                 // toward can't route around a building, so a ranged NPC would otherwise
                 // sit there forever re-attempting a blocked shot.
+                rt_note_chase_move(a, npc, 2, -1, -1);
                 rt_note_path_result(a, rt_advance_to_target(npc, a->target));
             } else {
                 // While the in-combat bit is set, anim.cc deducts the mover's engine
@@ -5609,8 +5644,10 @@ static void rt_update_actor(RtActor* a, float dt)
                     // Pathing around is at least a behaviour that ends in an attack, so it stands
                     // until the CHASE diagnostic below explains why actors sit in CHASE at all --
                     // guessing at the movement layer three times running is how this got worse.
+                    rt_note_chase_move(a, npc, 3, blocker != NULL ? blocker->pid : -1, stepDest);
                     rt_note_path_result(a, rt_advance_to_target(npc, a->target));
                 } else {
+                    rt_note_chase_move(a, npc, 1, -1, stepDest);
                     rt_step_toward(npc, a->target);
                 }
             }
