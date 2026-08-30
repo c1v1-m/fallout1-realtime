@@ -13,6 +13,7 @@
 #include "game/cycle.h"
 #include "game/editor.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
@@ -1230,6 +1231,25 @@ void map_clear_pending_transition()
     memset(&map_state, 0, sizeof(map_state));
 }
 
+// Queue "open the world map" the same way an exit grid queues a destination: map_check_state
+// performs it from the main loop. Used by a load whose save was taken ON the world map -- there is
+// no map to restore, so the restored game has to come up on the world map instead.
+//
+// ⚠️ Deliberately only ARMS the transition instead of calling world_map() directly. The load is
+// still unwinding its own call stack when this runs, and opening a modal screen from in there is
+// exactly the shape of bug that took four rounds to clear out of the load path already.
+void map_request_world_map()
+{
+    memset(&map_state, 0, sizeof(map_state));
+    map_state.map = -2;
+
+    // TEMP DIAG: the world-map save restore reaches the black screen sometimes and comes up
+    // right sometimes, so both halves of the handshake are traced -- this arms it,
+    // [FLOW/map-state] below reports whether map_check_state ever acted on it. STRIP once the
+    // cause is found.
+    trace_event(TRACE_FLOW, "wm-armed", "map=%d", map_state.map);
+}
+
 // True while a map transition is stored but not yet performed (map_check_state runs it, but only
 // once combat is over). Lets the realtime escape timer notice a destination that was queued while
 // combat happened to be cold and would otherwise sit there forever -- see rt_update_map_exit.
@@ -1278,12 +1298,18 @@ int map_check_state()
         return 0;
     }
 
+    // TEMP DIAG: what is pending and whether the combat gate below lets it through. Only fires
+    // when something IS pending, so it costs nothing on a normal frame. STRIP with wm-armed.
+    trace_event(TRACE_FLOW, "map-state", "map=%d inCombat=%d", map_state.map, isInCombat() ? 1 : 0);
+
     gmouse_3d_off();
     gmouse_set_cursor(MOUSE_CURSOR_NONE);
 
     if (map_state.map == -1) {
         if (!isInCombat()) {
             anim_stop();
+
+            unsigned int loadSerial = LoadGameSerial();
 
             ctx.state = 0;
             ctx.town = our_town;
@@ -1293,18 +1319,53 @@ int map_check_state()
                 ctx.town = our_town;
             }
 
-            world_map(ctx);
+            // A save loaded from inside the town map has already replaced the game; opening the
+            // world map on top of it would put the screen right back where the bug started.
+            if (LoadGameSerial() == loadSerial) {
+                world_map(ctx);
+            }
             KillWorldWin();
-            memset(&map_state, 0, sizeof(map_state));
+            // ⚠️ CLEAR ONLY IF NOTHING RE-ARMED IT WHILE THE SCREEN WAS UP. The pad reaches the
+            // pause menu from these screens, so a save can be loaded from inside them -- and if
+            // that save was itself taken on the world map, LoadSlot arms a BRAND NEW request on
+            // its way out. Zeroing map_state unconditionally threw that fresh request away and the
+            // restored game came up with no map and no world map: the dude alone on a black
+            // screen, and only ever on the loads that were started FROM the world map -- which is
+            // every second one, because a successful restore leaves you standing on it.
+            //
+            // ⚠️ COMPARING map_state.map AGAINST ITS OLD VALUE DOES NOT WORK, and that was the
+            // first attempt at this: the old request and the new one are BOTH -2, so the test
+            // passed and the memset ran anyway. The question is not "is the value the same", it is
+            // "is this still the same request" -- and the load counter is what answers it.
+            if (LoadGameSerial() == loadSerial) {
+                memset(&map_state, 0, sizeof(map_state));
+            }
         }
     } else if (map_state.map == -2) {
         if (!isInCombat()) {
             anim_stop();
+
+            unsigned int loadSerial = LoadGameSerial();
+
             ctx.state = 0;
             ctx.town = our_town;
             world_map(ctx);
             KillWorldWin();
-            memset(&map_state, 0, sizeof(map_state));
+            // ⚠️ CLEAR ONLY IF NOTHING RE-ARMED IT WHILE THE SCREEN WAS UP. The pad reaches the
+            // pause menu from these screens, so a save can be loaded from inside them -- and if
+            // that save was itself taken on the world map, LoadSlot arms a BRAND NEW request on
+            // its way out. Zeroing map_state unconditionally threw that fresh request away and the
+            // restored game came up with no map and no world map: the dude alone on a black
+            // screen, and only ever on the loads that were started FROM the world map -- which is
+            // every second one, because a successful restore leaves you standing on it.
+            //
+            // ⚠️ COMPARING map_state.map AGAINST ITS OLD VALUE DOES NOT WORK, and that was the
+            // first attempt at this: the old request and the new one are BOTH -2, so the test
+            // passed and the memset ran anyway. The question is not "is the value the same", it is
+            // "is this still the same request" -- and the load counter is what answers it.
+            if (LoadGameSerial() == loadSerial) {
+                memset(&map_state, 0, sizeof(map_state));
+            }
         }
     } else {
         if (!isInCombat()) {

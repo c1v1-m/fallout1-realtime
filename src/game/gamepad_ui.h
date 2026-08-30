@@ -53,7 +53,20 @@ void gamepad_ui_set_action_popup_active(bool active);
 // list. While set, the shared mouse hook suppresses left-stick cursor snapping and
 // A/Y-as-click so they don't fight that navigation; the right stick and RT still work.
 void gamepad_ui_set_self_nav(bool active);
+// Drop the A -> left-click synthesis while a screen handles A itself. Narrower than self_nav:
+// the right stick keeps driving the cursor, and RT keeps clicking. Returns the PREVIOUS state, so
+// a screen opened from another one (the editor from character selection) can restore rather than
+// clear -- clearing would hand the click back to the screen underneath, which still handles A.
+bool gamepad_ui_set_suppress_a_click(bool suppress);
+// Edge-tracking generation. A loop keeping its own prevA/prevB must re-prime when this changes:
+// a nested modal (dialog_out) has run its own input loop and the outer edges are stale.
+unsigned int gamepad_ui_input_epoch();
+void gamepad_ui_bump_input_epoch();
+bool gamepad_ui_a_click_suppressed();
 void gamepad_ui_set_suppress_snap(bool active);
+// Set while a pre-game modal screen with no live session is up (the death scene): the gameplay
+// shortcuts must not fire into a game that main_reset_system has already torn down.
+void gamepad_ui_set_no_session(bool active);
 
 // Consumes a pending loot/container quick-take request set by the A/Y buttons:
 // returns 0 (none), 1 (A = move one unit of the item under the cursor), or 2

@@ -369,6 +369,16 @@ static int curReviewSlot = 0;
 // 0x505198
 static int gdNumOptions = 0;
 
+// CE: bumped every time the reply list is rebuilt (gDialogProcessUpdate). The controller reply
+// nav in gDialogProcess watches it and re-seeds its highlight whenever it changes, so a NEW set
+// of options always comes up with option 0 highlighted. Without it only the FIRST set of the
+// conversation was seeded: after every answer the new replies were drawn with nothing highlighted
+// and the selection index still pointed at the option just answered -- you had to nudge up/down
+// to see (and correct) where the cursor actually was. Monotonic and global on purpose: nested
+// dialogue levels each keep their own last-seen value, so returning to an outer level re-seeds
+// there too.
+static unsigned int gdOptionGen = 0;
+
 // 0x50519C
 static int gReplyWin = -1;
 
@@ -1491,6 +1501,57 @@ static int gdialog_gamepad_reply_nav(int* sel)
     return keyCode;
 }
 
+// CE: RIGHT stick scrolls the NPC's reply when it does not fit in the box (gdReplyTooBig). The
+// engine already pages that text with the arrow keys, so this only has to synthesise them -- which
+// keeps one implementation of the paging and its page-offset bookkeeping.
+//
+// ⚠️ THE RIGHT STICK, NOT THE LEFT. The left stick and the D-pad move the reply SELECTION
+// (gdialog_gamepad_reply_nav), and the two must not fight over one axis: scrolling the NPC's text
+// and choosing your answer are different jobs and the player does them in the same moment.
+//
+// Edge-triggered with hold-to-repeat, same shape as the reply nav, plus a neutral-first arm so a
+// stick held from before the conversation opened cannot page on the first frame.
+static int gdialog_gamepad_reply_scroll()
+{
+    static bool prevUp = false;
+    static bool prevDown = false;
+    static bool armed = false;
+    static unsigned int lastStep = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevUp = false;
+        prevDown = false;
+        armed = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+    Sint16 ry = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
+    bool upNow = ry < -16000;
+    bool downNow = ry > 16000;
+
+    if (!upNow && !downNow) {
+        armed = true;
+    }
+
+    int keyCode = -1;
+    if (armed) {
+        bool repeat = elapsed_time(lastStep) >= 200;
+        if ((upNow && !prevUp) || (upNow && repeat)) {
+            keyCode = KEY_ARROW_UP;
+            lastStep = get_time();
+        } else if ((downNow && !prevDown) || (downNow && repeat)) {
+            keyCode = KEY_ARROW_DOWN;
+            lastStep = get_time();
+        }
+    }
+
+    prevUp = upNow;
+    prevDown = downNow;
+    return keyCode;
+}
+
 static int gDialogProcess()
 {
     if (gdReenterLevel == 0) {
@@ -1525,13 +1586,13 @@ static int gDialogProcess()
     int gdCursorY = -1;
     unsigned int gdCursorMove = get_time();
     int gdReplySel = 0;
+    // Deliberately NOT gdOptionGen: the first pass through the loop must see a mismatch and seed
+    // the highlight, exactly as entering a nested level must re-seed for its own option set.
+    unsigned int gdSeenOptionGen = gdOptionGen - 1;
     if (gdCursorController) {
         mouse_get_position(&gdCursorX, &gdCursorY);
         gmouse_set_cursor(MOUSE_CURSOR_NONE);
         gamepad_ui_set_self_nav(true);
-        if (gdNumOptions > 0) {
-            gDialogProcessHighlight(0); // start with the first reply highlighted
-        }
     }
 
     for (;;) {
@@ -1540,10 +1601,28 @@ static int gDialogProcess()
         int keyCode = get_input();
 
         if (gdCursorController) {
+            // A rebuilt reply list arrives with nothing highlighted and gdReplySel still on the
+            // option we just answered -- invisible AND wrong, since A would then confirm whatever
+            // sits at that stale index. Re-seed on option 0, the same state the conversation opens
+            // in. Runs before the nav read so the highlight is already up when the player pushes.
+            if (gdSeenOptionGen != gdOptionGen) {
+                gdSeenOptionGen = gdOptionGen;
+                gdReplySel = 0;
+                if (gdNumOptions > 0) {
+                    gDialogProcessHighlight(0);
+                }
+            }
+
             gdialog_tick_cursor(&gdCursorShown, &gdCursorX, &gdCursorY, &gdCursorMove);
             int navKey = gdialog_gamepad_reply_nav(&gdReplySel);
             if (keyCode == -1 && navKey != -1) {
                 keyCode = navKey;
+            }
+
+            // Right stick -> page the reply text. After the nav read, so a genuine keyboard key or a
+            // reply selection always wins the frame; scrolling is the one that can wait a frame.
+            if (keyCode == -1) {
+                keyCode = gdialog_gamepad_reply_scroll();
             }
         }
 
@@ -2017,6 +2096,10 @@ static void gDialogProcessReply()
 // 0x43F51C
 static void gDialogProcessUpdate()
 {
+    // CE: a fresh reply list starts here. Bumped at the TOP, not the bottom -- the option loop
+    // below has error returns, and a half-built list still needs re-seeding.
+    gdOptionGen++;
+
     replyRect.ulx = 5;
     replyRect.uly = 10;
     replyRect.lrx = 374;

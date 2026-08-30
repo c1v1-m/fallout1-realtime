@@ -75,6 +75,11 @@ struct RadialWheelArt {
 // always clamped fully on-screen. When `transparentBg` is true the panel background and
 // border are left transparent (index 0) so the world shows through the hub -- e.g. an
 // aimed-shot wheel placed over the highlighted enemy. No-op if already open. Safe-tick only.
+// Optional control hints pinned to the panel's top-left and top-right corners and kept visible
+// while you aim -- for something the player has to read mid-use, e.g. which shoulder buttons page
+// the wheel. Call AFTER radial_wheel_open; NULL clears either side.
+void radial_wheel_set_side_hints(const char* left, const char* right);
+
 void radial_wheel_open(const RadialSegment* segments, int count, const char* title,
     const RadialWheelArt* art, int atX, int atY, bool transparentBg);
 

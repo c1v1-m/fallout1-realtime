@@ -31,7 +31,9 @@
 #include "game/party.h"
 #include "game/perk.h"
 #include "game/perk_defs.h"
-#include "game/protinst.h" // obj_destroy, for spent healing items
+#include "game/proto.h" // proto_ptr, for the doorway magnet's scenery test
+#include "game/proto_types.h" // SCENERY_TYPE_DOOR
+#include "game/protinst.h" // obj_destroy, for spent healing items; obj_is_locked
 #include "game/radial_wheel.h"
 #include "game/roll.h"
 #include "game/skill.h" // skill_result, for the medic beat's First Aid / Doctor roll
@@ -145,6 +147,29 @@ namespace fallout {
 #define RT_KNOCKDOWN_DWELL_SECONDS 1.7f
 static float rt_knockdown_dwell = RT_KNOCKDOWN_DWELL_SECONDS;
 
+// HARD CAP (seconds) on the TOTAL time a critter spends resting on the ground, measured from the
+// moment its fall animation finishes. Past this it stands up no matter what is still being done to
+// it.
+//
+// Why it exists (trace_2026-08-24_185614, the dude): rt_bump_prone_dwell restarts the dwell on
+// every DAMAGING hit that lands on a downed critter -- deliberately, so shooting a downed enemy
+// keeps it down. But that restart had no ceiling, so any group whose combined hit cadence is
+// shorter than the dwell pins its victim on the ground FOREVER. Measured: the dude fell at
+// s=63.21, his fall finished at s=64.21, and he was still prone at s=70.26 -- six seconds against a
+// 1.7s dwell, with ZERO [FLOW/standup] in the log -- while two rats alternating at ~1s intervals
+// took him from 35 HP to 4. His input is blocked the whole time he is prone
+// (rt_dude_incapacitated), so that is a total, unbounded lockout ending in death.
+//
+// Note the EN-scaled flinch immunity (flinch_accum / immune_until) does NOT cover this: it was
+// built for the light hit-react stagger only. This cap is the knockdown's equivalent.
+//
+// Symmetric (dude and NPCs) -- an enemy pinned down by focus-fire has exactly the same problem.
+// Roughly two dwells, so a downed critter can still be kept there for a meaningful beat by
+// sustained fire; it just can't be kept there indefinitely. cfg lever `knockdown_max_ground`;
+// 0 = no cap (the pre-2026-08-24 behaviour). Scale it with knockdown_dwell.
+#define RT_KNOCKDOWN_GROUND_CAP 3.4f
+static float rt_knockdown_ground_cap = RT_KNOCKDOWN_GROUND_CAP;
+
 // A chasing critter whose walk animation is playing but whose TILE hasn't changed for this
 // long is stuck (crowd gridlock: everyone stepping into everyone else at once) -- its walk is
 // force-cleared so the FSM re-plans. A legit walk crosses a tile boundary well under this
@@ -175,6 +200,33 @@ static float rt_knockdown_dwell = RT_KNOCKDOWN_DWELL_SECONDS;
 // up and apply a floor so even low-perception critters engage at a usable range.
 #define RT_AGGRO_PERCEPTION_SCALE 2
 #define RT_AGGRO_MIN_TILES 5
+
+// R3 AUTO-LOCK RANGE (tiles) = max(PERCEPTION * scale, floor). Same shape as the aggro radius above,
+// deliberately: "how far can this character pick a target out of the scene" is the same question in
+// both directions, so it should read the same way.
+//
+// It used to be UNBOUNDED -- rt_nearest_lockable simply took the nearest lockable critter in the
+// registry, anywhere. That made Perception worth nothing to the one gesture that is entirely about
+// noticing someone.
+//
+// Numbers at 2.0 / 5: PE 1 -> 5, **PE 4 -> 8**, PE 7 -> 14, PE 10 -> 20. Identical to the aggro
+// radius on purpose, so the range at which NPCs notice YOU and the range at which you can single one
+// of THEM out are the same number.
+//
+// ⚠️ HOW THAT NUMBER WAS ARRIVED AT, because the first attempt was wrong. It shipped at 1.0 / 3 --
+// PE 4 -> 4 tiles -- from the user's "melee range plus a bit", which I took literally as 1+3 without
+// checking what "range" means in this game's data. Measured from his own traces: melee/unarmed is
+// range 1 (3393 samples), spears 2, pistols and SMGs 14-25, rifles 40-45; and roughly 12-13 tiles
+// fit on screen at 853x480. So 4 tiles left enemies plainly VISIBLE but unlockable, which reads as a
+// bug rather than as a stat. Anchor a reach on what the data says, not on what the phrase suggests.
+//
+// A low-PE character with a long gun still out-ranges his lock (SMG 25 vs 8 at PE 4). That is the
+// intended cost of a dull-eyed brawler build; both numbers are cfg (`lock_range_pe_scale`,
+// `lock_range_min`) if it ever needs widening for a sniper.
+#define RT_LOCK_PERCEPTION_SCALE 2.0f
+#define RT_LOCK_MIN_TILES 5
+static float rt_lock_pe_scale = RT_LOCK_PERCEPTION_SCALE;
+static int rt_lock_min_tiles = RT_LOCK_MIN_TILES;
 
 // Extra tiles beyond the chase range before a chasing critter gives up (returns to
 // IDLE). Keeps the engage/disengage from flickering at the boundary.
@@ -280,6 +332,19 @@ typedef struct RtActor {
     // the pool has recovered by RT_NPC_RUN_RESUME_MARGIN. Without this latch the reserve became a
     // free-sprint equilibrium -- see rt_npc_sprint_ok.
     bool run_winded;
+
+    // BREATHER. Set when the pool has drained to the attack reserve, cleared once it has
+    // recovered by RT_NPC_BREATHER_MARGIN -- the NPC half of the dude's rt_move_blocked. While
+    // set, CHASE movement is suppressed: the critter stands and catches its breath instead of
+    // walking at you for ever on a pool that can never empty.
+    //
+    // ⚠️ breather_since IS THE SAFETY VALVE, not bookkeeping. The reason NPCs never had a stop
+    // is the "enemy runs up and just looks at me" bug, and an unbounded latch is exactly how
+    // that comes back. RT_NPC_BREATHER_MAX_SECONDS caps every pause, so the worst case a bug
+    // here can produce is a critter that hesitates -- never one that is stuck.
+    bool breather;
+    float breather_since;
+
     bool hostile; // Genuinely hostile to the dude; see rt_refresh_registry.
     bool friendly; // A party member / follower -- fights the dude's enemies (see rt_update_actor).
     int last_results; // combat.results last frame, for watchdog event detection.
@@ -332,6 +397,12 @@ typedef struct RtActor {
     // flowing straight into the standup with no time down. -1 = not waiting to stand.
     float prone_since;
 
+    // rt_clock when the CURRENT knockdown's fall finished -- the same instant prone_since is first
+    // armed, but NEVER restarted by rt_bump_prone_dwell. This is the clock the hard ground cap
+    // (RT_KNOCKDOWN_GROUND_CAP) runs on, so focus-fire can extend the dwell but can't pin the
+    // critter down forever. -1 = not down.
+    float prone_fall_end;
+
     // Flinch-immunity (anti-stunlock) state. flinch_accum = seconds of CONTINUOUS hit-
     // reacting (builds while flinching, decays otherwise); when it crosses the EN-scaled
     // threshold the critter gets a brief immunity window (immune_until = rt_clock + EN-
@@ -350,11 +421,19 @@ typedef struct RtActor {
     int stuck_tile;
     float stuck_since;
 
+    // The SUB-TILE offset we last saw. A critter creeping across a tile has not moved `tile` yet,
+    // but these are changing every frame -- which is the difference between slow and stuck.
+    int stuck_x;
+    int stuck_y;
+
     // TEMP DIAG state for the "chase-why" trace line: last logged decision inputs, so the line is
     // emitted on change instead of every frame. Strip with the diagnostic.
     int diag_mode;
     int diag_range;
     int diag_dist;
+    // TEMP DIAG for the ping-pong (2026-08-28): pid of whatever refused the STRAIGHT step, so the
+    // blocker line is emitted on change instead of every frame. -2 = nothing logged yet.
+    int diag_blocker;
 
     // TEMP DIAG for the "běhalo sem a tam jako pták uličník" report: detects a critter REVERSING --
     // stepping back onto the tile it just left. One reversal is ordinary (the player moved, a path
@@ -375,6 +454,7 @@ typedef struct RtActor {
     float bal_ap;       // ready and in range, but cannot afford the attack
     float bal_approach; // chasing / not in range yet
     float bal_ready;    // nothing stopping it -- should be attacking this frame
+    float bal_breath;   // seconds held in the breather (a SUBSET of bal_approach)
     int bal_attacks;    // attacks it actually committed
     float bal_seen;     // rt_clock when it first entered the fight
 } RtActor;
@@ -513,7 +593,15 @@ static float rt_attack_cooldown_skill_factor = RT_ATTACK_COOLDOWN_SKILL_FACTOR;
 // gaps at 0.36 s, i.e. precisely this value. Symmetric gives STR 1 -> 1.36 s, 5 -> 1.00, 10 ->
 // 0.55: still a 2.5x reward for the stat, without handing the top end a free pass.
 // LESSON: a curve shape is not portable between a cosmetic lever and a balance lever.
-#define RT_ATTACK_COOLDOWN_HIGH_BIAS 1.0f
+// 2026-08-23: LOWERED TO 0.6 and made cfg-tunable, on his report that his own attacks felt too
+// fast. Measured first: his balance row read cd=1.05s with cool=50% ap=0% -- the cooldown was the
+// only thing pacing him, and AP was not gating him at all, so no AP lever could have helped. The
+// 1.05 s was entirely the stat term: STR 10 is five points over average and at a symmetric 0.12
+// that is a 60% cut off the 2.6 s base. The BASE was not wrong (a STR 1 cave rat sat at a perfectly
+// reasonable 4.04 s) -- only the reward at the top of the curve was. Damping just that side takes
+// him to ~1.68 s and leaves every weaker critter untouched.
+#define RT_ATTACK_COOLDOWN_HIGH_BIAS 0.6f
+static float rt_attack_cooldown_high_bias = RT_ATTACK_COOLDOWN_HIGH_BIAS;
 #define RT_ATTACK_COOLDOWN_MIN 0.25f
 // The dude has no RtActor, so his cooldown lives here. Reset with the rest of the session state.
 static float rt_player_next_attack_at = 0.0f;
@@ -644,10 +732,38 @@ static int rt_regen_falloff_tiles = RT_REGEN_FALLOFF_TILES;
 //   moving:   near 0.0  -> far 1.0   (moving INTO contact spends, approaching from range is free)
 // The moving curve is monotonic the other way ON PURPOSE: crossing open ground toward a distant
 // enemy costs you nothing extra, and the closer you get the more moving competes with attacking.
-#define RT_REGEN_NEAR_MULT_MOVING 0.0f // multiplier in contact WHILE MOVING (0 = no regen at all)
+// ⚠️ WAS 0.0f UNTIL 2026-08-29, AND THAT ZERO IS WHAT MADE CAMPING THE DOMINANT STRATEGY.
+// Standing in contact pays 1.4x -- the best regen in the game -- while MOVING in contact paid
+// nothing at all against a full 2.0 AP/s walk cost. The economy was not suggesting you hold still,
+// it was insisting: "vlastne je to docela lehcejsi, staci se zacampit". At 0.4 a repositioning
+// player still loses ground (net about -1.25 AP/s, ~7 s of walking instead of ~4.5) but is no
+// longer earning literally zero, and the stand:move ratio falls from infinity to about 3.5:1.
+// Deliberately partial -- standing is still the better play, this only stops it being the ONLY one.
+#define RT_REGEN_NEAR_MULT_MOVING 0.4f // multiplier in contact WHILE MOVING
 #define RT_REGEN_FAR_MULT_MOVING 1.0f  // multiplier at/beyond the falloff WHILE MOVING
 static float rt_regen_near_mult_moving = RT_REGEN_NEAR_MULT_MOVING;
 static float rt_regen_far_mult_moving = RT_REGEN_FAR_MULT_MOVING;
+
+// THE NPC MOVING CURVE. Same shape as the dude's pair above, deliberately gentler, and it is what
+// replaced the flat clamp-to-1.0 this file carried for one afternoon on 2026-08-29.
+//
+// The problem it fixes: an NPC in motion used to be handed a FLAT 1.0 -- which is the dude's BEST
+// case (his far end) applied at every distance, including standing on top of him. Measured against
+// walk_ap_cost 2.0, a Deathclaw (AGI 10, regen 2.00 AP/s) came out at EXACTLY zero net, so its pool
+// never moved off 8-10 of 10 for a whole fight and the breather could not physically trigger
+// (breath=0%, trace_2026-08-29_151004). That is the "enemy chodi za mnou jako zombici" report.
+//
+// So give them the same SHAPE the dude has -- cheap far away, expensive in contact -- just less
+// steep: 0.5 where his is 0.0. Contact now runs about -1.0 AP/s for a fast critter, so it drains to
+// its reserve in ~6 s and has to stop and breathe.
+//
+// ⚠️ THE FAR END MUST STAY 1.0. That is not a spare tuning knob, it is the guard on
+// trace_2026-08-03_222723: a build that charged NPCs for the WHOLE approach pinned chasing melee
+// critters at their reserve before they ever arrived. Only the near end may be tightened.
+#define RT_NPC_REGEN_NEAR_MULT_MOVING 0.5f // multiplier in contact WHILE MOVING
+#define RT_NPC_REGEN_FAR_MULT_MOVING 1.0f  // at/beyond the falloff -- approach is FREE, keep it so
+static float rt_npc_regen_near_mult_moving = RT_NPC_REGEN_NEAR_MULT_MOVING;
+static float rt_npc_regen_far_mult_moving = RT_NPC_REGEN_FAR_MULT_MOVING;
 
 // Does the moving curve apply to NPCs too? DEFAULT OFF, and that asymmetry is evidence-based,
 // not an oversight -- see the long note at the NPC regen site in rt_update_actor. A build that
@@ -679,6 +795,22 @@ static float rt_walk_ap_drain = 0.0f;
 //
 // rt_speed_mult is re-sampled once per frame at the top of combat_rt_update (not cached at
 // init) so moving the slider takes effect immediately, without a restart.
+// AIMED-SHOT SLOW MOTION. While the on-body limb picker is up (LB held), the world runs at this
+// fraction of normal speed.
+//
+// ⚠️ SLOW, NOT STOPPED, AND THE DIFFERENCE IS THE DESIGN. Every RADIAL wheel -- stimpak, weapon,
+// ammo -- freezes combat outright (see the early return in combat_rt_update): those are inventory
+// decisions, and a pausable tactical game lets you make them with the world held still. Picking a
+// limb is not that. It is an ATTACK being aimed, the shot is about to happen, and holding LB must
+// not become a free tactical timeout you can open whenever the fight turns. So the clock keeps
+// running -- just slowly enough that eight body parts is a real choice instead of a panic.
+//
+// It is also a nerf to what shipped: the freeze checks radial_wheel_is_open() only, and the limb
+// picker is NOT a radial wheel (it is gpui_aim_body_on, drawn on the target itself), so until now
+// aiming ran at FULL speed and you got mauled while choosing.
+#define RT_AIM_SLOWMO 0.25f
+static float rt_aim_slowmo = RT_AIM_SLOWMO;
+
 #define RT_COMBAT_SPEED_AP_MAX 2.0f // AP tempo at slider 50 (1.0 = disable the coupling)
 #define RT_COMBAT_SPEED_SLIDER_MAX 50.0f
 static float rt_combat_speed_ap_max = RT_COMBAT_SPEED_AP_MAX;
@@ -714,9 +846,28 @@ static bool rt_run_blocked = false;
 // entirely. Combat-only (the pool sits full out of combat, so it never latches there).
 static bool rt_move_blocked = false;
 
+// cfg `ap_empty_walks`: what rt_move_blocked MEANS. false (default) = the shipped behaviour, an
+// empty pool stops the dude dead. true = it drops him to a free walk instead, so a fight always
+// has an exit. See the header note on the key, and the deadlock guard at the regen call.
+static bool rt_ap_empty_walks = false;
+
 // Last AP value pushed to the interface bar's AP indicator, so the bulbs are
 // redrawn only when a point is actually spent or regenerated (-1 = never drawn).
 static int rt_last_hud_ap = -1;
+
+// Same, for the movement-blocked latch that turns those bulbs red. It is a SECOND redraw
+// trigger because the latch flips without the AP count changing -- it is set the instant a
+// walk drains the pool to 0 (already 0, so no AP change) and drops the instant the fight
+// ends -- and either edge would otherwise leave the bar the wrong colour until the next
+// regen tick. -1 = never drawn.
+static int rt_last_hud_blocked = -1;
+
+// Same, for the ARMOR CLASS readout. Vanilla only refreshes it on intface_redraw/show or on
+// leaving the inventory, which was fine while the AC bonus was a per-turn constant. Now that the
+// bonus rides on the REAL realtime pool (see combat_rt_critter_ap / stat_level) it moves with
+// every attack and every regen tick, so the number on the bar would be stale nearly all the time.
+// Pushed from here on change only -- same rule as the AP bulbs above. -1 = never drawn.
+static int rt_last_hud_ac = -1;
 
 // Follow-cam: the dude is pinned to screen center by centering on his tile and
 // shifting the view by the negative of his sub-tile walk offset (obj->x/y), so
@@ -752,6 +903,33 @@ static int rt_cam_last_off_y = 0;
 // direction. The screen<->hex alignment itself lives in sectorToRotation; this
 // just lets you nudge the feel. 0 = aligned.
 #define RT_GAMEPAD_ANGLE_OFFSET 0.0f
+
+// DOORWAY MAGNET. Six hex directions vs a 360-degree stick: aim one sector wrong and you slide
+// along the wall instead of through the gap. Doorways are the one place that really hurts, because
+// the opening is a SINGLE tile and there is no second chance -- you scrape past and have to back up.
+//
+// The assist bends the stick ANGLE toward a nearby doorway before it is bucketed into a sector. It
+// never moves the dude and never picks a destination: if the bent angle still lands in the sector
+// the player asked for, nothing at all changes. All it does is decide which side of a sector
+// boundary a near-miss falls on -- which is exactly the failure.
+#define RT_DOOR_MAGNET_TILES 4    // beyond this a door does not pull at all
+#define RT_DOOR_MAGNET_CONE 45.0f // and only within this many degrees of where the stick points
+#define RT_DOOR_MAGNET_MAX 4      // nearby doorways tracked at once
+
+// Strength, 0..1, from cfg door_magnet. 0 = off, 1 = the stick snaps straight at the doorway.
+static float rt_door_magnet = 0.7f;
+
+// Crowd assist, from cfg npc_slide. See rt_bystander_blocks / the slide block in
+// combat_rt_poll_gamepad.
+static bool rt_npc_slide = true;
+
+
+// Doorway tiles near the dude. Rebuilt only when he changes tile -- the set cannot change while he
+// stands still, and obj_create_list over every scenery object is not something to run per frame.
+static int rt_door_tiles[RT_DOOR_MAGNET_MAX];
+static int rt_door_count = 0;
+static int rt_door_cache_tile = -1;
+static int rt_door_cache_elev = -1;
 
 // Stick movement registers walk paths of this many tiles and seamlessly chains
 // the next segment one tile before the current one runs out, so holding the
@@ -806,13 +984,11 @@ struct RtInFlight {
     int playerApCost;    // >0 only for the DUDE's attack: AP to charge at commit, not at fire (so
                          // the pool drops when the swing lands ~half-anim in, not on button press)
 
-    // TEMP DIAG (fire-timing, 2026-08-10): the timeline of ONE attack, sampled each frame by the
-    // commit loop and emitted as a single [COMBAT/fire-time] line at commit. This exists to answer
-    // "does the hit land too late now?" with numbers instead of feel -- it is the measurement the
-    // projectile change asked for. Seconds since `started`, -1 = not reached yet.
-    // STRIP together with the other move/react diags once ranged timing is settled.
+    // Edges of the attacker's swing pose, in seconds since started (-1 = not reached yet).
+    // Load-bearing for THROWN weapons: their commit waits for the firing pose to END (poseEnded in
+    // the resolve loop), and tAnimStart must have been seen first, or a throw whose animation never
+    // registered would read as "pose already over" on frame one.
     float tAnimStart;    // the attacker's fid first became a real ATTACK pose
-    float tAction;       // its frame first reached the art's action frame (the visible discharge)
     float tAnimEnd;      // it left the attack pose (recoil/UNPOINT, or the projectile's flight)
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
@@ -896,6 +1072,10 @@ static float rt_dude_flinch_time = 0.0f;
 // rt_clock when the dude's knockdown fall finished (down and idle). Holds the same
 // RT_KNOCKDOWN_DWELL_SECONDS beat as the per-NPC prone_since before he stands up. -1 = not waiting.
 static float rt_dude_prone_since = -1.0f;
+
+// The dude's counterpart to prone_fall_end: when his fall finished, never restarted by a hit. Runs
+// the hard ground cap. -1 = not down.
+static float rt_dude_prone_fall_end = -1.0f;
 
 // Seconds since the last movement input. Reset to 0 each time the dude is fed a
 // direction (rt_player_move / rt_stick_move); incremented by dt each update. Under
@@ -989,6 +1169,30 @@ static void rt_note_result_change(Object* obj, int prev, int cur)
     int gained = cur & ~prev;
     if (gained == 0) {
         return;
+    }
+
+    // CRIPPLES AND BLINDNESS, traced the instant they land. They are NOT part of the rt_last_event
+    // digest below -- that names the one headline thing that happened to a critter, and a lost limb
+    // must not shadow the death that follows it. This is its own line for its own question.
+    //
+    // ⚠️ WITHOUT THIS THE WHOLE CRIPPLE SYSTEM IS INVISIBLE. The player asked the obvious question
+    // after shooting a Deathclaw's leg -- did it actually walk slower? -- and there was no way to
+    // answer it: STATE/critter carries no cripple bits, and rt_walk.log is emitted inside
+    // walk_dir_slowdown, which runs BEFORE the limp multiplier is applied at the call site. Two
+    // separate blind spots over the same mechanic. This closes the first; the crip= column added to
+    // rt_walk.log closes the second.
+    {
+        int crip = gained & (DAM_CRIP_LEG_LEFT | DAM_CRIP_LEG_RIGHT | DAM_CRIP_ARM_LEFT | DAM_CRIP_ARM_RIGHT | DAM_BLIND);
+        if (crip != 0 && obj != NULL) {
+            int nowFlags = cur;
+            int legs = (((nowFlags & DAM_CRIP_LEG_LEFT) != 0) ? 1 : 0) + (((nowFlags & DAM_CRIP_LEG_RIGHT) != 0) ? 1 : 0);
+            trace_event(TRACE_COMBAT, "cripple",
+                "pid=%d id=%d dude=%d legL=%d legR=%d armL=%d armR=%d blind=%d legsNow=%d t=%.2f",
+                obj->pid, obj->id, obj == obj_dude ? 1 : 0,
+                (crip & DAM_CRIP_LEG_LEFT) != 0 ? 1 : 0, (crip & DAM_CRIP_LEG_RIGHT) != 0 ? 1 : 0,
+                (crip & DAM_CRIP_ARM_LEFT) != 0 ? 1 : 0, (crip & DAM_CRIP_ARM_RIGHT) != 0 ? 1 : 0,
+                (crip & DAM_BLIND) != 0 ? 1 : 0, legs, rt_clock);
+        }
     }
 
     const char* what = NULL;
@@ -1259,12 +1463,48 @@ static bool rt_hand_holds_weapon(Object* critter)
 // Falling back to PUNCH is the right answer and not a consolation prize: rt_ensure_weapon_drawn
 // runs first and will have pulled a real weapon out of the pack if he owns one, so reaching here
 // means he genuinely has nothing but his fists -- which is exactly what vanilla's AI does with him.
+// True if this critter's CURRENT fid can actually play the attack animation for `hitMode`.
+//
+// ⚠️ A critter's fid carries a weapon animation code in bits 12-15 (art.h: 1 = knife 'd',
+// 6 = SMG 'i', ...) and the attack art file is built from THAT code, not from the weapon in
+// the hand -- both action_melee and register_object_animate use `(owner->fid & 0xF000) >> 12`.
+// When the two disagree the engine asks for an art that was never drawn: art_ptr_lock fails,
+// anim_preload calls anim_cleanup, the whole transaction is torn down, register_end returns -1
+// and combat_attack reports -1 with NOTHING logged anywhere. Silently, forever, every frame.
+//
+// MEASURED (trace_2026-08-23_155712, Lorenzo, proto 120): fid 0100602d = weapon code 6 = SMG,
+// art letter 'i', while item_w_range on his actual weapon is 1 (a melee item). NMMAXX has
+// IA/IB/IC/ID/IE/IH/II/IJ/IK but NO **IF** (thrust) and no **IG** (swing) -- an SMG does not
+// stab -- so all 642 of his attacks in that fight died in anim_preload. He walked up to the
+// player, failed to swing, stepped back, and did it again: the "he just paces" report.
+//
+// Vanilla asks the same question in ai_can_use_weapon (combatai.cc) before it lets the AI pick
+// a weapon at all, and refusing the weapon (-> PUNCH) is exactly what it does on a miss.
+static bool rt_attack_art_ok(Object* critter, int hitMode)
+{
+    Object* weapon = item_hit_with(critter, hitMode);
+    if (weapon == NULL) {
+        return false;
+    }
+
+    int fid = art_id(OBJ_TYPE_CRITTER,
+        critter->fid & 0xFFF,
+        item_w_anim_weap(weapon, hitMode),
+        (critter->fid & 0xF000) >> 12,
+        critter->rotation + 1);
+
+    return art_exists(fid);
+}
+
 static int rt_hit_mode(Object* critter)
 {
-    if (rt_hand_holds_weapon(critter)) {
+    if (rt_hand_holds_weapon(critter) && rt_attack_art_ok(critter, HIT_MODE_RIGHT_WEAPON_PRIMARY)) {
         return HIT_MODE_RIGHT_WEAPON_PRIMARY;
     }
 
+    // Either nothing to fight with, or the weapon it holds has no attack art for the body it
+    // is wearing. Fists always do (ANIM_THROW_PUNCH resolves to the 'a' art set every biped
+    // ships with), so punching is the difference between a fight and a critter pacing forever.
     return HIT_MODE_PUNCH;
 }
 
@@ -1275,6 +1515,72 @@ static int rt_hit_mode(Object* critter)
 // drawing and shooting. We only run the inventory search + take-out animation once
 // per engagement (weapon_checked latch), and only while the NPC is idle so the
 // wield's register_begin/register_end doesn't stomp an in-progress animation.
+// Re-stamps the critter's weapon POSE (fid bits 12-15) from the weapon it is actually holding.
+//
+// The engine keeps those in sync through inven_wield -> register_object_take_out, which is a
+// REGISTERED animation: it only lands if a transaction is open and survives to play. Anything
+// that puts an item in a hand without that -- a script, a load, a wield whose sequence was
+// cleared -- leaves the pose behind, and a pose that disagrees with the hand means every attack
+// animation is looked up under the wrong art letter (see rt_attack_art_ok).
+//
+// Deliberately conservative: only while the critter is idle (changing the fid under a running
+// animation swaps the art out from under it), only for the STAND pose, and only if the new fid
+// and its attack art BOTH exist -- otherwise leave the pose alone and let rt_hit_mode fall back
+// to fists rather than trade a broken attack for an invisible critter.
+// Defined further down (next to the other animation helpers); needed here for the wield.
+static bool rt_register_begin(int requestOptions, const char* where);
+
+// Returns TRUE once the pose is settled -- either it already matched, or it was just
+// re-stamped. FALSE means "ask again next frame": the critter was mid-animation, which is most
+// of a chase, and latching on that would leave the pose wrong for the whole fight.
+static bool rt_sync_weapon_fid(Object* npc)
+{
+    if (npc == NULL) {
+        return true;
+    }
+
+    // Changing the fid under a running animation swaps the art out from under it, and during a
+    // chase the anim type is WALK/RUN rather than STAND. Retry, do not give up.
+    if (anim_busy(npc) != 0 || FID_ANIM_TYPE(npc->fid) != ANIM_STAND) {
+        return false;
+    }
+
+    Object* weapon = inven_right_hand(npc);
+    int want = (weapon != NULL && item_get_type(weapon) == ITEM_TYPE_WEAPON)
+        ? item_w_anim_code(weapon)
+        : 0;
+    int have = (npc->fid & 0xF000) >> 12;
+    if (want == have) {
+        return true; // already holding the pose its weapon belongs to
+    }
+
+    int standFid = art_id(OBJ_TYPE_CRITTER, npc->fid & 0xFFF, ANIM_STAND, want, npc->rotation + 1);
+    if (!art_exists(standFid)) {
+        return true; // nothing better exists -- settle for what it has, PUNCH covers the attack
+    }
+
+    if (want != 0) {
+        int attackFid = art_id(OBJ_TYPE_CRITTER,
+            npc->fid & 0xFFF,
+            item_w_anim_weap(weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY),
+            want,
+            npc->rotation + 1);
+        if (!art_exists(attackFid)) {
+            return true; // the pose it wants can't swing either -- rt_hit_mode will use fists
+        }
+    }
+
+    Rect rect;
+    if (obj_change_fid(npc, standFid, &rect) != 0) {
+        return false; // retry next frame
+    }
+
+    tile_refresh_rect(&rect, npc->elevation);
+    trace_event(TRACE_FLOW, "weapon-pose", "id=%d pid=%d have=%d want=%d wpn=%d t=%.2f",
+        npc->id, npc->pid, have, want, weapon != NULL ? weapon->pid : -1, rt_clock);
+    return true;
+}
+
 static void rt_ensure_weapon_drawn(RtActor* a)
 {
     if (a->weapon_checked) {
@@ -1287,26 +1593,46 @@ static void rt_ensure_weapon_drawn(RtActor* a)
     // with a plain non-NULL check a critter holding a non-weapon (Morbid's First Aid Kit) latched
     // weapon_checked here on frame one, so the inventory search below never ran and he was left
     // "armed" with an item that has no range and no AP cost. See rt_hit_mode.
-    if (rt_hand_holds_weapon(npc)) {
-        a->weapon_checked = true;
-        return;
-    }
-
-    // Don't cut into a running animation; retry next frame once idle.
+    // Don't cut into a running animation; retry next frame once idle. Checked BEFORE the
+    // hand test, because everything below (the wield and the pose stamp alike) needs an idle
+    // critter, and latching while it walks would settle for whatever it happened to hold.
     if (anim_busy(npc) != 0) {
         return;
     }
 
-    // check_action_points = 0: pick the best weapon it owns regardless of the engine
-    // AP field (combat_rt runs its own AP pool). Returns the best usable weapon still
-    // in inventory, or NULL if it has none (stays unarmed -> PUNCH).
-    Object* best = ai_search_inven(npc, 0);
-    if (best != NULL) {
-        inven_wield(npc, best, 1);
-        trace_event(TRACE_FLOW, "draw-weapon", "npc pid=%d", npc->pid);
+    // ⚠️ HOLDING *A* WEAPON IS NOT THE SAME AS HOLDING ITS *BEST* ONE, and the old code stopped
+    // at the former. Lorenzo (proto 120) carries a 10mm SMG **and** a Knife, and the map puts the
+    // KNIFE in his hand -- so he closed to melee range and stabbed, with a submachine gun in his
+    // pack, because the check was only "is there a weapon in the hand?". Vanilla never settles
+    // for that: every AI turn runs ai_switch_weapons -> ai_search_inven -> ai_best_weapon, which
+    // prefers RANGED over melee and the pricier of two of a kind.
+    //
+    // ai_search_inven skips whatever is already held, so it returns the best OTHER weapon; the
+    // ai_best_weapon comparison against the held one decides whether swapping is actually an
+    // upgrade. check_action_points = 0: combat_rt runs its own AP pool, so the engine AP field
+    // must not veto the choice.
+    Object* held = rt_hand_holds_weapon(npc) ? inven_right_hand(npc) : NULL;
+    Object* candidate = ai_search_inven(npc, 0);
+
+    if (candidate != NULL && ai_best_weapon(held, candidate) == candidate) {
+        // Inside a transaction of our own: inven_wield stamps the new weapon POSE through
+        // register_object_take_out, which is a registered animation and silently does nothing
+        // when no transaction is open -- that leaves the item in the hand and the body still
+        // posed for the old one, which is exactly the mismatch that kills every attack
+        // (see rt_attack_art_ok). Bare inven_wield was how this code called it before.
+        if (rt_register_begin(ANIMATION_REQUEST_RESERVED, "wield")) {
+            inven_wield(npc, candidate, 1);
+            register_end();
+            trace_event(TRACE_FLOW, "draw-weapon", "npc pid=%d wpn=%d held=%d t=%.2f",
+                npc->pid, candidate->pid, held != NULL ? held->pid : -1, rt_clock);
+        }
+        return; // let the take-out play; the pose is re-checked next frame
     }
 
-    a->weapon_checked = true;
+    // Nothing better to switch to. The hand may still disagree with the BODY, though -- the pose
+    // carries its own weapon code and a stale one asks for art nobody drew. Latch only once that
+    // is settled.
+    a->weapon_checked = rt_sync_weapon_fid(npc);
 }
 
 // The AP an actor must pay to attack in the given hit mode (its original Fallout
@@ -1361,7 +1687,7 @@ static float rt_attack_cooldown(Object* attacker, int hitMode)
     // Same shape as ANIM_ATTACK_STAT_HIGH_BIAS: points above average are worth more, points below
     // average keep the plain factor so a weak character is not punished twice over.
     int delta = stat_level(attacker, stat) - 5;
-    float factor = delta > 0 ? rt_attack_cooldown_stat_factor * RT_ATTACK_COOLDOWN_HIGH_BIAS
+    float factor = delta > 0 ? rt_attack_cooldown_stat_factor * rt_attack_cooldown_high_bias
                              : rt_attack_cooldown_stat_factor;
     float cd = rt_attack_cooldown_base * (1.0f - delta * factor);
 
@@ -1586,6 +1912,11 @@ static void rt_missing_art_scan()
         if (FID_TYPE(obj->fid) != OBJ_TYPE_CRITTER || obj == obj_dude) {
             continue;
         }
+        // Staged content is not missing art, it is simply not shown yet -- warning about it would
+        // be pure noise.
+        if ((obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
         if (art_exists(obj->fid)) {
             continue;
         }
@@ -1649,6 +1980,7 @@ static void rt_balance_begin()
     for (int i = 0; i < rt_actor_count; i++) {
         RtActor* a = &rt_actors[i];
         a->bal_busy = a->bal_cooldown = a->bal_ap = a->bal_approach = a->bal_ready = 0.0f;
+        a->bal_breath = 0.0f;
         a->bal_attacks = 0;
         a->bal_seen = rt_clock;
     }
@@ -1687,9 +2019,11 @@ static void rt_balance_report()
         return; // too short to mean anything
     }
 
-    trace_event(TRACE_COMBAT, "balance", "=== fight %.1fs | levers: ap_regen=%.2f agiF=%.2f near=%.2f far=%.2f cd=%.2f cdF=%.2f cdSkillF=%.2f",
+    trace_event(TRACE_COMBAT, "balance", "=== fight %.1fs | levers: ap_regen=%.2f agiF=%.2f near=%.2f far=%.2f nearMov=%.2f farMov=%.2f npcNearMov=%.2f npcFarMov=%.2f cd=%.2f cdF=%.2f cdSkillF=%.2f",
         span, rt_ap_regen_seconds, rt_ap_regen_agility_factor,
         rt_regen_near_mult, rt_regen_far_mult,
+        rt_regen_near_mult_moving, rt_regen_far_mult_moving,
+        rt_npc_regen_near_mult_moving, rt_npc_regen_far_mult_moving,
         rt_attack_cooldown_base, rt_attack_cooldown_stat_factor,
         rt_attack_cooldown_skill_factor);
 
@@ -1700,9 +2034,10 @@ static void rt_balance_report()
             t = 0.01f;
         }
         trace_event(TRACE_COMBAT, "balance",
-            "DUDE str=%d per=%d agi=%d skill=%d maxAp=%d regen=%.2fs cd=%.2fs atk=%d | busy=%.0f%% cool=%.0f%% ap=%.0f%% approach=%.0f%% ready=%.0f%%",
+            "DUDE str=%d per=%d agi=%d seq=%d skill=%d maxAp=%d regen=%.2fs cd=%.2fs atk=%d | busy=%.0f%% cool=%.0f%% ap=%.0f%% approach=%.0f%% ready=%.0f%%",
             stat_level(obj_dude, STAT_STRENGTH), stat_level(obj_dude, STAT_PERCEPTION),
             stat_level(obj_dude, STAT_AGILITY),
+            stat_level(obj_dude, STAT_SEQUENCE),
             item_w_skill_level(obj_dude, rt_player_hit_mode()),
             stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS),
             rt_regen_interval(obj_dude), rt_attack_cooldown(obj_dude, rt_player_hit_mode()),
@@ -1719,16 +2054,18 @@ static void rt_balance_report()
             continue; // never really joined in
         }
         trace_event(TRACE_COMBAT, "balance",
-            "NPC pid=%d %s str=%d per=%d agi=%d skill=%d maxAp=%d regen=%.2fs cd=%.2fs atk=%d hp=%d in=%.0fs | busy=%.0f%% cool=%.0f%% ap=%.0f%% approach=%.0f%% ready=%.0f%%",
+            "NPC pid=%d %s str=%d per=%d agi=%d seq=%d skill=%d maxAp=%d regen=%.2fs cd=%.2fs atk=%d hp=%d in=%.0fs | busy=%.0f%% cool=%.0f%% ap=%.0f%% approach=%.0f%% ready=%.0f%% breath=%.0f%%",
             a->obj->pid, object_name(a->obj),
             stat_level(a->obj, STAT_STRENGTH), stat_level(a->obj, STAT_PERCEPTION),
             stat_level(a->obj, STAT_AGILITY),
+            stat_level(a->obj, STAT_SEQUENCE),
             item_w_skill_level(a->obj, rt_hit_mode(a->obj)),
             stat_level(a->obj, STAT_MAXIMUM_ACTION_POINTS),
             rt_regen_interval(a->obj), rt_attack_cooldown(a->obj, rt_hit_mode(a->obj)),
             a->bal_attacks, a->obj->data.critter.hp, t,
             100.0f * a->bal_busy / t, 100.0f * a->bal_cooldown / t,
-            100.0f * a->bal_ap / t, 100.0f * a->bal_approach / t, 100.0f * a->bal_ready / t);
+            100.0f * a->bal_ap / t, 100.0f * a->bal_approach / t, 100.0f * a->bal_ready / t,
+            100.0f * a->bal_breath / t);
     }
 
     rt_bal_start = -1.0f;
@@ -1828,9 +2165,18 @@ static float rt_proximity_regen_mult(int dist, bool moving, bool movingCurve)
         return 1.0f;
     }
 
+    // THREE curves, not two. `movingCurve` says whether THIS critter uses the dude's moving pair
+    // (the dude always; NPCs only under cfg regen_moving_npc=1). Anyone else who is MOVING now gets
+    // the NPC moving pair rather than the standing one -- that is the whole fix: a walking NPC used
+    // to be scored on the STANDING curve and then floored at 1.0, which handed it the contact BONUS
+    // for walking circles around the player.
     bool useMovingCurve = moving && movingCurve;
-    float nearMult = useMovingCurve ? rt_regen_near_mult_moving : rt_regen_near_mult;
-    float farMult = useMovingCurve ? rt_regen_far_mult_moving : rt_regen_far_mult;
+    bool useNpcMovingCurve = moving && !movingCurve;
+
+    float nearMult = useMovingCurve ? rt_regen_near_mult_moving
+        : (useNpcMovingCurve ? rt_npc_regen_near_mult_moving : rt_regen_near_mult);
+    float farMult = useMovingCurve ? rt_regen_far_mult_moving
+        : (useNpcMovingCurve ? rt_npc_regen_far_mult_moving : rt_regen_far_mult);
 
     float mult;
     float span = (float)rt_regen_falloff_tiles - 1.0f;
@@ -1846,18 +2192,21 @@ static float rt_proximity_regen_mult(int dist, bool moving, bool movingCurve)
         mult = farMult + (nearMult - farMult) * t;
     }
 
-    // THE OLD ONE-SIDED FLOOR, still the rule for anyone NOT on the moving curve (NPCs, by
-    // default). Distance alone cannot tell "I am kiting / sniping from range" apart from "I am
-    // WALKING TO the fight", and the first build of proximity regen punished both: crossing a
-    // room at 0.86 AP/s regen against a 2.0 AP/s walk cost is ~8s of walking then a ~6s forced
-    // stop, over and over. Flooring at 1.0 while moving fixes that while keeping the CONTACT
-    // BONUS, so a charging melee critter still arrives with a pool. The moving curve above
-    // replaces this wholesale: it keeps the free approach (far end 1.0) but drops the contact
-    // bonus to 0, which is the "either you move or you attack" trade the floor could not express.
-    if (moving && !movingCurve && mult < 1.0f) {
-        mult = 1.0f;
-    }
-
+    // NO FLOOR AND NO CLAMP ANY MORE -- the NPC moving curve above expresses both intents directly.
+    //
+    // What used to be here: a one-sided floor pushing a moving NPC's multiplier UP to 1.0, so that
+    // crossing a room to reach the fight was never punished (the first proximity-regen build made
+    // approach cost -1.14 AP/s net and produced ~8 s of walking followed by a ~6 s forced stop, on
+    // repeat). That intent is now the FAR END of the NPC moving curve, which is 1.0 by definition.
+    //
+    // What was briefly bolted on beside it: a matching clamp DOWN to 1.0, because the floor left a
+    // moving critter still being scored on the STANDING curve, collecting the 1.4x contact bonus
+    // for walking circles around the player -- 2.1 AP/s earned against 2.0 spent, a net GAIN. That
+    // intent is now the NEAR END of the same curve, and at 0.5 it goes further than the clamp could:
+    // the clamp could only reach break-even, which still means "never runs out".
+    //
+    // One curve, two ends, both tunable -- instead of a curve plus two corrections pulling against
+    // each other.
     return mult;
 }
 
@@ -1940,6 +2289,34 @@ static int rt_attack_reserve_ap(Object* npc)
 // How far above the attack reserve an NPC's pool must climb before it may sprint AGAIN. This is
 // the NPC counterpart of the dude's rt_run_resume_ap and it is what makes the sprint a BURST.
 #define RT_NPC_RUN_RESUME_MARGIN 3
+
+// BREATHER: the NPC counterpart of the dude's rt_move_blocked. When the pool is down to the
+// one-attack reserve the critter STANDS instead of walking, until it has banked this much AP
+// on top of the reserve. That is the whole point -- it stops with something in hand, so a
+// shooter that pauses can open fire the moment you step out.
+#define RT_NPC_BREATHER_MARGIN 3
+static int rt_npc_breather_margin = RT_NPC_BREATHER_MARGIN;
+
+// ⚠️ THE HARD CAP, AND THE REASON THIS IS SAFE TO SHIP AT ALL. Every previous attempt at
+// stopping an NPC re-created the "enemy runs up and just looks at me" bug, so no pause here is
+// allowed to be open-ended: past this many seconds the latch drops whatever the pool says. The
+// worst a mistake in the latch can then cause is hesitation, never a frozen chaser.
+#define RT_NPC_BREATHER_MAX_SECONDS 3.0f
+static float rt_npc_breather_max = RT_NPC_BREATHER_MAX_SECONDS;
+
+// ⚠️ HOW CLOSE YOU MUST BE TO BE ALLOWED TO STOP. Was RT_PREFERRED_ENGAGE_TILES (8) and that
+// was far too generous. Measured on a Ghoul (AGI 6, maxAp 8, reserve 5) at 6 tiles: walking nets
+// -0.85 AP/s, so it drains 8->5 in 3.5 s, then stands 1.8 s to climb back -- a third of the
+// approach spent standing still, in a visible walk/stop/walk stutter. "skubali se a nepshlo mi
+// ze by se zas tak moc hejbali."
+//
+// And the pause bought nothing. A critter in CHASE cannot attack by definition (if it could it
+// would be in RT_ATTACK), so banking AP mid-field only delays its arrival -- and the ATTACK
+// RESERVE already guarantees it turns up able to swing. At 2 tiles the pause finally means
+// something readable: it is gathering itself right before it reaches you, not stalling in the
+// open. See the open question in the notes -- this may want to be 0 (feature off) instead.
+#define RT_NPC_BREATHER_TILES 2
+static int rt_npc_breather_tiles = RT_NPC_BREATHER_TILES;
 
 // True while a chasing NPC can still afford to SPRINT.
 //
@@ -2295,7 +2672,26 @@ static void rt_cancel_flinch_for_move(Object* critter)
 // (rt_resolve_attacks) has no reaction gate at all.
 static bool rt_is_heavy_reaction(Object* critter)
 {
-    return rt_is_reacting(critter) && !rt_is_cancelable_reaction(critter);
+    // ⚠️ THE FID IS NOT ENOUGH ON ITS OWN. rt_is_reacting reads FID_ANIM_TYPE, so it only sees a
+    // knockdown once the fall is actually PLAYING -- and action_defender_reaction registers the fall
+    // a few frames before its first frame renders. In that window the critter is flagged
+    // DAM_KNOCKED_DOWN but still standing, and this predicate answered "no heavy reaction".
+    //
+    // Its one caller is rt_play_hit_react, whose next act is anim_force_clear(defender). So a second
+    // hit landing inside that window CUT THE QUEUED FALL and played a standing flinch instead: the
+    // knockdown SFX still fired (it rides the attacker's sequence, actions.cc:374) but the fall was
+    // never seen -- "mel bych padat, nicmene nepadam, slysim jen zvuk".
+    //
+    // The evidence is in the standup diag: trace_2026-08-29_163935 logged `fall=14 su=36` twice,
+    // i.e. the standup pass found the dude's fid on ANIM_HIT_FROM_FRONT while he was still flagged
+    // prone, so it stood him up from a pose he should never have been in.
+    //
+    // rt_death_just_registered is exactly the shield for this window and already covers knockdowns:
+    // it is armed for every `heavyReaction`, which is DAM_DEAD | KNOCKED_DOWN | KNOCKED_OUT |
+    // ON_FIRE, not deaths alone (the name predates the knockdown case). Reusing it here rather than
+    // adding a second grace list keeps one source of truth for "a fall is queued but not started".
+    return (rt_is_reacting(critter) && !rt_is_cancelable_reaction(critter))
+        || rt_death_just_registered(critter);
 }
 
 // True for an animation that ONLY plays when a critter DIES -- the gib/blood/burned/
@@ -2476,6 +2872,28 @@ static void rt_play_hit_react(Object* attacker, Object* defender)
 // True if a knocked-down critter is resting prone and idle, so it can be stood
 // back up (its fall animation has finished and it isn't dead/out/skipping). Used
 // by the defensive-standup passes for both the NPCs and the dude.
+// True when a critter resting prone has waited long enough to get up: either its dwell ran out (the
+// normal path) or the hard ground cap expired (the anti-pin backstop, see RT_KNOCKDOWN_GROUND_CAP).
+// `proneSince` is the dwell clock, restarted by every damaging hit; `fallEnd` is when the fall
+// finished and is NEVER restarted, which is what makes the cap a real ceiling. `capped` reports
+// which of the two fired, for the trace.
+static bool rt_prone_ready_to_stand(float proneSince, float fallEnd, bool* capped)
+{
+    *capped = false;
+
+    if (rt_clock - proneSince >= rt_knockdown_dwell) {
+        return true;
+    }
+
+    if (rt_knockdown_ground_cap > 0.0f && fallEnd >= 0.0f
+        && rt_clock - fallEnd >= rt_knockdown_ground_cap) {
+        *capped = true;
+        return true;
+    }
+
+    return false;
+}
+
 static bool rt_needs_standup(Object* critter)
 {
     // NOTE: intentionally NOT gated on DAM_LOSE_TURN. Every knockdown sets that flag
@@ -3211,6 +3629,53 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     // there's no cooldown-derived slow-down to apply.
     int rc = combat_attack(attacker, defender, hitMode, hitLocation);
 
+    // THE "ENEMY NEVER ACTUALLY ATTACKS" DEADLOCK.
+    //
+    // combat_attack's first act is action_attack -> `register_clear(attacker) == -2 -> -1`, and
+    // register_clear refuses on ANY live PRIORITIZED sequence that merely MENTIONS the attacker.
+    // anim_busy() does not agree with it: anim.cc:800 makes anim_busy skip a length-1 ANIM_STAND
+    // sequence outright. So an actor can read "not busy" by every test we have and still be
+    // refused by register_clear, every single frame, with nothing to show for it.
+    //
+    // Traced live (trace_2026-08-22_204421): a hostile next to the dude produced 54 consecutive
+    // `attack-fail rc=-1 defBusy=0 atkBusy=0 atkBlk=0 dist=1 range=1 oor=0` over 17 seconds --
+    // combat running, enemy adjacent, and not one swing, sound or hit. From the player's side the
+    // fight simply does not happen.
+    //
+    // So: if the engine refused while every busy-test says the attacker is idle, the blocker is a
+    // sequence he does not actually owe anything to. Force it out and try once more. Guarded to an
+    // attacker that is genuinely idle and neither prone nor dead -- a dying critter's prioritized
+    // sequence is its OWN death and carries the show_death callback, which anim_force_clear would
+    // flush early (that is the "corpse floating in the air" bug, see rt_settle_corpse_flat).
+    if (rc != 0 && anim_busy(attacker) == 0 && !critter_is_prone(attacker) && !critter_is_dead(attacker)) {
+        // Two different things can be wrong, and they need opposite fixes -- so check the
+        // GLOBAL gate first. register_begin refuses outright while a register_begin
+        // transaction is still open, and that state is not per-actor: it kills every attack
+        // in the game at once, for the dude and every NPC alike. Which is exactly what the
+        // trace showed after a mid-session load -- 196 DUDE and 544 NPC failures with the
+        // animation table nearly EMPTY (animOcc 0..2/64) and every busy-test at zero.
+        // loadsave.cc calls neither anim_stop() nor anim_reset(), so an open transaction
+        // survives the load and nothing ever closes it.
+        int openTx = -1;
+        int inStop = 0;
+        anim_debug_gate(&openTx, &inStop);
+
+        if (openTx != -1 && anim_discard_open_transaction()) {
+            trace_event(TRACE_WARN, "anim-tx-stuck", "discarded set=%d inStop=%d t=%.2f",
+                openTx, inStop, rt_clock);
+        } else {
+            // Per-actor blocker instead: a sequence the attacker owes nothing to. anim_busy
+            // skips a length-1 ANIM_STAND sequence (anim.cc) while register_clear does not,
+            // so an actor can read idle and still be refused.
+            anim_force_clear(attacker);
+        }
+
+        rc = combat_attack(attacker, defender, hitMode, hitLocation);
+        trace_event(TRACE_WARN, "attack-unblock", "%s->pid=%d rc=%d openTx=%d inStop=%d t=%.2f",
+            attacker == obj_dude ? "DUDE" : "NPC",
+            defender != NULL ? defender->pid : -1, rc, openTx, inStop, rt_clock);
+    }
+
     if (rc == 0) {
         trace_event(TRACE_COMBAT, "attack", "%s aid=%d ->pid=%d did=%d hm=%d t=%.2f",
             attacker == obj_dude ? "DUDE" : "NPC", attacker != NULL ? attacker->id : -1,
@@ -3253,8 +3718,7 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     f->defender = defender;
     f->started = rt_clock;
     f->playerApCost = 0; // set by the player-fire path; NPC attacks charge at fire as before
-    f->tAnimStart = -1.0f; // TEMP DIAG (fire-timing)
-    f->tAction = -1.0f;
+    f->tAnimStart = -1.0f;
     f->tAnimEnd = -1.0f;
     combat_clear_pending_attack();
 
@@ -3311,7 +3775,33 @@ static bool rt_dude_is_fidgeting()
 // registers (rt_stand_up clears the flag and moves him to anim 36/37, outside the prone range).
 static bool rt_dude_incapacitated()
 {
-    return obj_dude != NULL && critter_is_prone(obj_dude);
+    if (obj_dude == NULL) {
+        return false;
+    }
+
+    if (critter_is_prone(obj_dude)) {
+        return true;
+    }
+
+    // ⚠️ THE STANDUP ANIMATION ITSELF IS NOT COVERED BY critter_is_prone (2026-08-24).
+    //
+    // critter_is_prone is `DAM_KNOCKED_* flag || anim in FIRST..LAST_KNOCKDOWN_AND_DEATH_ANIM
+    // (20..35)`. rt_stand_up clears DAM_KNOCKED_DOWN on the SAME frame it registers the animation,
+    // and ANIM_BACK_TO_STANDING (37) / ANIM_PRONE_TO_STANDING (36) sit OUTSIDE that range -- so the
+    // gate fell open the instant the getting-up started, while it still had its whole run to play.
+    //
+    // Measured (trace_2026-08-24_194502): standup registered at s=19.78 (rcA=0, anim 37 frame 0 at
+    // s=19.80), the player nudged the stick at s=19.83, and by s=20.20 he was at anim=0 with no
+    // sequence at all. The walk segment replaced the standup and the stick-stop then cancelled the
+    // walk, so the animation never played -- his report was "no getting-up animation, he was just
+    // suddenly standing". Same hole the note in rt_resolve_attacks describes for ENEMIES not
+    // waiting a standup out; this is its other half, on the player's own input.
+    //
+    // Keeping the gate shut for the ~0.9 s of the animation is also what the fall/dwell block above
+    // is for: the point of a knockdown is that you cannot act through it.
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    return (anim == ANIM_BACK_TO_STANDING || anim == ANIM_PRONE_TO_STANDING)
+        && anim_busy(obj_dude) != 0;
 }
 
 static void rt_player_move(int rotation)
@@ -3328,7 +3818,11 @@ static void rt_player_move(int rotation)
 
     // Out of AP: movement is stopped until the pool regenerates to the resume threshold
     // (rt_move_blocked, set in the drain block). Standing recharges it. Combat-only.
-    if (rt_move_blocked) {
+    //
+    // Under ap_empty_walks the latch means "walk only" instead of "stop", and the keyboard path is
+    // walk-only and free to begin with -- so there is nothing left to refuse here and the input
+    // goes through.
+    if (rt_move_blocked && !rt_ap_empty_walks) {
         return;
     }
 
@@ -3590,6 +4084,46 @@ static void rt_stick_stop()
     }
 }
 
+// CANCEL WHATEVER THE PLAYER IS PART-WAY THROUGH. Returns true if there was something to cancel,
+// so the caller can swallow the button's other meaning only when it actually did something.
+//
+// The case it exists for: A on a distant object registers a WALK-THERE-THEN-ACT sequence (that is
+// how every vanilla action works -- action_use_an_object and friends walk you into reach first), and
+// once it is running there was no way to change your mind. The user clicked A, watched the dude set
+// off across the map, and had no brake -- "chtěl jsem zrušit akci a nešlo to".
+//
+// anim_clear_pending kills the whole registered sequence, trailing action included, which is exactly
+// right: cancelling the walk must also cancel the thing it was walking to do. Nothing else is
+// touched -- an attack in flight is combat_rt's business and has its own commit rules.
+bool combat_rt_cancel_player_action()
+{
+    if (obj_dude == NULL) {
+        return false;
+    }
+
+    // ⚠️ NOT WHILE THE STICK IS STEERING HIM. B cancels a COMMITTED action -- a walk-to-click, an
+    // attack wind-up -- something you asked for once and now want to take back. Stick movement is
+    // not that: it is continuous, you cancel it by letting go, and there is nothing queued to
+    // abort. Cancelling it anyway cut the step short AND ate the press, so B never reached its real
+    // job of toggling the firing mode ("dude neudělá celej krok a nepřepne se režim střílení").
+    if (combat_rt_stick_walking()) {
+        return false;
+    }
+
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    bool moving = anim == ANIM_WALK || anim == ANIM_RUNNING;
+    if (!moving && anim_busy_blocking(obj_dude) == 0) {
+        return false;
+    }
+
+    rt_stick_active = false;
+    rt_move_stuck_since = -1.0f;
+    anim_clear_pending(obj_dude);
+
+    trace_event(TRACE_ACTION, "cancel", "anim=%d t=%.2f", anim, rt_clock);
+    return true;
+}
+
 // True if obj is one of the critters currently tracked in the actor registry.
 // Pointer-compare only (no dereference), so it is safe to call on a possibly
 // stale lock-on pointer: the registry is rebuilt from live world objects, so a
@@ -3667,10 +4201,22 @@ static bool rt_is_lockable(Object* obj)
 
 // Nearest lockable critter on the map regardless of weapon range, or NULL. Used
 // to engage the R3 lock-on (you can lock a distant target and then close on it).
+// How far the dude can lock, from his own Perception. See RT_LOCK_PERCEPTION_SCALE.
+static int rt_lock_range()
+{
+    if (obj_dude == NULL) {
+        return rt_lock_min_tiles;
+    }
+
+    int range = (int)(stat_level(obj_dude, STAT_PERCEPTION) * rt_lock_pe_scale);
+    return range < rt_lock_min_tiles ? rt_lock_min_tiles : range;
+}
+
 static Object* rt_nearest_lockable()
 {
     Object* best = NULL;
     int bestDist = INT_MAX;
+    int maxDist = rt_lock_range();
 
     for (int i = 0; i < rt_actor_count; i++) {
         Object* critter = rt_actors[i].obj;
@@ -3679,6 +4225,9 @@ static Object* rt_nearest_lockable()
         }
 
         int dist = obj_dist(obj_dude, critter);
+        if (dist > maxDist) {
+            continue;
+        }
         if (dist < bestDist) {
             bestDist = dist;
             best = critter;
@@ -3812,9 +4361,20 @@ static bool rt_directional_lock(float sx, float sy)
     float currentScore = 0.0f;
     bool haveCurrent = false;
 
+    // Same Perception reach as R3 itself. Without it the stick could flick the lock onto someone
+    // R3 would refuse to lock in the first place -- two different answers to "can this character
+    // pick that one out", which is the sort of split that reads as a bug.
+    int switchMaxDist = rt_lock_range();
+
     for (int i = 0; i < rt_actor_count; i++) {
         Object* c = rt_actors[i].obj;
         if (!rt_is_lockable(c)) {
+            continue;
+        }
+
+        // The CURRENT target is exempt: it must always be scoreable, or a target that drifted out
+        // of range mid-fight could never be compared against and the lock would judder.
+        if (c != rt_lock_target && obj_dist(obj_dude, c) > switchMaxDist) {
             continue;
         }
 
@@ -3946,20 +4506,26 @@ static void rt_refresh_registry()
             a->unreachable_tile = prev->unreachable_tile;
             a->unreachable_until = prev->unreachable_until;
             a->run_winded = prev->run_winded;
+            a->breather = prev->breather;
+            a->breather_since = prev->breather_since;
             a->last_results = prev->last_results;
             a->weapon_checked = prev->weapon_checked;
             a->dead_since = prev->dead_since;
             a->prone_since = prev->prone_since;
+            a->prone_fall_end = prev->prone_fall_end;
             a->flinch_accum = prev->flinch_accum;
             a->immune_until = prev->immune_until;
             a->stuck_tile = prev->stuck_tile;
             a->stuck_since = prev->stuck_since;
+            a->stuck_x = prev->stuck_x;
+            a->stuck_y = prev->stuck_y;
             a->next_attack_at = prev->next_attack_at;
             a->heal_next_at = prev->heal_next_at;
             a->weapon_up_until = prev->weapon_up_until;
             a->diag_mode = prev->diag_mode;
             a->diag_range = prev->diag_range;
             a->diag_dist = prev->diag_dist;
+            a->diag_blocker = prev->diag_blocker;
             a->osc_tile = prev->osc_tile;
             a->osc_prev_tile = prev->osc_prev_tile;
             a->osc_since = prev->osc_since;
@@ -3969,6 +4535,7 @@ static void rt_refresh_registry()
             a->bal_ap = prev->bal_ap;
             a->bal_approach = prev->bal_approach;
             a->bal_ready = prev->bal_ready;
+            a->bal_breath = prev->bal_breath;
             a->bal_attacks = prev->bal_attacks;
             a->bal_seen = prev->bal_seen;
             prevHostile = prev->hostile;
@@ -3986,15 +4553,20 @@ static void rt_refresh_registry()
             a->unreachable_tile = -1;
             a->unreachable_until = 0.0f;
             a->run_winded = false;
+            a->breather = false;
+            a->breather_since = -1.0f;
             // Seed from the current results so a critter first seen already
             // dead/downed doesn't register a phantom event.
             a->last_results = obj->data.critter.combat.results;
             a->weapon_checked = false;
             a->dead_since = -1.0f;
             a->prone_since = -1.0f;
+            a->prone_fall_end = -1.0f;
             a->flinch_accum = 0.0f;
             a->immune_until = 0.0f;
             a->stuck_tile = obj->tile;
+            a->stuck_x = obj->x;
+            a->stuck_y = obj->y;
             a->stuck_since = rt_clock;
             // INITIATIVE. Not 0 -- that made every actor ready to swing on the same frame it was
             // first seen, so a fight opened with a simultaneous volley and the cooldowns then kept
@@ -4006,7 +4578,23 @@ static void rt_refresh_registry()
             // sluggish one waits. Plus a little jitter so two identical raiders don't march in
             // unison either. After this one seed, the differing cooldowns keep them drifting apart
             // on their own -- the exchange interleaves instead of alternating.
-            a->next_attack_at = rt_clock + rt_initiative_delay(obj);
+            // DIAG (initiative, the OTHER half): rt_wins_initiative already logs the contested
+            // roll, but that only fires on a mutual trade and is rare. THIS is the half that runs
+            // on every critter that joins a fight, and it had no number at all. `behind` is the
+            // fraction of the span it waits (0 = as quick as the dude or quicker, swings at once;
+            // 1 = fully outclassed), so a run of these says whether Sequence is doing anything at
+            // your stats or whether every enemy is simply pinned at the ceiling.
+            float initDelay = rt_initiative_delay(obj);
+            {
+                int foeSeq = stat_level(obj, STAT_SEQUENCE);
+                int dSeq = obj_dude != NULL ? stat_level(obj_dude, STAT_SEQUENCE) : 0;
+                trace_event(TRACE_COMBAT, "init-delay",
+                    "pid=%d seq=%d dudeSeq=%d behind=%.2f delay=%.2fs span=%.2f t=%.2f",
+                    obj->pid, foeSeq, dSeq,
+                    dSeq > 0 ? (float)(dSeq - foeSeq) / (float)dSeq : 0.0f,
+                    initDelay, rt_initiative_span, rt_clock);
+            }
+            a->next_attack_at = rt_clock + initDelay;
             // No opening delay on healing: a critter that walks into the fight already bloodied
             // should be able to patch itself immediately. The AP cost is the only opening gate.
             a->heal_next_at = 0.0f;
@@ -4016,6 +4604,7 @@ static void rt_refresh_registry()
             a->diag_mode = -1;
             a->diag_range = -1;
             a->diag_dist = -1;
+            a->diag_blocker = -2;
             // ⚠️ `fresh` is an UNINITIALISED stack array and every field is assigned by hand, so a
             // field added to RtActor without a line here holds garbage. That is exactly what
             // happened to the balance counters: an NPC that joined after the fight started never
@@ -4030,6 +4619,7 @@ static void rt_refresh_registry()
             a->bal_ap = 0.0f;
             a->bal_approach = 0.0f;
             a->bal_ready = 0.0f;
+            a->bal_breath = 0.0f;
             a->bal_attacks = 0;
             a->bal_seen = rt_clock;
         }
@@ -4403,13 +4993,29 @@ static void rt_update_actor(RtActor* a, float dt)
         if (a->prone_since < 0.0f) {
             a->prone_since = rt_clock;
         }
-        if (rt_clock - a->prone_since >= rt_knockdown_dwell) {
+        // Stamped SEPARATELY from prone_since, and only once per knockdown -- see the note on the
+        // hold branch below. prone_since is restarted by every hit (rt_bump_prone_dwell); this is
+        // the anchor the anti-pin cap measures from and it must survive that.
+        if (a->prone_fall_end < 0.0f) {
+            a->prone_fall_end = rt_clock;
+        }
+        bool capped = false;
+        if (rt_prone_ready_to_stand(a->prone_since, a->prone_fall_end, &capped)) {
+            if (capped) {
+                trace_event(TRACE_FLOW, "prone-cap", "id=%d pid=%d ground=%.2f dwellLeft=%.2f t=%.2f",
+                    npc->id, npc->pid, rt_clock - a->prone_fall_end,
+                    rt_knockdown_dwell - (rt_clock - a->prone_since), rt_clock);
+            }
             rt_stand_up(npc);
             a->prone_since = -1.0f;
+            a->prone_fall_end = -1.0f;
         }
-    } else {
+    } else if (!critter_is_prone(npc)) {
         a->prone_since = -1.0f;
+        a->prone_fall_end = -1.0f;
     }
+    // ...otherwise STILL DOWN but momentarily not standup-eligible -- HOLD both timers. See the
+    // long note at the dude's copy of this pass; the bug and the fix are identical.
 
     if (!rt_is_combatant(npc)) {
         a->state = RT_IDLE;
@@ -4423,8 +5029,27 @@ static void rt_update_actor(RtActor* a, float dt)
     // goes cold, and the warm combat bit stays stuck. Hostility is sticky, so RT_IDLE below
     // re-aggros the moment it perceives a target on the player's side again.
     if (a->state != RT_IDLE) {
-        bool giveUp = !rt_is_combatant(a->target)
-            || obj_dist(npc, a->target) > rt_chase_range(npc) + RT_DEAGGRO_MARGIN;
+        // ⚠️ THE ONLY DE-AGGRO PATH THAT USED TO BE SILENT. The other two (disengage,
+        // unreachable) each trace; this one dropped the target with nothing in the log, so a
+        // chaser that kept losing its target and re-acquiring it -- running to the player,
+        // forgetting them, walking back, aggroing again -- looked like a movement bug and could
+        // not be told apart from one. Measured in trace_2026-08-23_003610: id=2295 went
+        // st=2/tgt=18000/dist=1 to st=0/tgt=0 with NO disengage and NO unreachable line, while
+        // walk-seg showed it shuttling 23309<->22913 every ~0.46s ("furt chodím sem a tam").
+        bool targetGone = !rt_is_combatant(a->target);
+        int leash = rt_chase_range(npc) + RT_DEAGGRO_MARGIN;
+        int tgtDist = obj_dist(npc, a->target);
+        bool giveUp = targetGone || tgtDist > leash;
+
+        if (giveUp) {
+            trace_event(TRACE_FLOW, "deaggro", "id=%d pid=%d why=%s dist=%d leash=%d tgtDead=%d tgtKO=%d tgtHp=%d t=%.2f",
+                npc->id, npc->pid, targetGone ? "target-not-combatant" : "out-of-leash",
+                tgtDist, leash,
+                (a->target != NULL && (a->target->data.critter.combat.results & DAM_DEAD) != 0) ? 1 : 0,
+                (a->target != NULL && (a->target->data.critter.combat.results & DAM_KNOCKED_OUT) != 0) ? 1 : 0,
+                a->target != NULL ? stat_level(a->target, STAT_CURRENT_HIT_POINTS) : -999,
+                rt_clock);
+        }
 
         // VANILLA STOP RULE. Throttled (it traces line of sight) and held for a grace window, so
         // stepping behind a doorframe doesn't disengage half the map for one frame.
@@ -4545,6 +5170,89 @@ static void rt_update_actor(RtActor* a, float dt)
         if (a->run_winded && a->ap >= reserve + RT_NPC_RUN_RESUME_MARGIN) {
             a->run_winded = false;
         }
+
+        // BREATHER LATCH. run_winded drops the SPRINT; this drops movement altogether, which is
+        // what the dude's rt_move_blocked does to him. Without it the reserve made the pool a
+        // floor the critter could sit on for ever while still walking -- "enemy chodi za mnou
+        // jako zombici", and the reason camping beat manoeuvring: only one side ever had to stop.
+        //
+        // The critter stops with `reserve` in hand and leaves with `reserve + margin`, so a pause
+        // is never wasted time -- it is a shooter banking a shot for the moment you step out.
+        //
+        // Evaluated for BOTH gaits and while standing, like the recovery above: a critter that
+        // walks itself down to the reserve must latch on the step that gets it there, not on the
+        // next frame it happens to be running.
+        // ⚠️ THE DISTANCE GATE IS LOAD-BEARING -- it shipped missing and immediately reproduced
+        // the exact bug this feature was designed around. Walking costs AP at EVERY distance, so a
+        // critter crossing a map trends down to its reserve long before it arrives; ungated, the
+        // latch then stopped it out there. Measured in trace_2026-08-29_170410: 21 of 75
+        // activations fired at 16+ tiles, and the Hub Police Officers came out of a 12 s fight at
+        // `approach=98% atk=0 breath=66%` -- two thirds of it standing still, 16 tiles away, never
+        // arriving, never attacking. That is "enemy runs up and just looks at me" with an extra
+        // step, and it is the one outcome this whole feature was not allowed to produce.
+        //
+        // So a pause is only allowed INSIDE the bubble, where standing still is a tactic rather
+        // than a failure to arrive: a melee critter a few tiles off is in the fight, one 25 tiles
+        // away is still travelling to it. Beyond it the old guarantee holds in full -- movement is
+        // never blocked and the critter arrives with its one-attack reserve in hand.
+        //
+        // Gated HERE rather than at the movement branch so `breath=` in the balance line keeps
+        // meaning "seconds actually spent stopped". A latch that set but suppressed nothing would
+        // report time the critter spent walking normally.
+        // ⚠️ AND ONLY WHILE CHASING. The breather's sole effect is suppressing CHASE movement;
+        // in RT_ATTACK it latches, changes nothing, and then cannot recover either -- an attacking
+        // critter keeps spending its pool on attacks, so it sits below the reserve until the 3 s
+        // cap expires and immediately re-latches. Measured in trace_2026-08-30_185109: exits ran
+        // 7 timeout to 4 recovered, and the timeouts were attackers, not walkers. That inverted
+        // the one ratio I use to judge whether the margin is reachable, and it made `breath=`
+        // report seconds during which nothing was being suppressed at all.
+        bool breatherAllowed = a->state == RT_CHASE
+            && npcEnemyDist >= 0 && npcEnemyDist <= rt_npc_breather_tiles;
+
+        if (npcInFight && breatherAllowed && !a->breather && a->ap <= reserve) {
+            a->breather = true;
+            a->breather_since = rt_clock;
+            trace_event(TRACE_COMBAT, "breather", "enter id=%d pid=%d ap=%d reserve=%d dist=%d t=%.2f",
+                npc->id, npc->pid, a->ap, reserve, npcEnemyDist, rt_clock);
+        } else if (a->breather) {
+            // ⚠️ THE TARGET IS CLAMPED TO THE CRITTER'S OWN MAXIMUM. reserve + margin is not
+            // reachable for everyone: a 5 AP weapon on an 8 AP critter needs 8, and one point more
+            // of margin would put the target above anything it can ever hold. Unclamped, those
+            // critters could only ever leave the breather by TIMEOUT -- a 3 s pause every single
+            // time, for ever. Same clamp, same reason, as the dude's resume_ap against his max.
+            int breatherTarget = reserve + rt_npc_breather_margin;
+            int npcMaxAp = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS);
+            if (breatherTarget > npcMaxAp) {
+                breatherTarget = npcMaxAp;
+            }
+
+            // Three ways out, and the ORDER is only for the trace label -- any one ends it.
+            const char* why = NULL;
+            if (!npcInFight) {
+                why = "fight-over";
+            } else if (!breatherAllowed) {
+                // Target moved away (or was lost): stop resting and start travelling again.
+                why = "out-of-bubble";
+            } else if (a->ap >= breatherTarget) {
+                why = "recovered";
+            } else if (rt_clock - a->breather_since >= rt_npc_breather_max) {
+                // The safety valve. If this fires often the margin is unreachable for that critter
+                // (regen too slow, or something is still draining it) -- which is exactly the
+                // frozen-chaser shape, caught before it can be seen on screen.
+                why = "timeout";
+            }
+
+            if (why != NULL) {
+                trace_event(TRACE_COMBAT, "breather", "exit id=%d pid=%d why=%s ap=%d reserve=%d held=%.2f t=%.2f",
+                    npc->id, npc->pid, why, a->ap, reserve, rt_clock - a->breather_since, rt_clock);
+                a->breather = false;
+                a->breather_since = -1.0f;
+            }
+        }
+
+        if (a->breather) {
+            a->bal_breath += dt;
+        }
     }
 
     // Stuck-move watchdog. Whenever the critter actually changes tile, note the new tile and
@@ -4556,42 +5264,92 @@ static void rt_update_actor(RtActor* a, float dt)
     // legitimately and must not be interrupted here. Gated to CHASE/ATTACK actors (a->state !=
     // RT_IDLE): an IDLE townsperson's walk is script-driven wandering, not combat_rt's doing,
     // and cutting it would make the town jerky (the log showed idle NPCs being unstuck at eng=0).
-    if (npc->tile != a->stuck_tile) {
-        // TEMP DIAG (oscillation hunt). The critter just changed tile: if the tile it moved ONTO is
-        // the one it occupied two steps ago, that is a REVERSAL -- it went back where it came from.
-        // Counted in a run, and reported with whether the DUDE moved during that run, because a
-        // reversal while the player is walking around is simply following, and only a run of them
-        // against a STATIONARY player is the bug. dudeStill=1 is the case to chase.
-        if (npc->tile == a->osc_prev_tile && a->osc_prev_tile != 0) {
-            if (a->osc_count == 0 || rt_clock - a->osc_since > RT_OSC_WINDOW_SECONDS) {
-                a->osc_since = rt_clock;
-                a->osc_count = 0;
-                rt_osc_dude_tile = obj_dude != NULL ? obj_dude->tile : -1;
-            }
-            a->osc_count++;
-            if (a->osc_count >= RT_OSC_REPORT_AT) {
-                trace_event(TRACE_FLOW, "oscillate",
-                    "id=%d pid=%d n=%d span=%.2f a=%d b=%d dudeStill=%d st=%d dist=%d t=%.2f",
-                    npc->id, npc->pid, a->osc_count, rt_clock - a->osc_since,
-                    npc->tile, a->osc_tile,
-                    (obj_dude != NULL && obj_dude->tile == rt_osc_dude_tile) ? 1 : 0,
-                    a->state, obj_dude != NULL ? obj_dist(npc, obj_dude) : -1, rt_clock);
-                a->osc_count = 0; // one line per run, not per step
-            }
-        } else if (rt_clock - a->osc_since > RT_OSC_WINDOW_SECONDS) {
+    // ⚠️ THE REVERSAL DETECTOR NEEDS A REAL TILE CHANGE, and it is now its own branch because
+    // of that. It used to live inside the progress test below -- fine while that test only fired on
+    // a tile change, fatal once the test was widened to sub-tile movement: the history then shifted
+    // every frame the critter crept forward, so osc_tile and osc_prev_tile collapsed onto the
+    // CURRENT tile and `npc->tile == a->osc_prev_tile` became trivially true. 1364 phantom
+    // reversals in one session, every one of them logging a=b (the same tile twice), which is the
+    // tell: a real reversal is between two DIFFERENT tiles.
+    if (npc->tile != a->osc_tile) {
+    // TEMP DIAG (oscillation hunt). The critter just changed tile: if the tile it moved ONTO is
+    // the one it occupied two steps ago, that is a REVERSAL -- it went back where it came from.
+    // Counted in a run, and reported with whether the DUDE moved during that run, because a
+    // reversal while the player is walking around is simply following, and only a run of them
+    // against a STATIONARY player is the bug. dudeStill=1 is the case to chase.
+    if (npc->tile == a->osc_prev_tile && a->osc_prev_tile != 0) {
+        if (a->osc_count == 0 || rt_clock - a->osc_since > RT_OSC_WINDOW_SECONDS) {
+            a->osc_since = rt_clock;
             a->osc_count = 0;
+            rt_osc_dude_tile = obj_dude != NULL ? obj_dude->tile : -1;
         }
-        a->osc_prev_tile = a->osc_tile;
-        a->osc_tile = npc->tile;
+        a->osc_count++;
+        if (a->osc_count >= RT_OSC_REPORT_AT) {
+            trace_event(TRACE_FLOW, "oscillate",
+                "id=%d pid=%d n=%d span=%.2f a=%d b=%d dudeStill=%d st=%d dist=%d t=%.2f",
+                npc->id, npc->pid, a->osc_count, rt_clock - a->osc_since,
+                npc->tile, a->osc_tile,
+                (obj_dude != NULL && obj_dude->tile == rt_osc_dude_tile) ? 1 : 0,
+                a->state, obj_dude != NULL ? obj_dist(npc, obj_dude) : -1, rt_clock);
+            a->osc_count = 0; // one line per run, not per step
+        }
+    } else if (rt_clock - a->osc_since > RT_OSC_WINDOW_SECONDS) {
+        a->osc_count = 0;
+    }
+    a->osc_prev_tile = a->osc_tile;
+    a->osc_tile = npc->tile;
+    }
+
+    if (npc->tile != a->stuck_tile || npc->x != a->stuck_x || npc->y != a->stuck_y) {
 
         a->stuck_tile = npc->tile;
+        a->stuck_x = npc->x;
+        a->stuck_y = npc->y;
         a->stuck_since = rt_clock;
-    } else if (a->state != RT_IDLE && anim_busy(npc) != 0) {
+    } else if (anim_busy(npc) == 0) {
+        // ⚠️ STANDING STILL IS NOT BEING STUCK, AND THE TIMER MUST NOT RUN WHILE IT IS.
+        //
+        // Without this branch stuck_since only ever reset on a TILE CHANGE, so it kept counting
+        // through every legitimate pause -- an attack cooldown, the initiative delay, a breather,
+        // simply standing in RT_ATTACK. Any critter that held its tile for over
+        // RT_STUCK_MOVE_TIMEOUT arrived at its NEXT walk with the budget already spent, and the
+        // watchdog cut that walk on its first frame.
+        //
+        // anim_force_clear then drops the part-crossed sub-tile offset, so the body SNAPS BACK to
+        // the tile it started from: lurch forward, jump back, walk again. That is the rubberbanding
+        // -- "priblizuje se k hraci, ale pokazde se vrati jakoby zpatky". Measured in
+        // trace_2026-08-30_220545: unstick-move fired on 40 of 44 walk segments, every one of them
+        // about 0.01 s after the segment was issued against a 1.25 s timeout, and with
+        // FLOW/oscillate at ZERO -- so nothing was re-pathing backwards, the moves were being killed
+        // before they could start.
+        //
+        // The watchdog asks "is a move in flight and failing to make progress". Time spent with no
+        // move in flight is not an answer to that question.
+        a->stuck_since = rt_clock;
+    } else if (a->state != RT_IDLE) {
+        // ⚠️ PROGRESS IS THE SUB-TILE OFFSET, NOT THE TILE. This used to reset only when `tile`
+        // changed, and a tile change is a rare event: measured in trace_2026-08-30_225022, a Ghoul
+        // needs about 2.5 s to cross one tile (npcCross reports 760 ms of animation, but the actual
+        // frame cadence is slower), against a 1.25 s timeout. So the watchdog fired EVERY crossing,
+        // roughly halfway over -- id=1979 reached sub-tile (14,11) and was cut 0.06 s later, four
+        // times running at a metronomic 2.46 s.
+        //
+        // anim_force_clear then discards the part-crossed offset, so the body jumps back to where
+        // the step began: creep forward, snap back, creep forward. "priblizuje se k hraci, ale
+        // pokazde se vrati jakoby zpatky." It was never gridlock -- the watchdog was mistaking slow
+        // for stuck and then causing the very symptom it exists to clear.
+        //
+        // ⚠️ AND IT IS NOT THE SHOOTING. The unstick bursts looked like they followed the player's
+        // attacks, but per critter they are periodic and evenly spaced, and they continue with no
+        // attack anywhere near them. rt_play_hit_react does clear a defender's walk by design, but
+        // that is not what this was.
         int at = FID_ANIM_TYPE(npc->fid);
         if ((at == ANIM_WALK || at == ANIM_RUNNING)
             && rt_clock - a->stuck_since >= RT_STUCK_MOVE_TIMEOUT) {
             anim_force_clear(npc);
             a->stuck_since = rt_clock;
+            a->stuck_x = npc->x;
+            a->stuck_y = npc->y;
             trace_event(TRACE_FLOW, "unstick-move", "id=%d pid=%d tile=%d t=%.2f",
                 npc->id, npc->pid, npc->tile, rt_clock);
         }
@@ -4665,7 +5423,24 @@ static void rt_update_actor(RtActor* a, float dt)
             // the full chase leash -- so a pack splits between the dude and his followers instead
             // of everyone funnelling onto the dude, and companions actually draw fire.
             Object* tgt = rt_nearest_player_side(npc);
-            if (tgt != NULL && is_within_perception(npc, tgt)) {
+
+            // ⚠️ BEING SHOT COUNTS AS PERCEIVING, whatever the eyes say. is_within_perception is a
+            // SIGHT test -- PE * 5 tiles, halved through glass, quartered against a sneaking dude --
+            // and a radscorpion's PERCEPTION of 2 buys it ten. Shoot one from further out and it
+            // went hostile and then just STOOD THERE: trace_2026-08-26_194846, id=1516, host=1 with
+            // st=IDLE and tgt=0 for six seconds while the player emptied a magazine into it, moving
+            // exactly one tile before it died. "Radscorpion po výstřelu nechodil za mnou."
+            //
+            // whoHitMe is the engine's OWN record of who last hurt this critter (apply_damage sets
+            // it), so it answers "do I have a reason to come after you" with no new state and no
+            // new bookkeeping to keep in sync. A bullet out of the dark is exactly the case vanilla
+            // sight checks were never meant to arbitrate.
+            //
+            // Deliberately NOT widened to "any hostile chases from anywhere": the perception gate is
+            // what keeps an unaware critter across the map from marching at you, and that stays. The
+            // only thing added is that being HIT by this particular target is its own evidence.
+            Object* hurtBy = npc->data.critter.combat.whoHitMe;
+            if (tgt != NULL && (is_within_perception(npc, tgt) || hurtBy == tgt)) {
                 a->target = tgt;
                 a->state = RT_CHASE;
                 a->unperceived_since = -1.0f;
@@ -4739,6 +5514,20 @@ static void rt_update_actor(RtActor* a, float dt)
 
             if (inRange && !rt_shot_blocked(npc, a->target, mode)) {
                 a->state = RT_ATTACK;
+            } else if (a->breather) {
+                // STAND AND RECOVER. The latch lives in the drain block above; this is the only
+                // place it does anything, and what it suppresses is MOVEMENT ONLY.
+                //
+                // Only ever set inside the engagement bubble -- see the gate on the latch.
+                //
+                // ⚠️ IT IS DELIBERATELY BELOW THE RT_ATTACK BRANCH. A breathing critter that can
+                // see and reach you still attacks -- exactly like the dude, whose rt_move_blocked
+                // stops his feet and never his trigger. Putting this test first would have made a
+                // pause mean "cannot fight", which is the frozen-chaser bug wearing a new name.
+                //
+                // An in-flight walk segment is left alone rather than force-cleared: it finishes
+                // its current tile and then nothing new is issued, so the stop reads as slowing to
+                // a halt instead of snapping mid-stride.
             } else if (inRange) {
                 // In range but no LINE OF FIRE (target behind a wall/building): don't
                 // just stand -- path AROUND the obstacle to get an angle. A plain step
@@ -4764,6 +5553,28 @@ static void rt_update_actor(RtActor* a, float dt)
                 Object* blocker = stepDest != a->target->tile
                     ? obj_blocking_at(npc, stepDest, npc->elevation)
                     : NULL;
+
+                // TEMP DIAG (ping-pong, 2026-08-28). trace_2026-08-28_225016 caught id=669 and
+                // id=579 cycling between two tiles with dudeStill=1 -- 13 identical
+                // `walk-seg from=19495 to=19099 dist=4` and NO move-fail. The straight step and the
+                // detour disagree and each undoes the other every frame. Two earlier fixes here were
+                // REVERTED for making engagement worse, and both guessed at what was in the way, so
+                // measure it: WHAT refuses the straight step decides the fix. A wall means commit to
+                // the detour; a live critter means the queue case the comment below describes; a
+                // CORPSE means bodies are blocking tiles they should not. Emitted on change only.
+                // STRIP with diag_blocker.
+                {
+                    int bpid = blocker != NULL ? blocker->pid : -1;
+                    if (a->diag_blocker != bpid) {
+                        a->diag_blocker = bpid;
+                        bool bcritter = blocker != NULL && FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER;
+                        trace_event(TRACE_FLOW, "step-blocker",
+                            "id=%d pid=%d tile=%d step=%d blk=%d critter=%d dead=%d tgt=%d dist=%d t=%.2f",
+                            npc->id, npc->pid, npc->tile, stepDest, bpid, bcritter ? 1 : 0,
+                            (bcritter && (blocker->data.critter.combat.results & DAM_DEAD) != 0) ? 1 : 0,
+                            a->target->tile, obj_dist(npc, a->target), rt_clock);
+                    }
+                }
 
                 if (blocker != NULL) {
                     // WHAT is in the way decides what to do about it. A wall or a crate is
@@ -5170,12 +5981,15 @@ static void rt_reset_session_state()
     rt_run_blocked = false;
     rt_move_blocked = false;
     rt_last_hud_ap = -1;
+    rt_last_hud_blocked = -1;
+    rt_last_hud_ac = -1;
     rt_cam_last_tile = -1;
     rt_cam_last_off_x = 0;
     rt_cam_last_off_y = 0;
     rt_clock = 0.0f;
     rt_dude_flinch_time = 0.0f;
     rt_dude_prone_since = -1.0f;
+    rt_dude_prone_fall_end = -1.0f;
     rt_move_input_age = 1000.0f;
     snprintf(rt_last_event, sizeof(rt_last_event), "none");
     rt_last_event_pid = -1;
@@ -5194,6 +6008,19 @@ void combat_rt_init()
     double apRegen = RT_AP_REGEN_SECONDS;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_REGEN_KEY, &apRegen);
     rt_ap_regen_seconds = apRegen < 0.05 ? 0.05f : (float)apRegen;
+
+    // Doorway magnet strength (0 = off). Clamped to 0..1: past 1 the assist would overshoot the
+    // doorway and bend the stick past it, which reads as the controls fighting back.
+    double doorMagnet = 0.7;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_DOOR_MAGNET_KEY, &doorMagnet);
+    rt_door_magnet = doorMagnet < 0.0 ? 0.0f : (doorMagnet > 1.0 ? 1.0f : (float)doorMagnet);
+    rt_door_cache_tile = -1; // force a rebuild on the new map
+
+    // Crowd assist: step around a bystander instead of jamming into them (0 = off).
+    int npcSlide = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_SLIDE_KEY, &npcSlide);
+    rt_npc_slide = npcSlide != 0;
+
 
     // How hard AGILITY bends that cadence per critter (0 = the old flat rate for everyone).
     // Capped at 0.3 so the spread stays inside the clamps in rt_regen_interval.
@@ -5225,6 +6052,17 @@ void combat_rt_init()
         atkCdStat = 0.3;
     }
     rt_attack_cooldown_stat_factor = (float)atkCdStat;
+
+    // Same term, but only for stats ABOVE average. Capped at 1.0 = symmetric; there is no case for
+    // rewarding the top end MORE than the bottom is punished, which is how it got too fast.
+    double atkCdBias = RT_ATTACK_COOLDOWN_HIGH_BIAS;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_HIGH_BIAS_KEY, &atkCdBias);
+    if (atkCdBias < 0.0) {
+        atkCdBias = 0.0;
+    } else if (atkCdBias > 1.0) {
+        atkCdBias = 1.0;
+    }
+    rt_attack_cooldown_high_bias = (float)atkCdBias;
 
     // Weapon skill's contribution to the same cooldown. Capped at 0.5 because the term is applied
     // as (1 +- factor) and anything approaching 1.0 would let a low skill DOUBLE the cooldown while
@@ -5302,6 +6140,32 @@ void combat_rt_init()
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_RESUME_AP_KEY, &resumeAp);
     rt_run_resume_ap = resumeAp < 1 ? 1 : resumeAp;
 
+    // Breather margin. Floored at 1: a margin of 0 would let one regen tick end the pause, which
+    // is the stutter the run_winded latch exists to prevent, in a place where it would be worse
+    // (a critter twitching between standing and stepping every frame).
+    int breatherMargin = RT_NPC_BREATHER_MARGIN;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_BREATHER_MARGIN_KEY, &breatherMargin);
+    rt_npc_breather_margin = breatherMargin < 1 ? 1 : breatherMargin;
+
+    // Breather cap. 0 effectively DISABLES the breather: the latch still sets, but the very next
+    // frame times it out, so nothing is ever suppressed for a length anyone can see. That is the
+    // one-number rollback to the previous behaviour if this turns out to feel wrong.
+    double breatherMax = RT_NPC_BREATHER_MAX_SECONDS;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_BREATHER_MAX_KEY, &breatherMax);
+    rt_npc_breather_max = breatherMax < 0.0 ? 0.0f : (float)breatherMax;
+
+    // 0 disables the pause outright (the latch can then never arm), which is the honest rollback
+    // if it turns out a chaser should simply never stop.
+    int breatherTiles = RT_NPC_BREATHER_TILES;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_BREATHER_TILES_KEY, &breatherTiles);
+    rt_npc_breather_tiles = breatherTiles < 0 ? 0 : breatherTiles;
+
+    // Does an empty pool stop him or slow him? Defaults to 0 = the shipped stop, so the
+    // experiment is opt-in and rolling it back is one number in fallout.cfg, not a rebuild.
+    int emptyWalks = 0;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_EMPTY_WALKS_KEY, &emptyWalks);
+    rt_ap_empty_walks = emptyWalks != 0;
+
     // Walk cost (Variant C2): AP/sec drained while walking in combat. Floored at 0
     // (0 = free walking). Smaller than the run cost so kiting bleeds slowly.
     double walkCost = RT_WALK_AP_COST;
@@ -5334,6 +6198,23 @@ void combat_rt_init()
     double regenFarMoving = RT_REGEN_FAR_MULT_MOVING;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY, &regenFarMoving);
     rt_regen_far_mult_moving = regenFarMoving < 0.0 ? 0.0f : (float)regenFarMoving;
+
+    // The NPC moving pair. Same rules as the dude's above: negatives clamped away, nothing else --
+    // this curve is MEANT to run backwards (near < far), so the "near = max(near, far)" guard the
+    // STANDING curve carries must never be copied here.
+    double npcRegenNearMoving = RT_NPC_REGEN_NEAR_MULT_MOVING;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_REGEN_NEAR_MULT_MOVING_KEY, &npcRegenNearMoving);
+    rt_npc_regen_near_mult_moving = npcRegenNearMoving < 0.0 ? 0.0f : (float)npcRegenNearMoving;
+    double npcRegenFarMoving = RT_NPC_REGEN_FAR_MULT_MOVING;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_REGEN_FAR_MULT_MOVING_KEY, &npcRegenFarMoving);
+    rt_npc_regen_far_mult_moving = npcRegenFarMoving < 0.0 ? 0.0f : (float)npcRegenFarMoving;
+
+    // Aimed-shot slow motion. 1.0 disables it (full-speed combat while aiming, the pre-2026-08-29
+    // behaviour); the load floor matches the one in combat_rt_time_scale so cfg cannot produce a
+    // freeze by writing 0.
+    double aimSlowmo = RT_AIM_SLOWMO;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AIM_SLOWMO_KEY, &aimSlowmo);
+    rt_aim_slowmo = aimSlowmo < 0.05 ? 0.05f : (float)aimSlowmo;
 
     int regenMovingNpc = 0;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_MOVING_NPC_KEY, &regenMovingNpc);
@@ -5396,6 +6277,42 @@ void combat_rt_init()
     }
     rt_knockdown_dwell = (float)knockDwell;
 
+    // Hard ceiling on total ground time (anti-pin). 0 = off. Floored at the dwell itself: a cap
+    // BELOW the dwell would fire first every single time and silently replace it.
+    double knockCap = RT_KNOCKDOWN_GROUND_CAP;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_KNOCKDOWN_MAX_GROUND_KEY, &knockCap);
+    if (knockCap <= 0.0) {
+        knockCap = 0.0;
+    } else {
+        if (knockCap < knockDwell) {
+            knockCap = knockDwell;
+        }
+        if (knockCap > 20.0) {
+            knockCap = 20.0;
+        }
+    }
+    rt_knockdown_ground_cap = (float)knockCap;
+
+    // R3 auto-lock reach from Perception. Floors keep a silly cfg from making the lock useless
+    // (0 = nothing is ever lockable) or unbounded again.
+    double lockScale = RT_LOCK_PERCEPTION_SCALE;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_LOCK_RANGE_PE_SCALE_KEY, &lockScale);
+    if (lockScale < 0.0) {
+        lockScale = 0.0;
+    } else if (lockScale > 10.0) {
+        lockScale = 10.0;
+    }
+    rt_lock_pe_scale = (float)lockScale;
+
+    int lockMin = RT_LOCK_MIN_TILES;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_LOCK_RANGE_MIN_KEY, &lockMin);
+    if (lockMin < 1) {
+        lockMin = 1;
+    } else if (lockMin > 50) {
+        lockMin = 50;
+    }
+    rt_lock_min_tiles = lockMin;
+
     // The controller is owned by gamepad_ui (it must work outside a game
     // session too); combat_rt just borrows the handle.
 }
@@ -5410,6 +6327,143 @@ void combat_rt_reset()
 {
     rt_reset_session_state();
     combat_state &= ~COMBAT_STATE_0x01;
+}
+
+// Refresh rt_door_tiles for the dude's current tile. Usable, UNLOCKED doors only: pulling the
+// player toward a door he cannot open is worse than no assist at all.
+static void rt_door_cache_refresh()
+{
+    rt_door_count = 0;
+    rt_door_cache_tile = obj_dude->tile;
+    rt_door_cache_elev = obj_dude->elevation;
+
+    Object** list = NULL;
+    int count = obj_create_list(-1, map_elevation, OBJ_TYPE_SCENERY, &list);
+
+    for (int i = 0; i < count && rt_door_count < RT_DOOR_MAGNET_MAX; i++) {
+        Object* obj = list[i];
+        if (obj == NULL || obj->elevation != obj_dude->elevation) {
+            continue;
+        }
+
+        Proto* proto;
+        if (proto_ptr(obj->pid, &proto) == -1 || proto->scenery.type != SCENERY_TYPE_DOOR) {
+            continue;
+        }
+
+        if (obj_is_locked(obj)) {
+            continue;
+        }
+
+        int dist = tile_dist(obj_dude->tile, obj->tile);
+        if (dist <= 0 || dist > RT_DOOR_MAGNET_TILES) {
+            continue;
+        }
+
+        rt_door_tiles[rt_door_count++] = obj->tile;
+    }
+
+    if (list != NULL) {
+        obj_delete_list(list);
+    }
+}
+
+// Bend a stick angle (degrees, screen convention: right = 0, up = +90) toward the nearest doorway
+// that the player is already roughly pointing at. Returns the angle unchanged when no doorway
+// qualifies, which is the overwhelmingly common case.
+static float rt_door_magnet_apply(float angle)
+{
+    if (rt_door_magnet <= 0.0f || obj_dude == NULL) {
+        return angle;
+    }
+
+    if (obj_dude->tile != rt_door_cache_tile || obj_dude->elevation != rt_door_cache_elev) {
+        rt_door_cache_refresh();
+    }
+
+    if (rt_door_count == 0) {
+        return angle;
+    }
+
+    int dudeX;
+    int dudeY;
+    if (tile_coord(obj_dude->tile, &dudeX, &dudeY, obj_dude->elevation) == -1) {
+        return angle;
+    }
+
+    int bestDist = RT_DOOR_MAGNET_TILES + 1;
+    float bestDev = 0.0f;
+
+    for (int i = 0; i < rt_door_count; i++) {
+        int doorX;
+        int doorY;
+        if (tile_coord(rt_door_tiles[i], &doorX, &doorY, obj_dude->elevation) == -1) {
+            continue;
+        }
+
+        // Same convention as the stick: screen Y is +down, so negate it to make up positive.
+        float doorAngle = atan2f(-(float)(doorY - dudeY), (float)(doorX - dudeX)) * 57.2957795f;
+
+        // Signed shortest difference, -180..180.
+        float dev = fmodf(doorAngle - angle + 540.0f, 360.0f) - 180.0f;
+        if (dev < -RT_DOOR_MAGNET_CONE || dev > RT_DOOR_MAGNET_CONE) {
+            continue;
+        }
+
+        int dist = tile_dist(obj_dude->tile, rt_door_tiles[i]);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestDev = dev;
+        }
+    }
+
+    if (bestDist > RT_DOOR_MAGNET_TILES) {
+        return angle;
+    }
+
+    // Taper with distance: full strength on the doorstep, nothing at the edge of range. Without the
+    // taper a door four tiles away tugs as hard as the one you are stepping through, and walking
+    // PAST a doorway -- which is a thing players do constantly -- starts to feel sticky.
+    float taper = 1.0f - (float)(bestDist - 1) / (float)RT_DOOR_MAGNET_TILES;
+    if (taper < 0.0f) {
+        taper = 0.0f;
+    }
+
+    return angle + bestDev * rt_door_magnet * taper;
+}
+
+// Who is standing in the first tile along `rotation`, if it is someone we are willing to walk
+// AROUND rather than into? NULL when nothing blocks, when the blocker is scenery or a wall, or
+// when it is a hostile.
+//
+// Bystanders only. A HOSTILE keeps blocking exactly as before: closing to melee, holding a firing
+// angle and backing off a step all stay predictable, and the assist can never reposition you in a
+// fight you did not ask it to. rt_is_hostile answers false for anyone outside the combat registry,
+// which is what makes every peaceful townsfolk slide-able without a second test.
+//
+// ⚠️ THAT SAME "false for anyone outside the registry" IS ALSO THE HOLE, which is why the caller
+// gates this on `!rt_engaged`. rt_is_hostile reads the actor's sticky flag, so a critter you
+// attacked first (and who therefore never aggroed onto you) reads as a peaceful bystander -- and
+// the assist then refuses to let you walk into the very person you are fighting, deflecting a held
+// stick by a whole 60-degree rotation, every frame, for as long as you hold it. Traced in
+// trace_2026-08-24_234756: `want=3 took=4` five times across 1.5 s, each within 2 s of an attack,
+// which is exactly the report -- "držel jsem směr dolů, po útoku jsem ztratil kontrolu nad dudem a
+// šel jsem směrem, kam jsem nechtěl jít".
+static Object* rt_bystander_blocking(int rotation)
+{
+    Object* blocker = obj_blocking_at(obj_dude, tile_num_in_direction(obj_dude->tile, rotation, 1), map_elevation);
+    if (blocker == NULL || !rt_is_critter(blocker) || rt_is_hostile(blocker)) {
+        return NULL;
+    }
+
+    return blocker;
+}
+
+// Is the first step that way clear of ANYTHING -- critter, wall, scenery? A slide may only land on
+// a genuinely open tile; rounding a companion by walking into a wall is not an improvement.
+static bool rt_step_is_free(int rotation)
+{
+    return obj_blocking_at(obj_dude, tile_num_in_direction(obj_dude->tile, rotation, 1), map_elevation) == NULL;
 }
 
 void combat_rt_poll_gamepad()
@@ -5457,8 +6511,11 @@ void combat_rt_poll_gamepad()
     // makes its gait-change path do the seamless run->walk restart (no stop/freeze:
     // movement itself is never gated, only the run/walk choice). Out of combat,
     // running is always free.
-    int ltAxis = SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
-    bool ltHeld = ltAxis > RT_GAMEPAD_TRIGGER_THRESHOLD;
+    // ⚠️ RUN IS ON LB, NOT LT (swapped with the aimed shot, 2026-08-29). LB is a digital button,
+    // so there is no threshold to cross -- and that is the one behavioural difference the swap
+    // brought: the trigger had a dead zone you could rest a finger inside, the shoulder does not.
+    // The local stays named ltHeld because every gait test below reads it as "the run key".
+    bool ltHeld = SDL_GameControllerGetButton(rt_gamepad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     bool run = ltHeld && (!rt_engaged || (rt_player_ap > 0 && !rt_run_blocked));
 
     // Flight-recorder movement input: emit on a direction/gait EDGE (a held stick coalesces
@@ -5488,6 +6545,11 @@ void combat_rt_poll_gamepad()
         // atan2(-y, x): SDL Y is +down, so -y makes up positive (up = +90 deg,
         // right = 0 deg). RT_GAMEPAD_ANGLE_OFFSET is a feel knob on top.
         float angle = atan2f(-y, x) * 57.2957795f + RT_GAMEPAD_ANGLE_OFFSET;
+
+        // Doorway assist, applied BEFORE the sector bucketing below so it can only ever change
+        // which sector a near-miss falls into. See rt_door_magnet_apply.
+        angle = rt_door_magnet_apply(angle);
+
         angle = fmodf(angle, 360.0f);
         if (angle < 0.0f) {
             angle += 360.0f;
@@ -5509,6 +6571,50 @@ void combat_rt_poll_gamepad()
 
         int rotation = sectorToRotation[sector];
 
+        // CROWD ASSIST -- step AROUND a bystander instead of jamming into them. Same seam as the
+        // doorway magnet, opposite sense: the magnet bends the angle TOWARD a target, this bends it
+        // AWAY from an obstacle. Only the FIRST tile is tested because only the first tile decides:
+        // rt_stick_segment_start refuses the whole segment when that one is blocked (dist == 0),
+        // which is the stop the player feels.
+        //
+        // The side is chosen by where inside the 60-degree sector the stick actually points -- lean
+        // left of centre and you round them on the left. That makes it read as "he took the gap I
+        // was already leaning into" instead of a coin flip. The far side is the fallback when the
+        // near one is occupied too; if both are, nothing changes and you stop exactly as before.
+        //
+        // ⚠️ Deflects the ROTATION, not the angle, and does it AFTER rt_stick_last_sector was set
+        // from the undeflected sector -- the hysteresis belongs to the stick, not to the assist.
+        // Latching the deflected direction would hand it back as "the previous sector" next frame
+        // and keep the dude walking sideways after the obstacle had already cleared.
+        // ⚠️ OFF WHILE A FIGHT IS LIVE. The assist is crowd navigation -- get past Ian in a doorway
+        // -- and in a fight the player is aiming their movement, so a 60-degree "helpful" deflection
+        // is not help, it is losing the character. It fired repeatedly in the seconds right after
+        // attacks (see rt_bystander_blocking for the traced runs and why a critter you struck first
+        // reads as a bystander). Without it you simply stop against the blocker, which is vanilla,
+        // predictable, and recoverable by steering one notch yourself.
+        Object* bystander = (rt_npc_slide && !rt_engaged) ? rt_bystander_blocking(rotation) : NULL;
+        if (bystander != NULL) {
+            float dev = fmodf(angle - 60.0f * sector + 540.0f, 360.0f) - 180.0f;
+            int nearSector = dev >= 0.0f ? (sector + 1) % 6 : (sector + 5) % 6;
+            int farSector = dev >= 0.0f ? (sector + 5) % 6 : (sector + 1) % 6;
+
+            if (rt_step_is_free(sectorToRotation[nearSector])) {
+                rotation = sectorToRotation[nearSector];
+            } else if (rt_step_is_free(sectorToRotation[farSector])) {
+                rotation = sectorToRotation[farSector];
+            }
+
+            if (rotation != sectorToRotation[sector]) {
+                static float rt_slide_traced = -1.0f;
+                if (rt_clock - rt_slide_traced >= 0.25f) {
+                    rt_slide_traced = rt_clock;
+                    trace_event(TRACE_INPUT, "npc-slide", "want=%d took=%d dev=%.1f blocker=%d dead=%d t=%.2f",
+                        sectorToRotation[sector], rotation, dev, bystander->pid,
+                        critter_is_dead(bystander) ? 1 : 0, rt_clock);
+                }
+            }
+        }
+
         if (!rt_traced_stick_on || rotation != rt_traced_stick_rot || run != rt_traced_stick_run) {
             trace_event(TRACE_INPUT, "stick", "dir=%d gait=%s blocked=%d t=%.2f",
                 rotation, run ? "run" : "walk", rt_move_blocked ? 1 : 0, rt_clock);
@@ -5519,8 +6625,13 @@ void combat_rt_poll_gamepad()
 
         // Out of AP (walked/ran the pool dry): stop until it regenerates to the resume
         // threshold. Standing lets the pool climb back (see rt_move_blocked).
-        if (rt_move_blocked) {
+        if (rt_move_blocked && !rt_ap_empty_walks) {
             rt_stick_stop();
+        } else if (rt_move_blocked) {
+            // Out of AP, but this mode leaves him mobile: force the WALK gait whatever LT says.
+            // He can still leave a fight, just slower than the thing chasing him -- which is what
+            // makes it an exit and not an escape hatch.
+            rt_stick_move(rotation, false);
         } else {
             rt_stick_move(rotation, run);
         }
@@ -5735,14 +6846,68 @@ bool combat_rt_has_lock()
     return rt_lock_target != NULL;
 }
 
+// Is the player currently walking under LEFT-STICK control (as opposed to standing, or walking out
+// a click-to-move path)? Used by gmouse to keep the hover hex off the ground while he is already
+// moving -- see the guard in gmouse_bk_process.
+bool combat_rt_stick_walking()
+{
+    return rt_stick_active;
+}
+
 // The critter an aimed shot would hit: the lock-on target if it's a live combatant,
 // otherwise the nearest hostile within current-weapon range. NULL if neither exists.
+// Nearest critter in WEAPON RANGE that the player is allowed to shoot at all -- hostile or not.
+// Same membership rule as the R3 lock (rt_is_lockable: alive, not you, and either hostile or simply
+// on another team and perceivable), but ranged by the weapon rather than by Perception, because
+// this answers "can I shoot that" and not "can I see that".
+static Object* rt_nearest_aimable_in_range(int hitMode)
+{
+    int range = item_w_range(obj_dude, hitMode);
+    Object* best = NULL;
+    int bestDist = range + 1;
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (!rt_is_lockable(critter)) {
+            continue;
+        }
+
+        int dist = obj_dist(obj_dude, critter);
+        if (dist <= range && dist < bestDist) {
+            bestDist = dist;
+            best = critter;
+        }
+    }
+
+    return best;
+}
+
 static Object* rt_aim_target()
 {
     if (rt_lock_target != NULL && rt_is_targetable(rt_lock_target)) {
         return rt_lock_target;
     }
-    return rt_nearest_hostile_in_range(rt_player_hit_mode());
+
+    // HOSTILES FIRST, and that ordering is the whole safety of the fallback below. In a fight the
+    // answer is unchanged -- the nearest active enemy -- so nothing about combat aiming moves.
+    Object* hostile = rt_nearest_hostile_in_range(rt_player_hit_mode());
+    if (hostile != NULL) {
+        return hostile;
+    }
+
+    // ⚠️ AND ONLY THEN ANYONE ELSE. Without this the aim gesture was hostiles-only unless you had
+    // first locked the target with R3: `combat_rt_can_aim` ends in `rt_aim_target() != NULL`, so
+    // walking up to a peaceful NPC and holding the aim button did nothing at all, with no feedback
+    // explaining why. Nothing downstream ever objected -- rt_is_lockable already admits anyone on
+    // another team, and neither combat_rt_can_aim nor combat_rt_aimed_attack tests hostility -- so
+    // the restriction was an accident of this one fallback, not a rule anybody chose.
+    //
+    // ⚠️ IT DOES MEAN THE AIM BUTTON CAN OPEN FIRE ON A TOWNSPERSON. A tap fires immediately at
+    // the last-used body part (GPUI_AIM_TAP_MS), so in a peaceful map it is now possible to start a
+    // fight with one stray press. That is deliberate -- you can always shoot anyone in Fallout, and
+    // the alternative is a targeting system that silently refuses on exactly the target the player
+    // is pointing at -- but it is a foot-gun, and B cancels the picker if the shot was not intended.
+    return rt_nearest_aimable_in_range(rt_player_hit_mode());
 }
 
 bool combat_rt_can_aim()
@@ -5854,6 +7019,54 @@ bool combat_rt_aimed_attack(int hitLocation)
 // one is found it is stashed for combat_rt_update to open, and true is returned so
 // the gamepad layer routes tap-A to looting instead of a walk-click. Detection
 // only -- the loot window must open from the main loop, never the input hook.
+// Same scan with NO side effect: is there anything adjacent worth looting right now? Split out so
+// the pad can ask the question at the moment A goes down without queuing anything -- see
+// combat_rt_world_loot_available below.
+static Object* rt_find_world_loot(int* kindOut)
+{
+    if (obj_dude == NULL) {
+        return NULL;
+    }
+
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+        if (obj == obj_dude || obj_dist(obj_dude, obj) > 1) {
+            continue;
+        }
+        // Not drawn, not lootable. Same trap as the invisible caravan (see ip_classify): staged
+        // content is a real object until a script reveals it, and obj_find_first_at hands it over.
+        if ((obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
+
+        int fidType = FID_TYPE(obj->fid);
+        if (fidType == OBJ_TYPE_CRITTER && (obj->data.critter.combat.results & DAM_DEAD) != 0) {
+            *kindOut = 1;
+            return obj;
+        }
+        if (fidType == OBJ_TYPE_ITEM && item_get_type(obj) == ITEM_TYPE_CONTAINER) {
+            *kindOut = 2;
+            return obj;
+        }
+    }
+
+    return NULL;
+}
+
+// Is the dude mid-shooting? True while his own rate-of-fire cooldown is still running, i.e. a
+// swing or shot went out moments ago. The pad uses it to tell a DELIBERATE double-tap from plain
+// mashing at an enemy: if he is on cooldown he is attacking, and the taps mean attack.
+bool combat_rt_player_attack_busy()
+{
+    return obj_dude != NULL && rt_attack_on_cooldown(obj_dude);
+}
+
+// True if something adjacent could be looted this instant. Asks, never queues.
+bool combat_rt_world_loot_available()
+{
+    int kind = 0;
+    return rt_find_world_loot(&kind) != NULL;
+}
+
 bool combat_rt_try_world_loot()
 {
     if (obj_dude == NULL) {
@@ -5864,6 +7077,13 @@ bool combat_rt_try_world_loot()
         if (obj == obj_dude || obj_dist(obj_dude, obj) > 1) {
             continue;
         }
+        // Not drawn, not lootable. Same trap as the invisible caravan (see ip_classify): staged content is a
+        // real object until a script reveals it, and obj_find_first_at hands it over -- obj_create_list,
+        // which the combat registry uses, would not.
+        if ((obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
+
 
         int fidType = FID_TYPE(obj->fid);
         if (fidType == OBJ_TYPE_CRITTER && (obj->data.critter.combat.results & DAM_DEAD) != 0) {
@@ -5912,6 +7132,17 @@ static void rt_follow_cam()
     tile_set_center_offset(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW, offX, offY);
 }
 
+float combat_rt_time_scale()
+{
+    // Floored at a small positive value rather than allowed to reach 0. A zero scale would stop
+    // rt_clock dead while the picker is up, which is the full freeze this feature deliberately is
+    // not -- and it would divide by zero in compute_tpf's caller.
+    if (rt_enabled && gamepad_ui_aim_body_active()) {
+        return rt_aim_slowmo < 0.05f ? 0.05f : rt_aim_slowmo;
+    }
+    return 1.0f;
+}
+
 void combat_rt_update(float dt)
 {
     if (obj_dude == NULL) {
@@ -5927,6 +7158,12 @@ void combat_rt_update(float dt)
     if (radial_wheel_is_open()) {
         return;
     }
+
+    // ...but the LIMB PICKER only SLOWS it. Scaling dt here rather than returning is what makes it
+    // a slow-motion: rt_clock, AP regen, the movement drains, attack cooldowns, initiative and the
+    // in-flight commit timers are all keyed off this one number, so every one of them stretches by
+    // the same factor and nothing goes out of step with anything else.
+    dt *= combat_rt_time_scale();
 
     rt_clock += dt;
 
@@ -6025,8 +7262,7 @@ void combat_rt_update(float dt)
         f->defender = f->ctd.defender;
         f->started = rt_clock;
         f->playerApCost = 0; // scripted/orphan attack -- not the player's AP-tracked swing
-        f->tAnimStart = -1.0f; // TEMP DIAG (fire-timing)
-        f->tAction = -1.0f;
+        f->tAnimStart = -1.0f;
         f->tAnimEnd = -1.0f;
         combat_clear_pending_attack();
         trace_event(TRACE_COMBAT, "inflight-adopt", "t=%.2f", rt_clock);
@@ -6044,21 +7280,36 @@ void combat_rt_update(float dt)
     // walking/running defender doesn't read as hit (which would commit before the swing played).
     for (int i = 0; i < rt_inflight_count;) {
         RtInFlight* f = &rt_inflight[i];
+
+        // ⚠️ A DEAD ATTACKER'S BLOW NEVER LANDS. The snapshot is taken when the swing STARTS and
+        // commits up to a second and a half later, so a critter that dies in between would still
+        // deal its damage from beyond the grave -- "a rat hit me after it died", and he is right
+        // that it should not. Turn-based could never produce this (you cannot act on a turn you
+        // did not live to take), so there is no vanilla behaviour to preserve here.
+        //
+        // Checked at the TOP, before any commit condition, so it holds for every trigger --
+        // action frame, swing-done, connect and the hard cap alike. Applies to the dude too: if
+        // he dies mid-swing, his blow dies with him.
+        if (f->attacker != NULL && critter_is_dead(f->attacker)) {
+            trace_event(TRACE_COMBAT, "attack-voided",
+                "%s pid=%d ->pid=%d why=attacker-dead elapsed=%.2f t=%.2f",
+                f->attacker == obj_dude ? "DUDE" : "NPC", f->attacker->pid,
+                f->defender != NULL ? f->defender->pid : -1, rt_clock - f->started, rt_clock);
+            rt_inflight[i] = rt_inflight[--rt_inflight_count];
+            continue;
+        }
+
         float elapsed = rt_clock - f->started;
         bool swingDone = anim_busy(f->attacker) == 0;
         bool connected = rt_is_reacting(f->defender);
 
-        // TEMP DIAG (fire-timing): sample the attacker's animation timeline so the [COMBAT/fire-time]
-        // summary below can say WHERE the delay is -- swing start, visible discharge, end of the
-        // swing pose, and commit. Cheap (three float compares) and edge-latched, not per-frame spam.
+        // Latch the edges of the attacker's swing pose. poseEnded below reads them to commit a
+        // THROWN weapon once the throw itself is over. Edge-latched: two float compares a frame.
         if (f->attacker != NULL) {
             bool inAttackPose = rt_is_attack_anim(FID_ANIM_TYPE(f->attacker->fid));
             if (inAttackPose) {
                 if (f->tAnimStart < 0.0f) {
                     f->tAnimStart = elapsed;
-                }
-                if (f->tAction < 0.0f && rt_attack_action_frame_reached(f->attacker)) {
-                    f->tAction = elapsed;
                 }
             } else if (f->tAnimStart >= 0.0f && f->tAnimEnd < 0.0f) {
                 // Left the swing pose: from here on the sequence is the recoil/UNPOINT tail and,
@@ -6106,7 +7357,7 @@ void combat_rt_update(float dt)
         // rt_attack_action_frame_reached, made a rifle's hit land before the shot was visible.
         // ⚠️ THROWN vs SHOT is the line that matters here, not "has a projectile" (2026-08-10).
         // Both put something in the air, but only one of them is something you can WATCH fly:
-        //   * A GUN's bullet crosses the gap in 0-6 path steps (measured, proj-path) -- invisible.
+        //   * A GUN's bullet crosses the gap in 0-6 path steps (measured) -- invisible.
         //     Its bang IS the hit, so the commit belongs on the ACTION FRAME, where the shot fires
         //     and the weapon SFX plays. Waiting past it puts ~0.4 s between the bang and the target
         //     flinching, which is exactly the "I pictured the hit sound and the hit together" the
@@ -6126,7 +7377,7 @@ void combat_rt_update(float dt)
         // it would hand the unpoint's whole length back as damage delay, undoing the win from
         // dropping ANIM_POINT. Leaving the fire pose is the end of the VISIBLE shot, which is the
         // sync point the eye actually uses, and it keeps vanilla's ordering (damage before the
-        // weapon is lowered, never after). Measured flight is 0-6 steps (proj-path), so the
+        // weapon is lowered, never after). Measured flight is 0-6 steps, so the
         // remaining error is small and the cap still bounds everything.
         // Needs tAnimStart to have been seen, or a shot whose animation never registered would
         // read as "pose already over" on frame one.
@@ -6222,25 +7473,6 @@ void combat_rt_update(float dt)
                 swingDone, connected, actionReached, poseEnded, projectileAttack, capped,
                 rt_inflight_count - 1, rt_clock);
 
-            // TEMP DIAG (fire-timing, 2026-08-10): ONE line per resolved attack carrying the whole
-            // timeline, so "does the hit land too late now?" is a measurement instead of a feel.
-            // Read it as:  anim= the swing pose started | action= the shot became VISIBLE
-            //              swing= the swing pose ended  | commit= damage + reaction landed
-            // The number that matters for a gun/spear is commit MINUS action: that is discharge ->
-            // impact PLUS the UNPOINT tail, and the tail is what to trim if it feels sluggish.
-            // Grouped by wpn= so each weapon he tests can be read separately.
-            // STRIP with the other temp diags once ranged timing is settled.
-            {
-                Object* firedWith = rAttacker != NULL ? item_hit_with(rAttacker, f->ctd.hitMode) : NULL;
-                trace_event(TRACE_COMBAT, "fire-time",
-                    "%s wpn=%s proj=%d dist=%d anim=%.2f action=%.2f swing=%.2f commit=%.2f t=%.2f",
-                    rAttacker == obj_dude ? "DUDE" : "NPC",
-                    firedWith != NULL ? object_name(firedWith) : "unarmed",
-                    projectileAttack ? 1 : 0,
-                    (rAttacker != NULL && rDefender != NULL) ? obj_dist(rAttacker, rDefender) : -1,
-                    f->tAnimStart, f->tAction, f->tAnimEnd, elapsed, rt_clock);
-            }
-
             // E: play the defender's stagger as its own sequence (decoupled from the
             // attacker's swing) for a LIGHT hit only -- knockdown/death/fire play their
             // own full reaction via the engine and must not be overridden by a flinch.
@@ -6318,13 +7550,41 @@ void combat_rt_update(float dt)
         if (rt_dude_prone_since < 0.0f) {
             rt_dude_prone_since = rt_clock;
         }
-        if (rt_clock - rt_dude_prone_since >= rt_knockdown_dwell) {
+        if (rt_dude_prone_fall_end < 0.0f) {
+            rt_dude_prone_fall_end = rt_clock;
+        }
+        bool capped = false;
+        if (rt_prone_ready_to_stand(rt_dude_prone_since, rt_dude_prone_fall_end, &capped)) {
+            if (capped) {
+                trace_event(TRACE_FLOW, "prone-cap", "DUDE ground=%.2f dwellLeft=%.2f t=%.2f",
+                    rt_clock - rt_dude_prone_fall_end,
+                    rt_knockdown_dwell - (rt_clock - rt_dude_prone_since), rt_clock);
+            }
             rt_stand_up(obj_dude);
             rt_dude_prone_since = -1.0f;
+            rt_dude_prone_fall_end = -1.0f;
         }
-    } else {
+    } else if (!critter_is_prone(obj_dude)) {
+        // Genuinely back on his feet (or never down): both timers are meaningless, clear them.
         rt_dude_prone_since = -1.0f;
+        rt_dude_prone_fall_end = -1.0f;
     }
+    // ⚠️ STILL DOWN, JUST NOT ELIGIBLE THIS FRAME -> HOLD BOTH TIMERS. This `else` used to be
+    // unconditional, and clearing prone_fall_end here is what let a knockdown pin the player
+    // INDEFINITELY. rt_needs_standup requires anim_busy == 0, so every hit-react taken while on
+    // the ground flickered it false for a frame or two, and the reset moved the anchor the 3.4 s
+    // RT_KNOCKDOWN_GROUND_CAP is measured from. The cap is the ANTI-PIN backstop -- and it was
+    // being reset by exactly the thing it exists to bound, so the harder you were focus-fired the
+    // more reliably it failed to save you.
+    //
+    // Measured, trace_2026-08-29_131744 s=3227.9: anim=20 held on frame 10 (the fall finished --
+    // busy=0, so nothing was playing, the sprite was simply frozen) for 5+ seconds, with ZERO
+    // FLOW/standup and ZERO prone-cap in the entire 56-minute log. It ended only because the map
+    // changed. That is the "zasekne se mi jedna animace" report.
+    //
+    // The dwell restarting per hit is DELIBERATE (rt_bump_prone_dwell -- shooting a downed body
+    // keeps it down). The cap is what makes that bounded, so the two must not share an anchor:
+    // prone_since is the per-hit timer, prone_fall_end is stamped once and left alone.
 
     // Flinch cap backstop: even with no movement input, don't leave the dude
     // frozen in a hit-react or miss-dodge for its full length. Past
@@ -6453,7 +7713,16 @@ void combat_rt_update(float dt)
     // nothing to measure against, so the multiplier is a neutral 1.0 -- exactly what the NPC half
     // already does via npcInFight.
     int dudeEnemyDist = rt_engaged ? rt_dude_nearest_hostile_dist() : -1;
-    float regenDt = dt * rt_proximity_regen_mult(dudeEnemyDist, dudeWalking || dudeRunning, true);
+
+    // ⚠️ THE DEADLOCK GUARD FOR ap_empty_walks, AND IT IS NOT OPTIONAL. Under that mode the dude
+    // keeps moving at 0 AP for free, which is EXACTLY the shape that deadlocked an early build:
+    // free movement plus a zero-regen moving curve pins the pool at 0 forever. The stop-dead
+    // behaviour closed it by forcing him onto the standing curve; this mode closes it by putting
+    // him on the standing curve DIRECTLY while the latch is up, moving or not. The pool then always
+    // climbs, the latch always clears, and the walk is a penalty rather than a trap.
+    bool dudeOnMovingCurve = (dudeWalking || dudeRunning)
+        && !(rt_move_blocked && rt_ap_empty_walks);
+    float regenDt = dt * rt_proximity_regen_mult(dudeEnemyDist, dudeOnMovingCurve, true);
 
     // The dt=0 run call still clamps the INT_MAX startup sentinel to the dude's current
     // max on frame 1.
@@ -6497,7 +7766,13 @@ void combat_rt_update(float dt)
         // to resume_ap). Regen is paused for the whole walk (see the regen block above),
         // so this rate is the FULL burn, not a net figure. A zero rt_walk_ap_cost makes
         // this a no-op and walking is free again (but still non-regenerating).
-        rt_walk_ap_drain += rt_effective_walk_cost() * dt;
+        // Under ap_empty_walks the recovery walk is FREE: he has already paid for running dry by
+        // being reduced to a walk, and charging for it as well would hold the pool at 0 whenever
+        // the walk cost exceeds the regen (it does, at any distance from the enemy) -- a walk he
+        // could never walk out of.
+        if (!(rt_move_blocked && rt_ap_empty_walks)) {
+            rt_walk_ap_drain += rt_effective_walk_cost() * dt;
+        }
         while (rt_walk_ap_drain >= 1.0f && rt_player_ap > 0) {
             rt_player_ap--;
             rt_walk_ap_drain -= 1.0f;
@@ -6536,10 +7811,28 @@ void combat_rt_update(float dt)
     // intface_update_move_points itself reads combat_rt_player_ap() while
     // combat_rt is enabled, so the engine combat.ap (kept maxed for movement)
     // never reaches the bar.
+    // The dude's sprite must hold what his hand holds. The swap animation that normally keeps
+    // those in step is cancellable in realtime, so it is verified here instead of trusted.
+    intface_reconcile_weapon_fid();
+
     int hudAp = combat_rt_player_ap();
-    if (hudAp != rt_last_hud_ap) {
+    int hudBlocked = combat_rt_move_blocked() ? 1 : 0;
+    if (hudAp != rt_last_hud_ap || hudBlocked != rt_last_hud_blocked) {
         rt_last_hud_ap = hudAp;
+        rt_last_hud_blocked = hudBlocked;
         intface_update_move_points(hudAp, 0);
+    }
+
+    // Keep the ARMOR CLASS readout live for the same reason. animate=false on purpose: the
+    // animated path spins the digits with block_for_tocks + renderPresent, which would stall the
+    // realtime loop once per changed point. stat_level is the single source of truth here, so
+    // this also covers armour swaps and stat buffs, not just the AP term.
+    if (obj_dude != NULL) {
+        int hudAc = stat_level(obj_dude, STAT_ARMOR_CLASS);
+        if (hudAc != rt_last_hud_ac) {
+            rt_last_hud_ac = hudAc;
+            intface_update_ac(false);
+        }
     }
 
     // Un-stick the UI. combat_anim_begin disables the interface + shows the wait
@@ -6583,6 +7876,35 @@ int combat_rt_player_max_ap()
     return stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
 }
 
+// The REAL action-point pool of any critter under realtime combat, or -1 when combat_rt is not
+// the authority on it (disabled, no critter, or an NPC that isn't tracked in the registry).
+//
+// Exists because the engine's `combat.critter.ap` field is NOT the pool any more: combat_rt pins
+// it to max every frame for both the dude (so anim.cc won't truncate walking) and every NPC, and
+// only combat_attack briefly subtracts a weapon cost from it. Anything that wants to ask "how
+// many points does this critter actually have left" must come here -- see STAT_ARMOR_CLASS in
+// stat.cc, where vanilla's "unused AP make you harder to hit" rule was reading the pinned field
+// and therefore handing out a flat max-AP bonus for the whole fight.
+int combat_rt_critter_ap(Object* critter)
+{
+    if (!rt_enabled || critter == NULL) {
+        return -1;
+    }
+
+    if (critter == obj_dude) {
+        return combat_rt_player_ap();
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == critter) {
+            int ap = rt_actors[i].ap;
+            return ap < 0 ? 0 : ap;
+        }
+    }
+
+    return -1;
+}
+
 int combat_rt_player_ap()
 {
     // Clamp: rt_player_ap is the INT_MAX sentinel until the first update frame
@@ -6595,6 +7917,51 @@ int combat_rt_player_ap()
         return 0;
     }
     return rt_player_ap;
+}
+
+// Is movement currently stopped on an empty pool? -- see the header. Reports the LATCH, not
+// "AP is below the threshold", and the difference is the whole point: the pool also sits
+// under the threshold right after a shot, and there the dude is perfectly free to walk until
+// the drain runs him down to 0. Only the latch means he has actually lost the ability to
+// move, which is the one state the bar has any business colouring red.
+//
+// False out of a fight ON PURPOSE. The drain block is gated on rt_engaged, so outside combat
+// nothing empties the pool and no threshold is enforced; without this gate a fight that ended
+// on an empty pool would leave the bar red for the seconds it takes regen to clear the latch,
+// while the dude is already walking around freely.
+bool combat_rt_move_blocked()
+{
+    return rt_enabled && rt_engaged && rt_move_blocked;
+}
+
+// Empty a critter's realtime AP pool outright -- the realtime meaning of vanilla's "lose your
+// turn". A critical failure sets `combat.ap = 0` on the attacker (combat.cc, DAM_LOSE_TURN), but
+// combat_rt keeps that engine field pinned at max so movement stays free, so the punishment landed
+// on a number nothing reads and a critical miss cost you NOTHING beyond the miss itself. Draining
+// the real pool is the honest translation: no turns to lose, so you lose the points and wait out
+// the regen -- which is the same tempo cost, paid in the currency this combat model actually uses.
+//
+// The accumulator goes with it, or a fraction of a point banked before the failure would hand back
+// the first point almost immediately.
+void combat_rt_zero_ap(Object* critter)
+{
+    if (!rt_enabled || critter == NULL) {
+        return;
+    }
+
+    if (critter == obj_dude) {
+        rt_player_ap = 0;
+        rt_player_ap_regen = 0.0f;
+        return;
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == critter) {
+            rt_actors[i].ap = 0;
+            rt_actors[i].ap_regen = 0.0f;
+            return;
+        }
+    }
 }
 
 // Spend AP from the realtime pool (e.g. a weapon reload = 2). Free and always
@@ -6746,6 +8113,10 @@ bool combat_rt_death_anim_pending()
         if (FID_TYPE(obj->fid) != OBJ_TYPE_CRITTER) {
             continue;
         }
+        // A hidden body is not on screen, so nothing is waiting for its animation to finish.
+        if ((obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
         if ((obj->data.critter.combat.results & DAM_DEAD) == 0) {
             continue;
         }
@@ -6775,6 +8146,51 @@ bool combat_rt_under_threat()
         // After US specifically -- a critter busy with a scripted brawl against another NPC is
         // not a threat to the player and must not lock him out of talking or of his own scripts.
         if (a->target != obj_dude && !(a->target != NULL && isPartyMember(a->target))) {
+            continue;
+        }
+        if (!is_within_perception(a->obj, obj_dude)) {
+            continue;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// True while a fight is going on WITHIN SIGHT of the player -- whoever it is between.
+//
+// Vanilla has ONE global combat state: if anybody on the map is fighting, isInCombat() is true and
+// dialogue is refused outright. combat_rt_under_threat() deliberately narrowed that to "is something
+// after ME", which fixed the map-wide, minutes-long talk lockout (the "Gizmo's guards are dead and
+// the man still won't talk" report). But it also opened a hole vanilla never had: a brawl the player
+// is merely a BYSTANDER to leaves him free to stroll up and start a conversation mid-fight.
+//
+// That is exactly how the Skulz ambush got staged twice: Vinnie reads host=0 tgt=<another NPC> for
+// the whole fight, so nothing was ever "after" the player, so the talk gate opened -- and his
+// dialogue branch runs load_map, which re-spawns the ambush (see the memory note; the duplication
+// itself is vanilla script design, this gate is what let it be reached).
+//
+// NOTE the deliberate absence of an a->hostile test. The brawlers are NOT hostile to the dude --
+// that is the whole point. What matters is that a fight is happening where he can see it.
+//
+// Used ONLY by the player-initiated talk gates. Scripts, timed events and NPC behaviour keep using
+// combat_rt_under_threat(); widening those is what caused the lockouts in the first place.
+//
+// The player always has vanilla's own way out: combat_rt_end_combat() (Enter, or the D-pad entry)
+// sets every actor RT_IDLE and drops rt_engaged, so this goes false the moment he ends the fight.
+bool combat_rt_fight_in_view()
+{
+    if (!rt_enabled) {
+        return isInCombat();
+    }
+
+    if (!rt_engaged || obj_dude == NULL) {
+        return false;
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (a->state == RT_IDLE || a->target == NULL || !rt_is_combatant(a->obj)) {
             continue;
         }
         if (!is_within_perception(a->obj, obj_dude)) {
@@ -6838,6 +8254,76 @@ bool combat_rt_end_combat()
 
     trace_event(TRACE_FLOW, "end-combat", "manual actors=%d t=%.2f", rt_actor_count, rt_clock);
     return true;
+}
+
+// Onlooker notify for a victim that can no longer act as an aggro SEED -- i.e. one the hit
+// killed or knocked out outright.
+//
+// Vanilla calls combatai_notify_onlookers(defender) from apply_damage for EVERY damaged critter,
+// including one that dies from that very hit. combat_rt replaced that with the seed-anchored
+// spread in rt_refresh_registry, which recruits same-team onlookers around a LIVE hostile whose
+// whoHitMe is on the player's side. An instantly-killed victim never becomes that seed:
+// rt_is_combatant() is false for a corpse, so the victim is dropped both as an actor and as a
+// spread anchor, and the critter standing right next to it learns NOTHING. A one-shot kill
+// therefore read as a silent takedown, while the same shot that merely WOUNDED the victim
+// aggroed its whole camp one refresh later. Confirmed in trace_2026-08-27_170457: three player
+// attacks, two instant kills, and ZERO [FLOW/newhostile] / [FLOW/aggro-spread] in the whole log.
+//
+// So notify here, at the damage commit, exactly where vanilla did -- but ONLY for the case the
+// spread structurally cannot cover, and with the SAME recruitment bounds it uses (same team as
+// the victim, and must SEE the victim or HEAR the gunfire). Nothing is aggroed that a surviving
+// victim would not have aggroed a frame later; this only closes the death hole.
+void combat_rt_notify_victim(Object* attacker, Object* victim)
+{
+    if (!rt_enabled || attacker == NULL || victim == NULL) {
+        return;
+    }
+
+    if (!rt_is_critter(attacker) || !rt_is_critter(victim)) {
+        return;
+    }
+
+    // Only the PLAYER'S side recruits. The flag means "hostile to the dude", so an NPC-vs-NPC
+    // kill (a guard executing a thief) must not turn the victim's faction on US.
+    if (attacker != obj_dude && !isPartyMember(attacker)) {
+        return;
+    }
+
+    // Still standing -> the normal spread will seed off it on the next refresh. Leave it alone,
+    // so the surviving-victim path keeps its existing, play-tested behaviour.
+    if (rt_is_combatant(victim)) {
+        return;
+    }
+
+    int team = victim->data.critter.combat.team;
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        Object* onlooker = a->obj;
+        if (a->hostile || onlooker == victim || !rt_is_combatant(onlooker)) {
+            continue;
+        }
+
+        if (onlooker->data.critter.combat.team != team) {
+            continue;
+        }
+
+        // Sight is checked against the VICTIM (that is what there is to witness); earshot is
+        // checked against the ATTACKER, because rt_hears_gunfire derives "a firearm is involved"
+        // from the anchor's own hands, and a corpse's whoHitMe is not a reliable second source.
+        bool saw = is_within_perception(onlooker, victim);
+        bool heard = rt_hears_gunfire(onlooker, attacker);
+        if (!saw && !heard) {
+            continue;
+        }
+
+        a->hostile = true;
+        onlooker->data.critter.combat.maneuver |= CRITTER_MANEUVER_ENGAGING;
+        trace_event(TRACE_FLOW, "witness-kill",
+            "onlooker=%d(pid=%d) victim=%d(pid=%d) team=%d saw=%d heard=%d dist=%d t=%.2f",
+            onlooker->id, onlooker->pid, victim->id, victim->pid, team,
+            saw ? 1 : 0, heard ? 1 : 0, obj_dist(onlooker, victim), rt_clock);
+    }
 }
 
 void combat_rt_notify_attack(Object* attacker, Object* defender)
@@ -7244,10 +8730,17 @@ void combat_rt_trace_snapshot()
     int dudeHp = obj_dude != NULL ? stat_level(obj_dude, STAT_CURRENT_HIT_POINTS) : -1;
     int dudeAnim = obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1;
 
+    // TEMP DIAG (STRIP with ac-diag): ac= is the LIVE armor class and eap= the engine combat.ap
+    // it rides on. The interface readout only refreshes on intface_redraw/show, so the bar can
+    // sit on a stale value; this once-a-second sample says what the number actually was.
+    int dudeAc = obj_dude != NULL ? stat_level(obj_dude, STAT_ARMOR_CLASS) : -1;
+    int dudeEap = obj_dude != NULL ? obj_dude->data.critter.combat.ap : -1;
+
     trace_event(TRACE_STATE, "hb",
-        "eng=%d act=%d host=%d hp=%d ap=%d/%d lock=%d pend=%d inflight=%d anim=%d animOcc=%d/%d",
+        "eng=%d act=%d host=%d hp=%d ap=%d/%d ac=%d eap=%d lock=%d pend=%d inflight=%d anim=%d animOcc=%d/%d",
         rt_engaged ? 1 : 0, rt_actor_count, hostiles, dudeHp,
         combat_rt_player_ap(), combat_rt_player_max_ap(),
+        dudeAc, dudeEap,
         rt_lock_target != NULL ? 1 : 0, pending ? 1 : 0, rt_inflight_count,
         dudeAnim, occ, RT_ANIM_TABLE_CAP);
 

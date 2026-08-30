@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "game/anim.h"
+#include "game/game_trace.h"
 #include "game/combat.h"
 #include "game/combat_rt.h"
 #include "game/combatai.h"
@@ -11,7 +12,6 @@
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
-#include "game/game_trace.h" // TEMP DIAG (fire-timing): proj-path
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
@@ -704,8 +704,36 @@ void show_damage(Attack* attack, int a2, int delay, bool splitDefender)
 // 0x411134
 int action_attack(Attack* attack)
 {
-    if (register_clear(attack->attacker) == -2) {
-        return -1;
+    // ⚠️ register_clear ends ONE sequence and returns (anim.cc:602 -- `anim_set_end` then
+    // `return 0`), but check_registry further down vetoes on EVERY live sequence that lists the
+    // object as an owner. An attacker holding TWO of them therefore kept the second, and that
+    // second one refused the very first registration inside action_melee/action_ranged; the
+    // refusal calls anim_cleanup, which drops the transaction, so register_end returns -1 and
+    // the whole attack disappears -- with no reg-clear-refused (nothing was PRIORITIZED) and no
+    // reg-begin-fail (the slot was acquired). That is the shape measured in
+    // trace_2026-08-23_143356: 285 x `attack-fail rc=-1 atkBusy=0 defBusy=0`, zero of either
+    // warning, because a leftover length-1 ANIM_STAND is invisible to anim_busy (anim.cc:839)
+    // yet fatal to check_registry (anim.cc:803). So DRAIN them: keep clearing until nothing the
+    // attacker owns is left (-1) or one of them is prioritized (-2, the pre-existing refusal).
+    for (int cleared = 0;; cleared++) {
+        int rc = register_clear(attack->attacker);
+        if (rc == -1) {
+            break; // no sequence left mentions the attacker
+        }
+        if (rc == -2) {
+            trace_event(TRACE_WARN, "reg-clear-refused", "pid=%d busy=%d blk=%d cleared=%d",
+                attack->attacker != NULL ? attack->attacker->pid : -1,
+                anim_busy(attack->attacker), anim_busy_blocking(attack->attacker), cleared);
+            return -1;
+        }
+        // Bounded by the sequence table (anim.cc: 64 slots). anim_set_end retires the slot it
+        // just cleared, so this always terminates -- the cap is belt-and-braces against a
+        // sequence that somehow survives its own end.
+        if (cleared >= 64) {
+            trace_event(TRACE_WARN, "reg-clear-loop", "pid=%d",
+                attack->attacker != NULL ? attack->attacker->pid : -1);
+            break;
+        }
     }
 
     if (register_clear(attack->defender) == -2) {
@@ -767,11 +795,15 @@ int action_attack(Attack* attack)
     }
 
     int anim = item_w_anim(attack->attacker, attack->hitMode);
-    if (anim < ANIM_FIRE_SINGLE && anim != ANIM_THROW_ANIM) {
-        return action_melee(attack, anim);
-    } else {
-        return action_ranged(attack, anim);
-    }
+
+    // Scoped so check_registry names whoever refuses a registration in here -- the one exit
+    // that could still drop an attack silently now that the clear above drains the attacker.
+    anim_debug_attack_scope(true);
+    int rc = (anim < ANIM_FIRE_SINGLE && anim != ANIM_THROW_ANIM)
+        ? action_melee(attack, anim)
+        : action_ranged(attack, anim);
+    anim_debug_attack_scope(false);
+    return rc;
 }
 
 // True if the defender is mid-locomotion in realtime combat, so its purely-cosmetic
@@ -825,7 +857,18 @@ static int action_melee(Attack* attack, int anim)
 
     bool splitDefender = action_split_defender_anim();
 
-    register_begin(ANIMATION_REQUEST_RESERVED);
+    // The attack's WHOLE failure mode funnels through here. This return value used to be
+    // discarded; register_end() then returns -1 purely because no transaction is open, so
+    // combat_attack reports -1 with nothing anywhere saying the animation slot was never
+    // acquired. Two global reasons: an already-open transaction, or the anim_stop reentry
+    // guard -- and both are gone by the time the caller could look at them.
+    if (register_begin(ANIMATION_REQUEST_RESERVED) == -1) {
+        int openTx = -1;
+        int inStop = 0;
+        anim_debug_gate(&openTx, &inStop);
+        trace_event(TRACE_WARN, "reg-begin-fail", "melee pid=%d openTx=%d inStop=%d",
+            attack->attacker != NULL ? attack->attacker->pid : -1, openTx, inStop);
+    }
     register_priority(1);
 
     fid = art_id(OBJ_TYPE_CRITTER, attack->attacker->fid & 0xFFF, anim, (attack->attacker->fid & 0xF000) >> 12, attack->attacker->rotation + 1);
@@ -936,7 +979,18 @@ static int action_ranged(Attack* attack, int anim)
 
     bool splitDefender = action_split_defender_anim();
 
-    register_begin(ANIMATION_REQUEST_RESERVED);
+    // The attack's WHOLE failure mode funnels through here. This return value used to be
+    // discarded; register_end() then returns -1 purely because no transaction is open, so
+    // combat_attack reports -1 with nothing anywhere saying the animation slot was never
+    // acquired. Two global reasons: an already-open transaction, or the anim_stop reentry
+    // guard -- and both are gone by the time the caller could look at them.
+    if (register_begin(ANIMATION_REQUEST_RESERVED) == -1) {
+        int openTx = -1;
+        int inStop = 0;
+        anim_debug_gate(&openTx, &inStop);
+        trace_event(TRACE_WARN, "reg-begin-fail", "ranged pid=%d openTx=%d inStop=%d",
+            attack->attacker != NULL ? attack->attacker->pid : -1, openTx, inStop);
+    }
     register_priority(1);
 
     Object* projectile = NULL;
@@ -1044,15 +1098,6 @@ static int action_ranged(Attack* attack, int anim)
                     register_object_move_straight_to_tile(projectile, attack->defender->tile, attack->defender->elevation, ANIM_WALK, 0);
                     actionFrame = make_straight_path(projectile, projectileOrigin, attack->defender->tile, NULL, NULL, 32) - 1;
                     v24 = attack->defender->tile;
-
-                    // TEMP DIAG (fire-timing, 2026-08-10): how many steps the projectile flies.
-                    // combat_rt's [COMBAT/fire-time] can see when the SWING ended and when the hit
-                    // committed, but not how that gap splits between the flight and the UNPOINT
-                    // tail. This is the missing half. STRIP with the fire-time diag.
-                    if (combat_rt_enabled()) {
-                        trace_event(TRACE_COMBAT, "proj-path", "steps=%d pid=%d",
-                            actionFrame, weapon != NULL ? weapon->pid : -1);
-                    }
                 } else {
                     register_object_move_straight_to_tile(projectile, attack->tile, attack->defender->elevation, ANIM_WALK, 0);
                     actionFrame = 0;

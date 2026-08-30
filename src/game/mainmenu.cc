@@ -29,6 +29,7 @@ namespace fallout {
 
 typedef enum MainMenuButton {
     MAIN_MENU_BUTTON_INTRO,
+    MAIN_MENU_BUTTON_CONTINUE,
     MAIN_MENU_BUTTON_NEW_GAME,
     MAIN_MENU_BUTTON_LOAD_GAME,
     MAIN_MENU_BUTTON_CREDITS,
@@ -37,6 +38,8 @@ typedef enum MainMenuButton {
 } MainMenuButton;
 
 static int main_menu_fatal_error();
+static void main_menu_extend_plate();
+static const char* main_menu_label(int index);
 static void main_menu_play_sound(const char* fileName);
 static void main_menu_draw_option(int index, int color);
 static void main_menu_gamepad_highlight(int sel);
@@ -69,6 +72,7 @@ static unsigned int main_menu_timeout = 120000;
 // 0x505AA4
 static int button_values[MAIN_MENU_BUTTON_COUNT] = {
     KEY_LOWERCASE_I,
+    KEY_LOWERCASE_O, // c is taken by CREDITS, so cOntinue
     KEY_LOWERCASE_N,
     KEY_LOWERCASE_L,
     KEY_LOWERCASE_C,
@@ -78,6 +82,7 @@ static int button_values[MAIN_MENU_BUTTON_COUNT] = {
 // 0x505AB8
 static int return_values[MAIN_MENU_BUTTON_COUNT] = {
     MAIN_MENU_INTRO,
+    MAIN_MENU_CONTINUE,
     MAIN_MENU_NEW_GAME,
     MAIN_MENU_LOAD_GAME,
     MAIN_MENU_CREDITS,
@@ -142,6 +147,9 @@ int main_menu_create()
         MAIN_MENU_WINDOW_WIDTH);
     art_ptr_unlock(background_key);
 
+    // Six options need a six-row plate; the art only draws five. See the block above.
+    main_menu_extend_plate();
+
     int oldFont = text_curr();
     text_font(100);
 
@@ -202,11 +210,11 @@ int main_menu_create()
     text_font(104);
 
     for (int index = 0; index < MAIN_MENU_BUTTON_COUNT; index++) {
-        msg.num = 9 + index;
-        if (message_search(&misc_message_file, &msg)) {
-            len = text_width(msg.text);
+        const char* label = main_menu_label(index);
+        if (label != NULL) {
+            len = text_width((char*)label);
             text_to_buf(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (42 * index - index + 46) + 520 - (len / 2),
-                msg.text,
+                (char*)label,
                 MAIN_MENU_WINDOW_WIDTH - (520 - (len / 2)) - 1,
                 MAIN_MENU_WINDOW_WIDTH,
                 colorTable[21091]);
@@ -518,16 +526,93 @@ static void main_menu_play_sound(const char* fileName)
 // (non-antialiased) glyph text at fixed positions, so redrawing the same string
 // at the same spot in a new color cleanly overwrites the old glyphs — this is how
 // the gamepad selection highlight moves without touching the background.
+
+// ⚠️ THE PLATE ONLY HAS FIVE SLOTS. mainmenu.frm draws the metal option plate with its divider
+// lines baked in: measured off the art, they sit at y 74 / 115 / 156 / 197 / 238 -- a 41 px step
+// -- and the frame's bottom edge follows immediately after. Vanilla's five buttons fill it
+// exactly, so the sixth (CONTINUE) would have hung in mid-air below the panel.
+//
+// So GROW the plate by one row, in the WINDOW buffer: lift the real bottom border out of the
+// way, duplicate one clean interior band (a row plus its divider and rivets) into the space it
+// occupied, then put the border back underneath. The plate texture is uniform and the rivets
+// repeat per row, so the seam does not read.
+//
+// ⚠️ In the WINDOW, never in background_data -- that is the shared art cache and writing to it
+// would corrupt the plate for anything else that locks the same fid.
+#define MENU_PLATE_X0 398
+#define MENU_PLATE_X1 620
+#define MENU_PLATE_ROW_H 41
+#define MENU_PLATE_BAND_Y 159 // a clean interior row (its divider included) to clone
+#define MENU_PLATE_BOTTOM_Y 238
+#define MENU_PLATE_BOTTOM_H 14
+
+
+// ⚠️ THE LABEL IS NO LONGER `9 + index`. misc.msg ids 9..13 are INTRO / NEW GAME / LOAD GAME /
+// CREDITS / EXIT in exactly that order, so inserting CONTINUE at position 1 would have made every
+// row below it draw its neighbour's name. The mapping is explicit now.
+//
+// ⚠️ CONTINUE's text is HARDCODED rather than given a new msg id. misc.msg lives inside
+// MASTER.DAT: adding an id there would mean shipping a loose copy of the WHOLE file beside it,
+// which then fights every localisation and every patch. Same call, same reason, as the Pip-Boy
+// CONTROLS page.
+static const int menu_label_msg[MAIN_MENU_BUTTON_COUNT] = { 9, -1, 10, 11, 12, 13 };
+static const char* menu_label_literal[MAIN_MENU_BUTTON_COUNT] = { NULL, "CONTINUE", NULL, NULL, NULL, NULL };
+
+// The text for one row, or NULL if the message is missing. The returned pointer is the message
+// list's own storage (the same thing getmsg hands out), so it outlives this call.
+static const char* main_menu_label(int index)
+{
+    if (index < 0 || index >= MAIN_MENU_BUTTON_COUNT) {
+        return NULL;
+    }
+    if (menu_label_literal[index] != NULL) {
+        return menu_label_literal[index];
+    }
+
+    MessageListItem msg;
+    msg.num = menu_label_msg[index];
+    if (message_search(&misc_message_file, &msg)) {
+        return msg.text;
+    }
+    return NULL;
+}
+
+static void main_menu_extend_plate()
+{
+    const int w = MENU_PLATE_X1 - MENU_PLATE_X0;
+    unsigned char bottom[(MENU_PLATE_X1 - MENU_PLATE_X0) * MENU_PLATE_BOTTOM_H];
+
+    // 1. Stash the plate's real bottom border.
+    for (int y = 0; y < MENU_PLATE_BOTTOM_H; y++) {
+        memcpy(&bottom[y * w],
+            main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + y) + MENU_PLATE_X0,
+            w);
+    }
+
+    // 2. Clone one interior band over it, which is the new sixth row.
+    for (int y = 0; y < MENU_PLATE_ROW_H; y++) {
+        memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + y) + MENU_PLATE_X0,
+            main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BAND_Y + y) + MENU_PLATE_X0,
+            w);
+    }
+
+    // 3. Put the border back, now one row lower.
+    for (int y = 0; y < MENU_PLATE_BOTTOM_H; y++) {
+        memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + MENU_PLATE_ROW_H + y) + MENU_PLATE_X0,
+            &bottom[y * w],
+            w);
+    }
+}
+
 static void main_menu_draw_option(int index, int color)
 {
-    MessageListItem msg;
-    msg.num = 9 + index;
-    if (message_search(&misc_message_file, &msg)) {
+    const char* label = main_menu_label(index);
+    if (label != NULL) {
         int oldFont = text_curr();
         text_font(104);
-        int len = text_width(msg.text);
+        int len = text_width((char*)label);
         text_to_buf(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (42 * index - index + 46) + 520 - (len / 2),
-            msg.text,
+            (char*)label,
             MAIN_MENU_WINDOW_WIDTH - (520 - (len / 2)) - 1,
             MAIN_MENU_WINDOW_WIDTH,
             color);

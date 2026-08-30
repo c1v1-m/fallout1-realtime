@@ -5,6 +5,7 @@
 
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/game_trace.h"
 #include "game/gconfig.h"
 #include "game/item.h"
 #include "game/map.h"
@@ -15,6 +16,7 @@
 #include "game/sfxcache.h"
 #include "game/stat.h"
 #include "game/worldmap.h"
+#include "audio_engine.h"
 #include "int/audio.h"
 #include "int/audiof.h"
 #include "int/movie.h"
@@ -179,48 +181,327 @@ static char background_fname_requested[COMPAT_MAX_PATH];
 // capped the pile-up. We raised it to 32 to fix the opposite complaint ("only one shot was
 // audible"), which removed the cap along with the bug. This puts a deliberate, gentler one back.
 //
-// ⚠️ IT COUNTS SOUNDS ACTUALLY STARTED, NOT gsound_active_effect_counter. That counter is
-// incremented at LOAD time, and animation sounds are loaded when the sequence is REGISTERED --
-// well before they play -- so during a busy fight it is inflated by queued sounds that are still
-// silent, and ducking against it would attenuate lone shots for no reason. A ring of recent start
-// times measures exactly what is being complained about: how many sounds hit the ear at once.
+// ⚠️ TWO DUCKS, NOT ONE -- they answer different halves of the same spike.
+//
+// ⚠️⚠️ ALL OF THIS IS OFF BY DEFAULT AND MUST STAY OFF. The player's instruction was explicit --
+// "nech to jako ve vanilla" -- after a run of changes that had crept from "one gun is too loud"
+// into reshaping the whole mix. Every knob below therefore ships NEUTRAL: burst 0, dup 0, weapon
+// gain 1.0, limiter 0. Out of the box this file changes NOTHING about how the game sounds. The one
+// deliberate exception is the per-sample table further down, which holds exactly the one sample he
+// asked to have turned down.
+//
+// The machinery is kept rather than deleted because it is measured, documented and switchable in
+// one cfg line if a specific complaint ever comes back. ⚠️ Do not switch any of it on as a default
+// again without him asking for that specific thing.
+//
+// ⚠️ KEEP BOTH GENTLE IF EVER ENABLED. These two apply to EVERY sound, not just weapons, and at
+// them at 1.0 / 2.0 -- which the player's own log caught cutting overlapping hit sounds and voices
+// to `duck=0.08 vol=1856`, i.e. eight per cent of their level. Mid-fight that reads exactly like
+// somebody turned the whole game down, and he asked precisely that. They are NOT the level control:
+// the weapon-class gain below sets levels, the output limiter catches genuine clipping, and these
+// only thin out how often the limiter has to act. If a pile-up is still too loud, the honest fix is
+// the limiter ceiling, not squashing every sound that happens to share a moment with another.
+//
+// (1) BURST: n sounds of ANY kind starting together. The first still plays full; the k-th gets
+//     1/(1 + (k-1)*strength). At 0.35 that is 1.00 / 0.74 / 0.59 / 0.51 -- audible restraint that
+//     still leaves a firefight sounding like a firefight.
+//
+//     ⚠️ THE FIRST VERSION LET THREE THROUGH FLAT OUT. `FREE = 2` counts PREDECESSORS, so with
+//     strength 0.25 four shots summed to 3.6x -- audibly the same spike it was built to remove,
+//     which is why the report came straight back. Two sounds at full volume is already +6 dB.
+//
+// (2) DUPLICATE: the SAME sample starting again while the first is barely underway. This is the
+//     worst case by a distance -- identical waveforms sum perfectly in phase, so two copies are
+//     exactly twice the amplitude with none of the roughness that makes different sounds mask each
+//     other. It is also the common case in a firefight: four raiders with the same 10mm SMG. Ducked
+//     harder (default 2.0) because you genuinely cannot hear the difference between two identical
+//     cracks and one -- only the level.
+//
+// The two multiply. A second identical shot inside a burst lands at 0.50 * 0.33 = 0.17.
+//
+// ⚠️ ATTENUATES ON START ONLY; sounds already in flight keep their volume, because gsound hands out
+// no handle we may safely hold onto afterwards (it recycles Sound structs). A real limiter would
+// pull those down too. If spikes survive this, that is the next step -- and it needs the end
+// callback wired to a live handle list first, not a pointer ring.
+//
+// ⚠️ COUNTS SOUNDS ACTUALLY STARTED, NOT gsound_active_effect_counter. That counter is incremented
+// at LOAD time, and animation sounds load when the sequence is REGISTERED -- well before they play
+// -- so during a busy fight it is inflated by queued sounds that are still silent, and ducking
+// against it would attenuate lone shots for no reason.
 #define GSOUND_SFX_BURST_WINDOW_MS 120u
-#define GSOUND_SFX_BURST_FREE 2 // this many overlap at full volume; ducking starts above it
+// How many ALREADY-PLAYING overlaps are exempt. ⚠️ COUNTS PREDECESSORS, not sounds: at 0 the
+// first sound of a burst is still full volume (it has no predecessors) and only the SECOND is
+// ducked. The old value of 2 therefore let THREE play flat out, which is the +9 dB spike the
+// player kept reporting.
+#define GSOUND_SFX_BURST_FREE 0
+#define GSOUND_SFX_DUP_WINDOW_MS 150u
 #define GSOUND_SFX_RECENT_MAX 32
-static unsigned int gsound_sfx_recent[GSOUND_SFX_RECENT_MAX];
+
+typedef struct GSoundSfxStart {
+    unsigned int at;
+    char name[16]; // empty when the sample could not be named -- see gsound_sfx_lookup_name
+} GSoundSfxStart;
+
+static GSoundSfxStart gsound_sfx_recent[GSOUND_SFX_RECENT_MAX];
 static int gsound_sfx_recent_next = 0;
-// Strength of the duck (cfg sfx_burst_duck). 0 = off, restoring the old behaviour exactly.
-static float gsound_sfx_burst_duck = 0.25f;
+// Strength of the ducks (cfg sfx_burst_duck / sfx_dup_duck). 0 = off, restoring vanilla mixing.
+static float gsound_sfx_burst_duck = 0.0f;
+static float gsound_sfx_dup_duck = 0.0f;
 
-// Registers this play and quietens it in proportion to how many others just started.
-static void gsound_sfx_limit(Sound* sound)
+// Names of recently LOADED sfx, so a sound can be identified at PLAY time -- gsnd_anim_sound (the
+// whole combat path: every weapon report, hit and death cry) is handed a Sound* and nothing else.
+// Filled in gsound_load_sound_volume, the single loader the animation path uses (anim.cc
+// register_object_play_sfx).
+//
+// ⚠️ POINTER COMPARE ONLY, never dereferenced -- gsound recycles its Sound structs, so an entry can
+// outlive the sound it named, and a recycled pointer can return the previous tenant's name.
+//
+// ⚠️ THIS IS NOW LOAD-BEARING (the duplicate duck reads it), not just diagnostics. Both failure
+// modes are bounded on purpose: a stale name can only mis-scale one sound by one step, and an
+// UNNAMEABLE sound returns NULL rather than a placeholder -- if it returned a shared string like
+// "(anim)", every unnamed sound would look like a duplicate of every other one and the duck would
+// fire on completely different samples.
+#define GSOUND_SFX_NAMED_MAX 32
+static Sound* gsound_sfx_named_ptr[GSOUND_SFX_NAMED_MAX];
+static char gsound_sfx_named[GSOUND_SFX_NAMED_MAX][16];
+static int gsound_sfx_named_next = 0;
+
+static void gsound_sfx_remember_name(Sound* sound, const char* name)
 {
-    unsigned int now = get_time();
-
-    int overlapping = 0;
-    for (int i = 0; i < GSOUND_SFX_RECENT_MAX; i++) {
-        // Unsigned subtraction, so this stays correct across the tick counter wrapping.
-        if (gsound_sfx_recent[i] != 0 && now - gsound_sfx_recent[i] < GSOUND_SFX_BURST_WINDOW_MS) {
-            overlapping++;
-        }
-    }
-
-    gsound_sfx_recent[gsound_sfx_recent_next] = now;
-    gsound_sfx_recent_next = (gsound_sfx_recent_next + 1) % GSOUND_SFX_RECENT_MAX;
-
-    if (sound == NULL || gsound_sfx_burst_duck <= 0.0f || overlapping <= GSOUND_SFX_BURST_FREE) {
+    if (sound == NULL || name == NULL) {
         return;
     }
 
-    // 1 / (1 + excess * strength): monotonic, never reaches zero, and easy to reason about from the
-    // cfg number alone. At the default 0.25 -- 3 overlapping = 0.80, 5 = 0.57, 8 = 0.40.
-    float scale = 1.0f / (1.0f + (overlapping - GSOUND_SFX_BURST_FREE) * gsound_sfx_burst_duck);
+    gsound_sfx_named_ptr[gsound_sfx_named_next] = sound;
+    snprintf(gsound_sfx_named[gsound_sfx_named_next], sizeof(gsound_sfx_named[0]), "%s", name);
+    gsound_sfx_named_next = (gsound_sfx_named_next + 1) % GSOUND_SFX_NAMED_MAX;
+}
 
-    // SCALES the volume the caller already computed rather than replacing it -- that value carries
-    // the per-object distance attenuation from gsound_compute_relative_volume, and overwriting it
-    // would make every sound equally close.
-    int volume = soundGetVolume(sound);
-    soundVolume(sound, (int)(volume * scale));
+// NULL when the sample cannot be named -- see the warning above; never a placeholder string.
+static const char* gsound_sfx_lookup_name(Sound* sound)
+{
+    if (sound == NULL) {
+        return NULL;
+    }
+
+    for (int i = 0; i < GSOUND_SFX_NAMED_MAX; i++) {
+        if (gsound_sfx_named_ptr[i] == sound) {
+            return gsound_sfx_named[i];
+        }
+    }
+
+    return NULL;
+}
+
+// --- PER-SAMPLE GAIN ---
+//
+// Some shipped samples are simply mastered hotter than the rest, and no amount of limiting fixes
+// THAT: a limiter reacts to a spike, it cannot know one gun was always meant to sit level with the
+// others. The player named one directly -- Neal's gun in the Skum Pitt, which the map gives a 14mm
+// Pistol (proto 22, 6 rounds of 14mm AP). Its weapon sound code is 'E', so the sample is WAE1XXX1,
+// shared with exactly one other weapon, the .223 Pistol -- both big loud handguns, so quietening the
+// pair is right rather than collateral.
+//
+// ⚠️ IT SCALES, IT DOES NOT REPLACE. The character of the sample is untouched -- same grit, lower
+// level, which is what he asked for ("ztiš to, ať to má ten hrubý zvuk"). Anything else that turns
+// out to be too hot can be added below or, without a rebuild, dropped into fallout.cfg:
+//
+//     [sfx_gain]
+//     wae1xxx1=0.4
+//
+// The cfg value wins over the built-in default, so a bad default here is never a trap.
+struct GSoundSfxGain {
+    const char* name;
+    float gain;
+};
+
+static const GSoundSfxGain gsound_sfx_gain_defaults[] = {
+    // 14mm Pistol / .223 Pistol -- the one the player named, hotter than even the other guns.
+    { "WAE1XXX1", 0.30f },
+};
+
+// ⚠️ AND THE WHOLE WEAPON CLASS IS THE REAL ANSWER, not a per-sample list. The trace of a live fight
+// settled it: the shot that hurt was `name=WAA1XXX1 onsets=0 dupes=0 duck=1.00 vol=22281` -- a 10mm
+// Pistol, ALONE, at the full sfx volume, with nothing overlapping it. No stacking, no clipping, so
+// neither the ducks nor the limiter had any reason to touch it. Weapon reports are simply mixed hot
+// against everything else in the game: every other sample in that same trace sat at 22281 only when
+// right on top of the player and 11140 once distance attenuation applied, while every gunshot was
+// pinned at the maximum.
+//
+// So the weapon family ('W' prefix: WA attack, WH hit, WR ready, WO out of ammo, WF firing) gets one
+// level control, and chasing individual samples stays the exception for genuine outliers.
+//
+// ⚠️ A per-sample entry above REPLACES this, it does not multiply with it -- otherwise every outlier
+// would silently get squared the moment someone touched the class knob.
+static float gsound_sfx_weapon_gain = 1.0f;
+// Mirror of the cfg switch, only so the audio-cfg trace line can report what is actually in force.
+static bool gsound_sfx_limiter_enabled = true;
+
+// Resolved gains, so the config is searched once per distinct sample rather than once per shot.
+#define GSOUND_SFX_GAIN_CACHE 24
+static char gsound_sfx_gain_name[GSOUND_SFX_GAIN_CACHE][16];
+static float gsound_sfx_gain_value[GSOUND_SFX_GAIN_CACHE];
+static int gsound_sfx_gain_count = 0;
+
+static float gsound_sfx_gain_for(const char* name)
+{
+    if (name == NULL || name[0] == '\0') {
+        return 1.0f;
+    }
+
+    for (int i = 0; i < gsound_sfx_gain_count; i++) {
+        if (strcmp(gsound_sfx_gain_name[i], name) == 0) {
+            return gsound_sfx_gain_value[i];
+        }
+    }
+
+    float gain = (name[0] == 'W' || name[0] == 'w') ? gsound_sfx_weapon_gain : 1.0f;
+    for (int i = 0; i < (int)(sizeof(gsound_sfx_gain_defaults) / sizeof(gsound_sfx_gain_defaults[0])); i++) {
+        if (compat_stricmp(gsound_sfx_gain_defaults[i].name, name) == 0) {
+            gain = gsound_sfx_gain_defaults[i].gain;
+            break;
+        }
+    }
+
+    // Sample names arrive upper-cased (compat_strupr in gsnd_build_*_sfx_name) but a hand-written
+    // cfg key is far more likely to be lower case, and assoc_search matches exactly -- so try both
+    // rather than make the player guess which one the parser wants.
+    double configured;
+    char lower[16];
+    snprintf(lower, sizeof(lower), "%s", name);
+    compat_strlwr(lower);
+
+    if (config_get_double(&game_config, GAME_CONFIG_SFX_GAIN_SECTION_KEY, name, &configured)
+        || config_get_double(&game_config, GAME_CONFIG_SFX_GAIN_SECTION_KEY, lower, &configured)) {
+        gain = configured < 0.0 ? 0.0f : (configured > 1.0 ? 1.0f : (float)configured);
+    }
+
+    if (gsound_sfx_gain_count < GSOUND_SFX_GAIN_CACHE) {
+        snprintf(gsound_sfx_gain_name[gsound_sfx_gain_count], sizeof(gsound_sfx_gain_name[0]), "%s", name);
+        gsound_sfx_gain_value[gsound_sfx_gain_count] = gain;
+        gsound_sfx_gain_count++;
+    }
+
+    return gain;
+}
+
+// Applied at LOAD, not at play: the play sites for animation sounds only ever see a Sound*, and the
+// name ring that recovers a name there can miss if enough sounds load between registering a sequence
+// and firing it. At load the name is always in hand, so the gain can never silently not apply.
+static void gsound_apply_sample_gain(Sound* sound, const char* name)
+{
+    if (sound == NULL) {
+        return;
+    }
+
+    float gain = gsound_sfx_gain_for(name);
+    int before = soundGetVolume(sound);
+    if (gain < 1.0f) {
+        soundVolume(sound, (int)(before * gain));
+    }
+
+    // ⚠️ PROOF, NOT DECORATION. Four rounds of level changes produced "still loud" every time, and
+    // the play-time log could not tell me why: it identifies animation sounds through a 32-entry
+    // pointer ring, and in a busy scene a weapon sound loaded at sequence-registration time can be
+    // evicted before it ever fires -- so the shot plays with no name and no line. HERE the name is
+    // an argument, so a gunshot cannot pass through unlogged.
+    //
+    // Reading it: `WA...` at `gain=0.35 vol=22281->7798` means the setting reached the shot and the
+    // remaining loudness is the sample itself. No line at all for a shot you can hear means this
+    // function is not on that sound's path, which is a different bug entirely.
+    if (trace_enabled() && gain < 1.0f) {
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            // Logged from here rather than gsound_init because the trace file is not open yet that
+            // early -- the first gunshot is late enough to be certain.
+            trace_event(TRACE_FLOW, "audio-cfg", "weaponGain=%.2f burst=%.2f dup=%.2f limiter=%d sfxVol=%d",
+                gsound_sfx_weapon_gain, gsound_sfx_burst_duck, gsound_sfx_dup_duck,
+                gsound_sfx_limiter_enabled ? 1 : 0, sndfx_volume);
+        }
+
+        trace_event(TRACE_WARN, "sfx-gain", "name=%s gain=%.2f vol=%d->%d",
+            name, gain, before, soundGetVolume(sound));
+    }
+}
+
+// Registers this play and quietens it in proportion to how many others just started.
+static void gsound_sfx_limit(Sound* sound, const char* name)
+{
+    unsigned int now = get_time();
+    const char* resolved = name != NULL ? name : gsound_sfx_lookup_name(sound);
+
+    int overlapping = 0;
+    int dupes = 0;
+    for (int i = 0; i < GSOUND_SFX_RECENT_MAX; i++) {
+        if (gsound_sfx_recent[i].at == 0) {
+            continue;
+        }
+
+        // Unsigned subtraction, so this stays correct across the tick counter wrapping.
+        unsigned int age = now - gsound_sfx_recent[i].at;
+        if (age < GSOUND_SFX_BURST_WINDOW_MS) {
+            overlapping++;
+        }
+
+        // An unnameable sound counts toward the burst but can never be a duplicate -- guessing
+        // would duck unrelated samples.
+        if (age < GSOUND_SFX_DUP_WINDOW_MS && resolved != NULL
+            && gsound_sfx_recent[i].name[0] != '\0'
+            && strcmp(gsound_sfx_recent[i].name, resolved) == 0) {
+            dupes++;
+        }
+    }
+
+    gsound_sfx_recent[gsound_sfx_recent_next].at = now;
+    snprintf(gsound_sfx_recent[gsound_sfx_recent_next].name,
+        sizeof(gsound_sfx_recent[0].name), "%s", resolved != NULL ? resolved : "");
+    gsound_sfx_recent_next = (gsound_sfx_recent_next + 1) % GSOUND_SFX_RECENT_MAX;
+
+    // 1 / (1 + excess * strength) for both: monotonic, never reaches zero, and readable straight
+    // off the cfg number. Burst at 1.0 -- 2 overlapping = 0.50, 4 = 0.25. Dup at 2.0 -- the second
+    // copy of a sample = 0.33, the third = 0.20.
+    float scale = 1.0f;
+    if (gsound_sfx_burst_duck > 0.0f && overlapping > GSOUND_SFX_BURST_FREE) {
+        scale /= 1.0f + (overlapping - GSOUND_SFX_BURST_FREE) * gsound_sfx_burst_duck;
+    }
+    if (gsound_sfx_dup_duck > 0.0f && dupes > 0) {
+        scale /= 1.0f + dupes * gsound_sfx_dup_duck;
+    }
+
+    if (sound != NULL && scale < 1.0f) {
+        // SCALES the volume the caller already computed rather than replacing it -- that value
+        // carries the per-object distance attenuation from gsound_compute_relative_volume, and
+        // overwriting it would make every sound equally close.
+        int volume = soundGetVolume(sound);
+        soundVolume(sound, (int)(volume * scale));
+    }
+
+    // Verification line for the fix above -- a spike is now something we can point at instead of
+    // argue about. `onsets` is what the burst duck sees, `dupes` how many copies of THIS sample are
+    // already in the air, `playing` the mixer's live voice count (music and speech included, so it
+    // reads 1-2 higher than the sfx alone). `duck` is the combined scale actually applied.
+    //
+    // ⚠️ `playing` can exceed `onsets` by a lot and that is not a bug: onsets only see a 120 ms
+    // window, while a death scream or an explosion tail is still sounding seconds later. If spikes
+    // survive with low onsets and high playing, THAT is the reading that says the next fix is a
+    // limiter over sounds already in flight rather than a stronger number here.
+    if (trace_enabled()) {
+        int playing = numSoundsPlaying();
+
+        // EVERY weapon sound is logged, overlapping or not. The whole reason this took four rounds
+        // is that the loud shot was a LONE one -- exactly the case the old gate threw away. `vol=`
+        // on these lines is the final level after the weapon-class gain, so the log now answers
+        // "did the setting actually reach the gunshot" without anyone having to guess.
+        bool weapon = resolved != NULL && (resolved[0] == 'W' || resolved[0] == 'w');
+
+        if (weapon || overlapping >= 2 || dupes > 0 || playing >= 4) {
+            trace_event(TRACE_WARN, "sfx-burst", "onsets=%d dupes=%d playing=%d duck=%.2f vol=%d name=%s",
+                overlapping, dupes, playing, scale,
+                sound != NULL ? soundGetVolume(sound) : -1,
+                resolved != NULL ? resolved : "?");
+        }
+    }
 }
 
 // 0x4475A0
@@ -308,10 +589,31 @@ int gsound_init()
     add_bk_process(gsound_bkg_proc);
     gsound_initialized = true;
 
-    // Concurrent-SFX limiter strength -- see gsound_sfx_limit. 0 restores vanilla mixing exactly.
-    double burstDuck = 0.25;
+    // Concurrent-SFX limiter strengths -- see gsound_sfx_limit. 0 (either one) restores vanilla
+    // mixing for that half. Capped well above the defaults so a spike can be beaten down by ear
+    // without a rebuild; the formula never reaches zero, so no value here can silence a sound.
+    double burstDuck = 0.0;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_BURST_DUCK_KEY, &burstDuck);
-    gsound_sfx_burst_duck = burstDuck < 0.0 ? 0.0f : (burstDuck > 1.0 ? 1.0f : (float)burstDuck);
+    gsound_sfx_burst_duck = burstDuck < 0.0 ? 0.0f : (burstDuck > 4.0 ? 4.0f : (float)burstDuck);
+
+    double dupDuck = 0.0;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_DUP_DUCK_KEY, &dupDuck);
+    gsound_sfx_dup_duck = dupDuck < 0.0 ? 0.0f : (dupDuck > 8.0 ? 8.0f : (float)dupDuck);
+
+    // Level of the whole weapon-sound family against everything else -- see gsound_sfx_gain_for.
+    // The one knob for "guns are too loud", which is a different complaint from "a pile-up is too
+    // loud" and needs a different lever.
+    double weaponGain = 1.0;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_WEAPON_GAIN_KEY, &weaponGain);
+    gsound_sfx_weapon_gain = weaponGain < 0.0 ? 0.0f : (weaponGain > 1.0 ? 1.0f : (float)weaponGain);
+
+    // Output limiter (audioEngineMixin). This is the one that stops the mix CLIPPING, as opposed to
+    // the two ducks above which only thin out how often it would. Escape hatch only -- turning it
+    // off can do nothing but restore the distortion.
+    int limiter = 0;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_LIMITER_KEY, &limiter);
+    gsound_sfx_limiter_enabled = limiter != 0;
+    audioEngineSetLimiterEnabled(gsound_sfx_limiter_enabled);
 
     // SOUNDS
     bool sounds = 0;
@@ -699,7 +1001,14 @@ int gsound_background_play(const char* fileName, int a2, int a3, int a4)
     background_storage_requested = a3;
     background_loop_requested = a4;
 
-    strcpy(background_fname_requested, fileName);
+    // The volume/enable path replays the remembered track by handing background_fname_requested
+    // straight back in (gsound_background_volume_set -> gsound_background_enable -> here), so this
+    // is a strcpy onto ITSELF -- undefined behaviour vanilla got away with, and one Address-
+    // Sanitizer halts the process for (strcpy-param-overlap, hit on every end of dialogue).
+    if (fileName != background_fname_requested) {
+        strncpy(background_fname_requested, fileName, sizeof(background_fname_requested) - 1);
+        background_fname_requested[sizeof(background_fname_requested) - 1] = '\0';
+    }
 
     if (!gsound_initialized) {
         return -1;
@@ -1212,7 +1521,7 @@ int gsound_play_sfx_file_volume(const char* a1, int a2)
         return -1;
     }
 
-    gsound_sfx_limit(v1);
+    gsound_sfx_limit(v1, a1);
     soundPlay(v1);
 
     return 0;
@@ -1342,6 +1651,8 @@ Sound* gsound_load_sound_volume(const char* name, Object* object, int volume)
 
     if (sound != NULL) {
         soundVolume(sound, (volume * sndfx_volume) / VOLUME_MAX);
+        gsound_apply_sample_gain(sound, name);
+        gsound_sfx_remember_name(sound, name);
     }
 
     return sound;
@@ -1391,7 +1702,7 @@ int gsnd_anim_sound(Sound* sound, void* a2)
     }
 
     // The main combat path: every weapon report, hit and death cry is an animation-registered sfx.
-    gsound_sfx_limit(sound);
+    gsound_sfx_limit(sound, NULL);
     soundPlay(sound);
 
     return 0;
@@ -1687,7 +1998,9 @@ int gsound_play_sfx_file(const char* name)
         return -1;
     }
 
-    gsound_sfx_limit(sound);
+    // This path loads WITHOUT a volume, so gsound_load_sound_volume's gain never ran for it.
+    gsound_apply_sample_gain(sound, name);
+    gsound_sfx_limit(sound, name);
     soundPlay(sound);
 
     return 0;

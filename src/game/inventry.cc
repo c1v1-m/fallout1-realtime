@@ -480,7 +480,7 @@ static int inven_gamepad_scroll_key()
     bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
 
     // HOLD TO REPEAT. It used to be edge-only, so a long inventory meant one press per row --
-    // "zatím jde pouze klikat". Now a held direction keeps stepping: one row on the press, then a
+    // "zatÃ­m jde pouze klikat". Now a held direction keeps stepping: one row on the press, then a
     // pause, then a steady stream, which is how every list on a controller behaves.
     static unsigned int heldSince = 0;
     static unsigned int lastRepeat = 0;
@@ -1489,6 +1489,18 @@ void exit_inventory(bool shouldEnableIso)
 
         dropped_explosive = false;
     }
+
+    // ⚠️ THE BUMP LIVES HERE, NOT AT THE CALL SITES. Every inventory-family modal screen runs its
+    // own nested input loop while the pad's button edges sit in statics, so the button that closed
+    // the screen is still physically DOWN when gameplay resumes and its edge fires there. This was
+    // fixed once for handle_inventory and the other three screens were simply forgotten: closing a
+    // LOOT window with B cycled the weapon's firing mode, because B acts on the RELEASE edge and
+    // that release arrived in gameplay with a bDownTime taken inside the loot window.
+    //
+    // exit_inventory has exactly four callers -- handle_inventory, use_inventory_on,
+    // loot_container, barter_inventory -- and every one of them passes through here exactly once
+    // on the way out, which is why the counter belongs here. See gamepad_ui_bump_input_epoch.
+    gamepad_ui_bump_input_epoch();
 }
 
 // 0x463758
@@ -2528,11 +2540,19 @@ bool inven_gamepad_quick_normal()
     // a weapon already holding a DIFFERENT ammo type (it must be unloaded first
     // via the popup), in which case no weapon matches and this is a no-op.
     if (itemType == ITEM_TYPE_AMMO) {
+        // Same "active hand first" rule as the equip fallback below: reload the weapon the
+        // interface bar is showing, and only fall back to the other hand when that one cannot
+        // take this ammo. Only reachable with a reloadable weapon in BOTH hands, but the old
+        // hardcoded right-hand preference would then load the gun you are not holding.
+        int ammoActive = intface_is_item_right_hand() != 0 ? HAND_RIGHT : HAND_LEFT;
+        Object* first = ammoActive == HAND_RIGHT ? i_rhand : i_lhand;
+        Object* second = ammoActive == HAND_RIGHT ? i_lhand : i_rhand;
+
         Object* weapon = NULL;
-        if (i_rhand != NULL && item_w_can_reload(i_rhand, item)) {
-            weapon = i_rhand;
-        } else if (i_lhand != NULL && item_w_can_reload(i_lhand, item)) {
-            weapon = i_lhand;
+        if (first != NULL && item_w_can_reload(first, item)) {
+            weapon = first;
+        } else if (second != NULL && item_w_can_reload(second, item)) {
+            weapon = second;
         }
 
         if (weapon != NULL) {
@@ -2551,14 +2571,44 @@ bool inven_gamepad_quick_normal()
         return inven_wear_under_cursor();
     }
 
-    // Drugs and use-on-self items get used; weapons (and anything else) are equipped
+    // Drugs and items you can use ON YOURSELF get used; weapons (and anything else) are equipped
     // into a free hand.
+    //
+    // ⚠️ proto_action_can_use_ON is deliberately NOT part of this test, though it used to be. A
+    // use-ON item -- the rope, a lockpick, a doctor's bag -- cannot do anything from an inventory
+    // slot: it needs a TARGET, and the only way to give it one is to hold it and aim the engine's
+    // targeting cursor at something. Treating it as "use" meant A on the rope tried to use it on
+    // nothing instead of putting it in hand, so there was no way to arm it at all ("provaz se
+    // nechce dÃ¡t do Ã¡Äka, protoÅ¾e to bere jako pouÅ¾Ã­t"). can_use (use on SELF) still gets used --
+    // that one genuinely works from the list.
     bool useIt = itemType == ITEM_TYPE_DRUG
-        || (itemType != ITEM_TYPE_WEAPON
-            && (proto_action_can_use(item->pid) || proto_action_can_use_on(item->pid)));
+        || (itemType != ITEM_TYPE_WEAPON && proto_action_can_use(item->pid));
+
+    // WHICH HAND A TAP OF A FILLS. This used to be "right if it is free, else left", so with
+    // BOTH hands empty the item always landed in the right one -- the slot B equips -- no matter
+    // which hand the interface bar was actually showing ("mÃ¡m prÃ¡zdnÃ© ruce a kdyÅ¾ kliknu Ã¡Äkem na
+    // item, tak se dÃ¡ do BÄka slotu"). It only showed up with empty hands because with one hand
+    // occupied the fallback happened to pick the free one, which is what you wanted anyway.
+    //
+    // Now the ACTIVE hand wins -- the one Y toggles, the one on the interface bar, the one you
+    // attack with -- and the other hand is only used when the active one is occupied. With BOTH
+    // hands full the old fallback stands (replace the left), so a weapon drawn in the active hand
+    // is never swapped out from under the player.
+    int active = intface_is_item_right_hand() != 0 ? HAND_RIGHT : HAND_LEFT;
+    Object* activeHand = active == HAND_RIGHT ? i_rhand : i_lhand;
+    Object* otherHand = active == HAND_RIGHT ? i_lhand : i_rhand;
 
     if (!useIt) {
-        return inven_equip_under_cursor(i_rhand == NULL ? HAND_RIGHT : HAND_LEFT);
+        int hand;
+        if (activeHand == NULL) {
+            hand = active;
+        } else if (otherHand == NULL) {
+            hand = active == HAND_RIGHT ? HAND_LEFT : HAND_RIGHT;
+        } else {
+            hand = HAND_LEFT;
+        }
+
+        return inven_equip_under_cursor(hand);
     }
 
     if (itemType == ITEM_TYPE_DRUG) {
@@ -4093,6 +4143,7 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 }
 
 static void barter_warp_cursor(int sx, int sy);
+static void barter_draw_deal();
 
 // CE: loot-window panel jump. Pushing the left stick / D-pad LEFT snaps the pointer to the
 // first (top) slot of YOUR inventory (left panel); RIGHT snaps it to the first slot of the
@@ -4335,6 +4386,32 @@ int loot_container(Object* a1, Object* a2)
         }
 
         int keyCode = get_input();
+
+        // Gamepad D-pad up/down scrolls the LOOT list, which it could not do at all before --
+        // "containers nelzou hÃ½bat dpadem". handle_inventory wired inven_gamepad_scroll_key into
+        // its own loop; this window runs a separate one and never got it, so anything past the
+        // visible rows was unreachable on a controller.
+        //
+        // Two panels, so the direction has to pick one: scroll whichever the cursor is over. Both
+        // already have keyboard handlers below (plain arrows = your side, CTRL+arrows = the
+        // container's), so this only translates the pad into those and changes no scroll logic.
+        // Left stick is deliberately NOT used -- it drives the cursor here, same as in the normal
+        // inventory (see inven_gamepad_scroll_key).
+        if (keyCode == -1) {
+            int padKey = inven_gamepad_scroll_key();
+            if (padKey != -1) {
+                bool overTarget = mouseHitTestInWindow(i_wid,
+                    INVENTORY_LOOT_RIGHT_SCROLLER_X, INVENTORY_LOOT_RIGHT_SCROLLER_Y,
+                    INVENTORY_LOOT_RIGHT_SCROLLER_MAX_X,
+                    INVENTORY_SLOT_HEIGHT * inven_cur_disp + INVENTORY_LOOT_RIGHT_SCROLLER_Y);
+
+                if (overTarget) {
+                    keyCode = padKey == KEY_ARROW_UP ? KEY_CTRL_ARROW_UP : KEY_CTRL_ARROW_DOWN;
+                } else {
+                    keyCode = padKey;
+                }
+            }
+        }
 
         if (keyCode == KEY_CTRL_Q || keyCode == KEY_CTRL_X || keyCode == KEY_F10) {
             game_quit_with_confirm();
@@ -5150,6 +5227,12 @@ static void display_table_inventories(int win, Object* a2, Object* a3, int a4)
     }
 
     text_font(oldFont);
+
+    // The deal readout rides along with every table repaint. Hooked HERE rather than at the call
+    // sites because there are more than twenty of them across the vanilla barter loop, and one of
+    // them being missed is exactly how a stale number ends up on screen. Self-guarding: it returns
+    // immediately when there is no barter in progress.
+    barter_draw_deal();
 }
 
 // One occupied, visible barter slot: its screen rect + which list (0..3) and visible
@@ -5349,6 +5432,109 @@ static Object* barter_find_money(Object* obj, int* qtyOut)
 //   SELLING -- the player's offer is worth more than the NPC is giving -> move the NPC's caps
 //              into ITS offer table (btable) so the player gets paid for the difference.
 // Each side is capped at the caps that side actually carries.
+// THE DEAL READOUT -- the number the game decides on, finally on screen.
+//
+// ⚠️ VANILLA SHOWS YOU TWO NUMBERS AND JUDGES YOU ON A THIRD. The $N under each table is the RAW
+// item_total_cost of that table, but barter_attempt_transaction refuses unless
+// barter_compute_value(...) <= item_total_cost(ptable) -- and barter_compute_value applies the
+// Barter-skill / Master Trader / reputation modifier to the NPC's side. So two piles reading $100
+// and $100 are routinely rejected, because what the trader actually wants is $130, and nothing
+// anywhere told you that. That is the whole "trading is bad" experience: not a control problem, an
+// information problem.
+//
+// This draws what the check really compares -- what you are GIVING against what they WANT after the
+// markup -- plus the exact shortfall, which is also precisely the number X (barter_auto_offer)
+// covers with caps. The two features finally describe the same transaction.
+static void barter_draw_deal()
+{
+    if (ptable == NULL || btable == NULL || target_stack[0] == NULL) {
+        return;
+    }
+
+    unsigned char* windowBuffer = win_get_buf(i_wid);
+    if (windowBuffer == NULL) {
+        return;
+    }
+
+    int give = item_total_cost(ptable);                           // raw value of the player's pile
+    int want = barter_compute_value(inven_dude, target_stack[0]);  // adjusted price of the NPC's pile
+    int shortBy = want - give;
+
+    int oldFont = text_curr();
+    text_font(101);
+    int th = text_height();
+
+    // ⚠️ THE LAYOUT IS DICTATED BY FOUR 64px COLUMNS AT x 29 / 165 / 250 / 388. The first attempt
+    // put this in the gap between the two inner columns, which measures 250 - (165+64) = 17 PIXELS --
+    // enough for nothing. The usable space is the strip to the RIGHT of the NPC's $total (drawn at
+    // x 254) and before the NPC's inventory column starts at 388.
+    const int dealX = 300;
+    const int dealW = INVENTORY_TRADE_RIGHT_SCROLLER_X - dealX - 2;
+    const int dealY = INVENTORY_SLOT_HEIGHT * inven_cur_disp + 24;
+
+    // Both strips are FILLED first: this is background art underneath, not a flat panel, so text
+    // drawn straight onto it would sit on whatever the frame happens to show there.
+    if (dealW > 8) {
+        buf_fill(windowBuffer + INVENTORY_TRADE_WINDOW_WIDTH * dealY + dealX,
+            dealW, th + 2, INVENTORY_TRADE_WINDOW_WIDTH, colorTable[0]);
+
+        char text[32];
+        int color = shortBy > 0 ? colorTable[31744] : colorTable[992];
+        if (shortBy > 0) {
+            snprintf(text, sizeof(text), "SHORT %d", shortBy);
+        } else {
+            snprintf(text, sizeof(text), "DEAL OK");
+        }
+
+        int tw = text_width(text);
+        int tx = dealX + (dealW - tw) / 2;
+        if (tx < dealX) {
+            tx = dealX;
+        }
+        text_to_buf(windowBuffer + INVENTORY_TRADE_WINDOW_WIDTH * (dealY + 1) + tx,
+            text, dealW, INVENTORY_TRADE_WINDOW_WIDTH, color);
+    }
+
+    // THE CONTROL LEGEND, on screen where the controls are actually used. The Pip-Boy CONTROLS page
+    // lists these too, but a page you have to go looking for is how "even out with caps" and the
+    // split-stack picker sat unused for weeks -- if a control is not visible where it applies, it
+    // does not exist. The top strip is free: the inner item columns start at y 20 and the outer at
+    // y 30, so nothing is drawn across this band.
+    // Full window width, not just the gap between the outer columns: at y 4 NOTHING is drawn
+    // yet -- the outer item columns start at y 30 and the inner ones at y 20 -- so the whole
+    // 480px strip is free, and the legend needs it once the navigation keys are in there too.
+    const int legX = 6;
+    const int legW = INVENTORY_TRADE_WINDOW_WIDTH - 12;
+    const int legY = 4;
+
+    if (legW > 40) {
+        buf_fill(windowBuffer + INVENTORY_TRADE_WINDOW_WIDTH * legY + legX,
+            legW, th + 2, INVENTORY_TRADE_WINDOW_WIDTH, colorTable[0]);
+
+        // ⚠️ "LB/RB item", NOT "LB/RB column". barter_collect_slots walks the four lists in
+        // order and fills each one top-to-bottom, so LB/RB step through the flat list of every
+        // occupied slot -- they only cross into the next column once the current one runs out.
+        // Labelling them as a column switch would promise a jump they do not make.
+        const char* legend = "LB/RB item   D-pad column   A move   LT+A some   X even   Y offer   B exit";
+        int lw = text_width(legend);
+        int lx = legX + (legW - lw) / 2;
+        if (lx < legX) {
+            lx = legX;
+        }
+        text_to_buf(windowBuffer + INVENTORY_TRADE_WINDOW_WIDTH * (legY + 1) + lx,
+            legend, legW, INVENTORY_TRADE_WINDOW_WIDTH, colorTable[32767]);
+    }
+
+    text_font(oldFont);
+
+    Rect r;
+    r.ulx = legX < dealX ? legX : dealX;
+    r.uly = legY;
+    r.lrx = (legX + legW) > (dealX + dealW) ? (legX + legW) : (dealX + dealW);
+    r.lry = dealY + th + 2;
+    win_draw_rect(i_wid, &r);
+}
+
 static void barter_auto_offer()
 {
     Object* npc = target_stack[0];
@@ -5526,6 +5712,13 @@ static int barter_gamepad_input()
 
     // A transfers the item under the cursor -- the WHOLE stack, or (with LT held) a
     // chosen quantity via the split picker, so you can separate individual items.
+    //
+    // ⚠️ THIS ONE STAYS ON LT WHILE EVERY OTHER COMBO MOVED TO LB (2026-08-29). The tempting
+    // move is consistency -- LB is the modifier everywhere else now -- but LB is NOT free on this
+    // screen: lbEdge re-anchors the cursor to the nearest slot (see the rbEdge || lbEdge branch
+    // below). Holding LB to split would jump the cursor off the item you were pointing at before
+    // A was ever pressed, which breaks the gesture outright. LT has no job in a barter window, so
+    // the split keeps it.
     if (aEdge && over >= 0) {
         bool ltHeld = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8000;
         int listId = slots[over].listId;

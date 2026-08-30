@@ -25,6 +25,9 @@ int SaveGame(int mode);
 int LoadGame(int mode);
 // Headless saves for the auto/quick save scheme (slots 0,1=autosave ping-pong, 2=quick).
 int SaveGameSlot(int slot, const char* description);
+// Resume the most recent save with no load screen (main menu CONTINUE). 1 = loaded,
+// 0 = nothing to resume, -1 = failed.
+int LoadGameNewest();
 int AutoSaveLocation();
 int AutoSaveQuest();
 int QuickSaveGame();
@@ -34,6 +37,9 @@ void KillOldMaps();
 int MapDirErase(const char* path, const char* a2);
 int MapDirEraseFile(const char* a1, const char* a2);
 
+// Counter of successful loads. Sample it on entry to any screen that runs its own modal loop and
+// bail out when it changes -- the game under you has been swapped. See LoadSlot.
+unsigned int LoadGameSerial();
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_LOADSAVE_H_ */

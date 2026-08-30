@@ -30,8 +30,19 @@ else()
 endif()
 
 if(ASAN)
-    target_compile_options(${EXECUTABLE_NAME} PUBLIC "-fsanitize=address;-fsanitize-recover=address")
-    target_link_options(${EXECUTABLE_NAME} PUBLIC "-fsanitize=address;-fsanitize-recover=address")
+    if(MSVC)
+        # MSVC spells it /fsanitize=address and has no -fsanitize-recover equivalent (use the
+        # ASAN_OPTIONS env var at runtime instead). ASan is incompatible with incremental linking
+        # and with edit-and-continue debug info, so /Zi + /INCREMENTAL:NO are pinned here; the
+        # sanitizer runtime is added by the linker automatically. Only OUR target is instrumented
+        # -- SDL and the other fetched deps stay plain, which is fine: the interceptors live in
+        # the runtime, so allocations made anywhere are still checked.
+        target_compile_options(${EXECUTABLE_NAME} PRIVATE /fsanitize=address /Zi)
+        target_link_options(${EXECUTABLE_NAME} PRIVATE /INCREMENTAL:NO /DEBUG)
+    else()
+        target_compile_options(${EXECUTABLE_NAME} PUBLIC "-fsanitize=address;-fsanitize-recover=address")
+        target_link_options(${EXECUTABLE_NAME} PUBLIC "-fsanitize=address;-fsanitize-recover=address")
+    endif()
 endif()
 if(UBSAN)
     target_compile_options(${EXECUTABLE_NAME} PUBLIC "-fsanitize=undefined")
@@ -256,6 +267,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/plib/gnw/mouse.h"
     "src/plib/gnw/rect.cc"
     "src/plib/gnw/rect.h"
+    "src/plib/gnw/crt_shader.cc"
+    "src/plib/gnw/crt_shader.h"
     "src/plib/gnw/svga_types.h"
     "src/plib/gnw/svga.cc"
     "src/plib/gnw/svga.h"

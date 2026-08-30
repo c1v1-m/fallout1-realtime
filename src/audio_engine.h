@@ -11,6 +11,9 @@ namespace fallout {
 #define AUDIO_ENGINE_SOUND_BUFFER_STATUS_PLAYING 0x00000001
 #define AUDIO_ENGINE_SOUND_BUFFER_STATUS_LOOPING 0x00000004
 
+// CE: output limiter -- see audioEngineMixin. Enabled by default; cfg sfx_limiter turns it off.
+void audioEngineSetLimiterEnabled(bool enabled);
+
 bool audioEngineInit();
 void audioEngineExit();
 void audioEnginePause();

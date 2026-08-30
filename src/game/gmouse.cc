@@ -778,6 +778,37 @@ void gmouse_bk_process()
             return;
         }
 
+        // MOVE mode, cursor parked for a quarter second: vanilla now paints the red "you can walk
+        // here" hex onto the flat cursor object (empty outside combat, the AP cost or an X in it).
+        //
+        // ⚠️ NOT WHILE THE LEFT STICK IS ALREADY WALKING HIM. On a controller the cursor is normally
+        // hidden, so this never used to be seen at all; nudging the right stick to point at
+        // something reveals it, and if it then sits still for 250 ms the hex lands on the ground
+        // under it -- while the dude is walking somewhere else entirely ("zobrazilo se cestování po
+        // blocích, takové to červené"). The hex means "click here to walk here", which is not the
+        // question being asked when movement is already coming from the stick.
+        //
+        // Deliberately does NOT latch gmouse_3d_hover_test: the moment he stops, the next frame
+        // falls through and paints the hex normally. gmouse_3d_reset_flat_fid is a no-op (-1) once
+        // the fid is already the default, so running this every frame costs nothing.
+        // ⚠️ AND NOT ON A CONTROLLER AT ALL. Suppressing it only while the left stick was walking
+        // was too narrow: nudge the right stick where there is nothing to pick -- no outline, no
+        // prompt icon -- and the push falls through to the plain cursor path, which reveals the
+        // pointer and then leaves it sitting exactly where the stick dropped it. A quarter second
+        // later the red hex blooms on the ground under it, for a tile nobody asked about.
+        //
+        // The hex is a MOUSE affordance: it answers "the pointer is parked here, this is the tile
+        // and what walking to it costs". On a pad the pointer is never parked deliberately -- it is
+        // just wherever the stick last shoved it -- so the question it answers is one the player is
+        // not asking. Movement comes from the left stick and targets come from the picker.
+        if (combat_rt_stick_walking() || gamepad_ui_get_controller() != NULL) {
+            Rect tmp;
+            if (gmouse_3d_reset_flat_fid(&tmp) == 0) {
+                tile_refresh_rect(&tmp, map_elevation);
+            }
+            return;
+        }
+
         char formattedActionPoints[8];
         int color;
         int v6 = make_path(obj_dude, obj_dude->tile, obj_mouse_flat->tile, NULL, 1);
@@ -940,7 +971,9 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                         }
                     } else {
                         if (obj_action_can_talk_to(target)) {
-                            if (combat_rt_under_threat()) {
+                            // Same rule as the gamepad prompt (interact_prompt.cc): a fight in view
+                            // blocks talking even when it is not aimed at the player.
+                            if (combat_rt_fight_in_view()) {
                                 if (obj_examine(obj_dude, target) == -1) {
                                     obj_look_at(obj_dude, target);
                                 }

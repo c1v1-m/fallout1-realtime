@@ -16,6 +16,7 @@
 #include "game/gdialog.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
+#include "game/loadsave.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto.h"
@@ -803,10 +804,19 @@ int scripts_check_state()
 
     if ((scriptState.requests & SCRIPT_REQUEST_WORLD_MAP) != 0) {
         scriptState.requests &= ~SCRIPT_REQUEST_WORLD_MAP;
+
+        // Same guard map_check_state carries: a save loaded from inside the town map has already
+        // replaced the game, so opening the world map on top of it would put the screen straight
+        // back into the bug both screens now bail out of. This is the path the player actually
+        // hit -- the trace named scripts_check_state, not map_check_state.
+        unsigned int loadSerial = LoadGameSerial();
+
         ctx.state = 0;
         ctx.town = our_town;
         ctx = town_map(ctx);
-        world_map(ctx);
+        if (LoadGameSerial() == loadSerial) {
+            world_map(ctx);
+        }
         KillWorldWin();
     }
 

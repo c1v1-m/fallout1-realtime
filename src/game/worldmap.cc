@@ -14,6 +14,7 @@
 #include "game/combatai.h"
 #include "game/config.h"
 #include "game/critter.h"
+
 #include "game/cycle.h"
 #include "game/display.h"
 #include "game/game.h"
@@ -24,6 +25,8 @@
 #include "game/graphlib.h"
 #include "game/gsound.h"
 #include "game/intface.h"
+#include "game/game_trace.h"
+#include "game/loadsave.h"
 #include "game/item.h"
 #include "game/map_defs.h"
 #include "game/message.h"
@@ -116,6 +119,8 @@ static void DrawTownLabels(unsigned char* src, unsigned char* dst);
 static void DrawMapTime(int is_town_map);
 static void map_num(int value, int digits, int x, int y, int is_town_map);
 static void HvrOffBtn(int a1, int a2);
+static void TMapPadPark(int sel);
+static void TMapPadStep(int dirX, int dirY, int count);
 static int RegTMAPsels(int win, int city);
 static void UnregTMAPsels(int count);
 static void DrawTMAPsels(int win, int city);
@@ -813,6 +818,89 @@ static int bx_enable;
 // 0x670F60
 static int first_visit_flag;
 
+// CE: town currently picked by the D-pad in the world map list, -1 = none yet. File scope (not a
+// local static) so it is cleared on every entry to the screen -- a stale pick from the last visit
+// would put the cursor somewhere the player did not choose.
+static int wm_pad_town = -1;
+
+// CE: entrance currently picked by the pad on the TOWN MAP (index into brnpos[], -1 = none yet).
+//
+// ⚠️ THIS SCREEN USED TO LEAK THE GAMEPLAY A-CLICK -- the third screen in this family, after the
+// main menu and Preferences. town_map() never set gpui_self_nav, so gpui_action_buttons ran its
+// full GAMEPLAY A-router here: no menu, no dialog, no lock, no hostile in range => a_interacting is
+// true, the world interact finds nothing to do on a map screen, and the press falls through as a
+// plain synthetic left click at the cursor. The right stick meanwhile creeps that cursor freely, so
+// it lands on an entrance hotspot and the town opens by itself -- the user's report was "I could
+// not LEAVE, moving the stick opened Shady Sands as if I were pressing A".
+//
+// The fix is the same shape as every other screen in this family: own the pad (self_nav) and drive
+// the selection explicitly. See [[selfnav-click-leak]] for why gpui_action_buttons must still be
+// CALLED under self_nav (its press edges have to stay fresh, or the A that closes this screen fires
+// into the world on the next frame).
+static int tm_pad_sel = -1;
+
+
+// CE: TRAVELLING WHILE POISONED IS REFUSED OUTRIGHT.
+//
+// Why, with the numbers (measured 2026-08-24). Each poison tick is exactly -1 HP
+// (critter_check_poison) and re-queues itself `505 - 5 * poison` SECONDS later -- about 7.5 game-
+// minutes at poison 12. One step of world-map travel advances `864000 / wmap_day` = 12 to 24 game-
+// MINUTES. So every single travel step has at least one, usually two or three, poison ticks due,
+// and the loop performs one per rendered frame: the player watched 11 HP fall to 5 in a fraction of
+// a second ("insta drop, why?"). That is vanilla arithmetic -- it simply never showed, because
+// nobody sets off across the map on 11 HP with poison in them.
+//
+// It got worse from there: at HP <= 5 critter_check_poison returns 1, queue_process passes that up,
+// and the world map reads it as "stop travelling" -- but if you happen to be standing on a town it
+// pushes you INTO the town instead of just stopping. Leave, tick, get shoved back in. That was the
+// "I couldn't leave Shady Sands" report.
+//
+// Refusing the journey up front replaces both of those with one honest message. The player deals
+// with the poison first, which is what the HP<=5 interrupt was clumsily trying to say anyway.
+//
+// ⚠️ THE REFUSAL MUST DROP YOU INTO A MAP, NEVER JUST STOP YOU. World-map time only advances while
+// you are MOVING -- every set_game_time / queue_process in this loop sits inside `if (is_moving)`
+// -- and the screen natively offers no Pipboy and no inventory (its keys are A, P=pause, F12, quit,
+// gamma). So a poisoned player who is merely stopped out here can never rest, heal, cure, or tick
+// the poison down: that is an unwinnable save, not a difficulty spike. Landing him in the town he
+// is standing on (or a random terrain map when he is not) puts him somewhere the clock runs and the
+// Pipboy exists.
+//
+// ⚠️ Making the Pipboy itself reachable from the world map was tried first (keyboard Z / pad Y). It
+// was blamed for a crash and reverted -- WRONGLY, as it turned out: that crash was display_print
+// being handed a string LITERAL by the message below (it word-wraps in place, so it wrote into
+// read-only memory). The Pipboy idea was never actually disproven. It is also no longer needed, now
+// that the refusal only fires when the trip would be lethal.
+// ⚠️ THE TEST IS "WOULD THE TRIP KILL YOU", NOT "ARE YOU POISONED". The first version refused on
+// ANY poison at all, which was plainly wrong and he said so at 30 HP: *"normálně bych mohl pak odejít
+// a regenil bych se při travellingu jako ve vanilla."* Both halves of that are right --
+//
+//   * poison is FINITE. Each tick is -2 poison and -1 HP (critter_check_poison), so a poisoning of
+//     N costs exactly ceil(N/2) HP in total and then it is gone. At 30 HP that is a scratch.
+//   * travelling DOES heal. world_map calls partyMemberRestingHeal(24) once per travelled game day
+//     (worldmap.cc:1838) -- I had claimed the world map offers no healing, and that was wrong.
+//
+// So the refusal is scoped to the case it was actually built for: the trip ENDING at the vanilla
+// HP<=5 queue trigger, which stops the journey and shoves you into whatever town you are standing
+// on -- the "I can't leave Shady Sands" loop. Refuse exactly those, allow everything else, and the
+// healing above is ignored on purpose (it lands in one lump per travelled day, so counting on it
+// would be optimistic in precisely the short hops that matter).
+static bool WMapPoisonBlocksTravel()
+{
+    if (obj_dude == NULL) {
+        return false;
+    }
+
+    int poison = critter_get_poison(obj_dude);
+    if (poison <= 0) {
+        return false;
+    }
+
+    // Total HP the remaining poison still has to take, and where that leaves you.
+    int remaining = (poison + 1) / 2;
+    return critter_get_hits(obj_dude) - remaining <= 5;
+}
+
 // 0x670F64
 static int deltaLineY;
 
@@ -874,7 +962,9 @@ static int world_xpos;
 static int world_ypos;
 
 // 0x670FD4
-int world_win;
+// ⚠️ -1 WHEN NO WINDOW EXISTS, and that is what KillWorldWin keys off. It used to key off
+// a wwin_flag that a LOAD silently cleared -- see KillWorldWin.
+int world_win = -1;
 
 // 0x670FD8
 static unsigned char TwnSelKnwFlag[15][7];
@@ -882,8 +972,6 @@ static unsigned char TwnSelKnwFlag[15][7];
 // 0x671041
 static unsigned char WorldGrid[31][29];
 
-// 0x6713C4
-static unsigned char wwin_flag;
 
 // 0x4AA110
 int init_world_map()
@@ -907,7 +995,6 @@ int init_world_map()
     our_section = 1;
     first_visit_flag |= 1;
     TwnSelKnwFlag[TOWN_VAULT_13][0] = 1;
-    wwin_flag = 0;
 
     return 0;
 }
@@ -948,6 +1035,8 @@ int load_world_map(DB_FILE* stream)
 // 0x4AA360
 int world_map(WorldMapContext ctx)
 {
+    // TEMP DIAG: did we get in at all? STRIP with wm-armed.
+    trace_event(TRACE_FLOW, "wm-enter", "state=%d town=%d", ctx.state, ctx.town);
     const char* title;
     const char* text;
     const char* body[1];
@@ -1033,6 +1122,10 @@ int world_map(WorldMapContext ctx)
     art_flush();
 
     should_redraw = 1;
+    wm_pad_town = -1; // fresh pick per visit to this screen
+    // Which game we came in on. If a save is loaded while this loop is running, everything below
+    // is drawing over a world that no longer exists -- see the bail-out beside the quit check.
+    unsigned int wm_load_serial = LoadGameSerial();
     done = 0;
     autofollow = 1;
     is_entering_townmap = 0;
@@ -1090,6 +1183,9 @@ int world_map(WorldMapContext ctx)
 
     while (1) {
         if (InitWorldMapData() == -1) {
+            // TEMP DIAG: a failed init leaves the caller with no screen at all, which looks
+            // exactly like the black screen being chased. STRIP with wm-armed.
+            trace_event(TRACE_WARN, "wm-init-fail", "state=%d town=%d", ctx.state, ctx.town);
             return -1;
         }
 
@@ -1168,30 +1264,161 @@ int world_map(WorldMapContext ctx)
             }
             time = get_time();
             input = get_input();
+
+            // A SAVE WAS LOADED OUT FROM UNDER US, INSIDE THAT get_input().
+            //
+            // Vanilla's world map has no menu at all (its key handler knows only A, P, F12, quit
+            // and gamma), so Load was unreachable from here -- but our pad's gameplay shortcut
+            // layer runs inside this very loop (get_input -> process_bk -> mouse_info -> the hook)
+            // and START opens the pause menu. `intface_hide()` sets only intfaceHidden, never
+            // intfaceEnabled, so the shortcut layer's !intface_is_enabled() guard does not apply
+            // here. Loading replaces the entire game while this loop is still on the stack, and it
+            // carried on drawing over it.
+            //
+            // ⚠️ THE TEST HAS TO BE HERE, NOT AT THE BOTTOM OF THE BODY. Placed after the input
+            // handling it still worked, but the rest of the frame ran first -- and by then
+            // world_xpos/world_ypos hold the LOADED position, so the world map was redrawn once at
+            // the restored spot before it left ("world map ukazovala kde AKTUÁLNĚ jsem"). Bail
+            // before anything in this frame draws.
+            //
+            // Clearing every destination and breaking lands on the same `out:` cleanup the quit
+            // path uses; the caller (map_check_state / scripts_check_state) then tears the window
+            // down and the main loop resumes on whatever the save restored.
+            if (LoadGameSerial() != wm_load_serial) {
+                should_redraw = 0;
+                is_entering_city = 0;
+                is_entering_townmap = 0;
+                is_entering_random_encounter = 0;
+                is_entering_random_terrain = 0;
+                is_moving = 0;
+                done = 1;
+                break;
+            }
+
             mouseGetPositionInWindow(world_win, &mouse_x, &mouse_y);
 
-            // Gamepad A: enter the location the party is currently standing on -- the
-            // same as clicking a town tab while already inside that town's circle
-            // (mirrors the entering_city handoff at the input >= 500 branch below).
-            // Edge-detected so a held A fires once; a no-op when not on a known site.
+            // CE: D-PAD PICKS A TOWN FROM THE LEFT-HAND LIST, A confirms it.
+            //
+            // ⚠️ THE CONFIRM SYNTHESISES A TAB PRESS (input = 500 + town) RATHER THAN ACTING ITSELF.
+            // That branch below already decides correctly between the two things a tab means: travel
+            // to the town, or -- when it is the town you are already standing in -- enter it. Doing
+            // it here would mean duplicating that decision and having it drift.
+            //
+            // The cursor is parked on the chosen town's button as the indicator, which is why no
+            // custom highlight is drawn: the left panel is painted once outside the redraw loop
+            // (the loop only repaints the map area), so anything drawn into it would have to be
+            // erased by hand against a background this screen never keeps a clean copy of.
+            //
+            // Only VISITED towns are reachable (first_visit_flag), matching the tabs themselves --
+            // an unvisited town has no tab to click and no name on the list.
             {
                 static bool wmPrevA = false;
+                static bool wmWasMoving = false;
+                static bool wmPrevUp = false;
+                static bool wmPrevDown = false;
+                static unsigned int wmLastStep = 0;
+
                 SDL_GameController* wmPad = gamepad_ui_get_controller();
                 bool wmANow = false;
+                bool wmUpNow = false;
+                bool wmDownNow = false;
                 if (wmPad != NULL) {
                     SDL_GameControllerUpdate();
                     wmANow = SDL_GameControllerGetButton(wmPad, SDL_CONTROLLER_BUTTON_A) != 0;
+                    wmUpNow = SDL_GameControllerGetButton(wmPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+                    wmDownNow = SDL_GameControllerGetButton(wmPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
                 }
-                if (wmANow && !wmPrevA) {
+
+                // Start on the town you are standing in, so the very first A still means "enter
+                // here" exactly as it did before this existed.
+                if (wm_pad_town == -1) {
                     int wmHere = InCity(world_xpos, world_ypos);
-                    if (wmHere != -1) {
-                        entering_city = wmHere;
-                        is_entering_city = 1;
-                        should_redraw = 0;
-                        is_moving = 0;
+                    if (wmHere != -1 && (first_visit_flag & (1 << wmHere)) != 0) {
+                        wm_pad_town = wmHere;
                     }
                 }
+
+                // ⚠️ ARRIVED -- re-point the selection at whatever the party is now standing on.
+                //
+                // The selection was only ever set ONCE, on entering this screen, so after a journey
+                // it still named the place you SET OFF FROM: pressing A at your destination sent
+                // 500 + <old town>, and the tab handler dutifully turned the party around and walked
+                // all the way back. Which is the opposite of the one thing you want on arrival.
+                //
+                // Only on the moving -> stopped EDGE. Re-syncing every stationary frame would fight
+                // the D-pad, and picking a DIFFERENT town from the list is exactly how you set off
+                // in the first place. Landing somewhere with no tab (a site you have never visited,
+                // or open terrain) clears the selection instead, which drops A through to the
+                // "enter whatever is under the party" fallback below -- so a brand new location is
+                // entered with A too, tab or no tab.
+                if (wmWasMoving && !is_moving) {
+                    int wmArrived = InCity(world_xpos, world_ypos);
+                    if (wmArrived != -1 && (first_visit_flag & (1 << wmArrived)) != 0) {
+                        wm_pad_town = wmArrived;
+                        Rect wmWin;
+                        if (win_get_rect(world_win, &wmWin) == 0) {
+                            mouse_set_position(wmWin.ulx + 508 + 7, wmWin.uly + BttnYtab[wm_pad_town] + 7);
+                        }
+                    } else {
+                        wm_pad_town = -1;
+                    }
+                }
+                wmWasMoving = is_moving != 0;
+
+                int wmDir = 0;
+                bool wmRepeat = elapsed_time(wmLastStep) >= 180;
+                if ((wmUpNow && !wmPrevUp) || (wmUpNow && wmRepeat)) {
+                    wmDir = -1;
+                } else if ((wmDownNow && !wmPrevDown) || (wmDownNow && wmRepeat)) {
+                    wmDir = 1;
+                }
+
+                if (wmDir != 0) {
+                    wmLastStep = get_time();
+
+                    // Walk to the next VISITED town, wrapping. Bounded by TOWN_COUNT so a list with
+                    // nothing visited (impossible in practice -- Vault 13 is set at game start)
+                    // cannot spin here.
+                    int wmNext = wm_pad_town;
+                    for (int wmStep = 0; wmStep < TOWN_COUNT; wmStep++) {
+                        wmNext = (wmNext + wmDir + TOWN_COUNT) % TOWN_COUNT;
+                        if ((first_visit_flag & (1 << wmNext)) != 0) {
+                            break;
+                        }
+                    }
+
+                    if (wmNext != wm_pad_town && (first_visit_flag & (1 << wmNext)) != 0) {
+                        wm_pad_town = wmNext;
+                        gsound_play_sfx_file("ib1p1xx1");
+                    }
+
+                    if (wm_pad_town != -1) {
+                        Rect wmWin;
+                        if (win_get_rect(world_win, &wmWin) == 0) {
+                            mouse_set_position(wmWin.ulx + 508 + 7, wmWin.uly + BttnYtab[wm_pad_town] + 7);
+                        }
+                    }
+                }
+
+                if (wmANow && !wmPrevA) {
+                    if (wm_pad_town != -1 && (first_visit_flag & (1 << wm_pad_town)) != 0) {
+                        input = 500 + wm_pad_town;
+                    } else {
+                        // Nothing selectable (standing on an unvisited site): keep the original
+                        // behaviour of entering whatever is under the party.
+                        int wmHere = InCity(world_xpos, world_ypos);
+                        if (wmHere != -1) {
+                            entering_city = wmHere;
+                            is_entering_city = 1;
+                            should_redraw = 0;
+                            is_moving = 0;
+                        }
+                    }
+                }
+
                 wmPrevA = wmANow;
+                wmPrevUp = wmUpNow;
+                wmPrevDown = wmDownNow;
             }
 
             mouse_dx = abs(mouse_x - (world_xpos - viewport_x + 22));
@@ -1297,6 +1524,7 @@ int world_map(WorldMapContext ctx)
                     break;
                 }
             }
+
 
             if (game_user_wants_to_quit != 0) {
                 should_redraw = 0;
@@ -1492,6 +1720,46 @@ int world_map(WorldMapContext ctx)
                 is_moving = 1;
                 world_move_init();
                 is_moving_to_town = InCity(target_xpos, target_ypos) != -1;
+            }
+
+            // CE: single choke point for the poison refusal. Gating HERE rather than at each of the
+            // six `is_moving = 1` sites (stick, mouse, autofollow, script jumps) means no start path
+            // can slip past it, and an already-running journey is stopped too.
+            if (is_moving && WMapPoisonBlocksTravel()) {
+                is_moving = 0;
+                autofollow = 0;
+
+                gsound_play_sfx_file("iisxxxx1");
+
+                // ⚠️ display_print TAKES A MUTABLE BUFFER AND WRITES INTO IT. It word-wraps in
+                // place (display.cc:248 -- `*space = '\0'`, then restores the space), so handing it
+                // a STRING LITERAL is a write into read-only .rdata: instant ACCESS_VIOLATION.
+                // That is exactly what crashed him -- stack was display_print <- world_map <-
+                // map_check_state, "access: write 0x7ff730c3db0d" (trace_2026-08-24_234756). The
+                // signature says `char*` rather than `const char*` for precisely this reason, and
+                // every vanilla caller feeds it a getmsg() buffer or a local array.
+                char poisonMsg[64];
+                strcpy(poisonMsg, "You are poisoned, too weak to travel.");
+                display_print(poisonMsg);
+
+                // Land the same way the vanilla HP<=5 queue trigger does: the town under your feet
+                // if there is one, otherwise a random terrain map. Either way you end up somewhere
+                // time flows and the Pipboy and inventory exist, so the poison can be slept off,
+                // cured or out-healed -- which the world map cannot offer (its clock only runs
+                // while you are moving, and it has no Pipboy).
+                is_entering_city = 0;
+                is_entering_townmap = 0;
+                is_entering_random_encounter = 0;
+                is_entering_random_terrain = 0;
+                temp_town = InCity(world_xpos, world_ypos);
+                if (temp_town != -1) {
+                    entering_city = temp_town;
+                    is_entering_city = 1;
+                } else {
+                    is_entering_random_terrain = 1;
+                }
+
+                goto out;
             }
 
             if (is_moving) {
@@ -2756,7 +3024,7 @@ static int InitWorldMapData()
 
     memset(line1bit_buf, 0, 262500);
 
-    if (!wwin_flag) {
+    if (world_win == -1) {
         world_win = win_add((screenGetWidth() - WM_WINDOW_WIDTH) / 2,
             (screenGetHeight() - WM_WINDOW_HEIGHT) / 2,
             WM_WINDOW_WIDTH,
@@ -2777,7 +3045,6 @@ static int InitWorldMapData()
             return -1;
         }
 
-        wwin_flag = 1;
     }
 
     world_buf = win_get_buf(world_win);
@@ -3159,6 +3426,8 @@ static void map_num(int value, int digits, int x, int y, int is_town_map)
 // 0x4AD988
 WorldMapContext town_map(WorldMapContext ctx)
 {
+    // Which game we came in on -- see the bail-out in the loop below.
+    unsigned int tm_load_serial = LoadGameSerial();
     const char* title;
     const char* text;
     const char* body[1];
@@ -3350,7 +3619,7 @@ WorldMapContext town_map(WorldMapContext ctx)
         return new_ctx;
     }
 
-    if (!wwin_flag) {
+    if (world_win == -1) {
         world_win = win_add((screenGetWidth() - WM_WINDOW_WIDTH) / 2,
             (screenGetHeight() - WM_WINDOW_HEIGHT) / 2,
             WM_WINDOW_WIDTH,
@@ -3366,7 +3635,6 @@ WorldMapContext town_map(WorldMapContext ctx)
             // FIXME: Leak lots of memory.
             return new_ctx;
         }
-        wwin_flag = 1;
     }
 
     if (tbutntgl) {
@@ -3456,11 +3724,87 @@ WorldMapContext town_map(WorldMapContext ctx)
     cycle_disable();
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
+    // CE: this screen drives its own pad navigation from here on. Set AFTER every early-return path
+    // above, and cleared right after the loop, so no failure exit can leave the flag stuck on and
+    // silently kill the pad for the rest of the session.
+    gamepad_ui_set_self_nav(true);
+
+    // Start on the first entrance, so the screen opens with something selected and the player can
+    // press A immediately -- the same "the obvious choice is already picked" rule the world map's
+    // town list follows.
+    tm_pad_sel = tmap_sels_count > 0 ? 0 : -1;
+    TMapPadPark(tm_pad_sel);
+
+    // Latch the CURRENT button state as already-seen: the A that entered this town from the world
+    // map is very likely still physically down on our first frame, and reading it as a fresh press
+    // would instantly re-enter the first entrance.
+    bool tmPrevUp = true;
+    bool tmPrevDown = true;
+    bool tmPrevLeft = true;
+    bool tmPrevRight = true;
+    bool tmPrevA = true;
+    bool tmPrevB = true;
+
     while (new_ctx.state == -1) {
         sharedFpsLimiter.mark();
 
         time = get_time();
         input = get_input();
+
+        // CE: pad navigation. ⚠️ Re-fetch the controller EVERY frame -- gamepad_ui_get_controller()
+        // opens it lazily and gamepad_ui_tick does not run inside this blocking loop, so a handle
+        // latched once on entry can be NULL for the whole screen (the trap that made two earlier
+        // screens "not respond to the pad at all").
+        SDL_GameController* tmPad = gamepad_ui_get_controller();
+        if (tmPad != NULL) {
+            SDL_GameControllerUpdate();
+
+            // Left stick doubles as a D-pad here: the stick is what the player reaches for to
+            // "drive onto" an entrance, which is the whole point of this.
+            bool tmUp = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+                || SDL_GameControllerGetAxis(tmPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+            bool tmDown = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+                || SDL_GameControllerGetAxis(tmPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+            bool tmLeft = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+                || SDL_GameControllerGetAxis(tmPad, SDL_CONTROLLER_AXIS_LEFTX) < -16000;
+            bool tmRight = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+                || SDL_GameControllerGetAxis(tmPad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
+            bool tmA = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool tmB = SDL_GameControllerGetButton(tmPad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+            if (tmUp && !tmPrevUp) {
+                TMapPadStep(0, -1, tmap_sels_count);
+            }
+            if (tmDown && !tmPrevDown) {
+                TMapPadStep(0, 1, tmap_sels_count);
+            }
+            if (tmLeft && !tmPrevLeft) {
+                TMapPadStep(-1, 0, tmap_sels_count);
+            }
+            if (tmRight && !tmPrevRight) {
+                TMapPadStep(1, 0, tmap_sels_count);
+            }
+
+            // A enters the picked entrance, B leaves for the world map. Both set the result
+            // DIRECTLY instead of synthesising the button's input code (514+i / 512): this loop
+            // dispatches on get_input(), and feeding it fabricated codes is the trap that bit the
+            // Preferences steppers. The engine's own mouse path is untouched and still works.
+            if (tmA && !tmPrevA && tm_pad_sel >= 0 && tm_pad_sel < tmap_sels_count) {
+                gsound_play_sfx_file("ib1p1xx1");
+                new_ctx.state = 2;
+                new_ctx.town = ctx.town;
+                new_ctx.section = tcode_xref[tm_pad_sel];
+            } else if (tmB && !tmPrevB) {
+                new_ctx.state = 3;
+            }
+
+            tmPrevUp = tmUp;
+            tmPrevDown = tmDown;
+            tmPrevLeft = tmLeft;
+            tmPrevRight = tmRight;
+            tmPrevA = tmA;
+            tmPrevB = tmB;
+        }
 
         if (input >= 500 && input < 512) {
             if ((first_visit_flag & (1 << (input - 500))) != 0) {
@@ -3521,7 +3865,9 @@ WorldMapContext town_map(WorldMapContext ctx)
             }
         }
 
-        if (game_user_wants_to_quit != 0) {
+        // Same hole as the world map: the pad can reach Load from in here, and the game the town
+        // map is describing is then gone. Leave the way the quit path does.
+        if (game_user_wants_to_quit != 0 || LoadGameSerial() != tm_load_serial) {
             new_ctx.state = 1;
             break;
         }
@@ -3531,6 +3877,11 @@ WorldMapContext town_map(WorldMapContext ctx)
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    // CE: hand the pad back before anything else -- see the note on tm_pad_sel. Leaving this set
+    // would kill the shared right-stick cursor and A-as-click everywhere after this screen.
+    gamepad_ui_set_self_nav(false);
+    tm_pad_sel = -1;
 
     UnregTMAPsels(tmap_sels_count);
     buf_to_buf(tmap_pic, 453, 444, 453, world_buf + 640 * 20 + 20, 640);
@@ -3568,11 +3919,94 @@ WorldMapContext town_map(WorldMapContext ctx)
 // 0x4AE4C4
 void KillWorldWin()
 {
-    if (wwin_flag) {
+    // ⚠️ DO NOT GATE THIS ON A SEPARATE "is it open" FLAG (this used to test wwin_flag).
+    // `game_reset()` calls `init_world_map()`, which cleared that flag -- and `PrepLoad` calls
+    // `game_reset()`. So loading a save while this window is up
+    // DISARMS THE WINDOW'S OWN TEARDOWN: the flag says "no window", the window is still there, and
+    // it survives painted over the running game for the rest of the session. That is the Shady
+    // Sands town map sitting on top of a live map with its interface bar and message log both
+    // updating underneath -- the logic to leave the screen was already correct and running, only
+    // the teardown had been quietly switched off.
+    //
+    // Same family as the other load-time wreckage, inverted: not a stale global that survives a
+    // load, but a live resource whose bookkeeping a load CLEARS. The window handle is the truth.
+    if (world_win != -1) {
         win_delete(world_win);
-        tbutntgl = 0;
-        wwin_flag = 0;
-        dropbtn = 0;
+        world_win = -1;
+    }
+
+    tbutntgl = 0;
+    dropbtn = 0;
+}
+
+// CE: park the mouse on the picked entrance's HOTSPOT MARKER, which is what makes the engine's own
+// hover art (hvrbtn -- the marker lighting up plus the location name) appear. Nothing new is drawn
+// here; the selection is expressed entirely through the vanilla hover, so it looks exactly like the
+// mouse version.
+//
+// ⚠️ Aim at the MARKER, not at the button's centre. The button is 164x25 but carries a mask
+// (win_register_button_mask(.., btnmsk)), so only the pixels the mask covers are live -- and the
+// mask is the 25x13 marker blitted at offset (69,12). The geometric centre of the button lands on
+// masked-out pixels, where the engine sees no button at all.
+static void TMapPadPark(int sel)
+{
+    Rect tmWin;
+
+    if (sel < 0 || win_get_rect(world_win, &tmWin) != 0) {
+        return;
+    }
+
+    mouse_set_position(tmWin.ulx + brnpos[sel].x + 69 + HOTSPOT_WIDTH / 2,
+        tmWin.uly + brnpos[sel].y + 12 + HOTSPOT_HEIGHT / 2);
+}
+
+// CE: step the entrance selection one 4-way direction, spatially -- nearest hotspot AHEAD in the
+// pushed direction, scored by travel along that axis plus a perpendicular penalty. Same rule as
+// gpui_menu_snap, kept local because this screen owns its cursor under self_nav. Entrances are
+// laid out freely over the town picture (not a list), so a plain prev/next would wander.
+static void TMapPadStep(int dirX, int dirY, int count)
+{
+    int best = -1;
+    long bestScore = 0;
+    int index;
+
+    if (count <= 0) {
+        return;
+    }
+
+    if (tm_pad_sel < 0) {
+        tm_pad_sel = 0;
+        TMapPadPark(tm_pad_sel);
+        return;
+    }
+
+    for (index = 0; index < count; index++) {
+        if (index == tm_pad_sel) {
+            continue;
+        }
+
+        int rx = brnpos[index].x - brnpos[tm_pad_sel].x;
+        int ry = brnpos[index].y - brnpos[tm_pad_sel].y;
+        int along = dirX != 0 ? dirX * rx : dirY * ry;
+        int perp = dirX != 0 ? ry : rx;
+
+        if (along <= 2) {
+            continue; // not ahead the way we are pushing
+        }
+
+        long score = (long)along + 3L * labs(perp);
+        if (best < 0 || score < bestScore) {
+            best = index;
+            bestScore = score;
+        }
+    }
+
+    // No wrap: running out of entrances that way just stays put, so the player always knows where
+    // the selection is instead of it jumping across the map.
+    if (best >= 0) {
+        tm_pad_sel = best;
+        TMapPadPark(tm_pad_sel);
+        gsound_play_sfx_file("ib1p1xx1");
     }
 }
 

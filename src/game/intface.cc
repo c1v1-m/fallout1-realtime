@@ -17,6 +17,7 @@
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
+#include "game/game_trace.h"
 #include "game/gsound.h"
 #include "game/item.h"
 #include "game/object.h"
@@ -1054,6 +1055,93 @@ bool intface_is_enabled()
     return intfaceEnabled;
 }
 
+
+// --- REALTIME HEAL SLOT ----------------------------------------------------
+//
+// Shows the healing item LB+B would use NEXT, with its count, drawn where the END-TURN box
+// sits. That box is dead weight in realtime: its two buttons are only ever created by
+// intface_end_window_open, which is reached solely from combat_begin -- and realtime never
+// gets there, because combat() diverts to combat_rt_notify_attack and returns first. So all
+// that is behind us is decorative striped art.
+//
+// ⚠️ Nothing else on the 640x100 bar is free, which is why it is here and not somewhere more
+// obvious: the left panel is the message console, the middle is the weapon slot with the AP
+// dots above it, and the right column is HP/AC plus the four screen buttons. Moving the widget
+// is just the four constants below.
+#define HEAL_SLOT_X 580
+#define HEAL_SLOT_Y 38
+#define HEAL_SLOT_W 57
+#define HEAL_SLOT_H 58
+
+static Rect healSlotRect = { HEAL_SLOT_X, HEAL_SLOT_Y, HEAL_SLOT_X + HEAL_SLOT_W - 1, HEAL_SLOT_Y + HEAL_SLOT_H - 1 };
+
+// What is currently PAINTED, so the per-frame poll is free when nothing changed. -2 means
+// "never drawn", which is also what intface_redraw resets it to -- a full bar repaint wipes
+// our pixels, and without that reset the cache would suppress the redraw that puts them back.
+static int heal_slot_pid = -2;
+static int heal_slot_count = -1;
+
+void intface_invalidate_heal_slot()
+{
+    heal_slot_pid = -2;
+    heal_slot_count = -1;
+}
+
+void intface_update_heal_slot(Object* item, int count)
+{
+    // Turn-based still owns that box (it is where END TURN / END COMBAT appear), so stay off it.
+    if (interfaceWindow == -1 || !combat_rt_enabled()) {
+        return;
+    }
+
+    int pid = item != NULL ? item->pid : -1;
+    if (pid == heal_slot_pid && count == heal_slot_count) {
+        return;
+    }
+    heal_slot_pid = pid;
+    heal_slot_count = count;
+
+    // Flat black plate, inset 2px so the bar's own bevel still frames it. The weapon slot does
+    // the same thing for its item: a plain ground, or the striped art reads through the icon.
+    unsigned char* plate = interfaceBuffer + 640 * (HEAL_SLOT_Y + 2) + HEAL_SLOT_X + 2;
+    buf_fill(plate, HEAL_SLOT_W - 4, HEAL_SLOT_H - 4, 640, colorTable[0]);
+
+    int oldFont = text_curr();
+    text_font(101);
+
+    int lineH = text_height();
+    int iconH = HEAL_SLOT_H - 8 - lineH * 2;
+
+    if (item != NULL) {
+        // scale_art fits the art inside the box preserving aspect, through trans_cscale, so the
+        // 88x59 inventory frame lands centred with index 0 left alone -- which is why the plate
+        // is drawn first rather than after.
+        scale_art(item_inv_fid(item),
+            interfaceBuffer + 640 * (HEAL_SLOT_Y + 4) + HEAL_SLOT_X + 4,
+            HEAL_SLOT_W - 8,
+            iconH,
+            640);
+    }
+
+    // The binding, then the count -- same reading order as the weapon slot's mode label above
+    // its ammo counter. Yellow for the label, green for a usable count, red for empty, matching
+    // the colours the rest of the bar already uses for those three meanings.
+    const char* label = "LB+B";
+    int labelY = HEAL_SLOT_Y + 4 + iconH;
+    int labelX = HEAL_SLOT_X + (HEAL_SLOT_W - text_width((char*)label)) / 2;
+    text_to_buf(interfaceBuffer + 640 * labelY + labelX, (char*)label, 640, 640, colorTable[32747]);
+
+    char countText[8];
+    snprintf(countText, sizeof(countText), "%d", count);
+    int countY = labelY + lineH;
+    int countX = HEAL_SLOT_X + (HEAL_SLOT_W - text_width(countText)) / 2;
+    text_to_buf(interfaceBuffer + 640 * countY + countX, countText, 640, 640,
+        count > 0 ? colorTable[992] : colorTable[31744]);
+
+    text_font(oldFont);
+    win_draw_rect(interfaceWindow, &healSlotRect);
+}
+
 // 0x454528
 void intface_redraw()
 {
@@ -1062,6 +1150,8 @@ void intface_redraw()
         intface_update_hit_points(false);
         intface_update_ac(false);
         refresh_box_bar_win();
+        // The repaint above wiped our pixels; let the next poll put them back.
+        intface_invalidate_heal_slot();
         win_draw(interfaceWindow);
     }
     refresh_box_bar_win();
@@ -1100,14 +1190,28 @@ static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
 // take the same time to read.
 #define HP_ROLL_TOTAL_SECONDS (0.25f)
 
-// A long frame (a modal loop closing, a hitch) must neither burn the whole roll in a single
-// tick nor spin: steps per tick are capped and the leftover time is dropped.
-#define HP_ROLL_MAX_STEPS_PER_TICK (32)
+// Vanilla's counter is an ODOMETER, not a sequence of numbers. Every single point costs three
+// drawn frames (see intface_rotate_numbers): the digit rolls OUT upwards (upSrc), the value is
+// incremented, the digit rolls IN from below (downSrc), and only then is the new digit drawn.
+// Carries cascade the same way into tens and hundreds. Drawing only the third of those -- which
+// is what intface_rotate_numbers(..., delay = 0) does -- gives a counter that snaps from number
+// to number and reads nothing like the original. So the phases are stepped here instead.
+#define HP_ROLL_PHASE_OUT 0    // upSrc over every digit that is about to change
+#define HP_ROLL_PHASE_IN 1     // value stepped, downSrc over the digits that changed
+#define HP_ROLL_PHASE_SETTLE 2 // the new digits, clean
+#define HP_ROLL_PHASES 3
+
+// AT MOST ONE PHASE PER TICK. A frame loop cannot show more sub-frames than it draws frames, so
+// burning several phases in one tick would silently drop exactly the frames that ARE the animation
+// -- the snap we are fixing. A big hit therefore takes longer than vanilla's fixed ~250 ms, which
+// is the right trade in realtime: the roll stays visible instead of being compressed into nothing.
+// It also makes a hitch harmless: a long frame advances one phase, never a burst.
 
 static bool hp_roll_active = false;
 static int hp_roll_target = 0;
-static float hp_roll_step_seconds = 0.0f;
+static float hp_roll_step_seconds = 0.0f; // per PHASE, not per point
 static float hp_roll_accum = 0.0f;
+static int hp_roll_phase = HP_ROLL_PHASE_OUT;
 
 // The color thresholds vanilla applies at 25% / 50% of max HP. Evaluated per intermediate
 // value, which reproduces for free what vanilla does by splitting the roll into colored
@@ -1123,6 +1227,82 @@ static int intface_hp_points_color(int hp)
     } else {
         return INTERFACE_NUMBERS_COLOR_WHITE;
     }
+}
+
+// Which decimal digits differ between two values: bit 0 ones, bit 1 tens, bit 2 hundreds. Drives
+// the carry cascade -- vanilla rolls the tens only on the step where the tens actually turn over.
+static int intface_hp_digit_mask(int a, int b)
+{
+    int aa = abs(a);
+    int bb = abs(b);
+    int mask = 0;
+
+    if (aa % 10 != bb % 10) {
+        mask |= 1;
+    }
+    if ((aa / 10) % 10 != (bb / 10) % 10) {
+        mask |= 2;
+    }
+    if (aa / 100 != bb / 100) {
+        mask |= 4;
+    }
+
+    return mask;
+}
+
+// One frame of the roll. Same buffer arithmetic as intface_rotate_numbers (9x17 digits in a
+// 360-wide sheet, sign 6 wide, at 473,40), but it draws a single frame and returns instead of
+// spinning on block_for_tocks. transition: 0 none, +1 upSrc (rolling out), -1 downSrc (rolling in);
+// digitMask selects which digit positions the transition sprite covers.
+static void intface_hp_roll_draw(int value, int digitMask, int transition)
+{
+    if (value > 999) {
+        value = 999;
+    } else if (value < -999) {
+        value = -999;
+    }
+
+    unsigned char* numbers = numbersBuffer + last_points_color;
+    unsigned char* dest = interfaceBuffer + 640 * 40;
+
+    unsigned char* downSrc = numbers + 90;
+    unsigned char* upSrc = numbers + 99;
+    unsigned char* minusSrc = numbers + 108;
+    unsigned char* plusSrc = numbers + 114;
+
+    unsigned char* signDest = dest + 473;
+    unsigned char* hundredsDest = dest + 473 + 6;
+    unsigned char* tensDest = dest + 473 + 6 + 9;
+    unsigned char* onesDest = dest + 473 + 6 + 9 * 2;
+
+    int sign = value >= 0 ? 1 : -1;
+    int magnitude = abs(value);
+
+    int ones = magnitude % 10;
+    int tens = (magnitude / 10) % 10;
+    int hundreds = magnitude / 100;
+
+    buf_to_buf(numbers + 9 * hundreds, 9, 17, 360, hundredsDest, 640);
+    buf_to_buf(numbers + 9 * tens, 9, 17, 360, tensDest, 640);
+    buf_to_buf(numbers + 9 * ones, 9, 17, 360, onesDest, 640);
+    buf_to_buf(sign >= 0 ? plusSrc : minusSrc, 6, 17, 360, signDest, 640);
+
+    if (transition != 0) {
+        unsigned char* transitionSrc = transition > 0 ? upSrc : downSrc;
+
+        if ((digitMask & 1) != 0) {
+            buf_to_buf(transitionSrc, 9, 17, 360, onesDest, 640);
+        }
+        if ((digitMask & 2) != 0) {
+            buf_to_buf(transitionSrc, 9, 17, 360, tensDest, 640);
+        }
+        if ((digitMask & 4) != 0) {
+            buf_to_buf(transitionSrc, 9, 17, 360, hundredsDest, 640);
+        }
+    }
+
+    Rect numbersRect = { 473, 40, 473 + 33, 40 + 17 };
+    win_draw_rect(interfaceWindow, &numbersRect);
 }
 
 // Start -- or re-target -- the non-blocking roll. Re-targeting mid-roll is the common case
@@ -1142,10 +1322,15 @@ static void intface_hp_roll_start()
         return;
     }
 
-    hp_roll_step_seconds = HP_ROLL_TOTAL_SECONDS / (float)(abs(hp_roll_target - last_points) + 1);
+    // Vanilla budgets the WHOLE roll at ~250 ms regardless of size; keep that intent by dividing it
+    // across every phase. The one-phase-per-tick rule stretches a big roll past it rather than
+    // dropping frames -- see the note at HP_ROLL_PHASES.
+    hp_roll_step_seconds = HP_ROLL_TOTAL_SECONDS
+        / (float)((abs(hp_roll_target - last_points) + 1) * HP_ROLL_PHASES);
 
     if (!hp_roll_active) {
         hp_roll_accum = 0.0f;
+        hp_roll_phase = HP_ROLL_PHASE_OUT;
         hp_roll_active = true;
     }
 }
@@ -1165,26 +1350,44 @@ void intface_hp_roll_tick(float dt)
 
     hp_roll_accum += dt;
 
-    int budget = HP_ROLL_MAX_STEPS_PER_TICK;
-    bool changed = false;
-    while (hp_roll_accum >= hp_roll_step_seconds && last_points != hp_roll_target && budget > 0) {
-        hp_roll_accum -= hp_roll_step_seconds;
-        last_points += hp_roll_target > last_points ? 1 : -1;
-        budget -= 1;
-        changed = true;
+    if (hp_roll_accum < hp_roll_step_seconds) {
+        return;
     }
 
-    if (budget == 0) {
-        hp_roll_accum = 0.0f;
-    }
+    // Exactly one phase per tick; drop whatever time is left over so a hitch cannot bank up a burst.
+    hp_roll_accum = 0.0f;
 
-    if (changed) {
+    int step = hp_roll_target > last_points ? 1 : -1;
+
+    switch (hp_roll_phase) {
+    case HP_ROLL_PHASE_OUT:
+        // The digits about to turn over roll upwards, still showing the OLD value.
         last_points_color = intface_hp_points_color(last_points);
-        intface_rotate_numbers(473, 40, last_points, last_points, last_points_color, 0);
+        intface_hp_roll_draw(last_points, intface_hp_digit_mask(last_points, last_points + step), 1);
+        hp_roll_phase = HP_ROLL_PHASE_IN;
+        break;
+
+    case HP_ROLL_PHASE_IN: {
+        // Step the value, then show those same digits arriving from below.
+        int previous = last_points;
+        last_points += step;
+        last_points_color = intface_hp_points_color(last_points);
+        intface_hp_roll_draw(last_points, intface_hp_digit_mask(previous, last_points), -1);
+        hp_roll_phase = HP_ROLL_PHASE_SETTLE;
+        break;
     }
 
-    if (last_points == hp_roll_target) {
-        hp_roll_active = false;
+    case HP_ROLL_PHASE_SETTLE:
+    default:
+        // The new number, clean. One point is now complete.
+        last_points_color = intface_hp_points_color(last_points);
+        intface_hp_roll_draw(last_points, 0, 0);
+        hp_roll_phase = HP_ROLL_PHASE_OUT;
+
+        if (last_points == hp_roll_target) {
+            hp_roll_active = false;
+        }
+        break;
     }
 }
 
@@ -1199,6 +1402,7 @@ void intface_hp_roll_cancel()
 
     hp_roll_active = false;
     hp_roll_accum = 0.0f;
+    hp_roll_phase = HP_ROLL_PHASE_OUT;
 
     if (interfaceWindow != -1 && obj_dude != NULL) {
         intface_update_hit_points(false);
@@ -1228,6 +1432,7 @@ void intface_update_hit_points(bool animate)
     // whatever was in flight is stale.
     hp_roll_active = false;
     hp_roll_accum = 0.0f;
+    hp_roll_phase = HP_ROLL_PHASE_OUT;
 
     int hp = critter_get_hits(obj_dude);
     int maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
@@ -1299,7 +1504,35 @@ void intface_update_ac(bool animate)
     // 0x50561C
     static int last_ac = 0;
 
+    // The same guard the other indicators carry (intface_update_move_points et al). It matters
+    // now that combat_rt pushes this every frame the value moves: with no window there is no
+    // interfaceBuffer to blit into.
+    if (interfaceWindow == -1) {
+        return;
+    }
+
     int armorClass = stat_level(obj_dude, STAT_ARMOR_CLASS);
+
+    // TEMP DIAG (STRIP with ac-diag): why the AC readout moves. Vanilla stat_level adds the
+    // critter's ENGINE combat.ap to STAT_ARMOR_CLASS while isInCombat() and it is not its turn
+    // (stat.cc:199) -- "unused AP make you harder to hit". In realtime BOTH conditions hold for
+    // the whole fight (combat_rt owns COMBAT_STATE_0x01; combat_begin/combat_turn never run, so
+    // combat_turn_obj stays NULL), and combat.ap is NOT the real pool -- combat_rt pins it to max
+    // every frame so anim.cc will not truncate walking, while combat_attack keeps subtracting the
+    // weapon cost from it. Log the decomposition on every CHANGE so we can say what actually
+    // moved: `armor` is the AC without the AP term, `eap` the term itself, `rtap` the real pool.
+    if (armorClass != last_ac) {
+        int armorOnly = stat_get_base(obj_dude, STAT_ARMOR_CLASS)
+            + stat_get_bonus(obj_dude, STAT_ARMOR_CLASS);
+        trace_event(TRACE_STATE, "ac",
+            "%d->%d armor=%d eap=%d rtap=%d/%d inCombat=%d whoseTurn=%d anim=%d",
+            last_ac, armorClass, armorOnly,
+            obj_dude->data.critter.combat.ap,
+            combat_rt_player_ap(), combat_rt_player_max_ap(),
+            isInCombat() ? 1 : 0,
+            combat_whose_turn() == obj_dude ? 1 : 0,
+            animate ? 1 : 0);
+    }
 
     int delay = 0;
     if (animate) {
@@ -1336,6 +1569,26 @@ void intface_update_move_points(int actionPoints, int bonusMove)
         bonusMove = 0;
     } else {
         frmData = moveLightGreen;
+
+        // Realtime combat: an empty pool STOPS the dude outright, and he may only walk
+        // again once AP has climbed back to the resume threshold (combat_rt.cc,
+        // rt_move_blocked). Nothing on screen used to say so -- the player just lost
+        // control mid-step. So for exactly that window the points refilling the pool
+        // light up RED instead of green, and the strip snaps back to green on the point
+        // that frees him: watching the reds go 1-2-3 IS the countdown to moving again.
+        //
+        // Keyed on the BLOCKED LATCH, not on "AP is below the threshold". The pool also
+        // sits below it after a shot, and there the dude can still walk -- painting that
+        // red would be claiming a lockout that is not happening. So the reds only ever
+        // appear while the pool is climbing back from a zero that actually stopped him.
+        //
+        // It is the same red light vanilla puts on this strip via actionPoints == -1
+        // (the branch right above) to mean "you cannot act right now" -- the art and the
+        // meaning are the game's own, only the trigger is ours. Nothing else changes:
+        // the fill loop below is untouched, so the count of lit bulbs is still the pool.
+        if (combat_rt_move_blocked()) {
+            frmData = moveLightRed;
+        }
     }
 
     int circle = 0;
@@ -1686,7 +1939,26 @@ int intface_get_current_item(Object** itemPtr)
         return -1;
     }
 
-    *itemPtr = itemButtonItems[itemCurrentItem].item;
+    // ⚠️ THE "NO ITEM" SENTINEL HERE IS (Object*)-1, NOT NULL. intface_init_items seeds both
+    // hands with it (see the FIXME there -- it is vanilla's own oddity) and nothing in vanilla
+    // ever tests for it, because in vanilla this getter is only ever reached in-game, where
+    // intface_update_items has long since replaced the sentinel with a real item or a NULL.
+    //
+    // The gamepad layer broke that assumption: its mouse hook runs inside PRE-GAME modal loops
+    // too, so pressing A on the credits screen reached here before any game had touched the
+    // hands. The sentinel is not NULL, so a caller's NULL check waves it through -- and the
+    // next dereference reads 0xFFFF...FFFF + offsetof(Object, pid) = 0x77. That was the credits
+    // crash. (The title menu was safe only by accident: it runs under gpui_self_nav, which
+    // returns out of gpui_action_buttons before this path.)
+    //
+    // Answer "no item" instead. It is the truth, and it fixes every caller at once -- ours and
+    // vanilla's -- rather than bolting a second sentinel check onto each one.
+    Object* item = itemButtonItems[itemCurrentItem].item;
+    if (item == (Object*)-1) {
+        return -1;
+    }
+
+    *itemPtr = item;
 
     return 0;
 }
@@ -2129,6 +2401,60 @@ static int intface_change_fid_callback(Object* a1, Object* a2)
 {
     intface_fid_is_changing = false;
     return 0;
+}
+
+// SELF-HEALING WEAPON FID. The dude's sprite carries the weapon he is holding in bits 12-15 of his
+// fid, and the ONLY thing that normally updates it is the swap animation registered below -- via a
+// callback that fires at the end of that sequence.
+//
+// ⚠️ In realtime that sequence is not guaranteed to finish, or even to start. register_clear can
+// refuse on a dude who is mid-swing, register_end can fail, and combat_rt cancels pending sequences
+// on its own (anim_clear_pending) whenever it needs the dude's animation slot. Every one of those
+// leaves the hand holding one weapon and the SPRITE holding the previous one, silently and
+// permanently: "vystřelil jsem z pistole, ale přehrála se animace pušky", "vyměnil jsem nůž za
+// sledgehammer a stále jsem v animacích držel nůž" -- both after swapping during a fight.
+//
+// So the fid is reconciled against the hand every frame instead of being trusted to one callback.
+// This is a REPAIR path, not the normal one: it only acts when the dude is idle and no swap is in
+// flight, and it corrects the fid outright rather than replaying a put-away/take-out, because by
+// the time we get here the animation that should have done it is already gone.
+void intface_reconcile_weapon_fid()
+{
+    if (interfaceWindow == -1 || obj_dude == NULL || intface_fid_is_changing) {
+        return;
+    }
+
+    // Never fight a running animation -- that is how the fid got out of step in the first place.
+    if (anim_busy(obj_dude) != 0) {
+        return;
+    }
+
+    Object* item = itemButtonItems[itemCurrentItem].item;
+    if (item == (Object*)-1) {
+        return; // hands not initialised yet -- see intface_get_current_item
+    }
+
+    int wantCode = 0;
+    if (item != NULL && item_get_type(item) == ITEM_TYPE_WEAPON) {
+        wantCode = item_w_anim_code(item);
+    }
+
+    int haveCode = (obj_dude->fid & 0xF000) >> 12;
+    if (haveCode == wantCode) {
+        return;
+    }
+
+    // Keep the pose and facing the dude already has; only the weapon code changes.
+    int fid = art_id(OBJ_TYPE_CRITTER,
+        obj_dude->fid & 0xFFF,
+        FID_ANIM_TYPE(obj_dude->fid),
+        wantCode,
+        obj_dude->rotation + 1);
+
+    Rect rect;
+    if (obj_change_fid(obj_dude, fid, &rect) == 0) {
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
 }
 
 // 0x455C74

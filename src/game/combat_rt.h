@@ -48,6 +48,11 @@ bool combat_rt_active();
 // warm combat bit set for as long as anything anywhere is chasing, which turns those short,
 // bounded restrictions into permanent ones. Falls back to isInCombat() outside realtime.
 bool combat_rt_under_threat();
+// True while a fight is going on within sight of the player, whoever it is between -- including a
+// brawl he is only a bystander to. Restores vanilla's "no chatting mid-fight" for the PLAYER-INITIATED
+// talk gates only, without the map-wide lockout that a raw isInCombat() brings back. Cleared at once
+// by combat_rt_end_combat(). See the note above the definition before widening its use.
+bool combat_rt_fight_in_view();
 
 // True while any critter on the dude's elevation is still playing its death animation. Saving calls
 // anim_stop(), which force-ends every sequence and slams a mid-fall body flat, so an autosave must
@@ -81,6 +86,9 @@ bool combat_rt_is_hostile(Object* obj);
 // on an out-of-range target still consumes A (it just doesn't fire) instead of
 // falling through to a world click.
 bool combat_rt_has_lock();
+// True while the player is walking under left-stick control (not standing, not walking out a
+// click-to-move path).
+bool combat_rt_stick_walking();
 
 // --- L3 aimed-shot wheel support (gamepad_ui drives the body-part overlay). ---
 
@@ -123,11 +131,19 @@ bool combat_rt_try_world_loot();
 // player" signal (genuine hostiles request combat; peaceful NPCs never do).
 void combat_rt_notify_attack(Object* attacker, Object* defender);
 
+// Hook from the realtime damage committer (combat_commit_pending_attack) for a critter that the
+// hit KILLED or knocked out. Vanilla's combatai_notify_onlookers ran on dying defenders too;
+// combat_rt's aggro spread cannot, because it needs a live seed hostile -- so without this a
+// one-shot kill was invisible to the critter standing right next to the victim.
+void combat_rt_notify_victim(Object* attacker, Object* victim);
+
 // Hook from obj_remove_all() (object.cc) right before a map teardown frees every object.
 // Abandons any in-flight realtime attack and drops all object pointers combat_rt holds
 // (rt_resolving, the actor registry, lock/intent/loot, the engine's pending main_ctd) so a
 // stale attack can't commit against freed memory after a mid-combat map exit. Idempotent.
 void combat_rt_notify_objects_freed();
+// Cancel a queued walk-there-then-act the player started with A. True if something was cancelled.
+bool combat_rt_cancel_player_action();
 
 // Hook from obj_erase_object() (object.cc) right before a SINGLE object is freed (a script
 // destroy, a gibbed/cleaned-up corpse, etc.). If a critter is being freed mid-realtime-combat,
@@ -203,8 +219,42 @@ bool combat_rt_weapon_is_up(Object* attacker);
 // (which paces attacks) instead of the engine combat.ap that combat_rt keeps
 // maxed for free movement. Both clamp safely before the first update frame.
 int combat_rt_player_ap();
+// The REAL remaining action points of any critter in a realtime fight, or -1 when combat_rt is not
+// the authority (disabled / untracked). The engine's combat.critter.ap is pinned to max and is NOT
+// this number -- see the definition in combat_rt.cc.
+int combat_rt_critter_ap(Object* critter);
 int combat_rt_player_max_ap();
 bool combat_rt_spend_ap(int cost);
+
+// Empty a critter's realtime pool. The realtime stand-in for vanilla's "lose your turn" critical
+// failure: there are no turns, so the cost is paid as points plus the wait for them to come back.
+// Safe on anyone -- the dude, a tracked NPC, or a critter the registry has never heard of.
+void combat_rt_zero_ap(Object* critter);
+
+// Is something adjacent lootable RIGHT NOW (a corpse or a container)? Pure query -- unlike
+// combat_rt_try_world_loot it queues nothing. The pad asks this the instant A goes down, to tell a
+// press that MEANT to loot from the press that merely happened to kill something.
+bool combat_rt_world_loot_available();
+
+// True while the dude's own attack cooldown is still running -- he shot or swung a moment ago.
+// Distinguishes "mashing A at an enemy" from "deliberately double-tapping to loot".
+bool combat_rt_player_attack_busy();
+
+// True while movement is STOPPED on an empty pool and has not yet earned its way back: the
+// latch runs from the moment walking/running drains the pool to 0 until AP has climbed back
+// to the reserve threshold (cfg `resume_ap`, clamped to the dude's max). False out of a
+// fight, where nothing drains the pool and no threshold is enforced. The interface bar
+// paints the AP indicator RED for exactly this window, so the "you stop at 0, you move
+// again at 3" rule is on screen instead of being a silent loss of control.
+bool combat_rt_move_blocked();
+
+// How fast the world is currently running, as a fraction of normal. 1.0 nearly always; less than
+// that while the on-body limb picker is up, which slows the fight instead of pausing it.
+//
+// Read by anim.cc's compute_tpf as well as by combat_rt itself, so the animation clock and the
+// combat model slow together -- a critter that decides at quarter speed but walks at full speed
+// looks broken. Never returns 0: this is a slow-down, never a stop.
+float combat_rt_time_scale();
 
 } // namespace fallout
 

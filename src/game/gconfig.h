@@ -64,9 +64,27 @@ namespace fallout {
 // PERCEPTION. Duration multiplier = 1 - (stat - 5) * this (clamped 0.4..2.0); higher
 // factor = bigger spread. 0.09: stat 1 = 1.36x (slow), 5 = 1.0x, 10 = 0.55x (fast).
 #define GAME_CONFIG_ANIM_ATTACK_STAT_FACTOR_KEY "anim_attack_stat_factor"
+// How much of anim_attack_stat_factor applies ABOVE the average stat of 5 (below 5 the plain factor
+// always applies). 1.0 = symmetric, >1 exaggerates high stats, <1 damps them.
+// ⚠️ KEEP IT IN STEP WITH `attack_cooldown_high_bias` -- they shape the same half of the same curve,
+// one as animation and one as rate. They drifted apart once (this at 1.5 against a cooldown at 0.6)
+// and the result was a 0.35s punch inside a 1.63s cycle: 22% duty, a character that stood still and
+// twitched. See the note at ANIM_ATTACK_STAT_HIGH_BIAS in anim.cc.
+#define GAME_CONFIG_ANIM_ATTACK_STAT_HIGH_BIAS_KEY "anim_attack_stat_high_bias"
 // Realtime-combat AP regen interval (seconds per +1 AP) -> rt_ap_regen_seconds at
 // combat_rt_init. Lower = faster firing cadence (0.7 ~= 3.5s between 5-AP shots).
 #define GAME_CONFIG_AP_REGEN_KEY "ap_regen"
+#define GAME_CONFIG_DOOR_MAGNET_KEY "door_magnet"
+// Gamepad crowd assist: when a NON-HOSTILE critter stands on the tile you are walking into, take
+// the neighbouring hex direction nearest your stick angle instead of jamming to a stop. 0 = off
+// (bump and stand, the pre-assist behaviour). Hostiles and scenery/walls always block -- stopping
+// against them is deliberate (see rt_stick_segment_start). -> rt_npc_slide at combat_rt_init.
+#define GAME_CONFIG_NPC_SLIDE_KEY "npc_slide"
+// Right-stick free cursor: pixels per frame at FULL deflection, and the deadzone (0..0.8) below
+// which the stick does not move it. The response is squared, so small pushes are already gentle --
+// lower the speed when the last inch of aiming is the problem.
+#define GAME_CONFIG_CURSOR_SPEED_KEY "cursor_speed"
+#define GAME_CONFIG_CURSOR_DEADZONE_KEY "cursor_deadzone"
 // How hard AGILITY scales the AP refill rate in realtime combat. interval = ap_regen *
 // (1 - (AGI - 5) * factor). 0 = the old flat rate for everyone; 0.09 puts AGI 1 vs 10 at ~2.5x,
 // which is roughly vanilla's spread in action points per TURN. See rt_regen_interval.
@@ -76,6 +94,10 @@ namespace fallout {
 // the stat that owns the attack: STR melee, PE ranged, AGI thrown. See rt_attack_cooldown.
 #define GAME_CONFIG_ATTACK_COOLDOWN_BASE_KEY "attack_cooldown_base"
 #define GAME_CONFIG_ATTACK_COOLDOWN_STAT_FACTOR_KEY "attack_cooldown_stat_factor"
+// How much of attack_cooldown_stat_factor applies ABOVE the average stat of 5. 1.0 = symmetric
+// (a point of STR above 5 speeds you up as much as a point below 5 slows you down); lower damps
+// only the strong end, leaving weak critters exactly where they were. -> rt_attack_cooldown_high_bias.
+#define GAME_CONFIG_ATTACK_COOLDOWN_HIGH_BIAS_KEY "attack_cooldown_high_bias"
 // Realtime-combat run cost: AP drained per second while running IN COMBAT (walking
 // and out-of-combat running stay free) -> rt_run_ap_cost. Higher = sprint depletes
 // faster, so running and shooting compete harder for the shared pool. 0 disables.
@@ -89,12 +111,31 @@ namespace fallout {
 // dude walks (free) until AP regenerates back to this many points, then can sprint
 // again -> rt_run_resume_ap. Higher = longer walk between sprints (burst rhythm).
 #define GAME_CONFIG_RUN_RESUME_AP_KEY "resume_ap"
+// Realtime combat, EXPERIMENT (2026-08-26): what an empty pool does to movement.
+//   0 (default, shipped behaviour) -- it STOPS the dude dead until AP reaches resume_ap.
+//   1 -- it drops him to a WALK instead, and that walk is FREE while the latch is up.
+// The point is to give a fight an EXIT. With 0 the only way out of contact is a sprint that
+// ends in a forced stand-still, during which the enemy walks straight back onto you, so
+// disengaging is impossible and every contact is a fight to the death. With 1 you can always
+// leave -- at a walk, while they run, so it costs ground and cannot become endless kiting.
+// While the latch is up regen uses the STANDING curve even though he is moving: that is what
+// keeps free movement at 0 AP from re-opening the old zero-regen deadlock, and it is not
+// optional (see the long history note at the drain block in combat_rt.cc).
+#define GAME_CONFIG_AP_EMPTY_WALKS_KEY "ap_empty_walks"
 // Realtime-combat walk cost (kiting nerf, Variant C2): AP drained per second while
 // WALKING IN COMBAT -> rt_walk_ap_cost, in AP per second. Walking spends the same pool
 // attacks come out of, so moving competes with shooting and kiting dries up your offense.
 // Regen is NOT paused by walking -- what it does instead is switch to the moving proximity
 // curve below. Out-of-combat walking stays free. 0 disables (walk free).
 #define GAME_CONFIG_WALK_AP_COST_KEY "walk_ap_cost"
+// Breather (the NPC half of the dude's movement stop). margin = how far ABOVE its one-attack
+// reserve a critter must recover before it walks again; max = the hard cap on any single
+// pause, which is what guarantees a breathing critter can never become a stuck one.
+#define GAME_CONFIG_NPC_BREATHER_MARGIN_KEY "npc_breather_margin"
+#define GAME_CONFIG_NPC_BREATHER_MAX_KEY "npc_breather_max"
+// How close a chaser must be before it is allowed to stop and breathe at all. Small on purpose:
+// a pause mid-field is just a slower walk, see the note at RT_NPC_BREATHER_TILES.
+#define GAME_CONFIG_NPC_BREATHER_TILES_KEY "npc_breather_tiles"
 // Realtime-combat PROXIMITY REGEN (replaces the old stand_regen_mult standing bonus).
 // AP regen is multiplied by a factor that depends on how far the critter is from its
 // nearest enemy: regen_near_mult at contact, falling linearly to regen_far_mult at
@@ -112,6 +153,22 @@ namespace fallout {
 // (default 1.0, so crossing open ground toward a distant enemy is not punished).
 #define GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY "regen_near_mult_moving"
 #define GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY "regen_far_mult_moving"
+// The NPC counterpart of the pair above. Same shape, gentler: the near end is what stops a critter
+// profiting from walking circles around you, the far end is 1.0 and must stay there (it is what
+// keeps the approach free -- see the note at RT_NPC_REGEN_NEAR_MULT_MOVING). Setting both to 1.0
+// restores the flat pre-2026-08-29 behaviour without a rebuild.
+#define GAME_CONFIG_NPC_REGEN_NEAR_MULT_MOVING_KEY "npc_regen_near_mult_moving"
+#define GAME_CONFIG_NPC_REGEN_FAR_MULT_MOVING_KEY "npc_regen_far_mult_moving"
+// Slow-motion while the on-body limb picker is up (LB held). A fraction of normal speed: 0.25 is
+// quarter speed, 1.0 disables the effect entirely and restores full-speed combat while aiming.
+// Floored well above zero on load -- 0 would be a full freeze, and a freeze is deliberately NOT
+// what this is (see the note at rt_aim_slowmo).
+#define GAME_CONFIG_AIM_SLOWMO_KEY "aim_slowmo"
+// Crippled-leg movement penalty (realtime only), as a TILE-CROSSING TIME multiplier: 1.6 means a
+// tile takes 1.6x as long, i.e. ~62% speed. 1.0 disables. Turn-based has its own vanilla rule
+// (4x/8x action points per tile) and is untouched by these.
+#define GAME_CONFIG_CRIP_LEG_ONE_KEY "crip_leg_one_slow"
+#define GAME_CONFIG_CRIP_LEG_BOTH_KEY "crip_leg_both_slow"
 // Does the moving curve apply to NPCs as well (1) or only to the dude (0, default)? The
 // asymmetry is deliberate: a chasing melee NPC with zero regen while moving gets pinned at
 // its one-attack reserve for the whole chase (proven by trace_2026-08-03_222723), and unlike
@@ -152,6 +209,25 @@ namespace fallout {
 // keeps it down. 0 = stand up the instant the fall ends. Scale it with attack_cooldown_base: the
 // point is that a knockdown costs its victim roughly an attack cycle.
 #define GAME_CONFIG_KNOCKDOWN_DWELL_KEY "knockdown_dwell"
+// HARD CAP (seconds) on the total time a critter spends on the ground, measured from the end of its
+// fall and NOT restarted by further hits. Without it, several attackers whose combined hit cadence
+// beats knockdown_dwell pin their victim down until it dies (measured on the dude: 6 s prone, 35 HP
+// -> 4 HP, no input the whole time). 0 = no cap. Keep it above knockdown_dwell, or the dwell never
+// gets to run; ~2x is the intent.
+#define GAME_CONFIG_KNOCKDOWN_MAX_GROUND_KEY "knockdown_max_ground"
+// How near (hex tiles) an interactable must be before the contextual gamepad prompt offers it on
+// its own. The engine walks the dude the rest of the way when A fires, so this is only "close
+// enough that you clearly mean it". Lower = fewer things light up around you.
+#define GAME_CONFIG_INTERACT_RANGE_KEY "interact_range"
+// How far the RIGHT-STICK picker reaches, as opposed to interact_range which is the automatic
+// proximity offer. Pointing states intent, so it may reach further -- but bounded, and everything
+// it offers must also be on screen.
+#define GAME_CONFIG_INTERACT_PICK_RANGE_KEY "interact_pick_range"
+// R3 auto-lock reach: range (tiles) = max(PERCEPTION * lock_range_pe_scale, lock_range_min). Same
+// shape as the NPC aggro radius. Raise the scale if a low-Perception character with a long gun ends
+// up unable to lock anything he can shoot.
+#define GAME_CONFIG_LOCK_RANGE_PE_SCALE_KEY "lock_range_pe_scale"
+#define GAME_CONFIG_LOCK_RANGE_MIN_KEY "lock_range_min"
 // FLOOR (seconds) on how long a shooter's weapon still counts as SHOULDERED after a shot, during
 // which the next shot skips the ANIM_POINT raise. The raise costs ~0.43 s of nothing-visible BEFORE
 // the shot, so firing continuously pays it every round; this pays it once per burst instead.
@@ -176,10 +252,34 @@ namespace fallout {
 #define GAME_CONFIG_ATTACK_COOLDOWN_SKILL_FACTOR_KEY "attack_cooldown_skill_factor"
 // Strength of the concurrent-sound-effect limiter (see gsound_sfx_limit). Fallout plays every SFX
 // at full volume because turn-based resolves one attack at a time; realtime stacks several within a
-// few frames and they SUM. 0 = off (vanilla mixing), 0.25 default, 1.0 = heavy.
-// At 0.25 three overlapping sounds play at 0.80 volume, five at 0.57, eight at 0.40. The first two
-// overlapping sounds are always full volume, so a single shot is never quieter than before.
+// few frames and they SUM. 0 = off (vanilla mixing), 1.0 default, clamped at 4.
+// At 1.0 two overlapping sounds play at 0.50, three at 0.33, four at 0.25 -- four simultaneous
+// shots sum to ~2.1x a lone shot instead of ~4x. ONE sound always plays full, so a lone shot is
+// never quieter than before. (Was 0.25 with TWO free, which left four shots at 3.6x -- the spike
+// the player kept reporting.)
 #define GAME_CONFIG_SFX_BURST_DUCK_KEY "sfx_burst_duck"
+// Strength of the DUPLICATE-sample duck (same key idea, different quantity). The same sfx starting
+// twice inside 150 ms is the worst case there is: identical waveforms sum perfectly in phase, so
+// two copies are exactly double the amplitude with none of the roughness that makes different
+// sounds mask each other -- and four raiders carrying the same SMG make it the common case. 0 =
+// off, 2.0 default (second copy 0.33, third 0.20), clamped at 8. Multiplies with sfx_burst_duck.
+#define GAME_CONFIG_SFX_DUP_DUCK_KEY "sfx_dup_duck"
+// Output limiter in the mixer (audioEngineMixin), 1 = on (default), 0 = off. Different in kind from
+// the two ducks above: they thin out how often the mix would overflow, this stops the overflow
+// itself. SDL_MixAudioFormat sums voices into 16 bits and SATURATES, so a pile-up is not merely
+// loud, it is hard-clipped -- which is the harshness that hurt to listen to. Off restores that.
+#define GAME_CONFIG_SFX_LIMITER_KEY "sfx_limiter"
+// Level of the whole WEAPON sound family (sfx names starting with W: attack, hit, ready, out of
+// ammo, firing) against every other sound, 0..1, default 0.5. This is the "guns are too loud" knob,
+// which is a different complaint from "a pile-up is too loud" (sfx_burst_duck) and from "the mix
+// clips" (sfx_limiter). Measured cause: a lone gunshot plays at the full sfx volume while other
+// samples sit lower once distance attenuation applies.
+#define GAME_CONFIG_SFX_WEAPON_GAIN_KEY "sfx_weapon_gain"
+// SECTION (not a key): per-sample volume gains, e.g. `[sfx_gain]` / `wae1xxx1=0.4`. For samples the
+// game itself ships too hot -- a limiter can flatten a spike but cannot know one gun was always
+// meant to sit level with the others. Key = sfx file name without extension, value = 0..1
+// multiplier. Overrides the built-in table in gsound_sfx_gain_defaults.
+#define GAME_CONFIG_SFX_GAIN_SECTION_KEY "sfx_gain"
 // Minimum AI.TXT AGGRESSION at which an armed neutral critter will join a fight it witnesses, to
 // defend someone on its own team (see rt_guard_danger_source). 0 = off, and neutrals stay inert as
 // they were -- which is what let a whole bar watch the Skulz murder Neal.
@@ -205,6 +305,48 @@ namespace fallout {
 // with input/combat/anim/state events + a crash digest; 0 = disabled (all trace calls
 // become no-ops). On by default during the realtime test phase.
 #define GAME_CONFIG_TRACE_LOG_KEY "trace_log"
+
+// CRT post-process (plib/gnw/crt_shader.cc). `crt` is the on/off the CRT FILTER checkbox
+// on the Preferences screen writes; everything below it is look tuning, read once at
+// startup -- edit fallout.cfg and restart to change them.
+//   crt_scanline  0..1  beam separation. 0 = a soft blur between lines, 1 = hard black
+//                       gaps. The line pitch follows the INTERNAL resolution (f1_res.ini
+//                       SCALE_2X), so at 480 internal lines on a 1440p screen you get one
+//                       scanline every 3 output pixels.
+//   crt_sharpness 0..1  horizontal beam focus. Low smears neighbouring pixels together.
+//   crt_curvature 0..1  barrel warp of the tube. 0 = dead flat.
+//   crt_mask      0..3  phosphor layout: 0 none, 1 aperture grille (Trinitron stripes),
+//                       2 slot mask, 3 shadow mask. Needs real output pixels to show --
+//                       below ~1080p, prefer 0.
+//   crt_mask_strength 0..1  how dark the mask's off-phosphors go.
+//   crt_mask_scale    output pixels per mask cell. 1.0 = one R/G/B triad every 3 pixels.
+//   crt_bloom     0..2  halation, the glow that bleeds through the glass. THIS IS THE
+//                       EXPENSIVE PART (25 extra taps per pixel); set 0 on a weak GPU.
+//   crt_brightness      relative trim. The light the scanlines and mask eat is divided
+//                       back out automatically, so 1.0 already means "as bright as with
+//                       the filter off" no matter how hard the mask is pushed.
+//   crt_saturation      1.0 = untouched.
+//   crt_vignette  0..1  corner falloff.
+//   crt_corner    0..0.5  rounded tube corners.
+#define GAME_CONFIG_CRT_KEY "crt"
+#define GAME_CONFIG_CRT_SCANLINE_KEY "crt_scanline"
+#define GAME_CONFIG_CRT_SHARPNESS_KEY "crt_sharpness"
+#define GAME_CONFIG_CRT_CURVATURE_KEY "crt_curvature"
+#define GAME_CONFIG_CRT_MASK_KEY "crt_mask"
+#define GAME_CONFIG_CRT_MASK_STRENGTH_KEY "crt_mask_strength"
+#define GAME_CONFIG_CRT_MASK_SCALE_KEY "crt_mask_scale"
+#define GAME_CONFIG_CRT_QUALITY_KEY "crt_quality"
+#define GAME_CONFIG_CRT_SCAN_DENSITY_KEY "crt_scan_density"
+#define GAME_CONFIG_CRT_BEAM_CHROMA_KEY "crt_beam_chroma"
+#define GAME_CONFIG_CRT_BEAM_POWER_KEY "crt_beam_power"
+#define GAME_CONFIG_CRT_COMPENSATE_KEY "crt_compensate"
+#define GAME_CONFIG_CRT_BLOOM_KEY "crt_bloom"
+#define GAME_CONFIG_CRT_BRIGHTNESS_KEY "crt_brightness"
+#define GAME_CONFIG_CRT_SATURATION_KEY "crt_saturation"
+#define GAME_CONFIG_CRT_VIGNETTE_KEY "crt_vignette"
+#define GAME_CONFIG_CRT_SHADOW_LIFT_KEY "crt_shadow_lift"
+#define GAME_CONFIG_CRT_CORNER_KEY "crt_corner"
+
 #define GAME_CONFIG_TEXT_BASE_DELAY_KEY "text_base_delay"
 #define GAME_CONFIG_TEXT_LINE_DELAY_KEY "text_line_delay"
 #define GAME_CONFIG_BRIGHTNESS_KEY "brightness"

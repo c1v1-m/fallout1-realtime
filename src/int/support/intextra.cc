@@ -13,6 +13,7 @@
 #include "game/display.h"
 #include "game/endgame.h"
 #include "game/game.h"
+#include "game/game_trace.h" // trace_event, for the duplicate-spawn guard in op_create_object_sid
 #include "game/gconfig.h"
 #include "game/gdialog.h"
 #include "game/gmovie.h"
@@ -612,8 +613,52 @@ static void op_create_object_sid(Program* program)
         goto out;
     }
 
+    // DUPLICATE-SPAWN GUARD.
+    //
+    // A script that stages a scene with create_object_sid has no way to know the scene is ALREADY
+    // staged. Its own "already done" flag lives in program->stackValues (op_store_global, see
+    // intrpret.cc) and nothing persists that: a map reload destroys and recreates the program, and
+    // the flag is gone with it.
+    //
+    // VINNIE.INT's Skulz ambush walks straight into this. Its "yes, I am here to kill you" branch
+    // clears the flag and then calls load_map -- which tears the map down and rebuilds it, wiping
+    // the very flag that was supposed to stop a second run. Talk to him again and the whole gang is
+    // staged on top of the one already standing there. Measured: eight pairs, each pair one proto on
+    // one tile, plus an object-id collision (trace_2026-08-20_212253.log).
+    //
+    // Persisting VM globals would fix the cause but change what "a freshly started script" means for
+    // every script in the game, with no way to test the fallout. So catch it where the intent is
+    // unambiguous instead: a LIVING critter of the SAME proto already standing on the target tile at
+    // the same elevation is never something a script means to create a second copy of -- two
+    // identical critters on one tile cannot be rendered apart or pathed through.
+    //
+    // Hand the script the one that is already there. The sid block below re-attaches the same script
+    // index to it, so the existing ambusher ends up armed exactly as a fresh one would have been, and
+    // no twin is produced. Traced as a WARN because it should be rare; if it starts appearing in
+    // ordinary play, the rule is too broad and wants narrowing, not keeping.
+    Object* existing = NULL;
+    if (PID_TYPE(pid) == OBJ_TYPE_CRITTER && tile > 0) {
+        Object** here = NULL;
+        int hereCount = obj_create_list(tile, elevation, OBJ_TYPE_CRITTER, &here);
+
+        for (int i = 0; i < hereCount; i++) {
+            if (here[i] != obj_dude && here[i]->pid == pid && !critter_is_dead(here[i])) {
+                existing = here[i];
+                break;
+            }
+        }
+
+        if (here != NULL) {
+            obj_delete_list(here);
+        }
+    }
+
     Proto* proto;
-    if (proto_ptr(pid, &proto) != -1) {
+    if (existing != NULL) {
+        trace_event(TRACE_WARN, "spawn-dedup", "by=%s pid=%d tile=%d elev=%d reused=%d",
+            program->name != NULL ? program->name : "?", pid, tile, elevation, existing->id);
+        object = existing;
+    } else if (proto_ptr(pid, &proto) != -1) {
         if (obj_new(&object, proto->fid, pid) != -1) {
             if (tile == -1) {
                 tile = 0;

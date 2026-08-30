@@ -9,6 +9,7 @@
 
 #include <SDL.h>
 
+#include "game/anim.h"
 #include "game/automap.h"
 #include "game/bmpdlog.h"
 #include "game/combat.h"
@@ -19,6 +20,7 @@
 #include "game/display.h"
 #include "game/editor.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
@@ -209,6 +211,24 @@ static int ls_gamepad_keycode()
         || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
     bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+    // ⚠️ A CONFIRMATION BOX JUST RAN ITS OWN INPUT LOOP -- our edges describe the world from before
+    // it, so adopt the live state and emit nothing this poll.
+    //
+    // Without this, answering the "overwrite this save?" box with B closed the WHOLE save screen:
+    // the box consumed that B as its "no", returned, and the same still-held B rose-edged here as
+    // ESCAPE. His report: pressing B did not cancel, it dropped the entire menu -- and the question
+    // was still waiting the next time he opened the screen, because nothing had actually been saved.
+    static unsigned int lastEpoch = 0;
+    unsigned int epoch = gamepad_ui_input_epoch();
+    if (epoch != lastEpoch) {
+        lastEpoch = epoch;
+        prevUp = upNow;
+        prevDown = downNow;
+        prevA = aNow;
+        prevB = bNow;
+        return -1;
+    }
 
     // A -> Enter, B -> Escape: the slot loops map KEY_RETURN to their confirm (500)
     // and handle KEY_ESCAPE as cancel, and the save-description text-entry loop
@@ -439,6 +459,23 @@ int SaveGameSlot(int slot, const char* description)
         return -1;
     }
 
+    // ⚠️ NEVER SAVE A DEAD OR UNCONSCIOUS DUDE. main_game_loop ends the game the moment
+    // combat.results carries DAM_DEAD or DAM_KNOCKED_OUT -- that check is VANILLA (being knocked
+    // out IS game over for the player in Fallout 1). The flag is part of the saved state, so a
+    // save taken in that moment can never be loaded: every load drops straight into the death
+    // scene and back to the menu.
+    //
+    // Vanilla could not hit this because it has no headless saves -- the auto/quick save scheme
+    // is ours, and it fires on quest and location changes without asking whether the player is
+    // still on his feet. It produced exactly that unloadable save (SLOT05 "Autosave: Quest",
+    // 2026-08-29), and CONTINUE then picked it as the newest every single time: menu -> death
+    // screen -> menu, with no way forward.
+    if (obj_dude != NULL
+        && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        debug_printf("\nLOADSAVE: refusing to save a dead/unconscious dude (slot %d)\n", slot);
+        return -1;
+    }
+
     ls_error_code = 0;
 
     if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
@@ -470,6 +507,98 @@ int SaveGameSlot(int slot, const char* description)
 
     if (thumbnail_image[1] != NULL) {
         mem_free(snapshot);
+    }
+
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+
+    return rc != -1 ? 1 : -1;
+}
+
+
+// CE: headless "resume the most recent save" -- the read counterpart of SaveGameSlot, written for
+// the main menu's CONTINUE button. Picks the newest occupied slot and loads it with no load screen
+// in between.
+//
+// Returns 1 on success, 0 when there is NOTHING to resume (no occupied slot -- the caller decides
+// how to say so, since a menu and an in-game caller want different noises), -1 on a real failure.
+int LoadGameNewest()
+{
+    ls_error_code = 0;
+
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    // ⚠️ GetSlotList is not optional here: it is what fills LSstatus AND, through LoadHeader,
+    // LSData[].fileTime. Without it the "which is newest" question has no data to answer from.
+    int slotListRc = GetSlotList();
+    trace_event(TRACE_FLOW, "continue-enter", "getSlotList=%d", slotListRc); // STRIP with continue-diag
+    if (slotListRc == -1) {
+        return -1;
+    }
+
+    // ⚠️ NEWEST IS DECIDED BY THE FILE'S OWN mtime, NOT BY THE SAVE HEADER. LSData[].fileTime
+    // looks like the obvious field and is useless: vanilla fills it in GetTimeDate as
+    // `local->tm_hour + local->tm_min` -- hour PLUS minute, not hour*60+minute -- so 23:05 gives
+    // 28 while 10:59 gives 69, and it carries no date at all. Sorting on it picked essentially a
+    // random slot: the player got SLOT10 when his newest save was the quick save.
+    // The vanilla field is left alone because the load screen displays it and old saves carry it.
+    int best = -1;
+    long long bestTime = 0;
+    for (int index = 0; index < 10; index++) {
+        // Only OCCUPIED: an empty, corrupt or older-version slot is not something to resume into,
+        // and silently loading a different slot than "the newest" would be worse than refusing.
+        if (LSstatus[index] != SLOT_STATE_OCCUPIED) {
+            continue;
+        }
+
+        // `patches` is the real on-disk root (same composition SaveSlot uses), so this is the
+        // actual save file, not a db_ path that could resolve into MASTER.DAT.
+        char savePath[COMPAT_MAX_PATH];
+        snprintf(savePath, sizeof(savePath), "%s\\%s\\%s%.2d\\%s",
+            patches, "SAVEGAME", "SLOT", index + 1, "SAVE.DAT");
+
+        long long mtime = compat_file_mtime(savePath);
+        trace_event(TRACE_FLOW, "continue-slot", "slot=%d status=%d mtime=%lld path=%s",
+            index + 1, LSstatus[index], mtime, savePath); // STRIP with continue-diag
+        if (mtime == 0) {
+            continue; // cannot be stat-ed -- do not let an unknown age win by accident
+        }
+        if (best == -1 || mtime > bestTime) {
+            best = index;
+            bestTime = mtime;
+        }
+    }
+
+    // TEMP DIAG ("Continue nefunguje", 2026-08-29). Answers, in one line each, the three
+    // things guessing cannot separate: did the scan run, what did it see per slot, and what did
+    // it pick. STRIP with continue-diag.
+    trace_event(TRACE_FLOW, "continue-pick", "best=%d bestTime=%lld patches=%s",
+        best, bestTime, patches != NULL ? patches : "(null)");
+
+    if (best == -1) {
+        return 0;
+    }
+
+    slot_cursor = best;
+
+    // The same black cover the quick-load path puts up: LoadSlot tears the map down and rebuilds
+    // it, and without something over the screen you watch it happen.
+    int windowX = (screenGetWidth() - LS_WINDOW_WIDTH) / 2;
+    int windowY = (screenGetHeight() - LS_WINDOW_HEIGHT) / 2;
+    int window = win_add(windowX, windowY, LS_WINDOW_WIDTH, LS_WINDOW_HEIGHT, 256,
+        WINDOW_MODAL | WINDOW_DONT_MOVE_TOP);
+    if (window != -1) {
+        unsigned char* windowBuffer = win_get_buf(window);
+        buf_fill(windowBuffer, LS_WINDOW_WIDTH, LS_WINDOW_HEIGHT, LS_WINDOW_WIDTH, colorTable[0]);
+        win_draw(window);
+        renderPresent();
+    }
+
+    int rc = LoadSlot(slot_cursor);
+
+    if (window != -1) {
+        win_delete(window);
     }
 
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
@@ -702,10 +831,14 @@ int SaveGame(int mode)
             rc = 0;
         } else {
             switch (keyCode) {
+            // The ten slots WRAP: up from the first lands on the tenth, down from the tenth on
+            // the first. Vanilla clamped, which is fine when you are aiming a mouse at the row
+            // you want but wrong on a stick -- reaching slot 10 from slot 1 was nine presses
+            // in the only direction the list would move.
             case KEY_ARROW_UP:
                 slot_cursor -= 1;
                 if (slot_cursor < 0) {
-                    slot_cursor = 0;
+                    slot_cursor = 9;
                 }
                 selectionChanged = true;
                 doubleClickSlot = -1;
@@ -713,7 +846,7 @@ int SaveGame(int mode)
             case KEY_ARROW_DOWN:
                 slot_cursor += 1;
                 if (slot_cursor > 9) {
-                    slot_cursor = 9;
+                    slot_cursor = 0;
                 }
                 selectionChanged = true;
                 doubleClickSlot = -1;
@@ -1230,16 +1363,17 @@ int LoadGame(int mode)
             rc = 0;
         } else {
             switch (keyCode) {
+            // Wraps, same as the save screen above -- see the note there.
             case KEY_ARROW_UP:
                 if (--slot_cursor < 0) {
-                    slot_cursor = 0;
+                    slot_cursor = 9;
                 }
                 selectionChanged = true;
                 doubleClickSlot = -1;
                 break;
             case KEY_ARROW_DOWN:
                 if (++slot_cursor > 9) {
-                    slot_cursor = 9;
+                    slot_cursor = 0;
                 }
                 selectionChanged = true;
                 doubleClickSlot = -1;
@@ -1749,6 +1883,15 @@ static int LSGameStart(int windowType)
     // the shared gamepad hook to stop left-stick-snapping the cursor to buttons.
     gamepad_ui_set_self_nav(true);
 
+    // ⚠️ AND THROW AWAY THE PRESS THAT OPENED THIS SCREEN. ls_gamepad_keycode holds its A/B edges
+    // in statics that outlive the screen, so the A still held from picking SAVE GAME in the pause
+    // menu rose-edged on the FIRST poll here and went straight in as KEY_RETURN -- one press,
+    // and the screen had already confirmed the highlighted slot. Bumping the epoch makes that
+    // first poll adopt the live pad state and emit nothing, which is exactly what it already does
+    // after a confirmation box (bmpdlog.cc) for exactly the same reason. Entering a screen is the
+    // same situation as returning from one: the edges describe a world from before it existed.
+    gamepad_ui_bump_input_epoch();
+
     return 0;
 }
 
@@ -1881,6 +2024,34 @@ int isLoadingGame()
 }
 
 // 0x46FCCC
+// Set by SlotMap2Game when the save being restored was taken ON THE WORLD MAP, and consumed at
+// the very end of LoadSlot. Not a save-file field -- see ls_saved_on_world_map.
+static bool ls_resume_world_map = false;
+
+// Was this save taken on the world map?
+//
+// SaveHeader builds the header's map file name as strmfe(map_data.name, "sav"), and map_data.name
+// is EMPTY while the world map runs: map_save_in_game(true) writes the map out, clears the name and
+// tears the map down (obj_remove_all / proto_remove_all / square_reset) on the way there. So the
+// field reads ".sav" -- an extension with nothing in front of it, which no real map name can
+// produce. That emptiness IS the flag, which is why this needs no new field and no change to the
+// save format: a shifted stream is what made the TeamX patch eat every previous save.
+static bool ls_saved_on_world_map(const char* mapFileName)
+{
+    return mapFileName == NULL || mapFileName[0] == 0 || mapFileName[0] == 46; // "" or ".sav"
+}
+
+// Bumped once per SUCCESSFUL load. A nested screen that runs its own modal loop samples this on
+// entry and bails out the moment it changes: the game underneath it has just been replaced, so
+// everything it keeps drawing is painted over a different save. The world map is the one that
+// matters -- vanilla has no menu there at all, so only our pad can reach Load from inside it.
+static unsigned int ls_load_serial = 0;
+
+unsigned int LoadGameSerial()
+{
+    return ls_load_serial;
+}
+
 static int LoadSlot(int slot)
 {
     gmouse_set_cursor(MOUSE_CURSOR_WAIT_PLANET);
@@ -1948,8 +2119,17 @@ static int LoadSlot(int slot)
         debug_printf("\nError: Couldn't find LoadSave Message!");
     }
 
+    // The save was taken on the world map: arm the transition that brings it back up. Done HERE,
+    // after every handler has succeeded, so a load that failed halfway cannot leave a world map
+    // queued against the game the player is still in. map_check_state runs it from the main loop.
+    if (ls_resume_world_map) {
+        ls_resume_world_map = false;
+        map_request_world_map();
+    }
+
     loadingGame = 0;
     ls_just_loaded = true; // suppress the immediate location-change autosave in the main loop
+    ls_load_serial += 1;
 
     return 0;
 }
@@ -2590,7 +2770,52 @@ static int DummyFunc(DB_FILE* stream)
 static int PrepLoad(DB_FILE* stream)
 {
     game_reset();
+
+    // ⚠️ Abandon a register_begin transaction that was still open when the load started.
+    //
+    // register_begin is one-at-a-time and refuses outright while `curr_anim_set != -1`. An
+    // unclosed transaction therefore disables EVERY attack in the game -- the dude's and every
+    // NPC's -- silently and permanently, because nothing ever comes along to close it. The
+    // trace of it is unmistakable and was measured: 740 refusals in one session, the animation
+    // table nearly empty, every busy-test reading zero, and the player unable to fight from the
+    // moment they loaded ("first time I could attack, after the load I couldn't").
+    //
+    // Vanilla could not hit this: begin/end always completed inside one turn, and loading from
+    // the main menu started from a clean animation system. Realtime plus a mid-session load can
+    // leave one dangling, and neither game_reset() above nor anything else here clears it.
+    //
+    // Safe because an unclosed transaction has nothing running: register_end is what would have
+    // made it live, so there is no animation to interrupt and no callback to flush.
+    if (anim_discard_open_transaction()) {
+        debug_printf("LOAD: discarded a stale open animation transaction\n");
+    }
+
+    // ⚠️ Abandon a QUEUED MAP TRANSITION that was still pending when the load started.
+    //
+    // Exactly the same shape as the animation transaction above, and it survives for the same
+    // reason: `map_state` is a file-scope static in map.cc and NOTHING in game_reset() clears it
+    // (there is no map_reset; KillOldMaps doesn't touch it, and only map_new_map -- the NEW GAME
+    // path -- zeroes it). So a destination queued before the load is still queued after it, and the
+    // first map_check_state() that runs on the restored game performs it.
+    //
+    // The symptom is the user's report: load a save, and you are standing in the city with the
+    // WORLD MAP open in front of you. The stale map_state.map == -1 fires and pushes the town/world
+    // map screen over the map that was just restored.
+    //
+    // Realtime is what makes this reachable at all. map_check_state only performs a transition
+    // `if (!isInCombat())`, so a destination queued while combat was warm just sits there -- which
+    // is precisely why map_has_pending_transition() had to exist for rt_update_map_exit. Vanilla
+    // resolved a transition within the same turn it was queued, so it could never straddle a load.
+    //
+    // Safe: the pending transition is pure intent, nothing has been torn down for it yet, and the
+    // save being loaded already records where the player actually is.
+    if (map_has_pending_transition()) {
+        map_clear_pending_transition();
+        debug_printf("LOAD: discarded a stale pending map transition\n");
+    }
+
     map_data.name[0] = '\0';
+    ls_resume_world_map = false; // fresh per load; SlotMap2Game sets it if this save needs it
     set_game_time(LSData[slot_cursor].gameTime);
     return 0;
 }
@@ -2761,6 +2986,29 @@ static int SlotMap2Game(DB_FILE* stream)
     db_fclose(automap_stream);
     if (saved_automap_size != automap_size) {
         return -1;
+    }
+
+    // NOTHING TO LOAD, AND THAT IS THE CORRECT STATE. A save taken on the world map has no map to
+    // come back to, and this call used to die on map_load_in_game(".sav") and report "Unable to
+    // load game." -- while the save itself had been written happily, because map_save_in_game bails
+    // out early on an empty name and reports success. Vanilla could not reach Save from the world
+    // map at all; our pad can, so it was quietly producing saves that could never be opened.
+    //
+    // "No map + the dude still in the object table" is exactly the state the game runs in whenever
+    // the world map is up (obj_remove_all spares him via OBJECT_NO_REMOVE), so skipping the load
+    // lands on a state the engine already knows how to be in. PrepLoad has already cleared
+    // map_data.name, and load_world_map (a later handler) restores world_xpos / world_ypos /
+    // our_town, so the position comes back on its own.
+    // TEMP DIAG: prints the header map name for EVERY load, so a save that should have been
+    // recognised as a world-map one but was not is visible too. STRIP with wm-armed.
+    trace_event(TRACE_FLOW, "load-map", "name=\"%s\" worldMap=%d",
+        LSData[slot_cursor].fileName,
+        ls_saved_on_world_map(LSData[slot_cursor].fileName) ? 1 : 0);
+
+    if (ls_saved_on_world_map(LSData[slot_cursor].fileName)) {
+        debug_printf("LOADSAVE: save was taken on the world map -- no map to restore");
+        ls_resume_world_map = true;
+        return 0;
     }
 
     if (map_load_in_game(LSData[slot_cursor].fileName) == -1) {

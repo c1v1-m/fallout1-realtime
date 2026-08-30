@@ -12,6 +12,7 @@
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gamepad_ui.h"
 #include "game/gmouse.h"
 #include "game/graphlib.h"
@@ -652,16 +653,27 @@ enum {
     CE_GROUP_STATS = 0,
     CE_GROUP_SKILLS,
     CE_GROUP_TRAITS,
+    // Read-only rows of the character SHEET, focusable purely so the description box explains
+    // them: the status block (Hit Points, Poisoned, Radiated, the four cripples) and the derived
+    // stats below it. "chci se podívat na poisoned a nemůžu" -- there was no way to point at them.
+    CE_GROUP_STATUS,
+    CE_GROUP_DERIVED,
+    // The three little red buttons along the bottom. Reachable on BOTH screens: on the character
+    // sheet they were the one thing the pad could not touch at all -- "nemůžu ani potvrdit done".
+    CE_GROUP_BUTTONS,
     CE_GROUP_COUNT,
 };
 
 // info_line of the first trait row (traits occupy info_line 82..97: 0..7 left column, 8..15 right).
 #define CE_FIRST_TRAIT 82
 
+// ⚠️ The per-kind selection cursors that used to live here (ce_stat_sel / ce_skill_sel /
+// ce_trait_sel) are GONE. They were left over from the column-cycling navigation this screen
+// started as, and once the layout navigation replaced it nothing ever assigned them again --
+// but ce_stat_step went on READING one, so it spent every SPECIAL point on stat 0 = STRENGTH
+// no matter what was highlighted. ce_items[ce_focus] is now the single source of truth for
+// "what is selected"; do not re-introduce a parallel cursor beside it.
 static int ce_pad_group;
-static int ce_stat_sel;  // 0..6
-static int ce_skill_sel; // 0..SKILL_COUNT-1
-static int ce_trait_sel; // 0..15 (column = /8, row = %8)
 
 static bool ce_prev_up;
 static bool ce_prev_down;
@@ -672,21 +684,449 @@ static bool ce_prev_rb;
 static bool ce_prev_a;
 static bool ce_prev_b;
 static bool ce_prev_x;
+static bool ce_prev_y;
+
+// Stick/D-pad repeat while a direction is held, and how long A must be held to mean DONE.
+#define CE_REPEAT_DELAY_MS 320
+#define CE_REPEAT_RATE_MS 85
+// ⚠️ 400 was not a hold, it was a slightly slow press. Spending points is a TAP action and an
+// ordinary deliberate one crosses 400 ms easily -- so the confirm gesture kept eating presses
+// meant for the stat under the cursor. A hold has to feel held.
+#define CE_HOLD_MS 900
+
+static unsigned int ce_a_down_at = 0;
+static bool ce_a_consumed = false;
+
+// Direction auto-repeat state. FILE statics rather than locals inside ce_pad_poll, so the epoch
+// guard below can reset them: a direction held through a nested window must not fire a step the
+// moment that window closes.
+static int ce_held_dir = 0;
+static unsigned int ce_next_step_at = 0;
+
+// Last gamepad_ui input epoch this screen saw. See the guard at the top of ce_pad_poll.
+static unsigned int ce_last_epoch = 0;
+
+// PRINT/OPTIONS, DONE, CANCEL -- in the order they sit on screen (x 343 / 455 / 552, all y 454),
+// so left/right steps along the row the way it looks. The codes are this window's own, and its
+// loop eats them on the very next iteration.
+struct CeButton {
+    int x;
+    int code;
+};
+
+static const CeButton ce_buttons[] = {
+    { 343, 501 }, // PRINT on the sheet, OPTIONS during creation
+    { 455, 500 }, // DONE
+    { 552, 502 }, // CANCEL
+};
+
+#define CE_BUTTON_COUNT ((int)(sizeof(ce_buttons) / sizeof(ce_buttons[0])))
+#define CE_BUTTON_Y 454
+
+static int ce_button_sel = 1; // start on DONE -- the one you came here to press
+static int ce_status_sel = 0;
+static int ce_derived_sel = 0;
+
+// Status block: 8 rows from y=46, and the derived stats: 10 rows from y=179. Both are drawn at
+// x=194 (ListDrvdStats), stepping text_height() + 3.
+#define CE_STATUS_COUNT 8
+#define CE_STATUS_X 194
+#define CE_STATUS_Y 46
+#define CE_DERIVED_X 194
+#define CE_DERIVED_Y 179
+#define CE_ROW_STEP (text_height() + 3)
+
+// Which groups exist on which screen. Creation edits SPECIAL, tags skills and picks traits; the
+// sheet spends skill points and otherwise reads. Both end on the buttons.
+static const int ce_groups_creation[] = { CE_GROUP_STATS, CE_GROUP_SKILLS, CE_GROUP_TRAITS, CE_GROUP_BUTTONS };
+static const int ce_groups_sheet[] = { CE_GROUP_STATS, CE_GROUP_STATUS, CE_GROUP_DERIVED, CE_GROUP_SKILLS, CE_GROUP_BUTTONS };
+
+static const int* ce_group_order()
+{
+    return glblmode ? ce_groups_creation : ce_groups_sheet;
+}
+
+static int ce_group_order_count()
+{
+    return glblmode ? (int)(sizeof(ce_groups_creation) / sizeof(ce_groups_creation[0]))
+                    : (int)(sizeof(ce_groups_sheet) / sizeof(ce_groups_sheet[0]));
+}
+
+// Step to the next/previous group THIS screen actually has.
+static void ce_group_cycle(int dir)
+{
+    const int* order = ce_group_order();
+    int count = ce_group_order_count();
+    int at = 0;
+    for (int i = 0; i < count; i++) {
+        if (order[i] == ce_pad_group) {
+            at = i;
+            break;
+        }
+    }
+    ce_pad_group = order[(at + count + dir) % count];
+}
 static bool ce_prev_start;
 
 // Point info_line at the currently focused row and repaint every column so the highlight moves.
+// FOCUS FRAME. The engine already tints the focused row (colorTable[32747] in ListSkills /
+// ListTraits, and the info box names it), but a tint on one line of a screen this dense is not an
+// answer to "which control am I editing" -- the same objection the Preferences screen ran into, and
+// the same fix: a 1px box around the whole row, in Fallout's own selection yellow.
+//
+// Drawn and erased through a SAVE-UNDER, and refreshed once per loop iteration in editor_design --
+// erase at the top of the frame, let the engine repaint whatever it wants, draw again at the end.
+// A frame drawn only on focus CHANGE would vanish the moment the engine repainted a column under
+// it, which it does on every stat increment.
+#define CE_HL_MAX_W 260
+#define CE_HL_MAX_H 40
+
+static unsigned char ce_hl_top[CE_HL_MAX_W];
+static unsigned char ce_hl_bottom[CE_HL_MAX_W];
+static unsigned char ce_hl_left[CE_HL_MAX_H];
+static unsigned char ce_hl_right[CE_HL_MAX_H];
+static int ce_hl_x = -1;
+static int ce_hl_y;
+// Defined with the focus model further down; the frame drawing below needs it here.
+static void ce_focus_bounds(int* x, int* y, int* w, int* h);
+
+static int ce_hl_w;
+static int ce_hl_h;
+
+
+static void ce_hl_erase()
+{
+    if (ce_hl_x < 0 || win_buf == NULL) {
+        return;
+    }
+
+    memcpy(win_buf + 640 * ce_hl_y + ce_hl_x, ce_hl_top, ce_hl_w);
+    memcpy(win_buf + 640 * (ce_hl_y + ce_hl_h - 1) + ce_hl_x, ce_hl_bottom, ce_hl_w);
+    for (int i = 0; i < ce_hl_h; i++) {
+        unsigned char* row = win_buf + 640 * (ce_hl_y + i);
+        row[ce_hl_x] = ce_hl_left[i];
+        row[ce_hl_x + ce_hl_w - 1] = ce_hl_right[i];
+    }
+
+    ce_hl_x = -1;
+}
+
+static void ce_hl_draw()
+{
+    if (win_buf == NULL) {
+        return;
+    }
+
+    int x;
+    int y;
+    int w;
+    int h;
+    ce_focus_bounds(&x, &y, &w, &h);
+
+    if (x < 0 || y < 0 || w < 3 || h < 3 || w > CE_HL_MAX_W || h > CE_HL_MAX_H
+        || x + w > 640 || y + h > 480) {
+        return;
+    }
+
+    // Whole footprint saved BEFORE any of it is drawn, or the corners come back yellow (the
+    // vertical strips would record pixels the horizontal ones had just overwritten).
+    memcpy(ce_hl_top, win_buf + 640 * y + x, w);
+    memcpy(ce_hl_bottom, win_buf + 640 * (y + h - 1) + x, w);
+    for (int i = 0; i < h; i++) {
+        const unsigned char* row = win_buf + 640 * (y + i);
+        ce_hl_left[i] = row[x];
+        ce_hl_right[i] = row[x + w - 1];
+    }
+
+    unsigned char color = colorTable[32747]; // the same selection yellow Preferences uses
+    memset(win_buf + 640 * y + x, color, w);
+    memset(win_buf + 640 * (y + h - 1) + x, color, w);
+    for (int i = 0; i < h; i++) {
+        unsigned char* row = win_buf + 640 * (y + i);
+        row[x] = color;
+        row[x + w - 1] = color;
+    }
+
+    ce_hl_x = x;
+    ce_hl_y = y;
+    ce_hl_w = w;
+    ce_hl_h = h;
+}
+
+// ONE FLAT LIST OF EVERY FOCUSABLE THING ON THE SCREEN, navigated SPATIALLY.
+//
+// It started as columns you cycled with LB/RB, then arrows that changed values, and every version
+// left some part of the screen unreachable -- "chci se podívat na poisoned a nemůžu", "jak se
+// dostanu k done sakra", "ať je možné se třeba i zleva zhora dostat doprava dolů joystickem".
+// Columns were the wrong model: the screen is a LAYOUT, so the navigation follows the layout.
+// Push a direction and the focus goes to the nearest thing that way, whatever kind it is --
+// skills to DONE, status block to skills, top left to bottom right.
+enum {
+    CE_ITEM_STAT,    // SPECIAL, editable during creation only
+    CE_ITEM_STATUS,  // Hit Points / Poisoned / Radiated / cripples -- read-only, sheet only
+    CE_ITEM_DERIVED, // AC, AP, carry weight, ... -- read-only, sheet only
+    CE_ITEM_FOLDER_TAB,  // PERKS / KARMA / KILLS tab strip -- sheet only
+    CE_ITEM_FOLDER_LINE, // one row inside the open folder -- sheet only
+    CE_ITEM_SKILL,
+    CE_ITEM_TRAIT,   // creation only
+    CE_ITEM_BUTTON,  // PRINT/OPTIONS, DONE, CANCEL
+    CE_ITEM_BIO,     // NAME / AGE / GENDER strip, top-left, creation only
+};
+
+// The three creation-only buttons along the top edge, left to right. Reachable with the pad
+// only since 2026-08-26 -- the layout navigation had every other region of the screen but this
+// strip, so on a controller you were stuck with whatever name the game had handed you.
+static const int ce_bio_codes[] = { NAME_BTN_CODE, AGE_BTN_CODE, SEX_BTN_CODE };
+static const int ce_bio_graphics[] = { EDITOR_GRAPHIC_NAME_ON, EDITOR_GRAPHIC_AGE_ON, EDITOR_GRAPHIC_SEX_ON };
+
+#define CE_BIO_COUNT ((int)(sizeof(ce_bio_codes) / sizeof(ce_bio_codes[0])))
+
+
+// --- CHARACTER-SHEET FOLDER (PERKS / KARMA / KILLS) ------------------------
+//
+// The last region of the sheet the pad could not touch: "v char sheetu si chci projít jak perks,
+// karma, kills tak si projít jednotlivé traits a perky". Vanilla drives it purely by mouse --
+// FldrButton splits the tab strip by x, InfoButton's zone 527 turns a click in the list into
+// info_line -- so on a controller you could see the folder but never point AT a row, and the
+// description box therefore never explained one.
+//
+// Both halves are just focusable items, which is all it takes: navigation here is geometric, so
+// left/right along the tab strip, up/down through the rows, and stepping into the KILLS second
+// column all fall out for free.
+//
+// ⚠️ The info_line values are VANILLA's, not invented: 40 / 42 / 41 for the three tabs (note the
+// order -- karma is 42, kills 41) and 10 + row for a line, +10 again for the kills right column.
+// `row` is the same `selected_perk_line` space DrawFolder highlights, so the row the pad points
+// at and the row the folder draws inverted cannot drift apart.
+#define CE_FOLDER_TAB_Y 327
+#define CE_FOLDER_TAB_H 18
+#define CE_FOLDER_ROW_Y 364
+
+// Tab splits copied from FldrButton's own thresholds (x < 110 perks, < 208 karma, else kills)
+// rather than measured off the art, so the pad and the mouse agree by construction.
+static const int ce_folder_tab_x[] = { 11, 110, 208 };
+static const int ce_folder_tab_w[] = { 99, 98, 106 };
+static const int ce_folder_tab_folder[] = { EDITOR_FOLDER_PERKS, EDITOR_FOLDER_KARMA, EDITOR_FOLDER_KILLS };
+static const int ce_folder_tab_info[] = { 40, 42, 41 };
+
+
+struct CeItem {
+    int kind;
+    int index; // which stat / row / skill / trait / button
+    int x;
+    int y;
+    int w;
+    int h;
+};
+
+#define CE_ITEM_MAX 64
+static CeItem ce_items[CE_ITEM_MAX];
+static int ce_item_count = 0;
+static int ce_focus = 0;
+
+static void ce_add_item(int kind, int index, int x, int y, int w, int h)
+{
+    if (ce_item_count >= CE_ITEM_MAX) {
+        return;
+    }
+    CeItem* it = &(ce_items[ce_item_count++]);
+    it->kind = kind;
+    it->index = index;
+    it->x = x;
+    it->y = y;
+    it->w = w;
+    it->h = h;
+}
+
+// One item per row the OPEN folder actually lists -- an empty row would be focusable but explain
+// nothing. Counts come from the same places DrawFolder gets them, and karma_count / kills_count
+// are only valid once DrawFolder has run for that tab, which is why ce_folder_select redraws
+// BEFORE rebuilding the item list.
+static void ce_add_folder_lines()
+{
+    int oldFont = text_curr();
+    text_font(101);
+    int step = text_height() + 1;
+
+    switch (folder) {
+    case EDITOR_FOLDER_PERKS: {
+        int count = 0;
+        for (int perk = 0; perk < PERK_COUNT && count < 7; perk++) {
+            if (perk_level(perk) != 0) {
+                ce_add_item(CE_ITEM_FOLDER_LINE, count, 30, CE_FOLDER_ROW_Y + count * step - 1, 146, step);
+                count++;
+            }
+        }
+        // Traits live BELOW the separator, at rows 8 and 9. Row 7 is the "TRAITS" heading
+        // DrawFolder draws across the folder, and it is not selectable in vanilla either.
+        for (int i = 0; i < 2; i++) {
+            if (temp_trait[i] != -1) {
+                ce_add_item(CE_ITEM_FOLDER_LINE, 8 + i, 30, CE_FOLDER_ROW_Y + (8 + i) * step - 1, 146, step);
+            }
+        }
+        break;
+    }
+    case EDITOR_FOLDER_KARMA:
+        for (int i = 0; i < karma_count && i < 10; i++) {
+            ce_add_item(CE_ITEM_FOLDER_LINE, i, 30, CE_FOLDER_ROW_Y + i * step - 1, 146, step);
+        }
+        break;
+    case EDITOR_FOLDER_KILLS:
+        for (int i = 0; i < kills_count && i < 10; i++) {
+            ce_add_item(CE_ITEM_FOLDER_LINE, i, 30, CE_FOLDER_ROW_Y + i * step - 1, 146, step);
+        }
+        // Second column, drawn from x=191 and starting again at the top: vanilla's +10 on the
+        // row index is exactly the +10 InfoButton adds for a click right of x=174.
+        for (int i = 0; i + 10 < kills_count && i < 10; i++) {
+            ce_add_item(CE_ITEM_FOLDER_LINE, 10 + i, 187, CE_FOLDER_ROW_Y + i * step - 1, 126, step);
+        }
+        break;
+    default:
+        break;
+    }
+
+    text_font(oldFont);
+}
+
+// Geometry taken from the drawing code, not guessed: StatYpos for SPECIAL, ListDrvdStats' two
+// blocks at x=194 (y=46 and y=179, step text_height()+3), ListSkills' y=27 + i*(text_height()+1)
+// at x=380, ListTraits' two columns at x=47/199 from y=353, and the three little red buttons.
+static void ce_build_items()
+{
+    ce_item_count = 0;
+
+    for (int i = 0; i < 7; i++) {
+        ce_add_item(CE_ITEM_STAT, i, 30, StatYpos[i] - 2, 145, 30);
+    }
+
+    if (!glblmode) {
+        for (int i = 0; i < CE_STATUS_COUNT; i++) {
+            ce_add_item(CE_ITEM_STATUS, i, CE_STATUS_X - 3, CE_STATUS_Y + i * CE_ROW_STEP - 1,
+                124, text_height() + 2);
+        }
+        for (int i = 0; i < EDITOR_DERIVED_STAT_COUNT; i++) {
+            ce_add_item(CE_ITEM_DERIVED, i, CE_DERIVED_X - 3, CE_DERIVED_Y + i * CE_ROW_STEP - 1,
+                122, text_height() + 2);
+        }
+    }
+
+    for (int i = 0; i < SKILL_COUNT; i++) {
+        ce_add_item(CE_ITEM_SKILL, i, 376, 27 + i * (text_height() + 1) - 1, 240, text_height() + 2);
+    }
+
+    // The folder, sheet only. Tabs BEFORE lines so a tab keeps its item index when the line
+    // set changes underneath it -- ce_folder_select relies on that to hold focus across a
+    // rebuild.
+    if (!glblmode) {
+        for (int i = 0; i < 3; i++) {
+            ce_add_item(CE_ITEM_FOLDER_TAB, i, ce_folder_tab_x[i], CE_FOLDER_TAB_Y,
+                ce_folder_tab_w[i], CE_FOLDER_TAB_H);
+        }
+        ce_add_folder_lines();
+    }
+
+    if (glblmode) {
+        double tstep = text_height() + 3 + 0.56;
+        for (int i = 0; i < TRAIT_COUNT; i++) {
+            int col = i / 8;
+            int row = i % 8;
+            ce_add_item(CE_ITEM_TRAIT, i, (col != 0 ? 199 : 47) - 3,
+                353 + (int)(row * tstep) - 1, col != 0 ? 96 : 150, text_height() + 2);
+        }
+    }
+
+    // NAME / AGE / GENDER, laid out exactly as the button registration does it: all three sit
+    // on NAME_BUTTON_Y and each one starts where the previous one ends. Added LAST so the item
+    // indices below it do not shift -- the focus starts at item 0 and that has always been
+    // STRENGTH. Direction navigation is geometric, so list order costs it nothing; only the
+    // LB/RB group jump walks the list, and reaching the top strip last is fine.
+    if (glblmode) {
+        int bx = NAME_BUTTON_X;
+        for (int i = 0; i < CE_BIO_COUNT; i++) {
+            ce_add_item(CE_ITEM_BIO, i, bx, NAME_BUTTON_Y,
+                GInfo[ce_bio_graphics[i]].width, GInfo[ce_bio_graphics[i]].height);
+            bx += GInfo[ce_bio_graphics[i]].width;
+        }
+    }
+
+    for (int i = 0; i < CE_BUTTON_COUNT; i++) {
+        ce_add_item(CE_ITEM_BUTTON, i, ce_buttons[i].x - 3, CE_BUTTON_Y - 3,
+            GInfo[EDITOR_GRAPHIC_LITTLE_RED_BUTTON_UP].width + 6,
+            GInfo[EDITOR_GRAPHIC_LITTLE_RED_BUTTON_UP].height + 6);
+    }
+
+    if (ce_focus >= ce_item_count) {
+        ce_focus = 0;
+    }
+}
+
+// Opens one of the three folder tabs.
+//
+// ⚠️ THE ORDER IS LOAD-BEARING. DrawFolder runs FIRST because it is what assigns
+// karma_count / kills_count for the tab being opened -- ce_build_items reads those to decide
+// how many rows exist, so rebuilding first would size the new tab from the old tab's counts
+// (and on the very first visit, from zero).
+//
+// ⚠️ This REBUILDS ce_items, so any CeItem* the caller is holding is dangling afterwards.
+// ce_refresh_focus does not touch its `it` again after the switch; keep it that way.
+static void ce_folder_select(int tab)
+{
+    if (tab < 0 || tab >= (int)(sizeof(ce_folder_tab_folder) / sizeof(ce_folder_tab_folder[0]))) {
+        return;
+    }
+    if (folder != ce_folder_tab_folder[tab]) {
+        gsound_play_sfx_file("ib3p1xx1"); // the click FldrButton plays for the same action
+    }
+    folder = ce_folder_tab_folder[tab];
+    info_line = ce_folder_tab_info[tab];
+    DrawFolder();
+    ce_build_items();
+}
+
+static void ce_focus_bounds(int* x, int* y, int* w, int* h)
+{
+    const CeItem* it = &(ce_items[ce_focus]);
+    *x = it->x;
+    *y = it->y;
+    *w = it->w;
+    *h = it->h;
+}
+
 static void ce_refresh_focus()
 {
-    switch (ce_pad_group) {
-    case CE_GROUP_STATS:
-        info_line = ce_stat_sel;
+    const CeItem* it = &(ce_items[ce_focus]);
+
+    switch (it->kind) {
+    case CE_ITEM_STAT:
+        info_line = it->index;
         break;
-    case CE_GROUP_SKILLS:
-        info_line = ce_skill_sel + EDITOR_FIRST_SKILL;
+    case CE_ITEM_STATUS:
+        info_line = EDITOR_HIT_POINTS + it->index;
         break;
-    case CE_GROUP_TRAITS:
-        info_line = ce_trait_sel + CE_FIRST_TRAIT;
+    case CE_ITEM_DERIVED:
+        info_line = EDITOR_FIRST_DERIVED_STAT + it->index;
         break;
+    case CE_ITEM_SKILL:
+        info_line = it->index + EDITOR_FIRST_SKILL;
+        // ⚠️ skill_cursor is what the engine's own +/- act on and is otherwise only ever set by
+        // CLICKING a row, so without this every point went into skill 0.
+        skill_cursor = it->index;
+        break;
+    case CE_ITEM_TRAIT:
+        info_line = it->index + CE_FIRST_TRAIT;
+        break;
+    case CE_ITEM_FOLDER_TAB:
+        // Focusing a tab OPENS it -- there is no separate confirm, the same way pointing at a
+        // skill row selects it. ce_folder_select redraws and rebuilds; it deliberately runs
+        // before the redraw calls below so those see the new folder.
+        ce_folder_select(it->index);
+        break;
+    case CE_ITEM_FOLDER_LINE:
+        info_line = 10 + it->index;
+        DrawFolder(); // repaint so the newly pointed-at row is the highlighted one
+        break;
+    default:
+        break; // a button explains nothing -- leave the last description up
     }
 
     PrintBasicStat(RENDER_ALL_STATS, 0, 0);
@@ -697,80 +1137,281 @@ static void ce_refresh_focus()
     win_draw(edit_win);
 }
 
-// D-pad step. dx: -1 left / +1 right, dy: -1 up / +1 down (only one non-zero per call).
-static void ce_pad_move(int dx, int dy)
+// Nearest item in the pushed direction. Same two rules the character-selection screen needed, and
+// for the same reason -- this layout is not a tidy grid either: a candidate must move at least
+// CE_STEP_MIN along the pushed axis (a few pixels of sloppy alignment is not a direction), and one
+// that OVERLAPS on the other axis (a true row/column neighbour) beats one merely in line with it.
+#define CE_STEP_MIN 6
+
+static void ce_focus_step(int dx, int dy)
 {
-    if (ce_pad_group == CE_GROUP_STATS) {
-        if (dy != 0) {
-            ce_stat_sel = (ce_stat_sel + 7 + (dy > 0 ? 1 : -1)) % 7;
-            ce_refresh_focus();
-            gsound_play_sfx_file("ib1p1xx1");
-        } else {
-            // Decrement (510+i) / increment (503+i) the focused SPECIAL stat, then a release code
-            // (518) so StatButton's held-repeat loop applies exactly one step.
-            GNW_add_input_buffer((dx > 0 ? 503 : 510) + ce_stat_sel);
-            GNW_add_input_buffer(518);
+    const CeItem* cur = &(ce_items[ce_focus]);
+    int cx = cur->x + cur->w / 2;
+    int cy = cur->y + cur->h / 2;
+
+    int best = -1;
+    int bestScore = 0;
+    bool bestOverlaps = false;
+
+    for (int i = 0; i < ce_item_count; i++) {
+        if (i == ce_focus) {
+            continue;
         }
-    } else if (ce_pad_group == CE_GROUP_SKILLS) {
-        if (dy != 0) {
-            ce_skill_sel = (ce_skill_sel + SKILL_COUNT + (dy > 0 ? 1 : -1)) % SKILL_COUNT;
-            // ⚠️ KEEP THE ENGINE'S OWN CURSOR IN STEP. skill_cursor is what SliderBtn's +/- act on,
-            // and it is otherwise only ever set by CLICKING a skill row (the mouse-Y mapping further
-            // down this file). The pad never clicks, so it stayed pinned at 0 -- every point you
-            // managed to spend went into the first skill regardless of what was highlighted.
-            skill_cursor = ce_skill_sel;
-            ce_refresh_focus();
-            gsound_play_sfx_file("ib1p1xx1");
-        } else {
-            // LEFT/RIGHT SPEND AND REFUND SKILL POINTS -- this did nothing at all before, so on a
-            // controller there was simply NO WAY to raise a skill on level-up: D-pad only walked the
-            // list and A sends TagSkillSelect, which the engine ignores outside character creation
-            // (`glblmode == 1`). "Navigace skills stojí za hovno" was, underneath, "the screen does
-            // not work".
-            //
-            // 521 / 523 are the same codes the +/- buttons emit and SliderBtn already handles them
-            // (as does the keyboard's arrow keys). SliderBtn owns the accept/refuse messages, the
-            // unspent-points check and the can't-go-below-starting-value rule, so none of that is
-            // reimplemented here.
-            skill_cursor = ce_skill_sel;
-            GNW_add_input_buffer(dx > 0 ? 521 : 523);
+
+        const CeItem* it = &(ce_items[i]);
+        int ix = it->x + it->w / 2;
+        int iy = it->y + it->h / 2;
+
+        int along = dx != 0 ? (ix - cx) * dx : (iy - cy) * dy;
+        if (along < CE_STEP_MIN) {
+            continue;
         }
-    } else {
-        int col = ce_trait_sel / 8;
-        int row = ce_trait_sel % 8;
-        if (dy != 0) {
-            row = (row + 8 + (dy > 0 ? 1 : -1)) % 8;
-        } else {
-            col = (dx > 0) ? 1 : 0;
+
+        int across = dx != 0 ? (iy - cy) : (ix - cx);
+        if (across < 0) {
+            across = -across;
         }
-        ce_trait_sel = col * 8 + row;
+
+        bool overlaps = dx != 0
+            ? (it->y < cur->y + cur->h && it->y + it->h > cur->y)
+            : (it->x < cur->x + cur->w && it->x + it->w > cur->x);
+
+        // No slop cap here, unlike the selection screen: this layout has real gaps (the skills
+        // column is far to the right of everything else), and refusing to cross them is exactly
+        // what made DONE unreachable from the skill list. Overlap still wins outright, so a
+        // neighbour in the same row or column is always preferred to a diagonal reach.
+        int score = along + 2 * across;
+
+        if (best == -1 || (overlaps && !bestOverlaps)
+            || (overlaps == bestOverlaps && score < bestScore)) {
+            best = i;
+            bestScore = score;
+            bestOverlaps = overlaps;
+        }
+    }
+
+    if (best != -1) {
+        ce_focus = best;
         ce_refresh_focus();
         gsound_play_sfx_file("ib1p1xx1");
     }
 }
 
-// A button: act on the focused row via its own event code.
+// LB/RB keep their role as the QUICK jump: straight to the first item of the next/previous kind,
+// so reaching DONE or the skill list never needs a dozen steps.
+static void ce_focus_jump(int dir)
+{
+    int kind = ce_items[ce_focus].kind;
+    int at = ce_focus;
+
+    for (int guard = 0; guard < ce_item_count; guard++) {
+        at = (at + ce_item_count + dir) % ce_item_count;
+        if (ce_items[at].kind != kind) {
+            // Land on the FIRST item of that kind, whichever way we arrived.
+            int k = ce_items[at].kind;
+            for (int i = 0; i < ce_item_count; i++) {
+                if (ce_items[i].kind == k) {
+                    at = i;
+                    break;
+                }
+            }
+            ce_focus = at;
+            ce_refresh_focus();
+            gsound_play_sfx_file("ib1p1xx1");
+            return;
+        }
+    }
+}
+
+static bool ce_stat_step(int dir)
+{
+    if (!glblmode) {
+        return false; // SPECIAL is only editable during creation
+    }
+
+    // ⚠️ WHICH stat comes from the FOCUS. This used to read a file-static `ce_stat_sel` that
+    // NOTHING in the file ever assigned -- declared once, read once -- so it sat at 0 for the
+    // whole program and every point the pad spent went to STRENGTH, whatever row was
+    // highlighted. The skill half never had the bug because ce_pad_activate sets skill_cursor
+    // from the focused item before stepping; the stat half was simply missing that line.
+    //
+    // Reading the focus here rather than re-introducing a cursor keeps the two in step by
+    // construction: there is no second piece of state that can drift from what is highlighted.
+    // Every caller has already established that the focused item IS a stat, so the guard is a
+    // cheap invariant, not a real branch.
+    const CeItem* focused = &(ce_items[ce_focus]);
+    if (focused->kind != CE_ITEM_STAT) {
+        return false;
+    }
+
+    int stat = focused->index;
+    int savedPoints = character_points;
+    int previousValue = stat_get_base(obj_dude, stat) + stat_get_bonus(obj_dude, stat);
+    bool changed;
+
+    if (dir > 0) {
+        changed = character_points > 0 && previousValue < 10 && inc_stat(obj_dude, stat) == 0;
+        if (changed) {
+            character_points--;
+        }
+    } else {
+        changed = dec_stat(obj_dude, stat) == 0;
+        if (changed) {
+            character_points++;
+        }
+    }
+
+    if (!changed) {
+        gsound_play_sfx_file("iisxxxx1"); // at a limit, or out of points
+        return false;
+    }
+
+    PrintBasicStat(stat, ANIMATE, previousValue);
+    PrintBigNum(126, 282, ANIMATE, character_points, savedPoints, edit_win);
+    stat_recalc_derived(obj_dude);
+    ListDrvdStats();
+    ListSkills(0);
+    info_line = stat;
+    DrawInfoWin();
+    win_draw(edit_win);
+    return true;
+}
+
+// ONE point in or out of the focused SKILL, on the character SHEET. Same reasoning as
+// ce_stat_step: SliderBtn is another blocking held-repeat loop, and it exits only when its nested
+// get_input() sees 522/524 -- release codes the pad never produces at all, so feeding it 521 left
+// it spinning and auto-repeating until it had spent every point you had.
+static bool ce_skill_step(int dir)
+{
+    if (glblmode) {
+        return false; // creation spends points on TAG skills, not on the slider
+    }
+
+    int unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+    bool changed = false;
+
+    if (dir > 0) {
+        if (unspent > 0) {
+            changed = skill_inc_point(obj_dude, skill_cursor) != -3;
+        }
+    } else {
+        // Never below where the screen was opened: the engine's own rule for taking a point back.
+        if (skill_level(obj_dude, skill_cursor) > skillsav[skill_cursor]) {
+            changed = skill_dec_point(obj_dude, skill_cursor) != -2;
+        }
+    }
+
+    if (!changed) {
+        gsound_play_sfx_file("iisxxxx1");
+        return false;
+    }
+
+    info_line = skill_cursor + 61;
+    DrawInfoWin();
+    ListSkills(1);
+    PrintBigNum(522, 228, ANIMATE, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS), unspent, edit_win);
+    win_draw(edit_win);
+    return true;
+}
+
+// Y: pour EVERY remaining point into whatever is focused, one legal step at a time.
+//
+// Deliberately built on the same single steps the D-pad uses rather than on a bulk write, so all
+// the rules keep applying by construction -- the cap of 10 on a SPECIAL, the derived-stat recalc
+// after each point, the skill's own increasing cost per point, "never below the value the screen
+// opened with". It simply stops the moment a step refuses.
+//
+// Both screens, whichever points they actually have: SPECIAL during creation, skill points on the
+// character sheet. Anywhere else (traits, or a column that spends nothing) it just refuses.
+static void ce_spend_all()
+{
+    bool spent = false;
+
+    // Bounded well above any real pool (SPECIAL is at most ~40 points, skills a few hundred);
+    // the steps stop on their own, the cap only guarantees this can never sit and spin.
+    for (int guard = 0; guard < 500; guard++) {
+        bool stepped;
+        const CeItem* it = &(ce_items[ce_focus]);
+        if (glblmode && it->kind == CE_ITEM_STAT) {
+            if (character_points <= 0) {
+                break;
+            }
+            stepped = ce_stat_step(1);
+        } else if (!glblmode && it->kind == CE_ITEM_SKILL) {
+            if (stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) <= 0) {
+                break;
+            }
+            stepped = ce_skill_step(1);
+        } else {
+            break;
+        }
+
+        if (!stepped) {
+            break; // hit the cap on this entry, or ran out mid-way
+        }
+        spent = true;
+    }
+
+    if (!spent) {
+        gsound_play_sfx_file("iisxxxx1");
+    }
+}
+
+// D-pad step. dx: -1 left / +1 right, dy: -1 up / +1 down (only one non-zero per call).
+// A: act on whatever is focused.
 static void ce_pad_activate()
 {
-    switch (ce_pad_group) {
-    case CE_GROUP_STATS:
-        GNW_add_input_buffer(503 + ce_stat_sel); // increment
-        GNW_add_input_buffer(518);
-        break;
-    case CE_GROUP_SKILLS:
-        // TagSkillSelect is a CREATION-only action -- the engine ignores 536+ outside glblmode, so
-        // on the character sheet A has to do the thing that screen is actually for: spend a point.
-        // Same 521 the +/- button and the keyboard arrows emit, so SliderBtn owns the refusals.
+    const CeItem* it = &(ce_items[ce_focus]);
+
+    switch (it->kind) {
+    case CE_ITEM_STAT:
         if (glblmode) {
-            GNW_add_input_buffer(536 + ce_skill_sel);
+            ce_stat_step(1);
         } else {
-            skill_cursor = ce_skill_sel;
-            GNW_add_input_buffer(521);
+            gsound_play_sfx_file("iisxxxx1"); // read-only on the sheet
         }
         break;
-    case CE_GROUP_TRAITS:
-        GNW_add_input_buffer(555 + ce_trait_sel); // TraitSelect
+    case CE_ITEM_SKILL:
+        // TagSkillSelect is a CREATION-only action -- the engine ignores 536+ outside glblmode, so
+        // on the sheet A does the thing that screen is for: spend a point.
+        if (glblmode) {
+            GNW_add_input_buffer(536 + it->index);
+        } else {
+            skill_cursor = it->index;
+            ce_skill_step(1);
+        }
         break;
+    case CE_ITEM_TRAIT:
+        GNW_add_input_buffer(555 + it->index);
+        break;
+    case CE_ITEM_BUTTON:
+        GNW_add_input_buffer(ce_buttons[it->index].code);
+        break;
+    case CE_ITEM_BIO:
+        // NAME / AGE / GENDER each open their own nested window. ⚠️ The name one needs the
+        // KEYBOARD to type into -- the pad gets you to the field, not through it.
+        GNW_add_input_buffer(ce_bio_codes[it->index]);
+        break;
+    default:
+        gsound_play_sfx_file("iisxxxx1"); // a read-only row -- the description is the point
+        break;
+    }
+}
+
+// X: give a point back.
+static void ce_pad_undo()
+{
+    const CeItem* it = &(ce_items[ce_focus]);
+
+    if (it->kind == CE_ITEM_STAT && glblmode) {
+        ce_stat_step(-1);
+    } else if (it->kind == CE_ITEM_SKILL && !glblmode) {
+        skill_cursor = it->index;
+        ce_skill_step(-1);
+    } else if (glblmode) {
+        GNW_add_input_buffer(520); // Gender window -- creation only
+    } else {
+        gsound_play_sfx_file("iisxxxx1");
     }
 }
 
@@ -791,42 +1432,115 @@ static void ce_pad_poll(SDL_GameController* pad)
     bool a = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
     bool x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+    bool y = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
     bool start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
 
-    if (up && !ce_prev_up) {
-        ce_pad_move(0, -1);
-    } else if (down && !ce_prev_down) {
-        ce_pad_move(0, 1);
+    // ⚠️ A NESTED WINDOW JUST RAN ITS OWN INPUT LOOP -- our edges describe the pad from BEFORE it,
+    // so adopt the live state and act on nothing this poll. This screen was the last one still
+    // missing the guard every other nested-loop screen already has (bmpdlog, inventry, loadsave,
+    // options all bump the epoch on the way out).
+    //
+    // Without it, taking a perk shut the whole sheet: perks_dialog confirms on the PRESS edge and
+    // returns while A is still physically DOWN, so the outer poll saw that same hold as a FRESH
+    // press -- and A here acts on RELEASE (ce_pad_activate) or, past CE_HOLD_MS, types DONE. Either
+    // way the sheet closed the instant the perk was chosen, which is exactly what he reported.
+    //
+    // ⚠️ ce_a_consumed, not just the edges. Adopting `a` alone would still leave ce_prev_a true, and
+    // the release branch below fires on `!a && ce_prev_a` -- the press would act on the way UP.
+    // Marking it consumed is what says "the nested window already spent this press". Harmless when
+    // A is not held: the next real press clears the flag on its own down-edge.
+    unsigned int epoch = gamepad_ui_input_epoch();
+    if (epoch != ce_last_epoch) {
+        ce_last_epoch = epoch;
+        ce_prev_up = up;
+        ce_prev_down = down;
+        ce_prev_left = left;
+        ce_prev_right = right;
+        ce_prev_lb = lb;
+        ce_prev_rb = rb;
+        ce_prev_a = a;
+        ce_prev_b = b;
+        ce_prev_x = x;
+        ce_prev_y = y;
+        ce_prev_start = start;
+        ce_a_consumed = true;
+        ce_held_dir = up ? 1 : (down ? 2 : (left ? 3 : (right ? 4 : 0)));
+        ce_next_step_at = get_time() + CE_REPEAT_DELAY_MS;
+        return;
     }
 
-    if (left && !ce_prev_left) {
-        ce_pad_move(-1, 0);
-    } else if (right && !ce_prev_right) {
-        ce_pad_move(1, 0);
-    }
+    // ⚠️ HELD DIRECTIONS AUTO-REPEAT. Edge-only stepping meant one click of the stick per row --
+    // "joystick by mohl trackovat rychleji jako je to v inventory když scrolluji mezi itemy".
+    // First step immediately, then a pause, then a steady stream while it stays pushed.
+    {
+        int dir = up ? 1 : (down ? 2 : (left ? 3 : (right ? 4 : 0)));
 
-    // Column cycling is CREATION-only: on the character sheet stats and traits are read-only, so
-    // moving focus there would just be a way to get stuck somewhere that ignores every button.
-    if (glblmode) {
-        if (rb && !ce_prev_rb) {
-            ce_pad_group = (ce_pad_group + 1) % CE_GROUP_COUNT;
-            ce_refresh_focus();
-            gsound_play_sfx_file("ib1p1xx1");
-        } else if (lb && !ce_prev_lb) {
-            ce_pad_group = (ce_pad_group + CE_GROUP_COUNT - 1) % CE_GROUP_COUNT;
-            ce_refresh_focus();
-            gsound_play_sfx_file("ib1p1xx1");
+        bool fire = false;
+        if (dir != ce_held_dir) {
+            ce_held_dir = dir;
+            if (dir != 0) {
+                fire = true;
+                ce_next_step_at = get_time() + CE_REPEAT_DELAY_MS;
+            }
+        } else if (dir != 0 && get_time() >= ce_next_step_at) {
+            fire = true;
+            ce_next_step_at = get_time() + CE_REPEAT_RATE_MS;
+        }
+
+        if (fire) {
+            switch (dir) {
+            case 1:
+                ce_focus_step(0, -1);
+                break;
+            case 2:
+                ce_focus_step(0, 1);
+                break;
+            case 3:
+                ce_focus_step(-1, 0);
+                break;
+            default:
+                ce_focus_step(1, 0);
+                break;
+            }
         }
     }
 
+    if (rb && !ce_prev_rb) {
+        ce_focus_jump(1);
+    } else if (lb && !ce_prev_lb) {
+        ce_focus_jump(-1);
+    }
+
+    // ⚠️ A IS TAP-vs-HOLD. He asked for it outright ("prostÄ mÄ nech podrÅ¾et A pro potvrzenÃ­"),
+    // which means the tap can only be judged on RELEASE -- a press cannot know yet whether it is
+    // about to become a hold. The cost is that spending a point lands when you let go rather than
+    // when you press; the threshold is kept short so a real tap is imperceptible, and Y (spend all)
+    // plus the auto-repeat above mean rapid tapping is rarely what you want anyway.
+    // ⚠️ AND THE HOLD IS DEAD WHILE CREATION STILL HAS POINTS TO SPEND. DONE is REFUSED in that
+    // state -- it can only raise "You must use all character points" -- so a press it steals
+    // there cannot produce anything except that box. Which is exactly what happened: with the
+    // stat bug above, tapping A did nothing visible, he pressed harder and longer, at 400 ms the
+    // press turned into a hold, and character creation answered by refusing to finish
+    // (trace_2026-08-26_174251: code=500 injected with kind=0, a STAT, focused). The gesture
+    // comes back the moment the last point is spent, which is the only time it can work anyway.
+    bool holdCanConfirm = !(glblmode && character_points > 0);
     if (a && !ce_prev_a) {
+        ce_a_down_at = get_time();
+        ce_a_consumed = false;
+    } else if (a && holdCanConfirm && !ce_a_consumed && get_time() - ce_a_down_at >= CE_HOLD_MS) {
+        ce_a_consumed = true; // the hold is spent -- the release must not also act
+        gsound_play_sfx_file("ib1p1xx1");
+        GNW_add_input_buffer(500); // DONE
+    } else if (!a && ce_prev_a && !ce_a_consumed) {
         ce_pad_activate();
-    } else if (b && !ce_prev_b) {
+    }
+
+    if (b && !ce_prev_b) {
         GNW_add_input_buffer(KEY_ESCAPE);
-    } else if (x && !ce_prev_x && glblmode) {
-        GNW_add_input_buffer(520); // Gender window -- creation only; the sheet can't change sex
-    } else if (start && !ce_prev_start) {
-        GNW_add_input_buffer(500); // Done
+    } else if (y && !ce_prev_y) {
+        ce_spend_all();
+    } else if (x && !ce_prev_x) {
+        ce_pad_undo();
     }
 
     ce_prev_up = up;
@@ -838,6 +1552,7 @@ static void ce_pad_poll(SDL_GameController* pad)
     ce_prev_a = a;
     ce_prev_b = b;
     ce_prev_x = x;
+    ce_prev_y = y;
     ce_prev_start = start;
 }
 
@@ -855,15 +1570,65 @@ static void ce_pad_prime(SDL_GameController* pad)
     ce_prev_a = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     ce_prev_b = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
     ce_prev_x = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+    ce_prev_y = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
     ce_prev_start = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+
+    // ⚠️ AND MARK THE HELD A CONSUMED. Priming the edges alone is not enough
+    // on this screen, because A acts on the RELEASE (see ce_pad_poll): the A that opened the sheet
+    // sails past the missing press-edge and then fires ce_pad_activate the moment it comes up. Same
+    // reasoning as the epoch guard -- an edge tracker that was not running is not merely stale, it
+    // is wrong.
+    ce_a_consumed = true;
+    ce_held_dir = ce_prev_up ? 1 : (ce_prev_down ? 2 : (ce_prev_left ? 3 : (ce_prev_right ? 4 : 0)));
+    ce_next_step_at = get_time() + CE_REPEAT_DELAY_MS;
+
+    // Adopt the CURRENT epoch: this prime IS the resynchronisation the guard would otherwise do,
+    // and leaving it behind would make the guard swallow the first real poll for nothing.
+    ce_last_epoch = gamepad_ui_input_epoch();
 }
 
 // Auto-hide the editor cursor (controller only): hidden by default, revealed while the mouse
 // moves, re-hidden after idle. Same pattern as the options / load-save screens.
 #define CE_CURSOR_IDLE_MS 2000
 
+// Where the pointer is pinned while the pad drives this screen. x 340 is the bare frame between
+// the panels that end at 313 and the skills panel that starts at 370 -- verified against every
+// win_register_button(edit_win, ...) rect, info hot-zones 525-534 included.
+#define CE_PARK_X 340
+#define CE_PARK_Y 300
+
+static void ce_park_cursor()
+{
+    Rect r;
+    if (win_get_rect(edit_win, &r) == 0) {
+        mouse_set_position(r.ulx + CE_PARK_X, r.uly + CE_PARK_Y);
+    }
+}
+
 static void ce_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned int* lastMove)
 {
+    // ⚠️ PIN THE POINTER UNLESS THE RIGHT STICK IS DELIBERATELY PUSHED.
+    //
+    // He found this one: the LEFT stick was moving his focus AND the mouse cursor at the same
+    // time, walking the pointer onto PRINT / DONE, where the next click pressed them. Chasing the
+    // CLICK was the wrong end of it for four rounds -- the pointer had no business being on a
+    // button at all, because on this screen the pad navigates by focus, not by pointing.
+    //
+    // Pinned rather than hidden, and re-pinned every frame rather than once on entry, because the
+    // source of the drift does not matter: whatever moves it, it is back on dead panel before
+    // anything can be pressed. Push the RIGHT stick and it is yours again -- that is how you reach
+    // PRINT / DONE / OPTIONS, which the focus nav does not step through.
+    {
+        SDL_GameController* pad = gamepad_ui_get_controller();
+        if (pad != NULL) {
+            float rx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+            float ry = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+            if (rx * rx + ry * ry < 0.09f) { // right stick at rest -> the pointer is not the player's
+                ce_park_cursor();
+            }
+        }
+    }
+
     int x;
     int y;
     mouse_get_position(&x, &y);
@@ -894,6 +1659,15 @@ int editor_design(bool isCreationMode)
 
     SavePlayer();
 
+    // ⚠️ DROP ANYTHING STILL QUEUED FROM THE SCREEN WE CAME FROM. Button event codes are only
+    // unique WITHIN a window, and this screen shares its numbers with the in-game options menu:
+    // there 500 = SAVE and 501 = LOAD, here 500 = DONE and 501 = PRINT. They travel through ONE
+    // global input queue (GNW_add_input_buffer), and the pad injects them -- so a code posted for
+    // the options menu that its loop had not eaten yet arrived here and printed the character
+    // sheet, or pressed Done, right in the middle of spending points. That is exactly the pair he
+    // reported, and it is why the a-click veto logged nothing: no mouse was ever involved.
+    flush_input_buffer();
+
     if (CharEditStart() == -1) {
         debug_printf("\n ** Error loading character editor data! **\n");
         return -1;
@@ -921,6 +1695,7 @@ int editor_design(bool isCreationMode)
     // column (ce_pad_group is forced below and the LB/RB column cycle is suppressed) and A spends a
     // point instead of tagging -- see ce_pad_activate.
     SDL_GameController* cePad = gamepad_ui_get_controller();
+    bool ceSuppressWas = false; // restored on exit -- character SELECTION sets it too
     bool ceCursorShown = true;
     int ceCursorX = 0;
     int ceCursorY = 0;
@@ -928,15 +1703,58 @@ int editor_design(bool isCreationMode)
     if (cePad != NULL) {
         // The sheet has only one editable column, so start (and stay) on it. Creation still opens
         // on stats, where you spend your character points first.
-        ce_pad_group = glblmode ? CE_GROUP_STATS : CE_GROUP_SKILLS;
-        ce_stat_sel = 0;
-        ce_skill_sel = 0;
-        ce_trait_sel = 0;
+        ce_build_items();
+        // Creation opens on SPECIAL (where the points go first); the sheet opens on the skills,
+        // which is what that screen is for. Everything else is one push away.
+        ce_focus = 0;
+        if (!glblmode) {
+            for (int i = 0; i < ce_item_count; i++) {
+                if (ce_items[i].kind == CE_ITEM_SKILL) {
+                    ce_focus = i;
+                    break;
+                }
+            }
+        }
         // Keep the engine's own cursor in step from the very first frame: skill_cursor is what
         // SliderBtn's +/- act on, and it is otherwise only ever moved by CLICKING a row.
-        skill_cursor = ce_skill_sel;
+        // Seeded from the FOCUS, for the same reason ce_stat_step reads it: this line used to
+        // copy a never-assigned ce_skill_sel, i.e. a hard 0. Harmless in practice (every pad
+        // step re-points skill_cursor first) but the same defect, and it would have bitten the
+        // moment something spent a point without setting the cursor itself.
+        if (ce_items[ce_focus].kind == CE_ITEM_SKILL) {
+            skill_cursor = ce_items[ce_focus].index;
+        }
         ce_pad_prime(cePad);
+        // We act on A ourselves (ce_pad_activate). Without this the modal A-router would ALSO
+        // synthesise a left click wherever the pointer was last left -- which is how adding a
+        // point ended up pressing PRINT.
+        ceSuppressWas = gamepad_ui_set_suppress_a_click(true);
+
+        // ⚠️ AND STOP THE SHARED LAYER MOVING THE POINTER. gpui_menu_snap steps the mouse between
+        // the GNW buttons of any MODAL window off the left stick -- which this screen is. So while
+        // the stick was moving OUR focus down the stat list, the snap was quietly walking the
+        // pointer onto PRINT and DONE underneath. That is how a click could reach them at all, and
+        // suppressing only the click left the pointer sitting on a live button anyway.
+        gamepad_ui_set_suppress_snap(true);
+
         ce_refresh_focus();
+
+        // Park the pointer on dead panel (the info box) rather than wherever the world left it.
+        // Belt and braces to the two suppressions above: with nothing under the cursor, no click
+        // that might still slip through from anywhere can press anything. The right stick moves it
+        // again normally the moment the player wants a button the pad nav does not step through.
+        {
+            Rect ceRect;
+            if (win_get_rect(edit_win, &ceRect) == 0) {
+                // x 340 is the strip of bare frame between the trait/derived panels (which end
+                // at 313) and the skills panel (which starts at 370); no registered button on this
+                // screen covers it at any y. Checked against every win_register_button(edit_win)
+                // rect, including the info hot-zones 525-534, which are buttons too -- 250,280
+                // would have landed inside 529.
+                mouse_set_position(ceRect.ulx + 340, ceRect.uly + 300);
+            }
+        }
+
         mouse_get_position(&ceCursorX, &ceCursorY);
         gmouse_set_cursor(MOUSE_CURSOR_NONE);
         ceCursorShown = false;
@@ -947,12 +1765,42 @@ int editor_design(bool isCreationMode)
         sharedFpsLimiter.mark();
 
         if (cePad != NULL) {
+            // Strictly erase -> handle input -> draw, once per frame (the frame is put back at the
+            // bottom of this loop). Anything the engine repaints in between then lands on clean
+            // pixels, and the save-under never holds anything stale.
+            ce_hl_erase();
             ce_pad_poll(cePad);
             ce_tick_cursor(&ceCursorShown, &ceCursorX, &ceCursorY, &ceCursorMove);
         }
 
         frame_time = get_time();
         int keyCode = get_input();
+
+        // TEMP DIAG (2026-08-24): the PRINT press is REAL -- he can see the button depress -- yet
+        // the hook's veto has never once fired, which can only mean the suppression flag is not
+        // actually on while this screen runs, or the button state never passes through the hook.
+        // One line a second with everything that decides it: flag, live mouse buttons, cursor.
+        {
+            static unsigned int ceDiagAt = 0;
+            if (cePad != NULL && elapsed_time(ceDiagAt) >= 1000) {
+                ceDiagAt = get_time();
+                int mdx = 0;
+                int mdy = 0;
+                mouse_get_position(&mdx, &mdy);
+                trace_event(TRACE_INPUT, "ce-state", "suppress=%d btn=%#x x=%d y=%d rt=%d",
+                    gamepad_ui_a_click_suppressed() ? 1 : 0, mouse_get_buttons(), mdx, mdy,
+                    SDL_GameControllerGetAxis(cePad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT));
+            }
+        }
+
+        // TEMP DIAG (2026-08-23): PRINT keeps firing on the character sheet while he adds points,
+        // and the a-click veto proved NO synthetic mouse click is involved (0 vetoes logged). So it
+        // arrives as an INPUT CODE. 501 is OPTIONS during creation but PRINT on the sheet
+        // (editor.cc:1267) -- this says who is sending it. STRIP once the sender is known.
+        if (cePad != NULL && keyCode != -1) {
+            trace_event(TRACE_INPUT, "ce-key", "code=%d glbl=%d kind=%d idx=%d",
+                keyCode, glblmode ? 1 : 0, ce_items[ce_focus].kind, ce_items[ce_focus].index);
+        }
 
         bool done = false;
         if (keyCode == 500) {
@@ -1051,6 +1899,20 @@ int editor_design(bool isCreationMode)
             TraitSelect(keyCode - 555);
         } else if (keyCode == 390) {
             dump_screen();
+        }
+
+        // Frame goes back on last, over whatever the engine repainted this iteration, and before
+        // the single win_draw that publishes the window.
+        ce_hl_erase();
+    // And leave none of OUR codes behind for whatever loop runs next, for the same reason.
+    flush_input_buffer();
+    gamepad_ui_set_suppress_a_click(ceSuppressWas);
+    if (cePad != NULL) {
+        gamepad_ui_set_suppress_snap(false);
+    }
+
+    if (cePad != NULL) {
+            ce_hl_draw();
         }
 
         win_draw(edit_win);
@@ -3347,12 +4209,60 @@ static int AgeWindow()
         win_register_button_sound_func(prevBtn, gsound_med_butt_press, NULL);
     }
 
+    // ⚠️ PAD NAVIGATION -- same dead end the creation OPTIONS window had: this loop read only the
+    // keyboard, so on a controller you could open AGE and not change it. Nothing here needs a
+    // selection (the two arrows act directly), so there is no highlight to draw either: left/right
+    // step the age, A confirms, B cancels. Held left/right repeats on the same cadence the
+    // character screen uses, so walking the age up 20 years is one hold, not twenty presses.
+    //
+    // A/B edges are PRIMED from the live pad: the A that opened this window is still down, and a
+    // zeroed prevA would read it as a confirm and shut the window in the same frame.
+    SDL_GameController* agePrimePad = gamepad_ui_get_controller();
+    bool agePrevA = agePrimePad != NULL && SDL_GameControllerGetButton(agePrimePad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool agePrevB = agePrimePad != NULL && SDL_GameControllerGetButton(agePrimePad, SDL_CONTROLLER_BUTTON_B) != 0;
+    int ageHeldDir = 0;
+    unsigned int ageNextStepAt = 0;
+
     while (true) {
         sharedFpsLimiter.mark();
 
         frame_time = get_time();
         change = 0;
         int v32 = 0;
+
+        // Re-fetched every frame, never cached: the controller handle opens lazily.
+        SDL_GameController* agePad = gamepad_ui_get_controller();
+        if (agePad != NULL) {
+            SDL_GameControllerUpdate();
+
+            bool aNow = SDL_GameControllerGetButton(agePad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool bNow = SDL_GameControllerGetButton(agePad, SDL_CONTROLLER_BUTTON_B) != 0;
+            bool leftNow = SDL_GameControllerGetButton(agePad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+                || SDL_GameControllerGetAxis(agePad, SDL_CONTROLLER_AXIS_LEFTX) < -16000;
+            bool rightNow = SDL_GameControllerGetButton(agePad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+                || SDL_GameControllerGetAxis(agePad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
+
+            int dir = rightNow ? 1 : (leftNow ? -1 : 0);
+            if (dir != ageHeldDir) {
+                ageHeldDir = dir;
+                if (dir != 0) {
+                    GNW_add_input_buffer(dir > 0 ? 501 : 502);
+                    ageNextStepAt = get_time() + CE_REPEAT_DELAY_MS;
+                }
+            } else if (dir != 0 && get_time() >= ageNextStepAt) {
+                GNW_add_input_buffer(dir > 0 ? 501 : 502);
+                ageNextStepAt = get_time() + CE_REPEAT_RATE_MS;
+            }
+
+            if (aNow && !agePrevA) {
+                GNW_add_input_buffer(500); // DONE
+            } else if (bNow && !agePrevB) {
+                GNW_add_input_buffer(KEY_ESCAPE);
+            }
+
+            agePrevA = aNow;
+            agePrevB = bNow;
+        }
 
         keyCode = get_input();
 
@@ -3480,6 +4390,11 @@ static int AgeWindow()
     win_draw(edit_win);
     win_draw(win);
     win_delete(win);
+
+    // ⚠️ SAME REASON AS perks_dialog: the button that closed this window is still held as
+    // the parent's poll resumes. See the epoch guard in ce_pad_poll.
+    gamepad_ui_bump_input_epoch();
+
     return 0;
 }
 
@@ -3661,6 +4576,18 @@ static void SexWindow()
 
     PrintGender();
     win_delete(win);
+
+    // ⚠️ DRAIN WHATEVER THIS WINDOW POSTED AND NOBODY ATE. Its pad handler injects 501 (male),
+    // 502 (female) and 500 (confirm) -- and in the editor loop that opened it those SAME numbers
+    // mean PRINT, CANCEL and DONE. Anything still queued when this returns is delivered to the
+    // parent, which is how pressing things in the character screen also fired PRINT and Done.
+    // Button event codes are unique per WINDOW, the queue is GLOBAL: every nested window that
+    // injects must drain on the way out.
+    flush_input_buffer();
+
+    // ⚠️ SAME REASON AS perks_dialog: the button that closed this window is still held as
+    // the parent's poll resumes. See the epoch guard in ce_pad_poll.
+    gamepad_ui_bump_input_epoch();
 }
 
 // 0x431B08
@@ -3846,9 +4773,97 @@ static int OptionWindow()
 
         text_font(101);
 
+        // ⚠️ PAD NAVIGATION. This window runs its own modal loop and used to read nothing but
+        // the keyboard, so on a controller OPTIONS during creation was a dead end -- you could
+        // open it and then not move. Five buttons in one column with codes 500..504, so the
+        // whole nav is one index: up/down moves it, A sends the code that button would have
+        // sent, B leaves. Same shape as ce_pad_poll, kept local because this loop is local.
+        //
+        // Edge state is PRIMED from the live pad rather than zeroed: the A that opened this
+        // window is very likely still held, and a zeroed prevA would read that as a fresh press
+        // and fire the top button before the window had even been looked at.
+        const int optCount = 5;
+        int optSel = 0;
+        int optHlY = -1;
+        SDL_GameController* primePad = gamepad_ui_get_controller();
+        bool optPrevA = primePad != NULL && SDL_GameControllerGetButton(primePad, SDL_CONTROLLER_BUTTON_A) != 0;
+        bool optPrevB = primePad != NULL && SDL_GameControllerGetButton(primePad, SDL_CONTROLLER_BUTTON_B) != 0;
+        bool optPrevUp = false;
+        bool optPrevDown = false;
+
         int rc = 0;
         while (rc == 0) {
             sharedFpsLimiter.mark();
+
+            // Re-fetched every frame, never cached at entry: the controller handle is opened
+            // lazily, so a pad first seen while this window is up has to start working too.
+            SDL_GameController* optPad = gamepad_ui_get_controller();
+            if (optPad != NULL) {
+                SDL_GameControllerUpdate();
+
+                bool aNow = SDL_GameControllerGetButton(optPad, SDL_CONTROLLER_BUTTON_A) != 0;
+                bool bNow = SDL_GameControllerGetButton(optPad, SDL_CONTROLLER_BUTTON_B) != 0;
+                bool upNow = SDL_GameControllerGetButton(optPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+                    || SDL_GameControllerGetAxis(optPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+                bool downNow = SDL_GameControllerGetButton(optPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+                    || SDL_GameControllerGetAxis(optPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+
+                if (upNow && !optPrevUp) {
+                    optSel = (optSel + optCount - 1) % optCount;
+                } else if (downNow && !optPrevDown) {
+                    optSel = (optSel + 1) % optCount;
+                }
+
+                if (aNow && !optPrevA) {
+                    gsound_play_sfx_file("ib1p1xx1");
+                    GNW_add_input_buffer(500 + optSel);
+                } else if (bNow && !optPrevB) {
+                    GNW_add_input_buffer(KEY_ESCAPE);
+                }
+
+                optPrevA = aNow;
+                optPrevB = bNow;
+                optPrevUp = upNow;
+                optPrevDown = downNow;
+
+                // The highlight is a one-pixel frame drawn one pixel OUTSIDE the button's rect,
+                // which matters: that ring lies entirely on the window's own background art, so
+                // erasing it by copying grphbmp[41] back can never scrub off a button label.
+                int wantY = 17 + optSel * (height + 3);
+                if (wantY != optHlY) {
+                    int gw = GInfo[41].width;
+                    int gh = GInfo[41].height;
+                    int fx = 12;
+                    int fw = width + 2;
+                    int fh = height + 2;
+
+                    if (fx >= 0 && fx + fw <= gw) {
+                        if (optHlY > 0 && optHlY - 1 + fh <= gh) {
+                            int fy = optHlY - 1;
+                            memcpy(windowBuffer + gw * fy + fx, grphbmp[41] + gw * fy + fx, fw);
+                            memcpy(windowBuffer + gw * (fy + fh - 1) + fx, grphbmp[41] + gw * (fy + fh - 1) + fx, fw);
+                            for (int i = 0; i < fh; i++) {
+                                windowBuffer[gw * (fy + i) + fx] = grphbmp[41][gw * (fy + i) + fx];
+                                windowBuffer[gw * (fy + i) + fx + fw - 1] = grphbmp[41][gw * (fy + i) + fx + fw - 1];
+                            }
+                        }
+
+                        if (wantY > 0 && wantY - 1 + fh <= gh) {
+                            int fy = wantY - 1;
+                            unsigned char color = colorTable[32747]; // the selection yellow the rest of the pad UI uses
+                            memset(windowBuffer + gw * fy + fx, color, fw);
+                            memset(windowBuffer + gw * (fy + fh - 1) + fx, color, fw);
+                            for (int i = 0; i < fh; i++) {
+                                windowBuffer[gw * (fy + i) + fx] = color;
+                                windowBuffer[gw * (fy + i) + fx + fw - 1] = color;
+                            }
+                        }
+
+                        optHlY = wantY;
+                        win_draw(win);
+                    }
+                }
+            }
 
             int keyCode = get_input();
 
@@ -4108,6 +5123,10 @@ static int OptionWindow()
             mem_free(up[index]);
             mem_free(down[index]);
         }
+
+        // ⚠️ SAME REASON AS perks_dialog: the button that closed this window is still held as
+        // the parent's poll resumes. See the epoch guard in ce_pad_poll.
+        gamepad_ui_bump_input_epoch();
 
         return 0;
     }
@@ -5846,9 +6865,57 @@ static int InputPDLoop(int count, void (*refreshProc)())
 
     int v7 = 0;
 
+    // ⚠️ PAD NAVIGATION. Third screen tonight with its own modal loop and no controller input --
+    // and this one is the LEVEL-UP PERK PICK, so on a pad you could not choose your perk at all.
+    // Drives both callers (the perk list and the more-perks/trait list), because both come through
+    // here. The loop already speaks arrow keys and 500/502, so the pad just types them.
+    //
+    // A/B primed from the live pad, as everywhere else: the A that opened this window is still down
+    // and a zeroed prevA reads it as "take the highlighted perk" before you have seen the list.
+    SDL_GameController* pdPrimePad = gamepad_ui_get_controller();
+    bool pdPrevA = pdPrimePad != NULL && SDL_GameControllerGetButton(pdPrimePad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool pdPrevB = pdPrimePad != NULL && SDL_GameControllerGetButton(pdPrimePad, SDL_CONTROLLER_BUTTON_B) != 0;
+    int pdHeldDir = 0;
+    unsigned int pdNextStepAt = 0;
+
     int rc = 0;
     while (rc == 0) {
         sharedFpsLimiter.mark();
+
+        // Re-fetched every frame, never cached: the controller handle opens lazily.
+        SDL_GameController* pdPad = gamepad_ui_get_controller();
+        if (pdPad != NULL) {
+            SDL_GameControllerUpdate();
+
+            bool aNow = SDL_GameControllerGetButton(pdPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool bNow = SDL_GameControllerGetButton(pdPad, SDL_CONTROLLER_BUTTON_B) != 0;
+            bool upNow = SDL_GameControllerGetButton(pdPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+                || SDL_GameControllerGetAxis(pdPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+            bool downNow = SDL_GameControllerGetButton(pdPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+                || SDL_GameControllerGetAxis(pdPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+
+            // Held up/down repeats, so walking a long perk list is one hold.
+            int dir = upNow ? -1 : (downNow ? 1 : 0);
+            if (dir != pdHeldDir) {
+                pdHeldDir = dir;
+                if (dir != 0) {
+                    GNW_add_input_buffer(dir < 0 ? KEY_ARROW_UP : KEY_ARROW_DOWN);
+                    pdNextStepAt = get_time() + CE_REPEAT_DELAY_MS;
+                }
+            } else if (dir != 0 && get_time() >= pdNextStepAt) {
+                GNW_add_input_buffer(dir < 0 ? KEY_ARROW_UP : KEY_ARROW_DOWN);
+                pdNextStepAt = get_time() + CE_REPEAT_RATE_MS;
+            }
+
+            if (aNow && !pdPrevA) {
+                GNW_add_input_buffer(KEY_RETURN); // take the highlighted perk
+            } else if (bNow && !pdPrevB) {
+                GNW_add_input_buffer(KEY_ESCAPE); // back out without picking
+            }
+
+            pdPrevA = aNow;
+            pdPrevB = bNow;
+        }
 
         int keyCode = get_input();
         int v19 = 0;
@@ -6073,6 +7140,13 @@ static int InputPDLoop(int count, void (*refreshProc)())
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    // ⚠️ THE A THAT TOOK THE PERK IS STILL DOWN. This loop confirms on the PRESS edge and
+    // returns immediately, straight back into the character sheet's own poll -- which acts on
+    // A's RELEASE and reads that unreleased hold as a fresh press. It closed the whole sheet the
+    // moment a perk was chosen ("stisknuti acka pri potvrzeni perku mi hned vypnu char sheet").
+    // The bump makes ce_pad_poll drop its stale edges on the next frame; see the guard there.
+    gamepad_ui_bump_input_epoch();
 
     return rc;
 }

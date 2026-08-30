@@ -175,6 +175,12 @@ typedef struct PipboyBomb {
     unsigned char field_10;
 } PipboyBomb;
 
+// One row of the CONTROLS page in the archives -- see ctrl_lines.
+typedef struct PipboyControl {
+    const char* button;
+    const char* action;
+} PipboyControl;
+
 static int StartPipboy(int intent);
 static void EndPipboy();
 static void pip_days_left(int days);
@@ -192,6 +198,8 @@ static int PrintAMelevList(int a1);
 static int PrintAMList(int a1);
 static void PipArchives(int a1);
 static int ListArchive(int a1);
+static void ShowControls();
+static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
 static void DrawAlarmText(int a1);
 static void DrawAlrmHitPnts();
@@ -425,6 +433,64 @@ static PipboyRenderProc* PipFnctn[5] = {
     PipAlarm,
 };
 
+// The gamepad layout, listed on its own page of the Pip-Boy archives.
+//
+// Hardcoded rather than added to pipboy.msg: that file lives inside MASTER.DAT, and adding a
+// handful of message ids would mean shipping a loose override of the WHOLE file, which would
+// then fight every localised or patched pipboy.msg the player might install.
+//
+//   button == NULL, action != NULL -> section heading (underlined)
+//   both NULL                      -> blank spacer, dropped first if the page runs long
+static const PipboyControl ctrl_lines[] = {
+    { NULL, "MOVEMENT" },
+    { "Left stick", "Walk" },
+    { "LB", "Run" },
+    { "Right stick", "Cursor, pick a target" },
+    { "R3", "Lock on / off nearest enemy" },
+    { NULL, NULL },
+    { NULL, "ACTION" },
+    { "A", "Attack, or use what is lit up" },
+    { "A (hold)", "Aim held item at something" },
+    { "B", "Cancel / switch firing mode" },
+    { "X", "Reload" },
+    { "Y", "Swap active hand" },
+    { "LT", "Aimed shot (hold: pick part)" },
+    { "RB", "Switch cursor mode" },
+    { "RT", "Click" },
+    { "LB + B", "Use best stimpack" },
+    { NULL, NULL },
+    { NULL, "WHEELS - hold, aim with right stick" },
+    { "B", "Drugs and quick items" },
+    { "X", "Ammunition" },
+    { "Y", "Weapons" },
+    { "L3", "Skills" },
+    { NULL, NULL },
+    { NULL, "D-PAD - hold for a screen" },
+    { "Up", "Pip-Boy" },
+    { "Down", "Character sheet" },
+    { "Left", "Automap" },
+    { "Right", "End combat" },
+    { "Tap", "Next action on the target" },
+    { NULL, NULL },
+    { NULL, "BARTER" },
+    { "LB / RB", "Step between items" },
+    { "D-pad", "Move within a column" },
+    { "A", "Move the whole stack" },
+    { "LT + A", "Move only some of it" },
+    { "X", "Even out the deal with caps" },
+    { "Y", "Offer the trade" },
+    { "B", "Leave" },
+    { NULL, NULL },
+    { NULL, "OTHER" },
+    { "BACK", "Inventory" },
+    { "START", "Pause menu" },
+    { "LB + Y", "Quick save" },
+};
+
+// Title of the CONTROLS page, and the archive entry that opens it -- one string so the list
+// and the page it leads to can never drift apart.
+static const char* ctrl_entry = "CONTROLS";
+
 // 0x662A70
 static Size ginfo[PIPBOY_FRM_COUNT];
 
@@ -528,6 +594,15 @@ static unsigned char holo_flag;
 // 0x662CA6
 static unsigned char stat_flag;
 
+// Set while the CONTROLS page (the pad layout, reachable from the archives) is showing, so
+// PipArchives routes BACK to the list instead of treating hot-line codes as movies. Same
+// shape as holo_flag above, which does the job for the holodisk reader.
+static unsigned char ctrl_flag;
+
+// x of the CONTROLS page's second column, measured from the widest button label in
+// ShowControls -- see pip_ctrl_line.
+static int ctrl_col;
+
 // 0x486A80
 int pipboy(int intent)
 {
@@ -620,6 +695,7 @@ static int StartPipboy(int intent)
     bottom_line = PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / text_height() - 1;
     hot_line_start = 0;
     hot_back_line = 0;
+    ctrl_flag = 0;
 
     if (!message_init(&pipboy_message_file)) {
         return -1;
@@ -1753,13 +1829,45 @@ static int PrintAMList(int a1)
 static void PipArchives(int a1)
 {
     if (a1 == 1024) {
+        ctrl_flag = 0;
         NixHotLines();
         view_page = ListArchive(-1);
         AddHotLines(2, view_page, false);
-    } else if (a1 >= 0 && a1 <= view_page) {
+        return;
+    }
+
+    // The CONTROLS page is up. It has no hot lines of its own -- only the BACK button
+    // (event 528, arriving here as 1025), which returns to the archive list. Everything
+    // else is inert while it shows.
+    if (ctrl_flag) {
+        if (a1 == 1025) {
+            gsound_play_sfx_file("ib1p1xx1");
+            pip_back(colorTable[32747]);
+            win_draw_rect(pip_win, &pip_rect);
+            pause_for_tocks(200);
+            PipArchives(1024);
+        }
+        return;
+    }
+
+    if (a1 >= 0 && a1 <= view_page) {
         gsound_play_sfx_file("ib1p1xx1");
 
         ListArchive(a1);
+
+        // CONTROLS is the last entry of the list, and it is not a movie.
+        if (a1 == view_page) {
+            pause_for_tocks(200);
+            NixHotLines();
+            ShowControls();
+            AddHotLines(0, 0, true);
+            // ⚠️ Vanilla never sets this, so its own BACK button (the holodisk reader) leaks
+            // one registered button per open. Ours is claimed properly, so NixHotLines takes
+            // it down again on the way out -- the archive list re-registers over that row.
+            hot_back_line = 1;
+            ctrl_flag = 1;
+            return;
+        }
 
         int movie;
         for (movie = MOVIE_VEXPLD; movie < MOVIE_COUNT; movie++) {
@@ -1828,9 +1936,112 @@ static int ListArchive(int a1)
         }
     }
 
+    // CONTROLS -- the pad layout, always the LAST entry. Last rather than first because the
+    // archive fills up as the game is played and this must not shuffle around; and it is the
+    // only entry that exists at the start of a game, which is when it is actually wanted.
+    if (line++ == a1 - 1) {
+        color = colorTable[32747];
+    } else {
+        color = colorTable[992];
+    }
+
+    pip_print(ctrl_entry, 0, color);
+    cursor_line++;
+
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
+}
+
+// One row of the CONTROLS page: the pad button on the left, what it does on the right.
+// pip_print's column stops (8 and +175) are the wrong shape here -- the labels run to
+// "Tap a direction" and the descriptions are longer than half the page -- so the split is
+// measured from the widest label instead (ctrl_col, computed once per page in ShowControls).
+static void pip_ctrl_line(const char* button, const char* action, int color)
+{
+    int top = cursor_line * text_height() + PIPBOY_WINDOW_CONTENT_VIEW_Y;
+
+    if (button != NULL) {
+        text_to_buf(scrn_buf + PIPBOY_WINDOW_WIDTH * top + PIPBOY_WINDOW_CONTENT_VIEW_X + 8,
+            button,
+            PIPBOY_WINDOW_WIDTH,
+            PIPBOY_WINDOW_WIDTH,
+            color);
+    }
+
+    if (action != NULL) {
+        text_to_buf(scrn_buf + PIPBOY_WINDOW_WIDTH * top + PIPBOY_WINDOW_CONTENT_VIEW_X + ctrl_col,
+            action,
+            PIPBOY_WINDOW_WIDTH,
+            PIPBOY_WINDOW_WIDTH,
+            color);
+    }
+
+    if (cursor_line < bottom_line) {
+        cursor_line += 1;
+    }
+}
+
+// 0x000000 (not vanilla)
+static void ShowControls()
+{
+    buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_CONTENT_VIEW_WIDTH,
+        PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT,
+        PIPBOY_WINDOW_WIDTH,
+        scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_WIDTH);
+
+    int count = (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0]));
+
+    // Where the second column starts: past the widest button label, never so far right that a
+    // description would run out of the 350px text area. Measured rather than hardcoded so the
+    // page survives a different font (the Pip-Boy font is a data file, not ours).
+    ctrl_col = 0;
+    for (int index = 0; index < count; index++) {
+        if (ctrl_lines[index].button != NULL) {
+            int width = text_width(ctrl_lines[index].button);
+            if (width > ctrl_col) {
+                ctrl_col = width;
+            }
+        }
+    }
+    ctrl_col += 8 + 12;
+    if (ctrl_col > 160) {
+        ctrl_col = 160;
+    }
+
+    // The blank separator lines are the first thing to go if the page does not fit -- one line
+    // of headroom is worth more than the spacing, and pip_print/pip_ctrl_line would otherwise
+    // pile every overflowing row onto the bottom line.
+    int needed = 1 + count;
+
+    bool spacious = needed <= bottom_line;
+
+    if (bottom_line >= 0) {
+        cursor_line = 0;
+    }
+
+    // CONTROLS
+    pip_print(ctrl_entry, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
+
+    for (int index = 0; index < count; index++) {
+        const PipboyControl* entry = &(ctrl_lines[index]);
+
+        if (entry->button == NULL && entry->action == NULL) {
+            if (spacious) {
+                pip_ctrl_line(NULL, NULL, colorTable[992]);
+            }
+        } else if (entry->button == NULL) {
+            pip_print(entry->action, PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[32747]);
+        } else {
+            pip_ctrl_line(entry->button, entry->action, colorTable[992]);
+        }
+    }
+
+    pip_back(colorTable[992]);
+
+    win_draw_rect(pip_win, &pip_rect);
 }
 
 // 0x488E94

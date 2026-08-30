@@ -53,6 +53,13 @@ void intface_hp_roll_tick(float dt);
 void intface_hp_roll_cancel();
 void intface_update_ac(bool animate);
 void intface_update_move_points(int actionPoints, int bonusMove);
+
+// Realtime heal slot (the LB+B stimpak indicator) -- see the block above intface_redraw.
+void intface_update_heal_slot(Object* item, int count);
+void intface_invalidate_heal_slot();
+// Repairs the dude's weapon animation code when a swap animation failed to finish (realtime can
+// cancel it). Cheap and idempotent; combat_rt calls it once a frame. See the note in intface.cc.
+void intface_reconcile_weapon_fid();
 int intface_get_attack(int* hitMode, bool* aiming);
 int intface_update_items(bool animated);
 int intface_toggle_items(bool animated);

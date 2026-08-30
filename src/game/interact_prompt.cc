@@ -10,6 +10,7 @@
 #include "game/critter.h"
 #include "game/game_trace.h"
 #include "game/gamepad_ui.h"
+#include "game/gconfig.h"
 #include "game/gdialog.h"
 #include "game/gmouse.h"
 #include "game/inventry.h"
@@ -57,6 +58,7 @@ enum {
     IP_LOOT_CONTAINER, // container item -> action_use_an_object (opens it)
     IP_LOCKPICK,       // LOCKED door / container -> action_use_skill_on(SKILL_LOCKPICK)
     IP_LOOK,           // examine -- the vanilla action menu's eye
+    IP_PUSH,           // swap places with a PARTY MEMBER -- see ip_push_companion
 };
 
 static Object* ip_target = NULL;   // interactable currently highlighted (re-derived each tick)
@@ -98,6 +100,36 @@ static unsigned int ip_manual_since = 0;
 // side of a warehouse, and everything it offers must additionally be ON SCREEN.
 #define IP_PICK_RANGE_TILES 12
 
+// Both ranges are cfg levers (`interact_range` / `interact_pick_range`), read once on first tick.
+// They are pure feel and the right value only shows up in play, so they must be tunable without a
+// rebuild. The #defines above stay as the compiled-in defaults.
+static int ip_range_tiles = IP_RANGE_TILES;
+static int ip_pick_range_tiles = IP_PICK_RANGE_TILES;
+static bool ip_config_loaded = false;
+
+static void ip_load_config()
+{
+    if (ip_config_loaded) {
+        return;
+    }
+    ip_config_loaded = true;
+
+    int value = ip_range_tiles;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_INTERACT_RANGE_KEY, &value);
+    // Floored at 1: zero would mean nothing is ever offered, which reads as "the prompt is broken".
+    ip_range_tiles = value < 1 ? 1 : (value > 20 ? 20 : value);
+
+    value = ip_pick_range_tiles;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_INTERACT_PICK_RANGE_KEY, &value);
+    ip_pick_range_tiles = value < 1 ? 1 : (value > 40 ? 40 : value);
+
+    // Pointing is a statement of intent, so the picker must never reach LESS far than the automatic
+    // proximity offer -- otherwise something the prompt lights up on its own could not be pointed at.
+    if (ip_pick_range_tiles < ip_range_tiles) {
+        ip_pick_range_tiles = ip_range_tiles;
+    }
+}
+
 static bool ip_on_screen(Object* obj); // defined with the picker below
 
 static Object* ip_outlined = NULL; // object we placed an outline on, to restore it exactly
@@ -110,27 +142,67 @@ static int ip_hand_h = 0;
 static int ip_win_x = -32000;
 static int ip_win_y = -32000;
 
-// Classify an object into an interaction kind (0 = not interactable).
-// True only if the critter's script actually has a TALK procedure -- i.e. pressing A would produce
-// real dialogue (or a "moo"). This is the exact thing gdialog runs (exec_script_proc SCRIPT_PROC_TALK,
-// gdialog.cc). The engine's obj_action_can_talk_to returns true for EVERY critter, so it can't tell a
-// conversational NPC (or a brahmin) apart from a wild rat; the proc table can. procs[] is populated
-// when the script's program loads (on map-enter/start), so it's reliable for on-map critters.
+// Can this critter actually hold a conversation?
+//
+// ⚠️ A DECLARED `talk_p_proc` IS NOT REQUIRED, and assuming it was is what silently made Aradesh
+// and Tandi unspeakable while Killian was fine ("nemůžu mluvit jak s Tandi tak ani s jejím otcem
+// ... s Killianem šlo v pořádku"). `exec_script_proc` (scripts.cc:1125) falls back to PROCEDURE 1
+// -- `start` -- whenever procs[action] is NO_PROC, so a script whose dialogue hangs off `start`
+// converses perfectly well without ever declaring talk_p_proc. Read straight out of the shipped
+// data: KILLIAN.INT declares talk_p_proc, TANDI.INT declares only map_enter / map_update /
+// critter_p_proc, and ARADESH.INT declares NOTHING but `start`. All three talk in vanilla, and
+// all three have a DIALOG/*.MSG.
+//
+// The question this gate actually means is "is this a person or is it wildlife", and it takes two
+// steps to answer:
+//   1. A declared talk_p_proc. This is what keeps QUADRUPED talkers -- the brahmin declares one,
+//      which is exactly why the original body-type-only gate was wrong.
+//   2. Failing that, a BIPED with a script: every humanoid NPC, and none of the rats / molerats /
+//      radscorpions / dogs this gate exists for ("I can't hit the rats, the dude keeps talking to
+//      them"). A biped with nothing to say (a deathclaw) is already excluded a line above by
+//      combat_rt_is_engaging, and if one ever slips through, A runs its `start` and nothing
+//      happens -- the same no-op vanilla gives you for clicking the talk cursor on it.
+//
+// Step 2 also covers a hazard step 1 has on its own: procs[] is built by scr_build_lookup_table
+// only when the script's PROGRAM is first loaded, so before that it reads all-zero -- i.e. the
+// proc test can answer "no talk proc" for a critter that plainly has one.
 static bool ip_critter_can_converse(Object* obj)
 {
     if (obj->sid == -1) {
         return false;
     }
+
     Script* script;
     if (scr_ptr(obj->sid, &script) == -1) {
         return false;
     }
-    return script->procs[SCRIPT_PROC_TALK] != SCRIPT_PROC_NO_PROC;
+
+    if (script->procs[SCRIPT_PROC_TALK] != SCRIPT_PROC_NO_PROC) {
+        return true;
+    }
+
+    return critter_body_type(obj) == BODY_TYPE_BIPED;
 }
 
+// Classify an object into an interaction kind (0 = not interactable).
 static int ip_classify(Object* obj)
 {
     if (obj == NULL || obj == obj_dude) {
+        return IP_NONE;
+    }
+
+    // ⚠️ NOT DRAWN => NOT INTERACTABLE. Maps stage content that does not exist yet -- a caravan that
+    // arrives later, an ambush waiting for its trigger -- as real objects flagged OBJECT_HIDDEN, and
+    // a script clears the flag when their moment comes. Vanilla never had to think about it: the
+    // mouse picks targets out of what is RENDERED, so an undrawn object simply cannot be clicked.
+    //
+    // Our prompt enumerates with obj_find_first_at, which returns hidden objects too (obj_create_list
+    // filters them, obj_find_first_at does not), so it happily offered the talk hand to thin air --
+    // the player talked to an invisible caravan merchant outside Junktown (proto 180 "Merchant",
+    // trace_2026-08-21_231322 `interact-do kind=3 pid=16777396`, and note it appears in NO state
+    // heartbeat, because that walks obj_create_list). Talking to staged content early can also run
+    // its script out of order, which is a worse problem than the ghost itself.
+    if ((obj->flags & OBJECT_HIDDEN) != 0) {
         return IP_NONE;
     }
 
@@ -202,7 +274,11 @@ static int ip_classify(Object* obj)
         // to anyone, for minutes at a time. That is what the player hit after clearing Gizmo's
         // guards -- the man was neither hostile nor talkable. combat_rt_under_threat() asks the
         // question this rule actually meant, and gdialog_enter now uses the same one.
-        if (combat_rt_under_threat()) {
+        // Widened 2026-08-20 from combat_rt_under_threat(): a fight the player merely WATCHES also
+        // blocks talking, as it does in vanilla. under_threat only asks "is something after ME",
+        // which let him walk into the middle of the Skulz brawl and talk to Vinnie -- nobody there
+        // was ever hostile to HIM. END COMBAT (Enter / D-pad) clears this immediately.
+        if (combat_rt_fight_in_view()) {
             return IP_NONE;
         }
         // Offer TALK only when talking would actually do something -- i.e. the critter has a real
@@ -227,11 +303,59 @@ static int ip_classify(Object* obj)
 // Vanilla's remaining two menu entries (use-an-ITEM-on, use-a-SKILL-on) are left out: the skill
 // wheel (LB) already covers skills, and use-item-on opens a modal picker that would want its own
 // gamepad pass. Easy to add here later -- the dispatch in interact_prompt_tick is one case each.
+// LOOK-ONLY: scenery that has nothing to DO but plenty to say -- a signpost, a poster, a terminal
+// with no use action. 808 of the game's 908 scenery protos carry a description, which is exactly why
+// these are NOT in the automatic prompt: it would light up on every table, door and barrel in the
+// room and steal A from the things you actually meant.
+//
+// ⚠️ REACHABLE ONLY BY DELIBERATELY POINTING AT IT with the right stick. Pointing IS the statement
+// of intent, so the automatic nearest-pick stays exactly as clean as it was, and the cost is bounded
+// to the moments you are already sweeping the stick.
+//
+// Scenery only, on purpose: walls also carry descriptions and there are hundreds of segments in any
+// building, so including them would drown the picker in the one place signs actually hang.
+static bool ip_look_only(Object* obj)
+{
+    if (obj == NULL || obj == obj_dude || (obj->flags & OBJECT_HIDDEN) != 0) {
+        return false;
+    }
+
+    if (FID_TYPE(obj->fid) != OBJ_TYPE_SCENERY) {
+        return false;
+    }
+
+    // ⚠️ NO FLAT SCENERY. Flat objects are drawn WITH THE FLOOR (obj_toggle_flat, set from proto
+    // flag 0x08), which is the map designer's marker layer: floor decals and, above all, the
+    // invisible blockers used to fence the player off. Proto 67 "Secret Blocking Hex" is exactly
+    // that -- flags 0xa0000008 = FLAT | LIGHT_THRU | SHOOT_THRU -- and its vanilla description is
+    // the placeholder joke "If you can see this, blame the technical designer." Sweeping the right
+    // stick kept picking those out of thin air and printing it, which is how the user found this.
+    //
+    // Nothing worth reading is flat: signs, posters, terminals and lockers all stand up in the
+    // world. So this costs the picker nothing real and removes the whole marker layer at once --
+    // no pid blacklist, which would have missed every other map's markers.
+    //
+    // Only the LOOK-only path is filtered. ip_classify's usable scenery (doors, ladders, elevators)
+    // is untouched: a usable object stays usable even if a map flags it flat.
+    if ((obj->flags & OBJECT_FLAT) != 0) {
+        return false;
+    }
+
+    // Anything ip_classify already accepts is a normal target and must not be duplicated here.
+    return ip_classify(obj) == IP_NONE;
+}
+
 static int ip_build_actions(Object* obj, int* out)
 {
     int n = 0;
     int def = ip_classify(obj);
     if (def == IP_NONE) {
+        // A pointed-at sign has exactly one thing it can do, and the cycle must not be empty or the
+        // prompt would have a target with no action to show.
+        if (ip_look_only(obj)) {
+            out[n++] = IP_LOOK;
+            return n;
+        }
         return 0;
     }
 
@@ -244,8 +368,65 @@ static int ip_build_actions(Object* obj, int* out)
         out[n++] = FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY ? IP_USE : IP_LOOT_CONTAINER;
     }
 
+    // PUSH PAST YOUR OWN FOLLOWER -- the Fallout 2 move, which F1 only ever had through mods.
+    //
+    // ⚠️ It is an ACTION, not a movement rule, and that was his correction. The first attempt made
+    // walking INTO a companion swap you automatically ("ne takhle ne"), which silently overloads the
+    // one input you use constantly and gives no way to just stand next to Ian. As a D-pad entry the
+    // shove is something you ASK for, sitting right beside TALK on the follower you are already
+    // pointing at.
+    //
+    // Party members only, so it can never become a way to reposition strangers or enemies.
+    if (FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER && isPartyMember(obj) && !critter_is_dead(obj)) {
+        out[n++] = IP_PUSH;
+    }
+
     out[n++] = IP_LOOK;
     return n;
+}
+
+// Swap tiles with a party member. Returns 0 on success, -1 when it could not be done.
+//
+// ⚠️ The dude MOVES TOO, unlike the walk-into version -- there the player was already stepping, so
+// only the companion had to give way. Asking for a push while standing still means both of them
+// have to change places or nothing visibly happens.
+static int ip_push_companion(Object* companion)
+{
+    if (companion == NULL || obj_dude == NULL) {
+        return -1;
+    }
+
+    // Never tear a companion out of something it is committed to (an attack, a death, a knockdown).
+    // Walking is fine to interrupt -- it is only following you anyway.
+    if (critter_is_prone(companion) || critter_is_dead(companion)) {
+        return -1;
+    }
+
+    int anim = FID_ANIM_TYPE(companion->fid);
+    if (anim != ANIM_STAND && anim != ANIM_WALK && anim != ANIM_RUNNING) {
+        return -1;
+    }
+
+    int dudeTile = obj_dude->tile;
+    int theirTile = companion->tile;
+    if (dudeTile == theirTile) {
+        return -1;
+    }
+
+    // Drop whatever either of them had queued first -- otherwise an in-flight walk finishes from the
+    // OLD tile and drags them straight back.
+    anim_clear_pending(companion);
+    anim_clear_pending(obj_dude);
+
+    Rect r;
+    if (obj_move_to_tile(companion, dudeTile, map_elevation, &r) == 0) {
+        tile_refresh_rect(&r, map_elevation);
+    }
+    if (obj_move_to_tile(obj_dude, theirTile, map_elevation, &r) == 0) {
+        tile_refresh_rect(&r, map_elevation);
+    }
+
+    return 0;
 }
 
 // The action A would perform right now: the selected entry, or the plain classification when the
@@ -277,10 +458,15 @@ static Object* ip_find_nearest(int* kindOut)
     // object can die, be looted empty, be picked up, or be walked away from between frames.
     if (ip_manual_target != NULL) {
         int kind = ip_classify(ip_manual_target);
+        // A look-only target only ever exists because it was pointed at, so it is validated here
+        // and nowhere else -- the automatic scan below must never pick one up on its own.
+        if (kind == IP_NONE && ip_look_only(ip_manual_target)) {
+            kind = IP_LOOK;
+        }
         bool stale = get_time() - ip_manual_since > IP_MANUAL_HOLD_MS;
         // Validated against the PICKER's reach, not the automatic one -- a deliberately chosen
         // cabinet across the room would otherwise be discarded on the very next tick.
-        if (kind != IP_NONE && !stale && obj_dist(obj_dude, ip_manual_target) <= IP_PICK_RANGE_TILES
+        if (kind != IP_NONE && !stale && obj_dist(obj_dude, ip_manual_target) <= ip_pick_range_tiles
             && ip_on_screen(ip_manual_target)) {
             if (kindOut != NULL) {
                 *kindOut = kind;
@@ -301,7 +487,7 @@ static Object* ip_find_nearest(int* kindOut)
             continue;
         }
         int d = obj_dist(obj_dude, obj);
-        if (d > IP_RANGE_TILES) {
+        if (d > ip_range_tiles) {
             continue;
         }
         int prio = ip_priority(kind);
@@ -344,7 +530,7 @@ static bool ip_on_screen(Object* obj)
 }
 
 // Everything the right-stick picker may select. Deliberately a WIDER net than ip_find_nearest's:
-// the automatic pick stays close (IP_RANGE_TILES) because it has to guess what you meant, while
+// the automatic pick stays close (ip_range_tiles) because it has to guess what you meant, while
 // pointing the stick at something is unambiguous, so it may reach across the room. Pressing A then
 // walks you there -- exactly what a mouse click has always done.
 #define IP_CANDIDATES_MAX 24
@@ -353,10 +539,12 @@ static int ip_collect(Object** out, int max)
 {
     int n = 0;
     for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL && n < max; obj = obj_find_next_at()) {
-        if (ip_classify(obj) == IP_NONE) {
+        // The picker's set includes LOOK-ONLY scenery (signs and the like); the automatic prompt's
+        // does not. That difference is the whole design -- see ip_look_only.
+        if (ip_classify(obj) == IP_NONE && !ip_look_only(obj)) {
             continue;
         }
-        if (obj_dist(obj_dude, obj) > IP_PICK_RANGE_TILES) {
+        if (obj_dist(obj_dude, obj) > ip_pick_range_tiles) {
             continue;
         }
         if (!ip_on_screen(obj)) {
@@ -446,7 +634,7 @@ bool interact_prompt_pick_direction(float dirX, float dirY)
         }
 
         float dist = (float)obj_dist(obj_dude, cand[i]);
-        float score = dot - IP_PICK_DIST_WEIGHT * (dist / (float)IP_PICK_RANGE_TILES);
+        float score = dot - IP_PICK_DIST_WEIGHT * (dist / (float)ip_pick_range_tiles);
 
         if (cand[i] == ip_target) {
             currentScore = score;
@@ -523,6 +711,12 @@ static int ip_icon_art_num(int kind)
         return IP_TALK_ART_NUM;
     case IP_LOOK:
         return IP_LOOK_ART_NUM;
+    case IP_PUSH:
+        // PROVISIONAL ART, on his instruction ("zkus tam dát ikonku ruky provizorně"): the plain
+        // USE hand. It is wrong in the long run -- the hand already means "use this" on every other
+        // entry, so a shove reads as a use -- but no vanilla action-menu icon means "move aside",
+        // and inventing one is a separate job. Replace when a better glyph exists.
+        return IP_HAND_ART_NUM;
     case IP_LOCKPICK:
         // The skilldex icon, not the hand: a lockpick attempt is a SKILL roll, and drawing it as
         // the plain "use" hand is what made a mis-classified ladder impossible to spot on screen.
@@ -631,6 +825,8 @@ static void ip_show_overlay(Object* obj, int kind)
 
 void interact_prompt_tick()
 {
+    ip_load_config();
+
     // 1) Perform a queued interaction FIRST, from this safe main-loop context (never from the
     // input hook). Tear the overlay down before a talk/loot modal opens over it.
     if (ip_pending != NULL) {
@@ -680,6 +876,9 @@ void interact_prompt_tick()
                 rc = obj_look_at(obj_dude, obj);
             }
             break;
+        case IP_PUSH:
+            rc = ip_push_companion(obj);
+            break;
         }
         trace_event(TRACE_ACTION, "interact-do", "kind=%d pid=%d objType=%d rc=%d",
             kind, obj->pid, FID_TYPE(obj->fid), rc);
@@ -723,7 +922,7 @@ void interact_prompt_tick()
             lastPid = ndPid;
             lastDist = ndDist;
             trace_event(TRACE_FLOW, "ip-diag", "suppress=%d door_pid=%d dist=%d ipRange=%d",
-                reason, ndPid, nd != NULL ? ndDist : -1, IP_RANGE_TILES);
+                reason, ndPid, nd != NULL ? ndDist : -1, ip_range_tiles);
         }
     }
 
@@ -744,10 +943,19 @@ void interact_prompt_tick()
     // armed the lockpick FOR would be the one place the lockpick could not be used. Now that a
     // skill cursor stays armed after each use (gamepad_ui_skill_cursor_sticky), that overlap would
     // be permanent rather than momentary.
+    // ⚠️ THE USE-ITEM-ON CROSSHAIR COUNTS TOO, and it is NOT covered by the skill test above:
+    // GAME_MOUSE_MODE_USE_CROSSHAIR is 3, FIRST_GAME_MOUSE_MODE_SKILL is 4, so it slipped under the
+    // threshold. Everything the paragraph above says about a lockpick applies to it word for word:
+    // holding A with a rope in hand arms this cursor to use the rope ON something, and if the prompt
+    // kept highlighting the elevator, the A router queued "use the elevator" and swallowed the
+    // press -- so the one object you armed the rope FOR was the one it could not be used on. That
+    // was the user's report, twice.
+    int ipCursorMode = gmouse_3d_get_mode();
     if (obj_dude == NULL || gamepad_ui_menu_active() || dialog_active()
         || radial_wheel_is_open() || inven_any_open()
         || combat_rt_has_lock()
-        || gmouse_3d_get_mode() >= FIRST_GAME_MOUSE_MODE_SKILL) {
+        || ipCursorMode == GAME_MOUSE_MODE_USE_CROSSHAIR
+        || ipCursorMode >= FIRST_GAME_MOUSE_MODE_SKILL) {
         ip_clear_outline();
         ip_hide_overlay();
         ip_target = NULL;

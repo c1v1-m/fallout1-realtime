@@ -2010,6 +2010,14 @@ int obj_erase_object(Object* object, Rect* rect)
     // outside realtime / for non-critters.
     combat_rt_notify_critter_removed(object);
 
+    // anim.cc also holds raw pointers to this object -- the sad[] frame stepper and the
+    // animation-sequence table -- and obj_remove() below frees the Object without touching
+    // either. In realtime a script can erase a critter that is still mid-animation (this ran
+    // from op_destroy_object during doBkProcesses), and object_animate would dereference the
+    // freed pointer on the next frame. Must run BEFORE the free, like the combat_rt hook above.
+    anim_notify_object_freed(object);
+
+
     gmouse_remove_item_outline(object);
 
     ObjectListNode* node;

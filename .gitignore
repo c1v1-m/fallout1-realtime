@@ -391,3 +391,6 @@ FodyWeavers.xsd
 # CMake
 /out
 /build
+
+# Local ASan build tree (see the asan-build note); build output, never source.
+build-asan/

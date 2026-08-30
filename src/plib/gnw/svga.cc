@@ -1,5 +1,6 @@
 #include "plib/gnw/svga.h"
 
+#include "plib/gnw/crt_shader.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/mouse.h"
@@ -91,7 +92,15 @@ bool svga_init(VideoOptions* video_options)
     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
 
     if (video_options->fullscreen) {
-        windowFlags |= SDL_WINDOW_FULLSCREEN;
+        // CE: _DESKTOP, not plain SDL_WINDOW_FULLSCREEN. A real fullscreen window makes SDL
+        // switch the display mode, and SDL_video.c:ShouldMinimizeOnFocusLoss() then returns true
+        // for it by default -- so ANY focus loss (alt-tab, a notification, Steam) calls
+        // SDL_MinimizeWindow(). GNW95_isActive goes false with it, get_input() drops into
+        // idleImpl()'s SDL_Delay(125), and the game sits at 0% CPU behind the taskbar looking
+        // exactly like a crash -- it cost a play-test on 2026-08-28. _DESKTOP never minimizes,
+        // and since the requested size already equals the desktop the picture is unchanged.
+        // svga_toggle_fullscreen() has always used _DESKTOP; this just makes init agree with it.
+        windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
 
     gSdlWindow = SDL_CreateWindow(GNW95_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
@@ -144,6 +153,10 @@ bool svga_init(VideoOptions* video_options)
     mouse_blit_trans = NULL;
     scr_blit = GNW95_ShowRect;
     mouse_blit = GNW95_ShowRect;
+
+    // gconfig_init() has already run by the time initWindow() reaches here, so the crt*
+    // keys are readable. The GL objects themselves are built lazily on the first present.
+    crt_init();
 
     return true;
 }
@@ -203,6 +216,10 @@ static bool createRenderer(int width, int height)
 
 static void destroyRenderer()
 {
+    // The GL context dies with the renderer, and every CRT object with it -- so the
+    // handles must be dropped WITHOUT calling back into GL.
+    crt_invalidate(true);
+
     if (gSdlTextureSurface != NULL) {
         SDL_FreeSurface(gSdlTextureSurface);
         gSdlTextureSurface = NULL;
@@ -276,8 +293,17 @@ void svga_toggle_fullscreen()
 void renderPresent()
 {
     SDL_UpdateTexture(gSdlTexture, NULL, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);
-    SDL_RenderClear(gSdlRenderer);
-    SDL_RenderCopy(gSdlRenderer, gSdlTexture, NULL, NULL);
+
+    // With the CRT filter on the frame goes up through our own GL pass instead of SDL's
+    // blit -- and then SDL must not draw anything else this frame, because its renderer
+    // caches GL state we deliberately went around. crt_present() returns false whenever
+    // it could not run (filter off, non-GL renderer, shader failed to build), and the
+    // plain path below then runs exactly as it always did.
+    if (!crt_present(gSdlWindow, gSdlRenderer, gSdlTexture, screenGetWidth(), screenGetHeight())) {
+        SDL_RenderClear(gSdlRenderer);
+        SDL_RenderCopy(gSdlRenderer, gSdlTexture, NULL, NULL);
+    }
+
     SDL_RenderPresent(gSdlRenderer);
 }
 

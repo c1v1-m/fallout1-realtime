@@ -6,6 +6,7 @@
 #include <algorithm>
 
 #include "game/combat.h"
+#include "game/combat_rt.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
@@ -199,7 +200,24 @@ int stat_level(Object* critter, int stat)
         case STAT_ARMOR_CLASS:
             if (isInCombat()) {
                 if (combat_whose_turn() != critter) {
-                    value += critter->data.critter.combat.ap;
+                    // Vanilla: action points left unspent at the end of your turn make you harder
+                    // to hit until your next one.
+                    //
+                    // ⚠️ UNDER REALTIME THIS FIELD IS A LIE. combat_rt pins combat.ap to the
+                    // critter's MAX every frame (the dude so anim.cc won't truncate his walking,
+                    // NPCs alongside him), and it holds COMBAT_STATE_0x01 for the whole fight while
+                    // combat_whose_turn() never becomes anyone -- so both gates are permanently
+                    // open and the bonus was a flat +max_AP for every combatant, all fight long,
+                    // with no connection to whether anyone was saving points. Measured in
+                    // trace_2026-08-27_215442: EVERY armor class the player had all session was
+                    // either `armor` or exactly `armor + max_AP` (24/33, 25/35, 17/26).
+                    //
+                    // Ask combat_rt for the pool it actually spends instead, so the vanilla rule
+                    // means what it says here: hold points, be harder to hit; spend them attacking
+                    // and running, and the defence goes with them. Returns -1 outside realtime or
+                    // for an untracked critter, and then the vanilla field stands unchanged.
+                    int rtAp = combat_rt_critter_ap(critter);
+                    value += rtAp >= 0 ? rtAp : critter->data.critter.combat.ap;
                 }
             }
             break;

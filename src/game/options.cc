@@ -27,6 +27,7 @@
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
+#include "plib/gnw/crt_shader.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
@@ -44,6 +45,10 @@ namespace fallout {
 #define OPTIONS_WINDOW_BUTTONS_COUNT 10
 #define PRIMARY_OPTION_VALUE_COUNT 4
 #define SECONDARY_OPTION_VALUE_COUNT 2
+
+// Label for our CRT checkbox. options.msg is Interplay's and comes out of MASTER.DAT, so
+// there is no message id to add one under -- this string is literal on purpose.
+#define CRT_PREF_LABEL "CRT FILTER"
 
 #define GAMMA_MIN 1.0
 #define GAMMA_MAX 1.17999267578125
@@ -348,6 +353,35 @@ static int fontsave;
 // 0x661ED0
 static int plyrspdbid;
 
+// CRT FILTER checkbox -- the second checkbox on the Preferences screen, sharing the free
+// band the "Affect player speed" one sits in. Like player_speedup it is outside the
+// Preference enum, so its backup lives in its own variable rather than settings_backup.
+static int crtbid = -1;
+static int crt_filter;
+static int crt_filter_back;
+
+// Write the CRT flag straight through to fallout.cfg the moment it is flipped, instead of only
+// when the screen is left with DONE.
+//
+// It is a LOOK setting: you toggle it to see the screen change, and the natural way out after
+// looking is B / ESC -- which restores the value the screen opened with and threw the change away.
+// That is what "it forgets whether the filter was on" was. Persisting on the toggle makes it
+// impossible to lose; JustUpdate on the cancel path re-persists the restored value, so B still
+// undoes it properly.
+static void crt_persist()
+{
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CRT_KEY, crt_filter);
+    gconfig_save();
+}
+
+// Where the CRT checkbox ended up (it is placed after the "Affect player speed" label,
+// whose width depends on the language) and where the Preferences window sits on screen.
+// Both are needed by the controller navigation, which parks the mouse cursor on the
+// selected control -- see prefs_nav_move.
+static int crt_checkbox_x = 520;
+static int prfwin_x;
+static int prfwin_y;
+
 // 0x661ED4
 static bool changed;
 
@@ -593,6 +627,12 @@ int do_options()
 
     options_open = false;
 
+    // The pad's button edges are static across this whole nested loop, so the B that closed this
+    // screen is still held and would rose/fall-edge into gameplay. Same counter the load/save
+    // screen and the confirmation boxes use; gpui_button_shortcuts and gpui_action_buttons both
+    // drop their edges on the change. See gamepad_ui_bump_input_epoch.
+    gamepad_ui_bump_input_epoch();
+
     return rc;
 }
 
@@ -722,6 +762,11 @@ static int OptnStart()
 static int OptnEnd()
 {
     win_delete(optnwin);
+
+    // ⚠️ DRAIN. This menu's pad handler injects 500 + row (500 SAVE, 501 LOAD, 502 PREFERENCES,
+    // ...) and those exact numbers mean DONE / PRINT / CANCEL in the character editor, which can
+    // open on the very next frame. Codes are unique per WINDOW; the queue is GLOBAL.
+    flush_input_buffer();
     text_font(fontsave);
     message_exit(&optn_msgfl);
 
@@ -962,6 +1007,513 @@ static void ShadeScreen(bool is_world_map)
 }
 
 // 0x481E84
+// ---------------------------------------------------------------------------
+// Controller navigation for the Preferences screen.
+//
+// The screen has no "buttons" in the sense the options menu does -- every control is
+// painted straight into the window buffer by UpdateThing() and hit-tested from the raw
+// mouse position inside DoThing(). So there is no image to swap for a highlight, and
+// restoring a highlight rect from the clean background would wipe the labels, which are
+// drawn ONCE in PrefStart and never repainted.
+//
+// So the indicator is the CURSOR: selecting a control parks the mouse on it. Same choice
+// the world-map list nav made, for the same reason.
+//
+// The values are changed by our own stepper rather than by synthesising clicks. DoThing's
+// range-slider branch is a blocking DRAG loop that only exits on a mouse-button-up event;
+// calling it with no button held would hang the game.
+//
+//   D-pad / left stick  move the selection in ALL FOUR directions, geometrically -- left
+//                      and right cross between the three columns and along the button
+//                      row, exactly where the eye expects to go
+//   LB / RB            change the value, down / up (auto-repeating)
+//   A                  cycle the value / toggle the checkbox / press the button
+//   B                  CANCEL,  Y  DONE
+//   right stick        free cursor, as everywhere else
+//
+// Left/right steer rather than adjust because this screen is THREE COLUMNS, not a list:
+// binding them to the value left the other two columns reachable only by paging through
+// two dozen controls with up/down. The value moved to the shoulders, which is where a
+// settings screen on a pad usually puts it anyway.
+typedef enum PrefNavKind {
+    PREF_NAV_PRIMARY,
+    PREF_NAV_SECONDARY,
+    PREF_NAV_RANGE,
+    PREF_NAV_SPEEDUP,
+    PREF_NAV_CRT,
+    PREF_NAV_DEFAULT,
+    PREF_NAV_DONE,
+    PREF_NAV_CANCEL,
+} PrefNavKind;
+
+typedef struct PrefNavItem {
+    short kind;
+    // Index into btndat for the three preference kinds, -1 otherwise.
+    short pref;
+    // Which visual column, so LB/RB can skip to the next one.
+    short column;
+} PrefNavItem;
+
+// Visual order, not enum order: the two checkboxes live in the right-hand column between
+// the first and second slider, which is where they are drawn.
+static const PrefNavItem prefNav[] = {
+    { PREF_NAV_PRIMARY, PREF_GAME_DIFFICULTY, 0 },
+    { PREF_NAV_PRIMARY, PREF_COMBAT_DIFFICULTY, 0 },
+    { PREF_NAV_PRIMARY, PREF_VIOLENCE_LEVEL, 0 },
+    { PREF_NAV_PRIMARY, PREF_TARGET_HIGHLIGHT, 0 },
+    { PREF_NAV_PRIMARY, PREF_RUNNING_BURNING_GUY, 0 },
+    { PREF_NAV_SECONDARY, PREF_COMBAT_MESSAGES, 1 },
+    { PREF_NAV_SECONDARY, PREF_COMBAT_TAUNTS, 1 },
+    { PREF_NAV_SECONDARY, PREF_LANGUAGE_FILTER, 1 },
+    { PREF_NAV_SECONDARY, PREF_RUNNING, 1 },
+    { PREF_NAV_SECONDARY, PREF_SUBTITLES, 1 },
+    { PREF_NAV_SECONDARY, PREF_ITEM_HIGHLIGHT, 1 },
+    { PREF_NAV_RANGE, PREF_COMBAT_SPEED, 2 },
+    { PREF_NAV_SPEEDUP, -1, 2 },
+    { PREF_NAV_CRT, -1, 2 },
+    { PREF_NAV_RANGE, PREF_TEXT_BASE_DELAY, 2 },
+    { PREF_NAV_RANGE, PREF_MASTER_VOLUME, 2 },
+    { PREF_NAV_RANGE, PREF_MUSIC_VOLUME, 2 },
+    { PREF_NAV_RANGE, PREF_SFX_VOLUME, 2 },
+    { PREF_NAV_RANGE, PREF_SPEECH_VOLUME, 2 },
+    { PREF_NAV_RANGE, PREF_BRIGHTNESS, 2 },
+    { PREF_NAV_RANGE, PREF_MOUSE_SENSITIVIY, 2 },
+    { PREF_NAV_DEFAULT, -1, 3 },
+    { PREF_NAV_DONE, -1, 3 },
+    { PREF_NAV_CANCEL, -1, 3 },
+};
+
+#define PREF_NAV_COUNT ((int)(sizeof(prefNav) / sizeof(prefNav[0])))
+
+// The point the cursor is parked on -- for the rotary controls that is the centre DoThing
+// treats as "cycle", so a real click there does the same thing A does.
+static void prefs_nav_hotspot(int index, int* x, int* y)
+{
+    const PrefNavItem* item = &(prefNav[index]);
+    const PreferenceDescription* meta = item->pref >= 0 ? &(btndat[item->pref]) : NULL;
+
+    switch (item->kind) {
+    case PREF_NAV_PRIMARY:
+        *x = meta->knobX + 23;
+        *y = meta->knobY + 21;
+        break;
+    case PREF_NAV_SECONDARY:
+        *x = meta->knobX + 11;
+        *y = meta->knobY + 12;
+        break;
+    case PREF_NAV_RANGE:
+        // Mid-track: the knob itself slides, the track does not.
+        *x = 494;
+        *y = meta->knobY + 6;
+        break;
+    case PREF_NAV_SPEEDUP:
+        *x = 383 + 9;
+        *y = 68 + 9;
+        break;
+    case PREF_NAV_CRT:
+        *x = crt_checkbox_x + 9;
+        *y = 68 + 9;
+        break;
+    case PREF_NAV_DEFAULT:
+        *x = 34;
+        *y = 461;
+        break;
+    case PREF_NAV_DONE:
+        *x = 159;
+        *y = 461;
+        break;
+    default:
+        *x = 274;
+        *y = 461;
+        break;
+    }
+}
+
+// Nearest control in a direction, by geometry rather than by list order. Cost is the
+// distance ALONG the direction plus three times the sideways drift, so a step left from a
+// slider lands on the switch beside it rather than on whatever happens to be adjacent in
+// the array. Geometry also means the bottom button row needs no special case: from the
+// last control in a column, down simply finds DONE.
+static int prefs_nav_neighbour(int index, int dx, int dy)
+{
+    int cx;
+    int cy;
+    prefs_nav_hotspot(index, &cx, &cy);
+
+    int best = -1;
+    long bestCost = 0;
+
+    for (int i = 0; i < PREF_NAV_COUNT; i++) {
+        if (i == index) {
+            continue;
+        }
+
+        int x;
+        int y;
+        prefs_nav_hotspot(i, &x, &y);
+
+        int along = (x - cx) * dx + (y - cy) * dy;
+        if (along <= 0) {
+            continue;
+        }
+
+        int across = abs((x - cx) * dy - (y - cy) * dx);
+        if (across > 220) {
+            continue;
+        }
+
+        long cost = (long)along + (long)across * 3;
+        if (best < 0 || cost < bestCost) {
+            best = i;
+            bestCost = cost;
+        }
+    }
+
+    return best < 0 ? index : best;
+}
+
+static void prefs_nav_move(int index)
+{
+    int x;
+    int y;
+    prefs_nav_hotspot(index, &x, &y);
+    mouse_set_position(prfwin_x + x, prfwin_y + y);
+}
+
+// THE SELECTION INDICATOR IS A DRAWN FRAME, not the mouse cursor.
+//
+// The cursor was the first attempt, following the world-map list nav. It failed for a
+// reason that screen does not have: the options menu HIDES the cursor while a pad is
+// connected, and even shown, a small arrow on a busy 640x480 panel does not read as "this
+// is the control you are editing". The user's report was exactly that -- "both sticks just
+// change the difficulty, I can't get to another setting": the selection WAS moving, there
+// was simply nothing on screen saying so.
+//
+// Drawing it is awkward because the labels beside every control are painted ONCE in
+// PrefStart and never repainted, so a frame erased against the clean background bitmap
+// would take them with it. The fix is a save-under: keep the four 1px strips the frame
+// covers and put them back before anything else touches the window.
+//
+// That only stays consistent if nothing ever draws while the frame is up, so the loop is
+// strictly: erase -> handle input (steppers, DoThing, SetDefaults, whatever) -> draw.
+// The frame exists only between the end of one frame and the start of the next.
+#define PREF_HL_MAX_W 300
+#define PREF_HL_MAX_H 80
+
+static unsigned char pref_hl_top[PREF_HL_MAX_W];
+static unsigned char pref_hl_bottom[PREF_HL_MAX_W];
+static unsigned char pref_hl_left[PREF_HL_MAX_H];
+static unsigned char pref_hl_right[PREF_HL_MAX_H];
+static int pref_hl_x = -1;
+static int pref_hl_y;
+static int pref_hl_w;
+static int pref_hl_h;
+
+// The widget's own rectangle, three pixels of air around it. Sizes are the ones
+// UpdateThing actually blits: 46x47 rotary switch, 22x25 two-way switch, 21x12 slider knob
+// on a 384..624 track, 18x18 checkbox.
+static void prefs_nav_bounds(int index, int* x, int* y, int* w, int* h)
+{
+    const PrefNavItem* item = &(prefNav[index]);
+    const PreferenceDescription* meta = item->pref >= 0 ? &(btndat[item->pref]) : NULL;
+
+    switch (item->kind) {
+    case PREF_NAV_PRIMARY:
+        *x = meta->knobX - 3;
+        *y = meta->knobY - 3;
+        *w = 52;
+        *h = 53;
+        break;
+    case PREF_NAV_SECONDARY:
+        *x = meta->knobX - 3;
+        *y = meta->knobY - 3;
+        *w = 28;
+        *h = 31;
+        break;
+    case PREF_NAV_RANGE:
+        // The whole track, not the knob -- the knob moves and a frame that chased it
+        // would read as part of the value rather than as the selection.
+        *x = 381;
+        *y = meta->knobY - 3;
+        *w = 246;
+        *h = 18;
+        break;
+    case PREF_NAV_SPEEDUP:
+        *x = 380;
+        *y = 65;
+        *w = 24;
+        *h = 24;
+        break;
+    case PREF_NAV_CRT:
+        *x = crt_checkbox_x - 3;
+        *y = 65;
+        *w = 24;
+        *h = 24;
+        break;
+    default:
+        // DEFAULT / DONE / CANCEL, the little red buttons at y 450.
+        *x = (prefNav[index].kind == PREF_NAV_DEFAULT ? 23 : (prefNav[index].kind == PREF_NAV_DONE ? 148 : 263)) - 3;
+        *y = 447;
+        *w = ginfo2[PREFERENCES_WINDOW_FRM_LITTLE_RED_BUTTON_UP].width + 6;
+        *h = ginfo2[PREFERENCES_WINDOW_FRM_LITTLE_RED_BUTTON_UP].height + 6;
+        break;
+    }
+}
+
+static void prefs_hl_erase()
+{
+    if (pref_hl_x < 0) {
+        return;
+    }
+
+    memcpy(prefbuf + PREFERENCES_WINDOW_WIDTH * pref_hl_y + pref_hl_x, pref_hl_top, pref_hl_w);
+    memcpy(prefbuf + PREFERENCES_WINDOW_WIDTH * (pref_hl_y + pref_hl_h - 1) + pref_hl_x, pref_hl_bottom, pref_hl_w);
+    for (int i = 0; i < pref_hl_h; i++) {
+        unsigned char* row = prefbuf + PREFERENCES_WINDOW_WIDTH * (pref_hl_y + i);
+        row[pref_hl_x] = pref_hl_left[i];
+        row[pref_hl_x + pref_hl_w - 1] = pref_hl_right[i];
+    }
+
+    pref_hl_x = -1;
+}
+
+static void prefs_hl_draw(int index)
+{
+    int x;
+    int y;
+    int w;
+    int h;
+    prefs_nav_bounds(index, &x, &y, &w, &h);
+
+    if (x < 0) {
+        w += x;
+        x = 0;
+    }
+    if (y < 0) {
+        h += y;
+        y = 0;
+    }
+    if (x + w > PREFERENCES_WINDOW_WIDTH) {
+        w = PREFERENCES_WINDOW_WIDTH - x;
+    }
+    if (y + h > PREFERENCES_WINDOW_HEIGHT) {
+        h = PREFERENCES_WINDOW_HEIGHT - y;
+    }
+    if (w < 3 || h < 3 || w > PREF_HL_MAX_W || h > PREF_HL_MAX_H) {
+        return;
+    }
+
+    // Save the whole frame footprint BEFORE drawing any of it, or the corners come back
+    // white: the vertical strips would otherwise record pixels the horizontal ones just
+    // overwrote.
+    memcpy(pref_hl_top, prefbuf + PREFERENCES_WINDOW_WIDTH * y + x, w);
+    memcpy(pref_hl_bottom, prefbuf + PREFERENCES_WINDOW_WIDTH * (y + h - 1) + x, w);
+    for (int i = 0; i < h; i++) {
+        const unsigned char* row = prefbuf + PREFERENCES_WINDOW_WIDTH * (y + i);
+        pref_hl_left[i] = row[x];
+        pref_hl_right[i] = row[x + w - 1];
+    }
+
+    // Fallout's own selection colour -- the pale yellow the character screen and the
+    // save/load list use for the highlighted entry (colorTable[992] being the unselected
+    // green). Plain white belonged to no palette on this screen.
+    unsigned char color = colorTable[32747];
+    memset(prefbuf + PREFERENCES_WINDOW_WIDTH * y + x, color, w);
+    memset(prefbuf + PREFERENCES_WINDOW_WIDTH * (y + h - 1) + x, color, w);
+    for (int i = 0; i < h; i++) {
+        unsigned char* row = prefbuf + PREFERENCES_WINDOW_WIDTH * (y + i);
+        row[x] = color;
+        row[x + w - 1] = color;
+    }
+
+    pref_hl_x = x;
+    pref_hl_y = y;
+    pref_hl_w = w;
+    pref_hl_h = h;
+}
+
+// Nudge one control by one step. `wrap` is what A does on the rotary controls (cycle
+// round, like clicking their centre); the D-pad clamps instead, so holding a direction
+// settles at an end rather than flipping back to the other one.
+static void prefs_nav_step(int index, int dir, bool wrap)
+{
+    const PrefNavItem* item = &(prefNav[index]);
+    PreferenceDescription* meta = item->pref >= 0 ? &(btndat[item->pref]) : NULL;
+
+    switch (item->kind) {
+    case PREF_NAV_PRIMARY: {
+        int value = *meta->valuePtr + dir;
+        if (wrap) {
+            value = (value + meta->valuesCount) % meta->valuesCount;
+        } else {
+            value = std::clamp(value, 0, (int)meta->valuesCount - 1);
+        }
+        if (value == *meta->valuePtr) {
+            return;
+        }
+        *meta->valuePtr = value;
+        meta->direction = dir < 0 ? 1 : 0;
+        gsound_play_sfx_file("ib3lu1x1");
+        break;
+    }
+    case PREF_NAV_SECONDARY: {
+        // Left/right pick a side of the switch rather than toggling, so the direction
+        // always means the same thing. COMBAT MESSAGES has its two labels the other way
+        // round on screen -- mirror what DoThing does for a click on the same side.
+        int value;
+        if (wrap) {
+            value = *meta->valuePtr ^ 1;
+        } else if (dir < 0) {
+            value = item->pref == PREF_COMBAT_MESSAGES ? 1 : 0;
+        } else {
+            value = item->pref == PREF_COMBAT_MESSAGES ? 0 : 1;
+        }
+        if (value == *meta->valuePtr) {
+            return;
+        }
+        *meta->valuePtr = value;
+        gsound_play_sfx_file("ib2lu1x1");
+        break;
+    }
+    case PREF_NAV_RANGE: {
+        double value;
+        switch (item->pref) {
+        case PREF_TEXT_BASE_DELAY:
+            value = 6.0 - text_delay + 1.0;
+            break;
+        case PREF_BRIGHTNESS:
+            value = gamma_value;
+            break;
+        case PREF_MOUSE_SENSITIVIY:
+            value = mouse_sens;
+            break;
+        default:
+            value = *meta->valuePtr;
+            break;
+        }
+
+        // Twenty steps end to end -- the same resolution a slow drag gives.
+        double stepped = value + dir * (meta->maxValue - meta->minValue) / 20.0;
+        stepped = std::clamp(stepped, meta->minValue, meta->maxValue);
+        if (stepped == value) {
+            return;
+        }
+
+        switch (item->pref) {
+        case PREF_TEXT_BASE_DELAY:
+            text_delay = 6.0 - stepped + 1.0;
+            text_object_set_base_delay(text_delay);
+            break;
+        case PREF_BRIGHTNESS:
+            gamma_value = stepped;
+            colorGamma(gamma_value);
+            break;
+        case PREF_MOUSE_SENSITIVIY:
+            mouse_sens = stepped;
+            mouse_set_sensitivity(mouse_sens);
+            break;
+        case PREF_MASTER_VOLUME:
+            *meta->valuePtr = (int)stepped;
+            gsound_set_master_volume(master_volume);
+            break;
+        case PREF_MUSIC_VOLUME:
+            *meta->valuePtr = (int)stepped;
+            gsound_background_volume_set(music_volume);
+            break;
+        case PREF_SFX_VOLUME:
+            *meta->valuePtr = (int)stepped;
+            gsound_set_sfx_volume(sndfx_volume);
+            gsound_play_sfx_file("butin1");
+            break;
+        case PREF_SPEECH_VOLUME:
+            *meta->valuePtr = (int)stepped;
+            gsound_speech_volume_set(speech_volume);
+            break;
+        default:
+            *meta->valuePtr = (int)stepped;
+            break;
+        }
+        break;
+    }
+    case PREF_NAV_SPEEDUP:
+        player_speedup ^= 1;
+        win_set_button_rest_state(plyrspdbid, player_speedup, 0);
+        gsound_play_sfx_file("ib2lu1x1");
+        changed = true;
+        return;
+    case PREF_NAV_CRT:
+        crt_filter ^= 1;
+        crt_set_enabled(crt_filter != 0);
+        crt_persist();
+        win_set_button_rest_state(crtbid, crt_filter, 0);
+        gsound_play_sfx_file("ib2lu1x1");
+        changed = true;
+        return;
+    default:
+        // The three red buttons have nothing to step.
+        return;
+    }
+
+    UpdateThing(item->pref);
+    changed = true;
+}
+
+// A on the current item. The rotary controls cycle; the red buttons go through the same
+// event codes the mouse would post, so the loop below handles them in one place.
+static void prefs_nav_activate(int index)
+{
+    switch (prefNav[index].kind) {
+    case PREF_NAV_DEFAULT:
+        gsound_play_sfx_file("ib1p1xx1");
+        GNW_add_input_buffer(527);
+        break;
+    case PREF_NAV_DONE:
+        gsound_play_sfx_file("ib1p1xx1");
+        GNW_add_input_buffer(504);
+        break;
+    case PREF_NAV_CANCEL:
+        gsound_play_sfx_file("ib1p1xx1");
+        GNW_add_input_buffer(528);
+        break;
+    default:
+        prefs_nav_step(index, 1, true);
+        break;
+    }
+}
+
+// Edge plus hold-to-repeat, so a held direction walks a slider at a steady rate instead
+// of needing twenty presses. `state`: 0 released, 1 pressed and waiting out the initial
+// delay, 2 repeating.
+#define PREF_NAV_REPEAT_DELAY 320
+#define PREF_NAV_REPEAT_RATE 90
+
+static bool prefs_nav_edge(bool now, int* state, unsigned int* lastFire, bool repeat)
+{
+    if (!now) {
+        *state = 0;
+        return false;
+    }
+
+    if (*state == 0) {
+        *state = 1;
+        *lastFire = get_time();
+        return true;
+    }
+
+    if (!repeat) {
+        return false;
+    }
+
+    unsigned int wait = *state == 1 ? PREF_NAV_REPEAT_DELAY : PREF_NAV_REPEAT_RATE;
+    if (elapsed_time(*lastFire) >= wait) {
+        *state = 2;
+        *lastFire = get_time();
+        return true;
+    }
+
+    return false;
+}
+
 static int do_prefscreen()
 {
     if (PrefStart() == -1) {
@@ -969,9 +1521,155 @@ static int do_prefscreen()
         return -1;
     }
 
+    // Latched only as a starting value: it is re-fetched every frame below.
+    SDL_GameController* prefPad = gamepad_ui_get_controller();
+    int prefSel = 0;
+    int prefUpState = 0;
+    int prefDownState = 0;
+    int prefLeftState = 0;
+    int prefRightState = 0;
+    int prefLbState = 0;
+    int prefRbState = 0;
+    int prefAState = 0;
+    int prefBState = 0;
+    int prefYState = 0;
+    unsigned int prefUpAt = 0;
+    unsigned int prefDownAt = 0;
+    unsigned int prefLeftAt = 0;
+    unsigned int prefRightAt = 0;
+    unsigned int prefLbAt = 0;
+    unsigned int prefRbAt = 0;
+    unsigned int prefAAt = 0;
+    unsigned int prefBAt = 0;
+    unsigned int prefYAt = 0;
+
+    // do_options blanks the cursor whenever a pad is connected; this screen needs it back
+    // whether or not the pad is up, because a mouse user arrives here the same way.
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+
+    if (prefPad != NULL) {
+        prefs_nav_move(prefSel);
+
+        // Self-arming edges: we may have got here BY pressing A on the options menu, and
+        // that press is still down. Seed every state from the pad as it is right now so a
+        // carried-over button has to be released before it counts -- otherwise entering the
+        // screen would instantly cycle GAME DIFFICULTY.
+        SDL_GameControllerUpdate();
+        unsigned int now = get_time();
+        prefUpAt = prefDownAt = prefLeftAt = prefRightAt = now;
+        prefLbAt = prefRbAt = prefAAt = prefBAt = prefYAt = now;
+        prefUpState = (SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+            || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000) ? 1 : 0;
+        prefDownState = (SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+            || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000) ? 1 : 0;
+        prefLeftState = (SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+            || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTX) < -16000) ? 1 : 0;
+        prefRightState = (SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+            || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTX) > 16000) ? 1 : 0;
+        prefLbState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0 ? 1 : 0;
+        prefRbState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0 ? 1 : 0;
+        prefAState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_A) != 0 ? 1 : 0;
+        prefBState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_B) != 0 ? 1 : 0;
+        prefYState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_Y) != 0 ? 1 : 0;
+    }
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
+
+        // Take the frame down before anything can draw: the save-under underneath it is
+        // only valid while nothing else has touched those pixels.
+        prefs_hl_erase();
+
+        // Re-fetch every frame, never once on entry: gamepad_ui opens the controller LAZILY
+        // and is hotplug-aware, and its tick does not run inside a modal loop like this one.
+        // A handle latched at entry stays NULL for the whole screen if the pad happened not
+        // to be open yet, and then nothing here ever answers.
+        prefPad = gamepad_ui_get_controller();
+
+        if (prefPad != NULL) {
+            // Tell the shared layer this screen drives itself, so A is not ALSO turned into
+            // a synthetic mouse click and the left stick does not snap the cursor around.
+            gamepad_ui_set_self_nav(true);
+
+            SDL_GameControllerUpdate();
+
+            // self_nav also switches off the shared right-stick cursor (it exists to stop
+            // the stick creeping over buttons on menus that draw their own highlight). This
+            // screen wants both -- the D-pad hops between controls and the stick still
+            // steers freely, because the cursor IS the indicator -- so drive it here rather
+            // than lose it.
+            float rx = SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+            float ry = SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+            float rmag = sqrtf(rx * rx + ry * ry);
+            if (rmag > 0.25f) {
+                float t = (rmag - 0.25f) / 0.75f;
+                float speed = t * t * 14.0f;
+                int cx;
+                int cy;
+                mouse_get_position(&cx, &cy);
+                mouse_set_position(cx + (int)(rx / rmag * speed), cy + (int)(ry / rmag * speed));
+            }
+
+            bool upNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+                || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTY) < -16000;
+            bool downNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+                || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
+            bool leftNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0
+                || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTX) < -16000;
+            bool rightNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
+                || SDL_GameControllerGetAxis(prefPad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
+            bool lbNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+            bool rbNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+            bool aNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool bNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_B) != 0;
+            bool yNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_Y) != 0;
+
+            // Steering: all four directions, geometrically.
+            int navX = 0;
+            int navY = 0;
+            if (prefs_nav_edge(upNow, &prefUpState, &prefUpAt, true)) {
+                navY = -1;
+            } else if (prefs_nav_edge(downNow, &prefDownState, &prefDownAt, true)) {
+                navY = 1;
+            } else if (prefs_nav_edge(leftNow, &prefLeftState, &prefLeftAt, true)) {
+                navX = -1;
+            } else if (prefs_nav_edge(rightNow, &prefRightState, &prefRightAt, true)) {
+                navX = 1;
+            }
+
+            if (navX != 0 || navY != 0) {
+                int next = prefs_nav_neighbour(prefSel, navX, navY);
+                if (next != prefSel) {
+                    prefSel = next;
+                    prefs_nav_move(prefSel);
+                    gsound_play_sfx_file("ib1p1xx1");
+                }
+            }
+
+            // Value on the shoulders. BOTH edges must be evaluated -- `||` would
+            // short-circuit past RB's state update whenever LB fired, and RB would latch.
+            bool lbFired = prefs_nav_edge(lbNow, &prefLbState, &prefLbAt, true);
+            bool rbFired = prefs_nav_edge(rbNow, &prefRbState, &prefRbAt, true);
+            if (lbFired) {
+                prefs_nav_step(prefSel, -1, false);
+            } else if (rbFired) {
+                prefs_nav_step(prefSel, 1, false);
+            }
+
+            if (prefs_nav_edge(aNow, &prefAState, &prefAAt, false)) {
+                prefs_nav_activate(prefSel);
+            }
+            if (prefs_nav_edge(bNow, &prefBState, &prefBAt, false)) {
+                GNW_add_input_buffer(KEY_ESCAPE);
+            }
+            // Y, not START: while the options menu is open the shared shortcut layer turns
+            // START into ESCAPE, so binding DONE there would post an accept AND a cancel,
+            // and the cancel would throw the changes away.
+            if (prefs_nav_edge(yNow, &prefYState, &prefYAt, false)) {
+                GNW_add_input_buffer(504);
+            }
+        }
 
         int eventCode = get_input();
 
@@ -1007,14 +1705,27 @@ static int do_prefscreen()
             if (eventCode == KEY_ESCAPE || eventCode == 528 || game_user_wants_to_quit != 0) {
                 RestoreSettings();
                 rc = 0;
-            } else if (eventCode >= 505 && eventCode <= 524) {
+            } else if ((eventCode >= 505 && eventCode <= 524) || eventCode == 529) {
+                // 529 is the CRT FILTER checkbox; 525..528 belong to the range-knob
+                // hover, DEFAULT and CANCEL and are handled above.
                 DoThing(eventCode);
             }
             break;
         }
 
+        if (prefPad != NULL && rc == -1) {
+            prefs_hl_draw(prefSel);
+            win_draw(prfwin);
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
+    }
+
+    if (prefPad != NULL) {
+        // do_options re-asserts its own self_nav on the next frame; drop ours so a screen
+        // without controller navigation gets the shared stick-and-click layer back.
+        gamepad_ui_set_self_nav(false);
     }
 
     PrefEnd();
@@ -1053,6 +1764,8 @@ static int PrefStart()
 
     int preferencesWindowX = (screenGetWidth() - PREFERENCES_WINDOW_WIDTH) / 2;
     int preferencesWindowY = (screenGetHeight() - PREFERENCES_WINDOW_HEIGHT) / 2;
+    prfwin_x = preferencesWindowX;
+    prfwin_y = preferencesWindowY;
     prfwin = win_add(preferencesWindowX,
         preferencesWindowY,
         PREFERENCES_WINDOW_WIDTH,
@@ -1128,6 +1841,18 @@ static int PrefStart()
     messageItemText = getmsg(&optn_msgfl, &optnmesg, 122);
     text_to_buf(prefbuf + PREFERENCES_WINDOW_WIDTH * 72 + 405, messageItemText, PREFERENCES_WINDOW_WIDTH, PREFERENCES_WINDOW_WIDTH, colorTable[18979]);
 
+    // CRT FILTER -- shares the clear band between the first two sliders (y 64..90) with
+    // the checkbox above, starting where that label ends. Not in options.msg (it is ours,
+    // not Interplay's), so the string is literal. If the translated player-speed label
+    // runs long the pair is pushed back against the panel's right edge at x 624 rather
+    // than off it.
+    int crtLabelWidth = text_width(CRT_PREF_LABEL);
+    crt_checkbox_x = 405 + text_width(messageItemText) + 14;
+    if (crt_checkbox_x + 22 + crtLabelWidth > 620) {
+        crt_checkbox_x = 620 - 22 - crtLabelWidth;
+    }
+    text_to_buf(prefbuf + PREFERENCES_WINDOW_WIDTH * 72 + crt_checkbox_x + 22, CRT_PREF_LABEL, PREFERENCES_WINDOW_WIDTH, PREFERENCES_WINDOW_WIDTH, colorTable[18979]);
+
     for (i = 0; i < PREF_COUNT; i++) {
         UpdateThing(i);
     }
@@ -1189,6 +1914,25 @@ static int PrefStart()
     }
 
     win_register_button_sound_func(plyrspdbid, gsound_med_butt_press, gsound_med_butt_press);
+
+    // CRT FILTER
+    crtbid = win_register_button(prfwin,
+        crt_checkbox_x,
+        68,
+        ginfo2[PREFERENCES_WINDOW_FRM_CHECKBOX_OFF].width,
+        ginfo2[PREFERENCES_WINDOW_FRM_CHECKBOX_ON].height,
+        -1,
+        -1,
+        529,
+        529,
+        prfbmp[PREFERENCES_WINDOW_FRM_CHECKBOX_OFF],
+        prfbmp[PREFERENCES_WINDOW_FRM_CHECKBOX_ON],
+        NULL,
+        BUTTON_FLAG_TRANSPARENT | BUTTON_FLAG_0x01 | BUTTON_FLAG_0x02);
+    if (crtbid != -1) {
+        win_set_button_rest_state(crtbid, crt_filter, 0);
+        win_register_button_sound_func(crtbid, gsound_med_butt_press, gsound_med_butt_press);
+    }
 
     // DEFAULT
     btn = win_register_button(prfwin,
@@ -1550,6 +2294,12 @@ static void DoThing(int eventCode)
         }
     } else if (preferenceIndex == 19) {
         player_speedup ^= 1;
+    } else if (preferenceIndex == 24) {
+        // CRT FILTER. Applied immediately so the screen behind the dialog changes under
+        // the click -- that IS the preview, there is nothing else to show.
+        crt_filter ^= 1;
+        crt_set_enabled(crt_filter != 0);
+        crt_persist();
     }
 
     changed = true;
@@ -1896,6 +2646,11 @@ static void SetSystemPrefs()
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_BRIGHTNESS_KEY, &gamma_value);
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_SENSITIVITY_KEY, &mouse_sens);
 
+    // The CRT filter's own cfg read happened back in crt_init(), during svga_init -- it
+    // has to, the shader is live long before this screen exists. Take the flag from there
+    // instead of parsing the key a second time.
+    crt_filter = crt_is_enabled() ? 1 : 0;
+
     JustUpdate();
 }
 
@@ -1928,6 +2683,7 @@ static int SavePrefs(bool save)
     }
 
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PLAYER_SPEEDUP_KEY, player_speedup);
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CRT_KEY, crt_filter);
     config_set_value(&game_config, GAME_CONFIG_SOUND_KEY, GAME_CONFIG_MASTER_VOLUME_KEY, master_volume);
     config_set_value(&game_config, GAME_CONFIG_SOUND_KEY, GAME_CONFIG_MUSIC_VOLUME_KEY, music_volume);
     config_set_value(&game_config, GAME_CONFIG_SOUND_KEY, GAME_CONFIG_SNDFX_VOLUME_KEY, sndfx_volume);
@@ -1957,6 +2713,7 @@ static void SetDefaults(bool a1)
     item_highlight = 1;
     combat_speed = 0;
     player_speedup = 0;
+    crt_filter = 1;
     text_delay = 3.5;
     gamma_value = 1.0;
     mouse_sens = 1.0;
@@ -1972,6 +2729,8 @@ static void SetDefaults(bool a1)
             UpdateThing(index);
         }
         win_set_button_rest_state(plyrspdbid, player_speedup, 0);
+        win_set_button_rest_state(crtbid, crt_filter, 0);
+        crt_set_enabled(crt_filter != 0);
         win_draw(prfwin);
         changed = true;
     }
@@ -2000,6 +2759,7 @@ static void SaveSettings()
     settings_backup[PREF_SFX_VOLUME] = sndfx_volume;
     mouse_sens_back = mouse_sens;
     settings_backup[PREF_SPEECH_VOLUME] = speech_volume;
+    crt_filter_back = crt_filter;
 }
 
 // 0x4847D4
@@ -2025,6 +2785,7 @@ static void RestoreSettings()
     sndfx_volume = settings_backup[PREF_SFX_VOLUME];
     mouse_sens = mouse_sens_back;
     speech_volume = settings_backup[PREF_SPEECH_VOLUME];
+    crt_filter = crt_filter_back;
 
     JustUpdate();
 }
@@ -2045,6 +2806,7 @@ static void JustUpdate()
     item_highlight = std::clamp(item_highlight, 0, 1);
     combat_speed = std::clamp(combat_speed, 0, 50);
     player_speedup = std::clamp(player_speedup, 0, 1);
+    crt_filter = std::clamp(crt_filter, 0, 1);
     text_delay = std::clamp(text_delay, 1.0, 6.0);
     master_volume = std::clamp(master_volume, 0, VOLUME_MAX);
     music_volume = std::clamp(music_volume, 0, VOLUME_MAX);
@@ -2068,6 +2830,8 @@ static void JustUpdate()
     gsound_speech_volume_set(speech_volume);
     mouse_set_sensitivity(mouse_sens);
     colorGamma(gamma_value);
+    crt_set_enabled(crt_filter != 0);
+    crt_persist();
 }
 
 // 0x4848C8

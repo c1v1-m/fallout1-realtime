@@ -281,6 +281,7 @@ static int anim_move_straight_to_tile(Object* obj, int tile, int elevation, int 
 static void object_move(int index);
 static void object_straight_move(int index);
 static float walk_dir_slowdown(Object* object, int rotation);
+static float crippled_move_scale(Object* object);
 static float run_speed_scale(Object* object, int rotation);
 static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* frameY);
 static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int flags);
@@ -311,6 +312,22 @@ static PathNode dad[2000];
 
 // 0x560314
 static AnimationSequence anim_set[ANIMATION_SEQUENCE_LIST_CAPACITY];
+
+// Which sequences are CURRENTLY inside anim_set_end. Not a status flag -- a re-entrancy guard,
+// and the fix for a runaway recursion that overflowed the stack (Junktown, 2026-08-28: the
+// bartender killing the Skulz who killed the girl). The cycle, straight out of the crash digest:
+//
+//     obj_erase_object -> anim_notify_object_freed -> anim_force_clear -> anim_set_end
+//         -> obj_erase_object (its ANIM_KIND_HIDE owners)  -> ...and round again, for ever.
+//
+// The loop closes because anim_set_end marks the sequence dead (field_0 = -1000) only at its very
+// END, after the loop that erases the HIDE owners -- so the nested call sails past the dead check,
+// finds the SAME sequence, erases the SAME owner, and recurses. (The free at the bottom of
+// obj_erase_object is never reached, so nothing ever runs out except the stack.)
+//
+// ⚠️ Realtime-only in practice, like the hook that exposed it: turn-based erases objects between
+// turns, when no sequence is mid-teardown.
+static bool anim_set_ending[ANIMATION_SEQUENCE_LIST_CAPACITY];
 
 // 0x56A1E4
 static unsigned char seen[5000];
@@ -343,7 +360,28 @@ static float anim_attack_stat_factor = 0.09f;
 // a 3.1x spread from average to maxed, where the symmetric curve gave only 1.8x.
 // ANIM_ATTACK_SPEED_MIN was lowered from 0.4 to make room: at 0.4 the clamp bit from stat ~8 up
 // and 8/9/10 all animated identically, which is exactly the flat top this is meant to remove.
-#define ANIM_ATTACK_STAT_HIGH_BIAS 1.5f
+//
+// ⚠️ 2026-08-24: 1.5 -> 1.0 (SYMMETRIC), and promoted from a #define to a cfg key.
+//
+// This constant and `attack_cooldown_high_bias` shape the SAME half of the SAME curve, and they
+// had silently DRIFTED APART pointing in opposite directions: this one AMPLIFIES above-average
+// stats (1.5), while the cooldown's was damped to 0.6 on 2026-08-23. They started life equal (both
+// 1.5); the cooldown then went 1.5 -> 1.0 -> 0.6 across three balance rounds and nobody moved this
+// one with it.
+//
+// The visible result at STR 10 / unarmed 112: the punch played in 0.35 s (11 frames at 32 ms, i.e.
+// 3.1x its authored 10 fps) while attacks only came 1.56x more often -- so the DUTY CYCLE, flat at
+// 40-43% for stats 1..5, collapsed to 22%. The character stood motionless four fifths of the fight
+// and twitched. The animation was promising a rate the cooldown no longer delivered.
+//
+// At 1.0 the whole 1..10 range lands on 37-43%, i.e. the same band stats 1..5 already occupied.
+// STR 10 still animates visibly faster than STR 5 (0.60 s vs 1.10 s), it just isn't a flicker.
+//
+// ⚠️ The old note above -- "we can afford to exaggerate BECAUSE it is cosmetic" -- is still true
+// about BALANCE (this touches no throughput, hit chance or damage) but was wrong about READABILITY.
+// A cosmetic lever cannot be tuned in isolation from the pacing lever it renders.
+#define ANIM_ATTACK_STAT_HIGH_BIAS 1.0f
+static float anim_attack_stat_high_bias = ANIM_ATTACK_STAT_HIGH_BIAS;
 
 void anim_init()
 {
@@ -398,6 +436,19 @@ void anim_init()
         attackStatFactor = 0.3;
     }
     anim_attack_stat_factor = (float)attackStatFactor;
+
+    // How much of that factor applies ABOVE the average stat of 5 (below 5 always uses the plain
+    // factor). 1.0 = symmetric. Keep it in step with `attack_cooldown_high_bias` -- see the note at
+    // ANIM_ATTACK_STAT_HIGH_BIAS for what drifting apart looked like. Capped at 2.0 so the clamp in
+    // compute_tpf stays the exception rather than the rule.
+    double attackStatHighBias = ANIM_ATTACK_STAT_HIGH_BIAS;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ANIM_ATTACK_STAT_HIGH_BIAS_KEY, &attackStatHighBias);
+    if (attackStatHighBias < 0.0) {
+        attackStatHighBias = 0.0;
+    } else if (attackStatHighBias > 2.0) {
+        attackStatHighBias = 2.0;
+    }
+    anim_attack_stat_high_bias = (float)attackStatHighBias;
 }
 
 // 0x4134D0
@@ -416,6 +467,7 @@ void anim_reset()
     for (index = 0; index < ANIMATION_SEQUENCE_LIST_CAPACITY; index++) {
         anim_set[index].field_0 = -1000;
         anim_set[index].flags = 0;
+        anim_set_ending[index] = false;
     }
 }
 
@@ -486,6 +538,59 @@ void anim_debug_table(int* occupied, int* nonReserved, int* curr)
     if (occupied != NULL) *occupied = occ;
     if (nonReserved != NULL) *nonReserved = nr;
     if (curr != NULL) *curr = curr_anim_set;
+}
+
+// RECOVERY for a register_begin transaction nobody closed.
+//
+// register_begin refuses outright while `curr_anim_set != -1` -- it is a one-at-a-time
+// transaction and an unclosed one poisons EVERY later attempt, for every actor. The symptom
+// is total and silent: attacks return -1 forever, the dude and every NPC alike, with the
+// animation table nearly empty and all the busy-tests reading zero.
+//
+// Vanilla never had to care: register_begin/register_end always ran to completion inside one
+// turn. Realtime and a mid-session LoadGame can both leave one dangling -- loadsave.cc calls
+// neither anim_stop() nor anim_reset(), so whatever was open at save time survives the load.
+//
+// Abandoning the slot is safe precisely BECAUSE it never started: an unclosed transaction has
+// no running animation and no callbacks pending -- register_end is what would have made it
+// live. Returns true if one was actually discarded, so the caller can log it.
+bool anim_discard_open_transaction()
+{
+    if (curr_anim_set == -1) {
+        return false;
+    }
+
+    anim_set[curr_anim_set].field_0 = -1000;
+    anim_set[curr_anim_set].flags = 0;
+    curr_anim_set = -1;
+    curr_anim_counter = 0;
+    return true;
+}
+
+// Reports the two GLOBAL reasons register_begin can refuse, so a caller that just had an
+// attack rejected can say which one it was instead of guessing.
+void anim_debug_gate(int* openTransaction, int* inAnimStop)
+{
+    if (openTransaction != NULL) {
+        *openTransaction = curr_anim_set;
+    }
+    if (inAnimStop != NULL) {
+        *inAnimStop = anim_in_anim_stop ? 1 : 0;
+    }
+}
+
+// Set for the duration of an attack's registration (action_attack wraps action_melee /
+// action_ranged in it). check_registry refuses far more often than anim_busy reports -- it
+// vetoes on ANY live sequence that merely lists the object as an owner, including a length-1
+// ANIM_STAND that anim_busy skips outright -- and that refusal tears the transaction down via
+// anim_cleanup, so register_end returns -1 and the whole attack is dropped with every busy
+// test reading zero. Scoped, because check_registry runs for every walk in the game and an
+// unconditional log would drown the recorder.
+static bool anim_dbg_attack_scope = false;
+
+void anim_debug_attack_scope(bool on)
+{
+    anim_dbg_attack_scope = on;
 }
 
 // 0x413630
@@ -662,6 +767,54 @@ int anim_force_clear(Object* a1)
     return -1;
 }
 
+// Called from obj_erase_object() (object.cc) in the instant before an Object is freed.
+//
+// anim.cc holds RAW Object pointers in TWO tables and obj_remove() cleans NEITHER -- it frees the
+// Object and returns. The frame stepper then dereferences the dangling pointer on the very next
+// frame: object_animate() reads `object->rotation` to feed art_frame_offset(), so a garbage
+// rotation indexes art->xOffsets[] far out of bounds. That is the ACCESS_VIOLATION in
+// trace_2026-08-27_215442 (read 0x21a40981bfe):
+//     art_frame_offset (art.cc:796) <- object_animate (anim.cc:3454) <- process_bk
+// The free came from op_destroy_object inside a critter script during doBkProcesses -- ordinary
+// vanilla cleanup after the Junktown fight (eight critters erased in half a second).
+//
+// ⚠️ WHY THIS IS A REALTIME BUG. Turn-based never opened this window: scripts destroy objects
+// between turns, when no animation is in flight. Realtime runs scripts and animations in the same
+// frames, so a script can erase a critter that is mid-walk or mid-death. Same family as
+// combat_rt_notify_critter_removed (whoHitMe / the actor registry) -- a different holder of the
+// same freed pointer.
+//
+// sad[] is silenced FIRST because it is pure data with no side effects; the sequence teardown
+// after it can register follow-up animations, and by then nothing points at the dead object.
+void anim_notify_object_freed(Object* obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+
+    // field_20 == -1000 is this file's established "entry is dead" marker (see anim_set_end);
+    // every dereference of sad_entry->obj sits behind that check, and the two places that only
+    // COMPARE the pointer (anim_set_end, anim_extend_move) read NULL correctly. Clearing obj as
+    // well matters because the allocator can hand the same address to a later object, which would
+    // otherwise alias this dead entry.
+    for (int i = 0; i < curr_sad; i++) {
+        if (sad[i].obj == obj) {
+            sad[i].field_20 = -1000;
+            sad[i].obj = NULL;
+        }
+    }
+
+    // The sequence table holds the object as an AnimationDescription owner; left alone,
+    // anim_set_continue would run the NEXT description for a freed owner -- the second crash in
+    // the same window. One object can own descriptions in several live sequences and
+    // anim_force_clear ends one per call, so loop, bounded by the table size.
+    for (int i = 0; i < ANIMATION_SEQUENCE_LIST_CAPACITY; i++) {
+        if (anim_force_clear(obj) != 0) {
+            break;
+        }
+    }
+}
+
 // 0x413788
 int register_end()
 {
@@ -734,10 +887,18 @@ static void anim_cleanup()
 int check_registry(Object* obj)
 {
     if (curr_anim_set == -1) {
+        if (anim_dbg_attack_scope) {
+            trace_event(TRACE_WARN, "reg-conflict", "why=no-transaction pid=%d",
+                obj != NULL ? obj->pid : -1);
+        }
         return -1;
     }
 
     if (curr_anim_counter >= ANIMATION_DESCRIPTION_LIST_CAPACITY) {
+        if (anim_dbg_attack_scope) {
+            trace_event(TRACE_WARN, "reg-conflict", "why=descriptions-full pid=%d count=%d",
+                obj != NULL ? obj->pid : -1, curr_anim_counter);
+        }
         return -1;
     }
 
@@ -763,6 +924,22 @@ int check_registry(Object* obj)
                 AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
                 if (obj == animationDescription->owner && animationDescription->kind != 11) {
                     if ((animationSequence->flags & ANIM_SEQ_INSIGNIFICANT) == 0) {
+                        if (anim_dbg_attack_scope) {
+                            // Everything needed to name the blocker: whose slot, which sequence,
+                            // how long it is, what it is, and whether anim_busy can even see it
+                            // (len==1 && anim==ANIM_STAND is the one it skips).
+                            trace_event(TRACE_WARN, "reg-conflict",
+                                "why=owner-busy pid=%d seq=%d len=%d idx=%d kind=%d anim=%d flags=%#x prio=%d busy=%d",
+                                obj != NULL ? obj->pid : -1,
+                                animationSequenceIndex,
+                                animationSequence->length,
+                                animationDescriptionIndex,
+                                animationDescription->kind,
+                                animationDescription->anim,
+                                animationSequence->flags,
+                                (animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0 ? 1 : 0,
+                                anim_busy(obj));
+                        }
                         return -1;
                     }
 
@@ -1240,6 +1417,20 @@ int register_object_animate(Object* owner, int anim, int delay)
 
     // NOTE: Uninline.
     if (anim_preload(owner, fid, &(animationDescription->artCacheKey)) == -1) {
+        if (anim_dbg_attack_scope) {
+            // The OTHER way an attack dies without a word: not a busy slot but a MISSING ART.
+            // anim_cleanup below drops the whole transaction, so register_end -- and with it
+            // combat_attack -- returns -1 while every busy test reads zero. The weapon code in
+            // bits 12-15 of the owner's fid is the usual culprit (see rt_attack_art_ok).
+            trace_event(TRACE_WARN, "reg-art-missing",
+                "pid=%d ownerFid=%#x anim=%d wpnCode=%d rot=%d artFid=%#x",
+                owner != NULL ? owner->pid : -1,
+                owner != NULL ? owner->fid : 0,
+                animationDescription->anim,
+                owner != NULL ? (owner->fid & 0xF000) >> 12 : -1,
+                owner != NULL ? owner->rotation : -1,
+                fid);
+        }
         anim_cleanup();
         return -1;
     }
@@ -1965,6 +2156,13 @@ static int anim_set_end(int animationSequenceIndex)
         return -1;
     }
 
+    // Already tearing this sequence down one level up the stack -- see anim_set_ending. Bail out
+    // instead of ending it a second time; the outer call finishes the job and marks it dead.
+    if (anim_set_ending[animationSequenceIndex]) {
+        return -1;
+    }
+    anim_set_ending[animationSequenceIndex] = true;
+
     for (i = 0; i < curr_sad; i++) {
         AnimationSad* sad_entry = &(sad[i]);
         if (sad_entry->animationSequenceIndex == animationSequenceIndex) {
@@ -2068,6 +2266,8 @@ static int anim_set_end(int animationSequenceIndex)
     } else {
         animationSequence->flags = 0;
     }
+
+    anim_set_ending[animationSequenceIndex] = false;
 
     return 0;
 }
@@ -3012,19 +3212,59 @@ static void object_move(int index)
     // is applied here per step where the actual rotation is set. The scheduler re-
     // reads ticksPerFrame each tick, so updating it mid-sad takes effect. Player and
     // turn-based combat are untouched.
-    if (combat_rt_enabled() && object != obj_dude && sad_entry->anim == ANIM_WALK) {
-        float scale = walk_dir_slowdown(object, rotation);
-        if (scale > 1.0f) {
-            sad_entry->ticksPerFrame = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale);
+    // MOVEMENT RE-TIMING, all of it in one place: art normalisation, the Agility run curve and the
+    // crippled-leg limp, applied to a FRESHLY COMPUTED base every step.
+    //
+    // ⚠️ NEVER MULTIPLY sad_entry->ticksPerFrame BY ANYTHING. It is state that survives between
+    // steps, and this code runs on EVERY step, so scaling the stored value compounds. The limp
+    // shipped that way for one evening and the arithmetic is brutal: the NPC walk branch only
+    // re-times when its own scale exceeds 1.0, so on every other step nothing reset the field and
+    // the x1.6 stacked -- 1.6, 2.56, 4.1, 6.6, 10.5 -- until a single frame lasted seconds. The
+    // critter froze mid-tile with the walk animation still "playing", never reached the tile
+    // boundary that triggers obj_move_to_tile, and the 1.25 s stuck-move watchdog then cut and
+    // re-issued the walk for ever. On screen: a ghoul standing on one spot, twitching.
+    //
+    // Measured, trace_2026-08-30_192334: id=2115 (the critter the cripple trace names, legsNow=1)
+    // re-issued `from=22894` for 28 seconds without ever leaving it, sub-tile offset stuck at (6,5)
+    // and frame stuck at 3, with nothing blocking it and the animation table at 5/64.
+    //
+    // Deriving from compute_tpf every time makes the whole block idempotent: run it once or a
+    // hundred times on the same step and the answer is identical.
+    if (combat_rt_enabled()
+        && (sad_entry->anim == ANIM_WALK || sad_entry->anim == ANIM_RUNNING)) {
+        float scale = 1.0f;
+        bool retime = false;
+
+        if (sad_entry->anim == ANIM_RUNNING) {
+            // Run speed: art variance out, Agility in -- and unlike the walk branch this DOES
+            // include the dude, so the rule is the same for everyone. Both directions allowed (the
+            // stat has to be able to make you faster, not just slower), bounded by run_speed_scale's
+            // own clamps. Always re-timed, as before.
+            scale = run_speed_scale(object, rotation);
+            retime = true;
+        } else if (object != obj_dude) {
+            // NPC walk: equalise this facing's tile-crossing time against the reference. Only ever
+            // SLOWS (the > 1.0 test), which is why the dude's walk is left on its registration tpf.
+            float dirScale = walk_dir_slowdown(object, rotation);
+            if (dirScale > 1.0f) {
+                scale = dirScale;
+                retime = true;
+            }
         }
-    } else if (combat_rt_enabled() && sad_entry->anim == ANIM_RUNNING) {
-        // Run speed: art variance out, Agility in -- and unlike the walk branch this DOES include
-        // the dude, so the rule is the same for everyone. Both directions are allowed here (the
-        // stat has to be able to make you faster, not just slower), bounded by run_speed_scale's
-        // clamps, with a floor of 1 tick so a fast runner can never hit a zero frame duration.
-        float scale = run_speed_scale(object, rotation);
-        unsigned int tpf = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale);
-        sad_entry->ticksPerFrame = tpf > 0 ? tpf : 1;
+
+        // ⚠️ THE LIMP IS A FACTOR HERE, NOT A SEPARATE PASS -- and it must stay OUT of compute_tpf
+        // itself, because walk_dir_slowdown builds its scale from compute_tpf on both sides, so a
+        // factor hidden in there cancels out of the quotient exactly. It also has to stay out of the
+        // dude's reference, or shooting your own leg would slow every NPC on the map to match you.
+        float crip = crippled_move_scale(object);
+        if (crip > 1.0f) {
+            retime = true;
+        }
+
+        if (retime) {
+            unsigned int tpf = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale * crip);
+            sad_entry->ticksPerFrame = tpf > 0 ? tpf : 1;
+        }
     }
 
     int y = off_tile[1][rotation];
@@ -3945,6 +4185,53 @@ static void walk_log(const char* fmt, ...)
     fflush(f);
 }
 
+// Crippled legs, as a tile-crossing-time multiplier (1.0 = unhurt). Realtime replacement for the
+// vanilla rule, which is pure ACTION POINTS: critter_compute_ap_from_distance charges 4x per tile
+// for one bad leg and 8x for two. That rule is dead here -- the per-tile deduction it feeds is
+// explicitly skipped under combat_rt (see the guard in object_animate), because charging movement
+// AP would cut every script-driven walk to one tile. So until now a crippled leg did NOTHING in
+// realtime: you could shoot both of someone's legs off and they kept pace with you.
+//
+// ⚠️ NOT 4x / 8x. Translating the vanilla numbers straight across would be near-immobility --
+// in turn-based they cost you ground per TURN, with the fight politely waiting; in realtime they
+// would be four to eight times the wall-clock seconds to cross one tile, which is a stunlock
+// wearing a different name. These are the numbers that make it a real wound you can still fight
+// through, and both are cfg-tunable.
+//
+// Applies to the DUDE as well as NPCs, deliberately: he is the one who mostly does the crippling,
+// and a consequence he can never suffer is not a mechanic, it is a cheat code.
+static float crippled_move_scale(Object* object)
+{
+    if (object == NULL || FID_TYPE(object->fid) != OBJ_TYPE_CRITTER) {
+        return 1.0f;
+    }
+
+    static float crip_one = -1.0f;
+    static float crip_both = -1.0f;
+    if (crip_one < 0.0f) {
+        double one = 1.6;
+        double both = 2.5;
+        config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CRIP_LEG_ONE_KEY, &one);
+        config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CRIP_LEG_BOTH_KEY, &both);
+        // Floored at 1.0: this may only ever SLOW. A value below 1 would turn a shot-off leg into
+        // a speed boost, which is the kind of sign error a cfg typo makes very easy.
+        crip_one = one < 1.0 ? 1.0f : (float)one;
+        crip_both = both < 1.0 ? 1.0f : (float)both;
+        if (crip_both < crip_one) {
+            crip_both = crip_one; // two bad legs can never be better than one
+        }
+    }
+
+    int flags = object->data.critter.combat.results;
+    if ((flags & DAM_CRIP_LEG_LEFT) != 0 && (flags & DAM_CRIP_LEG_RIGHT) != 0) {
+        return crip_both;
+    }
+    if ((flags & DAM_CRIP_LEG_ANY) != 0) {
+        return crip_one;
+    }
+    return 1.0f;
+}
+
 static float walk_dir_slowdown(Object* object, int rotation)
 {
     if (rotation < 0 || rotation >= ROTATION_COUNT) {
@@ -4014,9 +4301,13 @@ static float walk_dir_slowdown(Object* object, int rotation)
     if (object->pid != wl_pid || rotation != wl_rot) {
         wl_pid = object->pid;
         wl_rot = rotation;
-        walk_log("pid=%d rot=%d | nfpt=%.1f npcCross=%.0f | dudeCross=%.0f ownMaxFpt=%.1f ownCross=%.0f refCross=%.0f | scale=%.2f finalTpf=%.1f",
+        // crip= is reported here but APPLIED at the call site, after this function returns -- so
+        // finalTpf below does NOT include it. Multiply the two to get the real tile time. Kept
+        // this way because moving the limp in here would let the normalisation cancel it (see
+        // the long note at the call site); reporting it is enough to make the log answerable.
+        walk_log("pid=%d rot=%d | nfpt=%.1f npcCross=%.0f | dudeCross=%.0f ownMaxFpt=%.1f ownCross=%.0f refCross=%.0f | scale=%.2f finalTpf=%.1f crip=%.2f",
             object->pid, rotation, nfpt, npcCross, dudeCross, np->maxFramesPerTile, ownCross,
-            refCross, scale, npcTpf * (scale > 1.0f ? scale : 1.0f));
+            refCross, scale, npcTpf * (scale > 1.0f ? scale : 1.0f), crippled_move_scale(object));
     }
 
     return scale;
@@ -4288,7 +4579,7 @@ unsigned int compute_tpf(Object* object, int fid)
         // Asymmetric: above-average points are worth more than below-average ones, so investing
         // past 5 actually shows. See ANIM_ATTACK_STAT_HIGH_BIAS.
         int delta = stat_level(object, stat) - 5;
-        float factor = delta > 0 ? anim_attack_stat_factor * ANIM_ATTACK_STAT_HIGH_BIAS
+        float factor = delta > 0 ? anim_attack_stat_factor * anim_attack_stat_high_bias
                                  : anim_attack_stat_factor;
         float mult = 1.0f - delta * factor;
         if (mult < ANIM_ATTACK_SPEED_MIN) {
@@ -4326,6 +4617,33 @@ unsigned int compute_tpf(Object* object, int fid)
         tpf = (unsigned int)(tpf / move_speed_scale);
         if (tpf < 1) {
             tpf = 1;
+        }
+    }
+
+    // AIMED-SHOT SLOW MOTION, applied LAST so it scales whatever every lever above arrived at.
+    // combat_rt scales its own dt by the same number, so the combat model and the animation clock
+    // stretch together; without this half the enemies would decide at quarter speed while still
+    // walking and swinging at full speed.
+    //
+    // tpf is a DURATION, so slowing divides: scale 0.25 makes each frame last four times as long.
+    //
+    // ⚠️ IN-FLIGHT ANIMATIONS ONLY PARTLY FOLLOW. ticksPerFrame is baked into the sad entry when
+    // an animation is registered, and the scheduler re-reads it each tick but nothing recomputes it
+    // -- except the WALK and RUN branches in object_animate, which call compute_tpf again on every
+    // step and therefore pick this up immediately. Movement is what you actually watch during an
+    // aim, so the effect reads correctly; a swing already in the air finishes at its original
+    // speed. Re-timing every live sad entry on entry/exit would be the complete fix and is not
+    // worth the reach into the animation tables for a fraction of a second of mismatch.
+    //
+    // ⚠️ RATIO-SAFE. walk_dir_slowdown and run_speed_scale compare an NPC's compute_tpf against
+    // the DUDE's; a factor applied to both cancels in the quotient, so normalisation is unaffected.
+    {
+        float aimScale = combat_rt_time_scale();
+        if (aimScale < 1.0f) {
+            tpf = (unsigned int)(tpf / aimScale);
+            if (tpf < 1) {
+                tpf = 1;
+            }
         }
     }
 

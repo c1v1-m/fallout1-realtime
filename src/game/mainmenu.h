@@ -5,6 +5,7 @@ namespace fallout {
 
 typedef enum MainMenuOption {
     MAIN_MENU_INTRO,
+    MAIN_MENU_CONTINUE,
     MAIN_MENU_NEW_GAME,
     MAIN_MENU_LOAD_GAME,
     MAIN_MENU_SCREENSAVER,

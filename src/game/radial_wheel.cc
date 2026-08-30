@@ -146,6 +146,15 @@ static bool wheel_has_icons = false; // any segment carries per-segment art -> i
 static RadialWheelArt wheel_art;
 static bool wheel_has_art = false;
 static char wheel_title[32];
+
+// Control hints pinned to the panel's TOP CORNERS -- as far left and as far right as the panel
+// goes. NOT the middle of those edges: with eight segments the ring puts a cell at 3 and 9
+// o'clock whose icon runs to within ~10 px of the border, so text there would land on a weapon.
+// And not in the hub either: stacking a third line under the caption and the detail line was too
+// much text in one column ("hodně textu pod sebou").
+static char wheel_hint_left[16];
+static char wheel_hint_right[16];
+
 static bool wheel_transparent = false;
 static bool wheel_buffering_on = false; // we toggled GNW buffering on for a transparent panel
 
@@ -197,7 +206,20 @@ static void wheel_draw_value(unsigned char* buf, int value, int centerX, int top
     }
     digits[n++] = value % 10;
 
-    int x = centerX - (n * wheel_art.digitWidth) / 2;
+    // ⚠️ KEEP THE WHOLE NUMBER ON THE PANEL. The segments sit on an ellipse, so the left and right
+    // ones are centred close to the panel edge -- and wheel_blit_trans clips per pixel against the
+    // panel, silently. A two-digit badge fitted; a three-digit one centred on the same point hung
+    // over the edge and lost its outer digit, so "123 rounds" was drawn and read as two digits.
+    // Slide it inward instead: an off-centre number is still the right number.
+    int span = n * wheel_art.digitWidth;
+    int x = centerX - span / 2;
+    if (x < 0) {
+        x = 0;
+    }
+    if (x + span > wheel_w) {
+        x = wheel_w - span;
+    }
+
     for (int i = 0; i < n; i++) {
         wheel_blit_trans(buf,
             wheel_art.digits + digits[i] * wheel_art.digitWidth,
@@ -380,6 +402,19 @@ static void wheel_draw()
         }
     }
 
+    // Corner hints last, so no segment can overdraw them.
+    if (wheel_hint_left[0] != '\0') {
+        text_to_buf(buf + 3 * pitch + 4, wheel_hint_left, pitch, pitch, colorTable[992]);
+    }
+    if (wheel_hint_right[0] != '\0') {
+        int hintWidth = text_width(wheel_hint_right);
+        int hx = wheel_w - 4 - hintWidth;
+        if (hx < 4) {
+            hx = 4;
+        }
+        text_to_buf(buf + 3 * pitch + hx, wheel_hint_right, pitch, pitch, colorTable[992]);
+    }
+
     // Fallout's own item description for whatever is aimed at, in its own band under the ring.
     if (wheel_desc_h > 0 && wheel_highlight >= 0 && wheel_highlight < wheel_count) {
         wheel_draw_description(buf, wheel_segs[wheel_highlight].description,
@@ -387,6 +422,29 @@ static void wheel_draw()
     }
 
     win_draw(wheel_win);
+}
+
+void radial_wheel_set_side_hints(const char* left, const char* right)
+{
+    if (left != NULL) {
+        strncpy(wheel_hint_left, left, sizeof(wheel_hint_left) - 1);
+        wheel_hint_left[sizeof(wheel_hint_left) - 1] = '\0';
+    } else {
+        wheel_hint_left[0] = '\0';
+    }
+
+    if (right != NULL) {
+        strncpy(wheel_hint_right, right, sizeof(wheel_hint_right) - 1);
+        wheel_hint_right[sizeof(wheel_hint_right) - 1] = '\0';
+    } else {
+        wheel_hint_right[0] = '\0';
+    }
+
+    // The wheel repaints only on a highlight change, so hints set right after opening would
+    // otherwise stay invisible until the first stick sweep.
+    if (wheel_win != -1) {
+        wheel_draw();
+    }
 }
 
 void radial_wheel_open(const RadialSegment* segments, int count, const char* title,
@@ -423,6 +481,10 @@ void radial_wheel_open(const RadialSegment* segments, int count, const char* tit
     } else {
         wheel_title[0] = '\0';
     }
+
+    // Never inherited from the previous wheel -- the caller sets them after opening, if at all.
+    wheel_hint_left[0] = '\0';
+    wheel_hint_right[0] = '\0';
 
     // Per-segment art switches the wheel to the icon look and, being typically larger than
     // a button frame (an FO1 inventory FRM is 88x59 against the skilldex button's 86x33),

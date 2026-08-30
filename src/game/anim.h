@@ -112,11 +112,26 @@ void anim_init();
 void anim_reset();
 void anim_exit();
 void anim_debug_table(int* occupied, int* nonReserved, int* curr); // TEMP DIAG
+
+// Discards a register_begin transaction nobody closed. Returns true if there was one.
+// See the comment in anim.cc -- an unclosed transaction disables ALL attacks game-wide.
+bool anim_discard_open_transaction();
+
+// The two global reasons register_begin refuses: an open transaction (-1 = none) and the
+// anim_stop reentry guard.
+void anim_debug_gate(int* openTransaction, int* inAnimStop);
+// Turns on the [WARN/reg-conflict] log inside check_registry for the duration of an attack's
+// registration -- the refusal that silently aborts the whole attack via anim_cleanup.
+void anim_debug_attack_scope(bool on);
 int register_begin(int a1);
 int register_priority(int a1);
 int register_clear(Object* a1);
 // register_clear variant that ends even a PRIORITIZED sequence (realtime combat; see anim.cc).
 int anim_force_clear(Object* a1);
+// Hook from obj_erase_object(): drop every raw pointer anim.cc holds to an object about to be
+// freed (the sad[] frame stepper + the sequence table). Without it object_animate dereferences
+// the dangling pointer next frame -- the art_frame_offset ACCESS_VIOLATION. See anim.cc.
+void anim_notify_object_freed(Object* obj);
 // register_clear variant that only ends a sequence in which `a1` still has UNPLAYED work.
 // MUST be used instead of register_clear by anything gated on anim_busy_blocking (see anim.cc).
 int anim_clear_pending(Object* a1);

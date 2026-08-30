@@ -116,6 +116,8 @@ int map_load_file(DB_FILE* stream);
 int map_load_in_game(char* fileName);
 int map_leave_map(MapTransition* transition);
 void map_clear_pending_transition();
+// Arm "come up on the world map" -- for restoring a save that was taken there. See map.cc.
+void map_request_world_map();
 bool map_has_pending_transition();
 int map_check_state();
 void map_fix_critter_combat_data();

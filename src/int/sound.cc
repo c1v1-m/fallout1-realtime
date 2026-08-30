@@ -1310,6 +1310,17 @@ void soundMgrDelete(Sound* sound)
             soundStop(sound);
         }
 
+        // CE: ...and a sound that IS playing never reaches soundStop, so numSounds is never given
+        // back. Every one-shot effect self-deletes through here (soundContinue's `type & 0x04`
+        // branch), so the count climbs for the whole session -- measured live: 4, 7, 8, 9, 12 ...
+        // 33 and never once down. Harmless while nothing read it, which is why it survived; it is
+        // not harmless now that numSoundsPlaying() reports concurrency to the mixer diagnostics.
+        // Guarded on the flag so this can never double-count with the soundStop above.
+        if ((sound->statusFlags & SOUND_STATUS_IS_PLAYING) != 0) {
+            sound->statusFlags &= ~SOUND_STATUS_IS_PLAYING;
+            numSounds--;
+        }
+
         if (sound->callback != NULL) {
             sound->callback(sound->callbackUserData, 1);
         }

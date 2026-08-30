@@ -152,6 +152,57 @@ int gnw_main(int argc, char** argv)
                 main_menu_create();
 
                 break;
+            case MAIN_MENU_CONTINUE:
+                trace_event(TRACE_FLOW, "continue-case", "reached"); // STRIP with continue-diag
+                // Resume the newest save with no load screen in between. Deliberately the same
+                // shape as MAIN_MENU_LOAD_GAME below -- same cover window, same fades, same
+                // main_loadgame_new / main_reset_system pairing -- because everything that path
+                // does is required by LoadSlot, not by the load SCREEN.
+                if (1) {
+                    int win = win_add(0, 0, screenGetWidth(), screenGetHeight(), colorTable[0], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
+                    main_menu_hide(true);
+                    main_menu_destroy();
+                    gsound_background_stop();
+
+                    // NOTE: Uninline.
+                    main_loadgame_new();
+
+                    loadColorTable("color.pal");
+                    palette_fade_to(cmap);
+
+                    int continueRc = LoadGameNewest();
+                    trace_event(TRACE_FLOW, "continue-rc", "rc=%d", continueRc); // STRIP with continue-diag
+                    if (continueRc > 0) {
+                        win_delete(win);
+                        win = -1;
+                        main_game_loop();
+                    }
+
+                    palette_fade_to(white_palette);
+                    if (win != -1) {
+                        win_delete(win);
+                    }
+
+                    // NOTE: Uninline.
+                    main_unload_new();
+
+                    // NOTE: Uninline.
+                    main_reset_system();
+
+                    if (main_show_death_scene != 0) {
+                        main_death_scene();
+                        main_show_death_scene = 0;
+                    }
+
+                    main_menu_create();
+
+                    // Nothing to resume (rc 0) or the load failed (-1): say so instead of
+                    // bouncing silently back to a menu that looks like the button did nothing.
+                    if (continueRc <= 0) {
+                        gsound_play_sfx_file("iisxxxx1");
+                    }
+                }
+                break;
             case MAIN_MENU_LOAD_GAME:
                 if (1) {
                     int win = win_add(0, 0, screenGetWidth(), screenGetHeight(), colorTable[0], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
@@ -621,6 +672,44 @@ static void main_selfrun_play()
 }
 
 // 0x472D90
+
+// --- Death-screen pad handling ---------------------------------------------
+//
+// The scene's own loop only breaks on a KEYBOARD key, so on a controller there was no way out of
+// it: "nefunguje skipnout death screen". A/B/START now count as that key.
+static bool main_death_pad_down = false;
+
+// ⚠️ PRIMED FROM THE LIVE PAD, never from false. Whatever you were holding when you died is very
+// likely still down as this screen opens, and a held button read as a fresh press would skip the
+// scene before it drew a frame. Same rule every screen that takes over A/B has needed.
+static void main_death_pad_prime()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    main_death_pad_down = pad != NULL
+        && (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0
+            || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0
+            || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0);
+}
+
+// Rising edge of A / B / START. Re-polls the controller every call, so a pad that wakes up late
+// still works (the main menu needed the same).
+static bool main_death_pad_skip()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        main_death_pad_down = false;
+        return false;
+    }
+
+    bool now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0
+        || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0
+        || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+
+    bool edge = now && !main_death_pad_down;
+    main_death_pad_down = now;
+    return edge;
+}
+
 static void main_death_scene()
 {
     // 0x4725B0
@@ -630,6 +719,15 @@ static void main_death_scene()
         "narrator\\nar_5",
         "narrator\\nar_6",
     };
+
+    // ⚠️ NO GAMEPLAY SHORTCUTS IN HERE. main_reset_system() has already run, so the game this
+    // screen sits on top of is torn down -- yet this loop pumps get_input(), which reaches the
+    // pad through the shared mouse hook. BACK opened the inventory over a reset dude and
+    // everything after that was wrong. self_nav also drops the A-as-left-click synthesis, so A
+    // cannot fire a world click at whatever the cursor happens to sit on.
+    gamepad_ui_set_no_session(true);
+    gamepad_ui_set_self_nav(true);
+    main_death_pad_prime();
 
     art_flush();
     cycle_disable();
@@ -701,6 +799,9 @@ static void main_death_scene()
                     sharedFpsLimiter.mark();
 
                     keyCode = get_input();
+                    if (keyCode == -1 && main_death_pad_skip()) {
+                        keyCode = KEY_ESCAPE; // any non -1 breaks; ESC is what the mouse path uses
+                    }
                     if (keyCode != -1) {
                         break;
                     }
@@ -745,6 +846,11 @@ static void main_death_scene()
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
     cycle_enable();
+
+    gamepad_ui_set_no_session(false);
+    // Cleared, not restored: the only thing that follows this screen is the title menu, which
+    // sets it again on entry. Same as main_menu_loop does on its way out.
+    gamepad_ui_set_self_nav(false);
 }
 
 // 0x472F68

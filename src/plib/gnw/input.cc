@@ -7,6 +7,8 @@
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
+#include "game/game_trace.h"
+#include "plib/gnw/crt_shader.h"
 #include "plib/gnw/dxinput.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
@@ -239,6 +241,20 @@ void GNW_add_input_buffer(int a1)
 {
     if (a1 == -1) {
         return;
+    }
+
+    // TEMP DIAG (2026-08-23): PRINT keeps firing on the character sheet and neither the click veto
+    // (0 hits) nor the editor main-loop key log (no 501) caught it -- so the code is reaching some
+    // OTHER loop. Button event codes are only unique within a window and several screens inject
+    // them through this one global queue, so log every injection WITH A BACKTRACE and let the
+    // sender name itself. Codes 500..560 only, which is the range the screens collide in.
+    // STRIP once the sender is known.
+    if (a1 >= 500 && a1 <= 560) {
+        int mx = 0;
+        int my = 0;
+        mouse_get_position(&mx, &my);
+        trace_event(TRACE_INPUT, "inject", "code=%d x=%d y=%d btn=%#x", a1, mx, my, mouse_get_buttons());
+        trace_backtrace("inject");
     }
 
     if (a1 == pause_key) {
@@ -498,16 +514,32 @@ static void buf_blit(unsigned char* src, unsigned int srcPitch, unsigned int a3,
 }
 
 // 0x4B3890
+// Where F12 drops its shots. Created on demand -- mkdir on an existing directory just
+// fails harmlessly, so there is nothing to check.
+//
+// ⚠️ What lands here is the frame BEFORE the CRT filter. dump_screen() re-runs the window
+// manager's blit into a private 8-bit buffer (see buf_blit above) and never touches the
+// SDL texture, so the shader in crt_shader.cc -- which runs later, on the GPU, at the
+// present -- is not in the picture. That is the engine's own design, not an oversight, and
+// it is usually what you want: a clean capture of what the game drew. To capture the
+// filtered image, grab the window with the OS instead.
+#define SCREENDUMP_DIR "screenshots"
+
 int default_screendump(int width, int height, unsigned char* data, unsigned char* palette)
 {
-    char fileName[16];
+    char fileName[COMPAT_MAX_PATH];
     FILE* stream;
     int index;
     unsigned int intValue;
     unsigned short shortValue;
 
+    // Bytes per stored row: BMP pads each one up to a multiple of 4.
+    const int stride = (width + 3) & ~3;
+
+    compat_mkdir(SCREENDUMP_DIR);
+
     for (index = 0; index < 100000; index++) {
-        snprintf(fileName, sizeof(fileName), "scr%.5d.bmp", index);
+        snprintf(fileName, sizeof(fileName), "%s\\scr%.5d.bmp", SCREENDUMP_DIR, index);
 
         stream = compat_fopen(fileName, "rb");
         if (stream == NULL) {
@@ -534,7 +566,7 @@ int default_screendump(int width, int height, unsigned char* data, unsigned char
     // 14 - sizeof(BITMAPFILEHEADER)
     // 40 - sizeof(BITMAPINFOHEADER)
     // 1024 - sizeof(RGBQUAD) * 256
-    intValue = width * height + 14 + 40 + 1024;
+    intValue = stride * height + 14 + 40 + 1024;
     fwrite(&intValue, sizeof(intValue), 1, stream);
 
     // bfReserved1
@@ -574,7 +606,7 @@ int default_screendump(int width, int height, unsigned char* data, unsigned char
     fwrite(&intValue, sizeof(intValue), 1, stream);
 
     // biSizeImage
-    intValue = 0;
+    intValue = stride * height;
     fwrite(&intValue, sizeof(intValue), 1, stream);
 
     // biXPelsPerMeter
@@ -605,13 +637,31 @@ int default_screendump(int width, int height, unsigned char* data, unsigned char
         fwrite(&rgbReserved, sizeof(rgbReserved), 1, stream);
     }
 
+    // ⚠️ BMP rows are padded to a 4-byte boundary. The original wrote `width` bytes flat,
+    // which is correct ONLY while the width happens to be a multiple of 4 -- and vanilla
+    // ran at 640x480, so it always was. At an internal width like 853 every row is short by
+    // three bytes and the whole image shears diagonally in any correct decoder.
     for (int y = height - 1; y >= 0; y--) {
         unsigned char* dataPtr = data + y * width;
         fwrite(dataPtr, 1, width, stream);
+
+        for (int pad = width; pad < stride; pad++) {
+            unsigned char zero = 0;
+            fwrite(&zero, sizeof(zero), 1, stream);
+        }
     }
 
     fflush(stream);
     fclose(stream);
+
+    // And ask the shader for the same frame as it actually reaches the screen. The file
+    // above is the game BEFORE the filter -- unavoidable, since dump_screen never touches
+    // the GPU -- which is the right capture for most purposes and the wrong one for judging
+    // how the CRT looks. So F12 now produces both, `_crt` being the filtered one. No-op
+    // when the filter is off.
+    char filteredName[COMPAT_MAX_PATH];
+    snprintf(filteredName, sizeof(filteredName), "%s\\scr%.5d_crt.bmp", SCREENDUMP_DIR, index);
+    crt_request_capture(filteredName);
 
     return 0;
 }

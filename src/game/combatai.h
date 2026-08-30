@@ -53,6 +53,9 @@ Object* ai_danger_source(Object* critter);
 // a civilian; see rt_guard_danger_source in combat_rt.cc.
 int combatai_aggression(Object* critter);
 Object* ai_search_inven(Object* critter, int check_action_points);
+// Ranks two weapons the way the turn-based AI does: RANGED beats THROW beats melee, ties broken
+// by item cost. NULL-tolerant, so it doubles as "is the candidate better than what is held?".
+Object* ai_best_weapon(Object* weapon1, Object* weapon2);
 void combat_ai_begin(int critters_count, Object** critters);
 void combat_ai_over();
 Object* combat_ai(Object* critter, Object* target);

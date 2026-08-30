@@ -258,6 +258,24 @@ int compat_remove(const char* path)
     return remove(nativePath);
 }
 
+// Last-modified time of `path`, as a plain seconds-since-epoch, or 0 when the file cannot be
+// stat-ed. Added for the main menu's CONTINUE, which has to answer "which save is newest" --
+// a question the SAVE HEADER cannot answer, because vanilla stores its timestamp as
+// `tm_hour + tm_min` (see GetTimeDate in loadsave.cc), which is neither monotonic nor dated.
+long long compat_file_mtime(const char* path)
+{
+    char nativePath[COMPAT_MAX_PATH];
+    strcpy(nativePath, path);
+    compat_windows_path_to_native(nativePath);
+    compat_resolve_path(nativePath);
+
+    struct stat st;
+    if (stat(nativePath, &st) != 0) {
+        return 0;
+    }
+    return (long long)st.st_mtime;
+}
+
 int compat_rename(const char* oldFileName, const char* newFileName)
 {
     char nativeOldFileName[COMPAT_MAX_PATH];

@@ -568,6 +568,9 @@ int dialog_out(const char* title, const char** body, int bodyLength, int x, int 
         message_exit(&messageList);
     }
 
+    // Tell every outer loop that keeps its own button edges that they are now stale -- the button
+    // that answered this box is very likely still down. See gamepad_ui_bump_input_epoch.
+    gamepad_ui_bump_input_epoch();
     return rc;
 }
 

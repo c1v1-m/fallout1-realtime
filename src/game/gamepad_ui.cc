@@ -6,6 +6,7 @@
 
 #include "game/actions.h"
 #include "game/anim.h"
+#include "game/critter.h"
 #include "game/art.h"
 #include "game/automap.h"
 #include "game/combat.h"
@@ -15,6 +16,7 @@
 #include "game/editor.h"
 #include "game/game_trace.h"
 #include "game/gdialog.h"
+#include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
 #include "game/interact_prompt.h"
@@ -51,8 +53,43 @@ namespace fallout {
 #define GPUI_AXIS_MAX 32767.0f
 #define GPUI_STICK_DEADZONE 0.2f
 #define GPUI_CURSOR_MAX_SPEED 14.0f // pixels per frame at full deflection
+// Both are cfg (`cursor_speed`, `cursor_deadzone`), read at gamepad_ui_init. Aiming precision is
+// pure feel and only shows up in play -- he reported the free cursor as "sometimes hard to hit what
+// I want". LOWER speed = finer control (the response is already squared, so small pushes are gentle;
+// what a high ceiling costs you is the last inch). Deadzone only sets where movement STARTS.
+static float gpui_cursor_max_speed = GPUI_CURSOR_MAX_SPEED;
+static float gpui_stick_deadzone = GPUI_STICK_DEADZONE;
 // Right trigger -> left click threshold (~0.5 of the 0..32767 trigger range).
 #define GPUI_TRIGGER_THRESHOLD 16000
+
+// ⚠️ A TRIGGER DRIVING A TAP/HOLD GESTURE NEEDS HYSTERESIS, AND A SINGLE THRESHOLD IS NOT IT.
+// GPUI_TRIGGER_THRESHOLD is one level with no gap, so an analog axis resting anywhere near it
+// DITHERS: a few counts of jitter either way produce a stream of phantom press/release edges.
+// For the click that was survivable -- the worst case is a flickering mouse button -- but for the
+// aimed shot it is fatal, because every phantom edge restamps lbDownTime and the 220 ms hold window
+// can then never elapse. That is the "aiming sometimes catches, sometimes not" report: the gesture
+// was not being ignored, its clock was being reset out from under it.
+//
+// The gap between the two levels IS the debounce; they must never be equal. The press level is also
+// lower than the click's 50% -- half a trigger pull is a lot to ask for "start aiming", and that
+// number was inherited from the click rather than chosen for this.
+#define GPUI_AIM_TRIGGER_PRESS 12000   // ~37% pull to engage
+#define GPUI_AIM_TRIGGER_RELEASE 6000  // ~18% pull to let go
+
+// Schmitt trigger over an analog axis: latches on above `press`, releases only below `release`.
+// `state` is the caller's own latch, so each gesture keeps its own and they cannot interfere.
+static bool gpui_trigger_held(SDL_GameController* pad, SDL_GameControllerAxis axis, bool* state)
+{
+    int v = SDL_GameControllerGetAxis(pad, axis);
+    if (*state) {
+        if (v < GPUI_AIM_TRIGGER_RELEASE) {
+            *state = false;
+        }
+    } else if (v > GPUI_AIM_TRIGGER_PRESS) {
+        *state = true;
+    }
+    return *state;
+}
 
 // Left-stick menu snapping tuning.
 #define GPUI_SNAP_AXIS_THRESHOLD 0.5f   // how far past center counts as a press
@@ -67,9 +104,27 @@ namespace fallout {
 // popup instead of the quick-action tap.
 #define GPUI_A_HOLD_MS 250
 
-// Aimed-shot (VATS) LB tap-vs-hold split: a press+release shorter than this fires an aimed shot at
+// Aimed-shot (VATS) LT tap-vs-hold split: a press+release shorter than this fires an aimed shot at
 // the last-used body part IMMEDIATELY (no wheel); holding past it opens the body-part wheel to pick.
 #define GPUI_AIM_TAP_MS 220
+
+// How long the stick has to REST on a new body part before the selection actually moves there.
+//
+// Without it the pick was recomputed every frame straight from the stick angle, so sweeping across
+// the body flickered through three or four parts on the way to the one you wanted, and any tremor
+// near a boundary bounced the selection between two neighbours. "chci head tak drzim a tocim a
+// utika mi to" -- the selection was not running away, it was tracking the stick far too eagerly.
+//
+// ⚠️ IT DELAYS THE COMMIT, NOT THE FEEDBACK. What you are pointing at is computed every frame as
+// before; only the ACT of changing the selection waits. Under the window the marker simply stays
+// where it was, so a sweep reads as "nothing happens until I settle", never as input lag on the
+// thing you are watching.
+#define GPUI_AIM_SETTLE_MS 130
+
+// Stick deflection needed to aim at all, as a fraction of full throw. Higher than the old 0.18
+// rest test: a thumb resting on the stick sits well above 0.18 on a worn pad, which meant the
+// picker was steering off noise the whole time the wheel was up.
+#define GPUI_AIM_STICK_MIN 0.35f
 
 // Quick-use wheel B tap-vs-hold split: hold B past this to bring up the drug wheel; a
 // shorter press stays the weapon's firing-mode cycle. Same window as the aimed-shot split
@@ -93,6 +148,10 @@ namespace fallout {
 // last enemy dies -- without this it would immediately loot the fresh corpse (or fire a
 // world interaction) mid-fight. The window absorbs that spam tail; then A loots normally.
 #define GPUI_POST_KILL_LOOT_MS 500
+// Window between two A presses for the DOUBLE TAP that loots the body you are standing on during a
+// fight. Short on purpose: a deliberate double tap is quick, while attacking taps are paced by the
+// weapon's rate of fire and land much further apart.
+#define GPUI_LOOT_DOUBLE_TAP_MS 300
 
 // How long the pointer stays visible after the last right-stick nudge before it hides
 // again. The stick keeps it fresh while held, then it fades out this long after release.
@@ -133,6 +192,42 @@ static bool gpui_quick_normal = false;
 // An engine hold-drag action popup (world/inventory) is mid-navigation.
 static bool gpui_action_popup_active = false;
 
+// ⚠️ "A NESTED MODAL JUST ATE PAD INPUT -- RE-PRIME YOUR EDGES."
+//
+// Bumped by dialog_out when its box closes. Any loop that keeps its OWN prevA/prevB (the load/save
+// slot list, Preferences, the character screens...) is frozen while such a box runs its own input
+// loop, so its edge state describes the world from BEFORE the box. The button the player pressed to
+// answer the box is usually still physically down when the outer loop resumes -- and reads as a
+// fresh press.
+//
+// That is exactly what ate his save: B answered "no, don't overwrite", the box closed, and the same
+// unreleased B rose-edged again in the slot list as ESCAPE, which closed the whole save screen.
+// From his side the Cancel button simply did not work and the menu vanished.
+//
+// Same family as the dialog's own dialog_pad_prime (a box opened by a held A answering itself) and
+// the self-nav click leak -- an edge tracker that stops being called does not stop being WRONG.
+static unsigned int gpui_input_epoch = 0;
+
+unsigned int gamepad_ui_input_epoch()
+{
+    return gpui_input_epoch;
+}
+
+void gamepad_ui_bump_input_epoch()
+{
+    gpui_input_epoch++;
+}
+
+// An A press whose interaction was held back because a use-on item is in hand, so the press might
+// still turn out to be a HOLD (which arms the use-item cursor instead). Set in gpui_action_buttons
+// on the press edge, resolved in gpui_useon_arm on the tick: armed -> dropped, released early ->
+// the interaction runs then. See the note at its use.
+static bool gpui_a_interact_deferred = false;
+
+// True while the ACTIVE HAND holds an item the engine can "use on" something (proto_action_can_use_on).
+static bool gpui_useon_item_in_hand();
+static bool gpui_targeting_cursor_armed();
+
 // A screen is running its OWN controller-driven navigation and reads the pad
 // directly in its own loop -- the main menu (highlight + A) and the load/save slot
 // list (left stick / D-pad step, A/B confirm/cancel). While set, the shared hook
@@ -147,6 +242,29 @@ static bool gpui_self_nav = false;
 // buttons and fights that stepping. Unlike gpui_self_nav, it must NOT disable the
 // A-router, since barter still relies on A to transfer the item under the cursor.
 static bool gpui_suppress_snap = false;
+
+// Set by a screen that handles A ITSELF (character editor, character selection). Those screens are
+// modal, so gamepad_ui_menu_active() is true and the A-router below would ALSO synthesise a left
+// click -- at whatever stale position the pointer was left at, which on the character sheet meant
+// A both spent a point AND pressed whatever the cursor happened to be sitting on. He caught it
+// hitting PRINT: "kurzor byl dole u zbranÃÂÃÂ­, a kdyÃÂÃÂ¾ jsem pÃÂÃÂidÃÂÃÂ¡val body, maÃÂÃÂkalo to PRINT".
+//
+// ⚠️ NARROWER THAN gpui_self_nav ON PURPOSE. self_nav also takes the right stick away from the
+// cursor, and these screens want it: it is how you reach PRINT / DONE / OPTIONS, which the pad
+// nav does not step through. Only the A CLICK is suppressed; RT stays the deliberate click.
+static bool gpui_suppress_a_click = false;
+
+bool gamepad_ui_a_click_suppressed()
+{
+    return gpui_suppress_a_click;
+}
+
+bool gamepad_ui_set_suppress_a_click(bool suppress)
+{
+    bool previous = gpui_suppress_a_click;
+    gpui_suppress_a_click = suppress;
+    return previous;
+}
 
 // Aim-picker cancel handshake. Declared up here rather than beside gpui_aim_body_on because the
 // B-button shortcut handler further down the file has to see the swallow flag: the press that
@@ -205,6 +323,20 @@ void gamepad_ui_set_action_popup_active(bool active)
 void gamepad_ui_set_self_nav(bool active)
 {
     gpui_self_nav = active;
+}
+
+
+// Set while a PRE-GAME modal screen with no live session is up -- currently the death scene.
+// Sibling of in_main_menu, and it exists for the identical reason: those screens run their own
+// get_input() loop, which reaches the pad through the shared mouse hook, so without a gate the
+// gameplay shortcuts fire into a game that has already been torn down. On the death screen that
+// meant BACK opened the inventory over a reset dude and everything after it was wrong
+// ("je mozne otevrit okno inventory a pak je cela hra nejak rozesrana").
+static bool gpui_no_session = false;
+
+void gamepad_ui_set_no_session(bool active)
+{
+    gpui_no_session = active;
 }
 
 void gamepad_ui_set_suppress_snap(bool active)
@@ -600,6 +732,38 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     prevA = aNow;
     prevRB = rbNow;
 
+    // ⚠️ A SCREEN JUST RAN ITS OWN INPUT LOOP -- our edges describe the world before it, so adopt
+    // the live pad state and emit NOTHING this frame.
+    //
+    // These statics outlive every modal screen. Confirm a level-up perk by holding A, and the same
+    // still-held A rose-edged HERE the moment the window closed: the dude walked over and started
+    // looting the corpse the hand icon happened to be sitting on. Every screen with its own loop
+    // has the same exit, which is why this is fixed once, here, rather than per screen.
+    //
+    // Same counter and the same reasoning as the load/save screen and the confirmation boxes
+    // (gamepad_ui_bump_input_epoch): entering or leaving a nested loop invalidates button edges.
+    static unsigned int lastEpoch = 0;
+    unsigned int epoch = gamepad_ui_input_epoch();
+    if (epoch != lastEpoch) {
+        lastEpoch = epoch;
+        gpui_a_interacting = false;
+        return;
+    }
+
+    // ⚠️ EDGES ARE TRACKED EVEN UNDER self_nav -- only the ACTIONS below are skipped, and
+    // that is why this returns HERE rather than the caller skipping the call.
+    //
+    // A screen that drives its own navigation reads A itself (options menu, Preferences,
+    // main menu, load/save). If this function were simply not called while such a screen is
+    // up, prevA would still hold whatever it held before it opened -- so the A that is still
+    // physically down when the screen closes reads as a FRESH press on the next frame and
+    // fires a world click. That is the "pressed DONE and immediately started talking to
+    // Ian" bug: the click landed on whoever the cursor happened to be over.
+    if (gpui_self_nav) {
+        gpui_a_interacting = false;
+        return;
+    }
+
     // While an inventory window is open, A is the quick-action/popup router
     // (gpui_inventory_a), not a raw left click -- so the generic A arbitration is
     // skipped and A never injects a plain left button here.
@@ -627,7 +791,22 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             //    without needing a lock just because a neutral bystander/item sits a few tiles off
             //    ("plain A doesn't fire when I'm not aiming"). A hostile enemy is never itself an
             //    interact target (ip_classify returns IP_NONE for it), so it never routes to talk.
-            gpui_a_interacting = gamepad_ui_menu_active()
+            // ⚠️ AN ARMED TARGETING CURSOR OWNS A OUTRIGHT, ahead of every other rule here. A skill
+            // armed from the L3 wheel (or the use-on crosshair from holding A) is aimed and then
+            // CONFIRMED with A, and that confirming press has to reach gmouse as a plain click --
+            // it is what runs action_use_skill_on. Without this it fell through to the normal
+            // arbitration and the interact prompt answered instead: standing at a locked cabinet
+            // with TRAPS armed, A took the container path and printed "It is locked." rather than
+            // using the skill ("chtÃÂÃÂl jsem dÃÂÃÂ¡t traps na skÃÂÃÂÃÂÃÂ­ÃÂÃÂ, ale byl jsem blÃÂÃÂ­zko skÃÂÃÂÃÂÃÂ­nÃÂÃÂ").
+            //
+            // Being CLOSE is what did it: interact_prompt_target_adjacent() below is exactly the
+            // override that lets an adjacent object beat a fight, so proximity handed A away. It
+            // also fixes the mirror case -- with a hostile in range and nothing adjacent, A would
+            // have ATTACKED instead of applying the armed skill.
+            bool targetingArmed = gpui_targeting_cursor_armed();
+
+            gpui_a_interacting = targetingArmed
+                || gamepad_ui_menu_active()
                 || dialog_active()
                 || (!combat_rt_has_lock()
                     && (!gpui_hostile_in_range_cached
@@ -656,18 +835,98 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             // interact_prompt_request() -- the "can't open a door with my gun out" bug. The cooldown
             // still guards CORPSE looting (its actual purpose: an A-spam tap the instant the last
             // enemy dies mustn't pop the fresh body), and the adjacent-corpse loot fallback.
+            // ⚠️ WITH A USE-ON ITEM IN HAND, A's MEANING CANNOT BE DECIDED ON THE PRESS EDGE.
+            //
+            // Holding A arms the use-item-on cursor (gpui_useon_arm), but this block fires the
+            // prompt's interaction the INSTANT A goes down -- so standing at the elevator with the
+            // rope in hand, the press rode the elevator before the hold was ever recognised ("the
+            // elevator is highlighted and the press-the-elevator action fills up"). Tap and hold
+            // have to be told apart first, so the interaction is DEFERRED to the release and only
+            // happens if the press never became a hold. Same shape as the B / X / Y tap-vs-hold
+            // splits; deferring costs the tap a few frames and nothing else.
+            //
+            // Only when a use-on item is actually held: with anything else A stays instant.
             bool interactNow = false;
-            if (gpui_a_interacting && !gamepad_ui_menu_active() && !dialog_active()) {
+            // ⚠️ NOT once the cursor is already ARMED. The rope is still in hand then, so this test
+            // stays true -- but that A is the CONFIRMING press and must reach gmouse as a plain
+            // click immediately. Deferring it would suppress the very click that applies the item.
+            bool deferForUseOn = gpui_useon_item_in_hand() && !targetingArmed;
+            if (targetingArmed) {
+                // Nothing to do here, and that is the point: fall through to the plain left click
+                // below. No interaction runs, so interactNow and aLooting both stay false and
+                // nothing swallows the press.
+            } else if (deferForUseOn) {
+                gpui_a_interact_deferred = true;
+            } else if (gpui_a_interacting && !gamepad_ui_menu_active() && !dialog_active()) {
                 if (interact_prompt_target() != NULL && !interact_prompt_offering_corpse()) {
                     interactNow = interact_prompt_request();
                 } else if (!postKillCooldown) {
                     interactNow = interact_prompt_request() || combat_rt_try_world_loot();
                 }
             }
-            aLooting = gpui_a_interacting
+            // A deferred press must not drop through as a world walk-click either.
+            interactNow = interactNow || deferForUseOn;
+            // ⚠️ SWALLOW THE PRESS ONLY IF SOMETHING ACTUALLY HAPPENED, or if this is the genuine
+            // post-kill moment. It used to swallow on `postKillCooldown` alone -- and that flag is
+            // TRUE FOR THE WHOLE FIGHT, because its anchor is refreshed every frame a hostile sits
+            // within weapon range, which a drawn gun makes true across the entire screen. So
+            // standing next to a corpse mid-fight, A did NOTHING AT ALL: the loot was refused by
+            // the cooldown and the attack was eaten by this line.
+            //
+            // The guard's real job is the instant the LAST enemy dies -- an A still being mashed
+            // must not pop the fresh body. That moment is "cooldown running AND nothing left to
+            // fight", which is exactly what this now tests. While enemies are still up, an
+            // unhandled A falls through and attacks, like it always should have.
+            bool freshKillGuard = postKillCooldown
+                && !gpui_hostile_in_range_cached
+                && !combat_rt_has_lock();
+
+            aLooting = !targetingArmed
+                && gpui_a_interacting
                 && !gamepad_ui_menu_active()
                 && !dialog_active()
-                && (postKillCooldown || interactNow);
+                && (freshKillGuard || interactNow);
+        }
+        // HOLD A TO LOOT A BODY YOU ARE STANDING ON, mid-fight, gun out. His idea, and the reason
+        // it costs nothing here: the TAP is not deferred at all. The attack still fires on the
+        // press edge exactly as before -- this only watches whether the finger STAYS down, and
+        // acts later. No hold threshold is ever added to the time it takes to shoot.
+        //
+        // ⚠️ Adjacency alone could not do this job. Letting a neighbouring corpse flip A to
+        // "interact" would take attacking away precisely when you need it: kill one enemy in
+        // melee, you are standing on it, and every A meant for the NEXT enemy would open the body
+        // instead. The hold says "I mean the corpse" without ever making a tap ambiguous.
+        //
+        // Deliberately narrow: only a CORPSE, only an ADJACENT one, only once per press.
+        // DOUBLE-TAP A TO LOOT the body you are standing on, mid-fight, gun out.
+        //
+        // ⚠️ It is a double tap and not a HOLD because holding A is SUSTAINED FIRE: the attack
+        // intent is re-armed every frame the button is down (combat_rt.cc, `if (attack && ...)`,
+        // not edge-gated). A hold-to-loot therefore stole the trigger from anyone standing next to
+        // a body -- and stepping off the body is not free either, walking costs AP.
+        //
+        // ⚠️ And it is gated on the attack cooldown, because MASHING A is a real way people fight
+        // and it produces double taps on its own. While the dude is inside his own rate-of-fire
+        // cooldown he is shooting, so the taps mean shoot. The gesture only lands in a lull --
+        // nothing in range, target already dead, weapon between shots -- which is exactly when a
+        // player would reach for the corpse.
+        static unsigned int aLastTapAt = 0;
+        static bool aTapLooted = false;
+        if (aEdge) {
+            unsigned int now = get_time();
+            bool second = now - aLastTapAt <= GPUI_LOOT_DOUBLE_TAP_MS;
+
+            if (second && !aTapLooted
+                && !gpui_targeting_cursor_armed()
+                && !gamepad_ui_menu_active()
+                && !dialog_active()
+                && !combat_rt_player_attack_busy()) {
+                aTapLooted = combat_rt_try_world_loot();
+            } else {
+                aTapLooted = false;
+            }
+
+            aLastTapAt = now;
         }
         if (!aNow) {
             gpui_a_interacting = false;
@@ -682,7 +941,10 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             bool worldClickAtHiddenCursor = gmouse_move_cursor_is_hidden()
                 && !gamepad_ui_menu_active()
                 && !dialog_active();
-            if (!worldClickAtHiddenCursor) {
+            // Edges above are updated either way -- only the CLICK is dropped. Skipping the
+            // whole router instead is what leaked a stale click into the world once (see the
+            // note at the top of this function).
+            if (!worldClickAtHiddenCursor && !gpui_suppress_a_click) {
                 *buttons |= MOUSE_STATE_LEFT_BUTTON_DOWN;
             }
         }
@@ -704,6 +966,9 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     // Inventory A router (no-op / self-resetting when no inventory is open).
     gpui_inventory_a(pad, buttons);
 
+    // NOT while a radial wheel owns the screen: RB pages the weapon wheel there, and letting the
+    // same press ALSO fire the engine's right-click would silently flip the world cursor's mode
+    // behind the wheel -- you would put the gun away and find yourself in the wrong cursor.
     // NOT while a radial wheel owns the screen: RB pages the weapon wheel there, and letting the
     // same press ALSO fire the engine's right-click would silently flip the world cursor's mode
     // behind the wheel -- you would put the gun away and find yourself in the wrong cursor.
@@ -750,6 +1015,15 @@ static void gpui_open_dpad_screen(int which)
 {
     gpui_in_dpad_screen = true;
     gpui_dpad_screen_open = which;
+
+    // ⚠️ Take the world prompt down BEFORE the screen paints. The floating hand and the target
+    // outline live in their own always-on-top window, and interact_prompt_tick -- the only thing
+    // that hides them -- does not run inside these screens' own input loops. So whatever the prompt
+    // was pointing at when you pressed the button stayed drawn over the Pip-Boy ("kdyÃÂÃÂ¾ jdu do menu,
+    // je vidÃÂÃÂt z in-game hry ruka"). The tick's own suppression list misses them too: it keys on
+    // win_get_top_modal, and the Pip-Boy and character sheet are WINDOW_MOVE_ON_TOP, not modal.
+    interact_prompt_reset();
+
     switch (which) {
     case GPUI_DPAD_PIPBOY:
         pipboy(false);
@@ -769,6 +1043,12 @@ static void gpui_open_dpad_screen(int which)
     }
     gpui_in_dpad_screen = false;
     gpui_dpad_screen_open = -1;
+
+    // ⚠️ The screen ran its own input loop and the button that CLOSED it is almost certainly still
+    // held. Invalidate every button edge the shared layer is holding, or that press rises again the
+    // instant we are back in the world -- which is how confirming a level-up perk with A had the
+    // dude immediately loot the corpse under the hand icon.
+    gamepad_ui_bump_input_epoch();
 }
 
 // BACK/SELECT toggles handle_inventory(), and while the inventory is open X/B
@@ -796,9 +1076,15 @@ static void gpui_open_dpad_screen(int which)
 // Declared here because the tap handler is compiled before the wheel that sets it.
 static bool gpui_quick_consumed_b = false;
 
+// LB + B = DEDICATED HEAL. Set on the B PRESS edge while LB is held; drained by
+// gamepad_ui_tick, which is the only place it is safe to actually use an item (the press is
+// read inside the mouse hook, and gpui_quick_use registers an animation). Same deferral the
+// wheels use -- see gpui_use_best_heal.
+static bool gpui_heal_pending = false;
+
 // The same arrangement for Y: a HOLD opens the weapon wheel (gpui_weapon_wheel), so the hand-swap
 // has to wait for the release. Set by ANYTHING that has already spent this Y press -- the wheel, or
-// an LT+Y quick save -- so the release doesn't also swap hands. (Testing "is LT still down?" at
+// an LB+Y quick save -- so the release doesn't also swap hands. (Testing "is LT still down?" at
 // release time is not enough: letting go of LT first would leak the swap through.)
 static bool gpui_weapon_consumed_y = false;
 
@@ -887,6 +1173,36 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     prevDown = downNow;
     prevLeft = leftNow;
 
+    // ⚠️ A SCREEN JUST RAN ITS OWN INPUT LOOP (inventory, pause menu, Pip-Boy, a confirmation
+    // box, load/save). Same counter and the same reasoning as gpui_action_buttons: these statics
+    // outlive every modal screen, so the edges derived above describe the world BEFORE it.
+    //
+    // ⚠️ STAMPING THE LIVE STATE IS NOT ENOUGH HERE, and that is the whole reason this needs its
+    // own block. B, X and Y act on the RELEASE edge (a hold opens their wheel), so the B that
+    // closed the inventory is still physically DOWN when we get here: prevB=true is correct, and
+    // its release then arrives as an ordinary bReleased whose bDownTime was taken INSIDE the
+    // inventory -- comfortably under the tap threshold -- so it cycled the weapon's firing mode
+    // ("when I close the inventory with B, my firing mode switches"). Mark every held release-edge
+    // button SPENT, exactly the way each wheel already marks the press that opened it.
+    //
+    // gpui_dpad_* is deliberately NOT reset: a direction held through a D-pad-opened screen must
+    // stay spent until it is genuinely released, or the screen reopens the instant it closes.
+    static unsigned int lastShortcutEpoch = 0;
+    unsigned int shortcutEpoch = gamepad_ui_input_epoch();
+    if (shortcutEpoch != lastShortcutEpoch) {
+        lastShortcutEpoch = shortcutEpoch;
+        if (bNow) {
+            gpui_quick_consumed_b = true;
+        }
+        if (xNow) {
+            gpui_ammo_consumed_x = true;
+        }
+        if (yNow) {
+            gpui_weapon_consumed_y = true;
+        }
+        return;
+    }
+
     // Every state below that RETURNS before the D-pad arbitration must also forget a hold in
     // progress, or the direction still held when (say) a conversation starts would look like a
     // fresh release once gameplay resumed and fire a phantom action-cycle. Mirrors the guards
@@ -896,7 +1212,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // hold that opened the Pip-Boy is still physically down while the Pip-Boy is up; forgetting it
     // would restart the timer the moment the screen closed and immediately reopen it. Keeping
     // gpui_dpad_handled set means that direction stays spent until it is genuinely released.
-    if (in_main_menu || (!gpui_in_dpad_screen
+    if (in_main_menu || gpui_no_session || (!gpui_in_dpad_screen
             && (inven_any_open() || options_is_open() || gamepad_ui_menu_active()
                 || dialog_active() || !intface_is_enabled() || gpui_action_popup_active))) {
         gpui_dpad_forget();
@@ -909,7 +1225,10 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // catch this because intface can still read enabled after returning from a game, and the title
     // window is not modal (so gamepad_ui_menu_active() is false too). Edges are tracked above, so a
     // button still held when gameplay actually starts is not misread as a fresh press.
-    if (in_main_menu) {
+    // gpui_no_session covers the death scene, which is the same situation one screen later:
+    // main_reset_system() has already run by then, so anything these shortcuts open would be
+    // operating on a torn-down game.
+    if (in_main_menu || gpui_no_session) {
         return;
     }
 
@@ -924,8 +1243,13 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // deliberately do nothing -- these screens run nested modal loops, so switching between them
     // would stack rather than swap.
     if (gpui_in_dpad_screen) {
+        // Pressing the direction that OPENED the screen closes it again -- a toggle, which is the
+        // right feel for a screen you only look at.
+        //
+        // ⚠️ NOT THE CHARACTER SHEET. That one grew real navigation, where Down means "next row",
+        // so the toggle was eating the most-used direction on the screen: every step down the skill
+        // list also closed it. B / BACK still back out of it, like everywhere else.
         bool sameDirection = (gpui_dpad_screen_open == GPUI_DPAD_PIPBOY && upPressed)
-            || (gpui_dpad_screen_open == GPUI_DPAD_CHAR && downPressed)
             || (gpui_dpad_screen_open == GPUI_DPAD_AUTOMAP && leftPressed);
         if (bPressed || backPressed || sameDirection) {
             GNW_add_input_buffer(KEY_ESCAPE);
@@ -981,7 +1305,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
 
     // BACK/START open inventory/options directly on press. (They used to be deferred to
     // release so a BACK+START quick-save combo could pre-empt them, but that combo collided
-    // with Steam Big Picture / Xbox Game Bar grabbing BACK -- quick save now lives on LT+Y.)
+    // with Steam Big Picture / Xbox Game Bar grabbing BACK -- quick save now lives on LB+Y.)
     if (backPressed) {
         gsound_play_sfx_file("ib1p1xx1");
         handle_inventory();
@@ -1073,19 +1397,51 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         }
     }
 
-    // Quick save = hold LT (left trigger) + press Y (emulator-style). LT is otherwise
-    // unused in gameplay and -- unlike BACK/START -- is not intercepted by Steam/Xbox
-    // overlays. The LT modifier suppresses Y's normal weapon swap for that press.
-    bool ltNow = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > GPUI_TRIGGER_THRESHOLD;
+    // Quick save = hold RB + press Y (emulator-style). The modifier suppresses Y's normal weapon
+    // swap for that press.
+    //
+    // ⚠️ IT SHARES A BUTTON WITH RUN, AND THAT IS A DELIBERATE ACCEPTED COST. The modifier used to
+    // live on LT precisely because LT was "otherwise unused in gameplay"; after the LB/LT swap the
+    // modifier follows RUN, which is the most-HELD button on the pad. So Y pressed while running
+    // quick-saves instead of swapping weapons, and B while running heals instead of cycling firing
+    // mode. That is the trade the layout makes -- there is no unused shoulder left to move it to.
+    // Still named ltNow because every guard that reads it means "the combo key is down".
+    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
 
-    // Quick save stays on the PRESS edge -- the LT modifier already makes the gesture unambiguous
-    // (the weapon wheel refuses to open while LT is held), so there is nothing to disambiguate and
+    // DIAG (LB+B / LB+Y "nefunguje", 2026-08-29). One line per B or Y PRESS with the modifier state
+    // at that instant, which is the single fact that separates the two possible answers and that no
+    // amount of reading the source can settle: either the modifier was genuinely not down when the
+    // button went in (a gesture question), or it WAS down and the combo still did not fire (a code
+    // question). The button trace alone cannot say -- it timestamps LB and B independently, and an
+    // overlap of a few frames is not reliably visible when the coalescer merges runs.
+    //
+    // ⚠️ STRIP THIS once the answer is known. Press edges only, so it costs two lines per gesture.
+    if (bPressed || yPressed) {
+        trace_event(TRACE_INPUT, "combo", "btn=%s mod=%d", bPressed ? "B" : "Y", ltNow ? 1 : 0);
+    }
+
+    // Quick save stays on the PRESS edge -- the modifier already makes the gesture unambiguous
+    // (the weapon wheel refuses to open while it is held), so there is nothing to disambiguate and
     // no reason to make a save wait for the release. Mark the press spent so the release below
     // doesn't also swap hands.
     if (yPressed && ltNow) {
         gsound_play_sfx_file("ib1p1xx1");
         gpui_weapon_consumed_y = true;
         QuickSaveGame();
+    }
+
+    // LB + B = HEAL NOW. Same shape and the same reasoning as the quick save above: the LB
+    // modifier makes the gesture unambiguous -- gpui_quick_wheel now refuses to open while LT is
+    // held, the same guard the weapon wheel already had -- so this sits on the PRESS edge
+    // and marks the press spent so the release below neither cycles the firing mode nor cancels
+    // a bound action. Wanted as a dedicated button because reaching for the wheel mid-fight is
+    // exactly when you cannot afford to.
+    //
+    // ⚠️ DEFERRED, not done here. This runs inside the mouse hook; gpui_quick_use registers an
+    // animation and destroys an object, which belongs in the per-frame safe tick with the wheels.
+    if (bPressed && ltNow) {
+        gpui_quick_consumed_b = true;
+        gpui_heal_pending = true;
     }
 
     // X is TAP-vs-HOLD like B and Y: a hold opens the ammo wheel (gpui_ammo_wheel), so the plain
@@ -1132,6 +1488,19 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
             // the firing-mode cycle it normally does is meaningless while a skill cursor is up.
             gsound_play_sfx_file("ib1p1xx1");
             gpui_cancel_skill_cursor();
+        } else if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
+            // Same idea for the use-item-on cursor that holding A arms: B is the way out, and the
+            // firing-mode cycle is meaningless while it is up.
+            gsound_play_sfx_file("ib1p1xx1");
+            gmouse_set_cursor(MOUSE_CURSOR_NONE);
+            gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
+        } else if (combat_rt_cancel_player_action()) {
+            // STOP. A on something across the room registers a walk-there-then-act sequence, and
+            // until now nothing could call it off -- "I clicked A and the character walked far, I
+            // wanted to cancel and couldn't". B is already "back out of this" everywhere else on
+            // the pad, so it is the one that gets it. Only swallows the firing-mode cycle when
+            // there really was something to stop, so a B tap while standing still still cycles.
+            gsound_play_sfx_file("ib1p1xx1");
         } else if (get_time() - bDownTime < GPUI_QUICK_HOLD_MS) {
             // Cycle the active weapon's firing mode, mirroring the keyboard 'N'. B's inventory
             // role (equip right hand) is handled in the inven_is_open() branch above, so this is
@@ -1314,6 +1683,57 @@ static void gpui_icon_from_pid(RadialSegment* segs, int index, int pid)
     }
 }
 
+// UNLOAD gets a DRAWN glyph, not an item picture: a single stroke running from the top left down
+// to the bottom right. It used to borrow the art of whatever ammo was in the gun, which made it
+// look exactly like the reload entries sitting next to it -- the one cell on the wheel that does
+// the opposite of its neighbours was the one that looked most like them.
+//
+// Built once into a static buffer and handed over as a plain indexed bitmap, the same thing
+// art_lock hands back. Index 0 is transparent to the wheel's blitter, so only the stroke shows,
+// and there is nothing to unlock afterwards.
+#define GPUI_UNLOAD_ICON_W 56
+#define GPUI_UNLOAD_ICON_H 40
+
+static unsigned char gpui_unload_icon[GPUI_UNLOAD_ICON_W * GPUI_UNLOAD_ICON_H];
+static bool gpui_unload_icon_built = false;
+
+static void gpui_icon_unload_glyph(RadialSegment* segs, int index)
+{
+    if (index < 0 || index >= RADIAL_WHEEL_MAX) {
+        return;
+    }
+
+    if (!gpui_unload_icon_built) {
+        memset(gpui_unload_icon, 0, sizeof(gpui_unload_icon));
+
+        // Straight line, corner to corner, inset so the stroke never touches the cell box the
+        // wheel draws around it. Walked along x with y interpolated, then thickened vertically --
+        // the slope here is shallower than 1, so stepping x leaves no gaps.
+        const int x0 = 6;
+        const int y0 = 7;
+        const int x1 = GPUI_UNLOAD_ICON_W - 7;
+        const int y1 = GPUI_UNLOAD_ICON_H - 8;
+        const int thickness = 3;
+
+        unsigned char ink = colorTable[32767];
+        for (int x = x0; x <= x1; x++) {
+            int y = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            for (int t = 0; t < thickness; t++) {
+                int yy = y + t;
+                if (yy >= 0 && yy < GPUI_UNLOAD_ICON_H) {
+                    gpui_unload_icon[yy * GPUI_UNLOAD_ICON_W + x] = ink;
+                }
+            }
+        }
+
+        gpui_unload_icon_built = true;
+    }
+
+    segs[index].icon = gpui_unload_icon;
+    segs[index].iconWidth = GPUI_UNLOAD_ICON_W;
+    segs[index].iconHeight = GPUI_UNLOAD_ICON_H;
+}
+
 // Give segment `index` an interface FRM (the action-menu icon set: hand, eye, talk face...), used
 // at 1:1 -- those are already icon-sized. Same failure contract as gpui_icon_from_pid.
 static void gpui_icon_from_interface(RadialSegment* segs, int index, int frmId)
@@ -1494,6 +1914,23 @@ static bool gpui_skill_cursor_armed()
     return mode >= FIRST_GAME_MOUSE_MODE_SKILL && mode < GAME_MOUSE_MODE_COUNT;
 }
 
+// True while ANY armed targeting cursor is up: one of the seven skill cursors, or the use-item-on
+// crosshair that holding A arms from the active hand.
+//
+// ⚠️ THE RIGHT STICK MUST DRIVE THE CURSOR IN THESE MODES. The interact-prompt picker otherwise
+// claims the stick outright whenever two or more interactables are in reach ("the picker OWNS the
+// stick while it is available"), so arming a cursor and then pushing the stick just walked the
+// prompt's outline from object to object -- the user's report was that he armed the rope and then
+// "the stick doesn't move the cursor, it scouts what is around me". The gesture these modes exist
+// for is aim-then-click; without the cursor there is nothing to aim.
+//
+// This very likely also explains the long-open "do the seven skill cursors actually apply?" question
+// from the skill wheel: same stick, same picker, same silent theft.
+static bool gpui_targeting_cursor_armed()
+{
+    return gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR || gpui_skill_cursor_armed();
+}
+
 // Put the cursor back to plain MOVE and stop it re-arming. The explicit way out of a sticky skill.
 static void gpui_cancel_skill_cursor()
 {
@@ -1553,6 +1990,10 @@ enum {
     GPUI_WHEEL_AMMO,
 };
 static int gpui_wheel_owner = GPUI_WHEEL_NONE;
+
+
+// Set for one tick by gamepad_ui_tick when A goes down; read by every wheel as "select".
+static bool gpui_wheel_a_edge = false;
 
 // The eight body parts, clockwise from the top (head up, groin down, limbs on the sides).
 static const struct {
@@ -1685,7 +2126,7 @@ static void gpui_skill_wheel(SDL_GameController* pad)
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (l3Released) {
+        } else if (l3Released || gpui_wheel_a_edge) {
             int skill = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -1726,7 +2167,7 @@ static void gpui_skill_wheel(SDL_GameController* pad)
 //
 // ⚠️ THIS REPLACED A FIXED EIGHT-SLOT LIST, and the trade is deliberate. The fixed list bought
 // muscle memory (the same drug always on the same segment) at two prices the player hit in play:
-// it showed dead segments for drugs he had none of ("když držím B vidím i drogy které nemám"), and
+// it showed dead segments for drugs he had none of ("kdyÃÂÃÂ¾ drÃÂÃÂ¾ÃÂÃÂ­m B vidÃÂÃÂ­m i drogy kterÃÂÃÂ© nemÃÂÃÂ¡m"), and
 // it could never show a drug that wasn't one of its eight -- Rad-X, Jet, Healing Powder were
 // unreachable no matter how many you carried. The weapon wheel already made the opposite choice for
 // the same reason; this now matches it.
@@ -1813,6 +2254,92 @@ static void gpui_drug_detail(int pid, char* out, size_t size)
     }
 }
 
+// Rounds an ammo inventory entry really holds.
+//
+// ⚠️ A STACK OF AMMO IS NOT "N IDENTICAL BOXES". item_identical (item.cc:538) deliberately
+// blanks the round count before comparing, so boxes with DIFFERENT contents merge into one
+// entry -- and the surviving Object carries a single count that belongs to the box currently
+// being drawn from, not to all of them. item_w_reload takes rounds off exactly that one box.
+//
+// So `per * boxes` overcounts wildly, and it moves wrong: measured (trace_2026-08-26_201959),
+// 4 boxes of 24 read 96, then a reload that took TEN rounds left per=14, boxes=4 -> 56. Forty
+// rounds gone from the badge because the ten came off a figure that was then multiplied by four.
+//
+// The stack is really one partial box plus (boxes - 1) FULL ones, and a full one holds the
+// proto's own quantity. Same data, checked against the same trace: 24 + 3*24 = 96 before, and
+// 14 + 3*24 = 86 after -- exactly the ten that were spent.
+static int gpui_ammo_stack_rounds(Object* ammo, int boxes)
+{
+    if (ammo == NULL || boxes <= 0) {
+        return 0;
+    }
+
+    int per = item_w_curr_ammo(ammo);
+    if (boxes == 1) {
+        return per;
+    }
+
+    Proto* proto = NULL;
+    int full = 0;
+    if (proto_ptr(ammo->pid, &proto) != -1 && proto != NULL) {
+        full = proto->item.data.ammo.quantity; // rounds a fresh box of this proto holds
+    }
+    if (full <= 0) {
+        full = per; // unreadable proto: fall back to treating them as equally full
+    }
+
+    return per + (boxes - 1) * full;
+}
+
+// What one box of ammo actually DOES, for the second line of the AMMO wheel's hub. The weapon and
+// drug wheels have carried a detail line for a while and the ammo wheel had none -- it showed a
+// name and a round count, which tells you what you are holding but not why you would pick it.
+//
+// The three numbers that make ammo worth choosing in Fallout are the ones vanilla hides entirely:
+// AC modifier (how much of the target's armour class it ignores), DR modifier (same for damage
+// resistance) and the damage multiplier. Each part is printed only when it is not the neutral
+// value, so plain ball ammo gets a short line instead of a row of zeroes.
+static void gpui_ammo_detail(Object* ammo, char* out, size_t size)
+{
+    out[0] = '\0';
+    if (ammo == NULL) {
+        return;
+    }
+
+    Proto* proto = NULL;
+    if (proto_ptr(ammo->pid, &proto) == -1 || proto == NULL) {
+        return;
+    }
+
+    int ac = proto->item.data.ammo.armorClassModifier;
+    int dr = proto->item.data.ammo.damageResistanceModifier;
+    int mult = proto->item.data.ammo.damageMultiplier;
+    int div = proto->item.data.ammo.damageDivisor;
+
+    // A zero divisor is a broken proto, not a divide-by-zero waiting to happen.
+    if (div <= 0) {
+        div = 1;
+    }
+
+    size_t len = 0;
+    if (mult != div) {
+        // "x2" reads better than "2/1"; only a proto with a real fraction spends the extra chars.
+        if (div == 1) {
+            len += (size_t)snprintf(out + len, len < size ? size - len : 0, "dmg x%d", mult);
+        } else {
+            len += (size_t)snprintf(out + len, len < size ? size - len : 0, "dmg x%d/%d", mult, div);
+        }
+    }
+
+    if (ac != 0 && len < size) {
+        len += (size_t)snprintf(out + len, size - len, "%sAC %+d", len != 0 ? "  " : "", ac);
+    }
+
+    if (dr != 0 && len < size) {
+        snprintf(out + len, size - len, "%sDR %+d", len != 0 ? "  " : "", dr);
+    }
+}
+
 // "damage, what it eats, and how much of that I am carrying". The ammo count is the whole point of
 // the line: a gun's magazine is already on its badge, but whether there is a second magazine in
 // your pack is what actually decides which weapon you pull.
@@ -1845,8 +2372,7 @@ static void gpui_weapon_detail(Object* weapon, char* out, size_t size)
     for (int i = 0; i < inventory->length; i++) {
         Object* item = inventory->items[i].item;
         if (item != NULL && item->pid == ammoPid) {
-            int per = item_w_curr_ammo(item);
-            rounds += (per > 0 ? per : 1) * inventory->items[i].quantity;
+            rounds += gpui_ammo_stack_rounds(item, inventory->items[i].quantity);
         }
     }
 
@@ -1946,6 +2472,20 @@ static void gpui_open_quick_wheel()
 // so the player's quick-use and the AI's go through identical engine paths.
 static void gpui_quick_use(int pid)
 {
+    // ⚠️ COSTS 2 AP AND REFUSES WHEN YOU CANNOT PAY (2026-08-29). It used to charge only when
+    // the pool could afford it and never refuse -- "running dry should not be what stops you
+    // healing" -- and the player caught it: "přišlo mi že můžu stimpackovat, ikdyž nemám body".
+    // That exemption contradicted the rule he set for movement, where 0 AP MUST stop you (see
+    // the rejected ap_empty_walks): a free action on an empty pool is a free action either way.
+    //
+    // The test is FIRST because the charge below happens after the item has been consumed and
+    // destroyed -- refusing down there would eat the drug and heal nothing. Out of combat the
+    // pool sits at maximum, so this never bites outside a fight.
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
     Object* item = NULL;
     Inventory* inventory = &(obj_dude->data.inventory);
     for (int i = 0; i < inventory->length; i++) {
@@ -1974,21 +2514,79 @@ static void gpui_quick_use(int pid)
     // intended. NOTE: combatai follows a failed register_end() with combat_turn_run(); that
     // pumps the game loop and must never be called from this frame tick, so it is omitted --
     // a refused registration just means no animation plays.
-    register_begin(ANIMATION_REQUEST_RESERVED);
-    register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
-    register_end();
+    //
+    // ⚠️ NOT WHILE HE IS DOWN. ANIMATION_REQUEST_RESERVED means this registration does not ask
+    // permission -- it takes obj_dude off whatever he is currently playing. Fired during a
+    // knockdown that is the FALL, so the dude snapped upright into the drug-taking pose in the
+    // middle of going down: "mel bych padat, nicmene nepadam, slysim jen zvuk" (the knockdown SFX
+    // rides the attacker's sequence, so it still played). Traced 2026-08-29_165046 s=37-40 --
+    // anim 20 (falling) -> anim 11 (this) -> anim 14, and the standup pass then reported
+    // `fall=14`, i.e. it stood him up from a hit-react he should never have been in.
+    //
+    // The HEAL still happens -- it is already applied above and the AP is charged below. Only the
+    // cosmetic animation is skipped, which is a state this code path already supports (see the
+    // refused-registration note directly above). Making the drug itself fail here would be a
+    // silent balance change: being knocked down would start costing you the heal.
+    if (!critter_is_prone(obj_dude)) {
+        register_begin(ANIMATION_REQUEST_RESERVED);
+        register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
+        register_end();
+    }
 
     obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
     obj_destroy(item);
 
     intface_update_hit_points(true);
 
-    // Vanilla charges 2 AP for taking a drug. Charge the same from the realtime pool when
-    // it can be paid, but never REFUSE the use over it -- running dry should not be what
-    // stops you healing.
-    if (combat_rt_player_ap() >= 2) {
-        combat_rt_spend_ap(2);
+    // Vanilla charges 2 AP for taking a drug. Unconditional now: affordability was settled at
+    // the top of this function, before the item was spent.
+    combat_rt_spend_ap(2);
+}
+
+// What the dedicated heal button (LB+B) reaches for, best first. Fallout 1 has no other
+// injectable healing: FIRST_AID_KIT and DOCTORS_BAG are ITEM_TYPE_MISC used THROUGH a skill,
+// not through item_d_take_drug, so they are not candidates here.
+//
+// Plain Stimpack first on purpose. The Super heals more but does delayed damage, so spending
+// it while an ordinary one is in the pack would be a worse trade made on the player's behalf;
+// it is the FALLBACK, for when the ordinary ones have run out.
+static const int gpui_heal_order[] = {
+    PROTO_ID_STIMPACK,
+    PROTO_ID_SUPER_STIMPACK,
+};
+
+// The healing item LB+B would reach for NEXT, and how many of it are carried. ONE selection
+// rule for the button and for the interface-bar slot that advertises it -- if these two ever
+// disagreed, the bar would be showing you an item the button does not use.
+static Object* gpui_next_heal(int* count)
+{
+    *count = 0;
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int rank = 0; rank < (int)(sizeof(gpui_heal_order) / sizeof(gpui_heal_order[0])); rank++) {
+        for (int i = 0; i < inventory->length; i++) {
+            Object* item = inventory->items[i].item;
+            // The type test matters: gpui_quick_use refuses anything that is not a DRUG, so a
+            // pid match on some other item would burn the press and heal nothing.
+            if (item != NULL && item->pid == gpui_heal_order[rank]
+                && item_get_type(item) == ITEM_TYPE_DRUG) {
+                *count = inventory->items[i].quantity;
+                return item;
+            }
+        }
     }
+    return NULL;
+}
+
+// Uses the best healing item carried. Drained once per press from gamepad_ui_tick.
+static void gpui_use_best_heal()
+{
+    int count;
+    Object* item = gpui_next_heal(&count);
+    if (item == NULL) {
+        gsound_play_sfx_file("iisxxxx1"); // nothing to heal with: refuse audibly, never silently
+        return;
+    }
+    gpui_quick_use(item->pid);
 }
 
 // Drive from the per-frame safe tick (gamepad_ui_tick). Open once B has been held past the
@@ -2016,15 +2614,25 @@ static void gpui_quick_wheel(SDL_GameController* pad)
 
     // Don't bring up (or keep up) the wheel over a modal menu / inventory / a disabled
     // interface bar -- and not while the aimed-shot picker is up, where B means cancel.
+    // ⚠️ LB BLOCKS THIS WHEEL, exactly as it blocks the weapon wheel: LB+B is the dedicated heal,
+    // so while LT is held B is not ours at all. Without it the same hold both healed (on the
+    // press) and opened this wheel 220 ms later.
+    // ⚠️ THE MODIFIER GATES *OPENING* ONLY -- IT MUST NOT CLOSE A WHEEL THAT IS ALREADY UP.
+    // RB is the modifier now, and RB is also how you PAGE an open wheel. Folding it into `blocked`
+    // (which closes the overlay) would have meant that reaching for the next page shut the wheel
+    // instead of turning it. The two roles never actually collide: while the wheel is up the page
+    // step owns RB, and while it is down RB is free to be half of a shortcut.
+    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()
         || gpui_aim_picker_active();
+    bool blockedOpen = blocked || ltNow;
 
     if (radial_wheel_is_open()) {
         if (blocked) {
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (bReleased) {
+        } else if (bReleased || gpui_wheel_a_edge) {
             int pid = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -2046,7 +2654,7 @@ static void gpui_quick_wheel(SDL_GameController* pad)
         return;
     }
 
-    if (bNow && !bHandled && !blocked && get_time() - bDownTime >= GPUI_QUICK_HOLD_MS) {
+    if (bNow && !bHandled && !blockedOpen && get_time() - bDownTime >= GPUI_QUICK_HOLD_MS) {
         bHandled = true;
         gpui_open_quick_wheel();
         if (radial_wheel_is_open()) {
@@ -2062,7 +2670,7 @@ static void gpui_quick_wheel(SDL_GameController* pad)
 //
 // Y already means "weapon" (tap = swap hands), so a HOLD naturally means "which weapon" -- the
 // same tap-vs-hold split B got for quick-use, and for the same reason: no pad button is free.
-// LT+Y stays quick save; holding LT suppresses the wheel outright so the two gestures never race.
+// LB+Y stays quick save; holding LB suppresses the wheel outright so the two gestures never race.
 //
 // ⚠️ Unlike the drug wheel this list is BUILT FROM THE INVENTORY, not fixed. That breaks the
 // muscle-memory property the drug wheel was designed around -- but weapons ARE whatever you happen
@@ -2124,8 +2732,8 @@ static void gpui_open_weapon_wheel()
     // ⚠️ Showing every weapon OBJECT was inconsistent in a way that looked like a bug: Fallout
     // stacks identical items into a single inventory entry, so four identical 10mm Pistols are ONE
     // entry and appeared once, while two shotguns with different magazines are two entries and
-    // appeared twice. Same wheel, same inventory, two different rules -- "ukazuješ jen jednu pistol
-    // a mám 4 v inventory". Collapsing by proto makes it one rule.
+    // appeared twice. Same wheel, same inventory, two different rules -- "ukazujeÃÂÃÂ¡ jen jednu pistol
+    // a mÃÂÃÂ¡m 4 v inventory". Collapsing by proto makes it one rule.
     //
     // When a type has several distinct objects, keep the FULLEST one: the reason to distinguish
     // them at all was to grab the loaded gun rather than the empty one, and that survives here
@@ -2217,8 +2825,9 @@ static void gpui_open_weapon_wheel()
     gpui_icon_from_interface(segs, n, GPUI_UNARMED_ART_NUM);
     n++;
 
-    // Title carries the page number only when there IS more than one page, so the common case
-    // stays the plain word.
+    // The page number goes back in the title (shown in the hub while nothing is aimed at), and the
+    // BUTTONS go to the panel's outer corners, where they stay readable while you choose -- one
+    // column of hub text was too much to read at a glance.
     char title[32];
     if (gpui_weapon_pages > 1) {
         snprintf(title, sizeof(title), "WEAPONS %d/%d", gpui_weapon_page + 1, gpui_weapon_pages);
@@ -2229,6 +2838,12 @@ static void gpui_open_weapon_wheel()
     RadialWheelArt art;
     radial_wheel_open(segs, n, title,
         gpui_wheel_art_for_icons(&art, gpui_icons_held), -1, -1, false);
+
+    // LB on the far left, RB on the far right -- the way they sit on the pad. Only with something
+    // to page to.
+    if (gpui_weapon_pages > 1) {
+        radial_wheel_set_side_hints("LB", "RB");
+    }
 
     if (!radial_wheel_is_open()) {
         gpui_icons_release();
@@ -2287,7 +2902,6 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
     static unsigned int yDownTime = 0;
     static bool yHandled = false; // this hold already tried to open; don't retry every frame
 
-    static bool prevLB = false;
     static bool prevRB = false;
 
     bool yNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
@@ -2296,15 +2910,13 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
     prevY = yNow;
 
     // Page step for the open wheel, edge-triggered so one press is exactly one page.
-    bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    // ⚠️ RB ONLY -- LB USED TO PAGE BACKWARDS AND CANNOT ANY MORE. Since the 2026-08-29 swap LB
+    // is RUN, and every wheel is BLOCKED while it is held (it is the quick-save / heal modifier --
+    // see `blocked` below), so an LB press meant to page would have CLOSED the wheel instead.
+    // Nothing is lost: gpui_weapon_rebuild wraps the page index in BOTH directions, so RB alone
+    // still reaches every page, it just takes more presses to get to the last one.
     bool rbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
-    int pageStep = 0;
-    if (rbNow && !prevRB) {
-        pageStep = 1;
-    } else if (lbNow && !prevLB) {
-        pageStep = -1;
-    }
-    prevLB = lbNow;
+    int pageStep = (rbNow && !prevRB) ? 1 : 0;
     prevRB = rbNow;
 
     if (yEdge) {
@@ -2318,18 +2930,24 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
         return;
     }
 
-    // Same blocks as the quick-use wheel, plus LT: LT+Y is quick save, so while LT is held Y is
+    // Same blocks as the quick-use wheel, plus LB: LB+Y is quick save, so while LB is held Y is
     // not ours at all.
-    bool ltNow = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > GPUI_TRIGGER_THRESHOLD;
+    // ⚠️ THE MODIFIER GATES *OPENING* ONLY -- IT MUST NOT CLOSE A WHEEL THAT IS ALREADY UP.
+    // RB is the modifier now, and RB is also how you PAGE an open wheel. Folding it into `blocked`
+    // (which closes the overlay) would have meant that reaching for the next page shut the wheel
+    // instead of turning it. The two roles never actually collide: while the wheel is up the page
+    // step owns RB, and while it is down RB is free to be half of a shortcut.
+    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()
-        || gpui_aim_picker_active() || ltNow;
+        || gpui_aim_picker_active();
+    bool blockedOpen = blocked || ltNow;
 
     if (radial_wheel_is_open()) {
         if (blocked) {
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (yReleased) {
+        } else if (yReleased || gpui_wheel_a_edge) {
             int index = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -2363,7 +2981,7 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
         return;
     }
 
-    if (yNow && !yHandled && !blocked && get_time() - yDownTime >= GPUI_QUICK_HOLD_MS) {
+    if (yNow && !yHandled && !blockedOpen && get_time() - yDownTime >= GPUI_QUICK_HOLD_MS) {
         yHandled = true;
         gpui_open_weapon_wheel();
         if (radial_wheel_is_open()) {
@@ -2397,6 +3015,11 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
 static Object* gpui_ammo_slot[GPUI_AMMO_MAX];
 static int gpui_ammo_count = 0;
 
+// TOTAL rounds of each slot's proto across the whole pack -- every box, times every stack. The
+// slot Object above is only the one the reload will draw from; it is not what the player is
+// carrying, and showing its magazine as the count was the "wtf, that is not how much I have" bug.
+static int gpui_ammo_rounds[GPUI_AMMO_MAX];
+
 // The weapon the wheel was opened for, so a hand swap mid-hold cannot reload the wrong gun.
 static Object* gpui_ammo_weapon = NULL;
 
@@ -2425,14 +3048,30 @@ static void gpui_open_ammo_wheel()
             continue;
         }
 
+        // ⚠️ COUNT THE ROUNDS, NOT THE BOX YOU HAPPENED TO FIND FIRST. The badge used to show
+        // item_w_curr_ammo of this one Object, so a pack holding six full boxes and one with three
+        // rounds left announced whichever the inventory listed first -- "3" while you were carrying
+        // 123. Ammo also STACKS, so a single entry can be many boxes: rounds are per-box times the
+        // stack quantity, and every entry of the same proto adds into the same total. Same sum
+        // gpui_weapon_detail already prints for the gun's ammo line, for the same reason.
+        int rounds = gpui_ammo_stack_rounds(ammo, inventory->items[i].quantity);
+
+        // TEMP DIAG (2026-08-26, STRIP with ammo-count): kept until the corrected sum is confirmed
+        // in play. It prints the raw pieces, so a badge that is still wrong says which one lies.
+        trace_event(TRACE_INPUT, "ammo-count", "pid=%d per=%d boxes=%d rounds=%d | gun cur=%d max=%d",
+            ammo->pid, item_w_curr_ammo(ammo), inventory->items[i].quantity, rounds,
+            item_w_curr_ammo(weapon), item_w_max_ammo(weapon));
+
         bool dup = false;
         for (int j = 0; j < gpui_ammo_count; j++) {
             if (gpui_ammo_slot[j]->pid == ammo->pid) {
+                gpui_ammo_rounds[j] += rounds;
                 dup = true;
                 break;
             }
         }
         if (!dup) {
+            gpui_ammo_rounds[gpui_ammo_count] = rounds;
             gpui_ammo_slot[gpui_ammo_count++] = ammo;
         }
     }
@@ -2460,7 +3099,15 @@ static void gpui_open_ammo_wheel()
         segs[i].id = i;
         segs[i].label = object_name(ammo);
         segs[i].enabled = true;
-        segs[i].value = item_w_curr_ammo(ammo); // rounds left in this box
+        segs[i].value = gpui_ammo_rounds[i]; // every round of this type in the pack
+
+        // Same two extras the weapon and drug wheels carry: the stat line under the name, and
+        // Fallout's own prose for the item. Without them the ammo wheel was the only one that
+        // named a thing without ever saying what it does.
+        gpui_ammo_detail(ammo, gpui_detail_buf[i], sizeof(gpui_detail_buf[i]));
+        segs[i].detail = gpui_detail_buf[i][0] != '\0' ? gpui_detail_buf[i] : NULL;
+        segs[i].description = object_description(ammo);
+
         gpui_icon_from_pid(segs, i, ammo->pid);
     }
 
@@ -2471,9 +3118,7 @@ static void gpui_open_ammo_wheel()
         segs[slot].label = "Unload";
         segs[slot].enabled = true;
         segs[slot].value = item_w_curr_ammo(weapon); // rounds currently IN the gun
-        // Icon of the ammo that is loaded right now -- "take THIS back out" reads immediately,
-        // where a generic symbol would need learning.
-        gpui_icon_from_pid(segs, slot, item_w_ammo_pid(weapon));
+        gpui_icon_unload_glyph(segs, slot);
     }
 
     RadialWheelArt art;
@@ -2490,6 +3135,14 @@ static void gpui_open_ammo_wheel()
 // looped -- a weapon holding more rounds than one box's capacity would otherwise be half-emptied.
 static void gpui_ammo_unload()
 {
+    // ⚠️ AP FIRST, before anything moves. Both of these charge unconditionally at the bottom
+    // now, so an empty pool has to bounce here or it would go negative -- and refusing halfway
+    // would leave ammo half-moved. Same rule as the tap-X reload and gpui_quick_use.
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
     // Re-check: the wheel was open for a while and a hand swap could have moved the gun.
     Object* weapon = NULL;
     if (intface_get_current_item(&weapon) != 0 || weapon != gpui_ammo_weapon) {
@@ -2516,10 +3169,10 @@ static void gpui_ammo_unload()
     }
 
     // Same 2 AP a reload costs -- clearing the gun is the same handling, and making it free would
-    // hand you a cost-free way to stall in a firefight.
-    if (combat_rt_player_ap() >= 2) {
-        combat_rt_spend_ap(2);
-    }
+    // hand you a cost-free way to stall in a firefight. REFUSES when the pool cannot pay, matching
+    // the tap-X reload (which always did) and gpui_quick_use (which stopped being an exception on
+    // 2026-08-29). Checked before anything is moved, so a refusal leaves the gun untouched.
+    combat_rt_spend_ap(2);
     intface_update_items(true);
 }
 
@@ -2528,6 +3181,14 @@ static void gpui_ammo_unload()
 // "already full" refusal all behave exactly as vanilla.
 static void gpui_ammo_load(int index)
 {
+    // ⚠️ AP FIRST, before anything moves. Both of these charge unconditionally at the bottom
+    // now, so an empty pool has to bounce here or it would go negative -- and refusing halfway
+    // would leave ammo half-moved. Same rule as the tap-X reload and gpui_quick_use.
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
     if (index < 0 || index >= gpui_ammo_count || gpui_ammo_weapon == NULL) {
         return;
     }
@@ -2544,20 +3205,63 @@ static void gpui_ammo_load(int index)
     // Swapping to a DIFFERENT ammo type means dumping what is loaded first; vanilla's reload
     // refuses a mismatched type outright rather than mixing. item_w_reload handles the same-type
     // top-up; for a different type the engine drops the old rounds itself.
-    int rc = item_w_reload(weapon, ammo);
-    if (rc == 0) {
-        obj_destroy(ammo); // box fully consumed
+    // ⚠️ FILL THE GUN, DO NOT EMPTY ONE BOX. Vanilla's reload draws from exactly ONE box and stops
+    // (item.cc:1244) -- so a box worn down to 2 rounds put 2 in the chamber and made you reload
+    // again, and again, while 96 rounds sat in the pack. The partial box is not an edge case
+    // either: every reload leaves one, because the gun takes what it needs and the remainder stays
+    // behind. That is tolerable in an inventory screen where each reload is a deliberate click; on
+    // a wheel you open mid-fight it is the whole complaint.
+    //
+    // So: keep pulling from boxes of this same proto until the gun is FULL or the pack runs out.
+    // Still ONE action and one AP charge -- the player asked for a full magazine, not for n boxes.
+    int pid = ammo->pid;
+    bool any = false;
+
+    for (;;) {
+        int rc = item_w_reload(weapon, ammo);
+        if (rc == -1) {
+            break; // gun already full of this type, or this box will not go in
+        }
+
+        any = true;
+
+        if (rc != 0) {
+            break; // rounds left over in the box, which means the gun took all it could hold
+        }
+
+        // Box consumed. obj_destroy takes the Object with it, so the pointer dies here -- the next
+        // box has to be looked up again rather than stepped to.
+        obj_destroy(ammo);
+        ammo = NULL;
+
+        if (item_w_curr_ammo(weapon) >= item_w_max_ammo(weapon)) {
+            break;
+        }
+
+        int idx = -1;
+        for (;;) {
+            Object* next = inven_find_type(obj_dude, ITEM_TYPE_AMMO, &idx);
+            if (next == NULL) {
+                break;
+            }
+            if (next->pid == pid && item_w_can_reload(weapon, next)) {
+                ammo = next;
+                break;
+            }
+        }
+
+        if (ammo == NULL) {
+            break; // no more of this ammo -- a partly filled gun is the right outcome
+        }
     }
 
-    if (rc == -1) {
+    if (!any) {
         gsound_play_sfx_file("iisxxxx1"); // already full of this type
         return;
     }
 
-    // Vanilla charges 2 AP for a reload; mirror the tap-X path.
-    if (combat_rt_player_ap() >= 2) {
-        combat_rt_spend_ap(2);
-    }
+    // Vanilla charges 2 AP for a reload; mirror the tap-X path, refusal included.
+    combat_rt_spend_ap(2);
     intface_update_items(true);
 }
 
@@ -2590,7 +3294,7 @@ static void gpui_ammo_wheel(SDL_GameController* pad)
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (xReleased) {
+        } else if (xReleased || gpui_wheel_a_edge) {
             int index = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -2641,6 +3345,17 @@ static void gpui_ammo_wheel(SDL_GameController* pad)
 // (tile_refresh_rect), which is exactly how the engine erases its own transient drawing.
 static int gpui_aim_last_part = HIT_LOCATION_HEAD; // part a quick tap / release fires at
 static bool gpui_aim_body_on = false;              // on-body picker currently up
+
+// True from the instant the aim trigger goes down until it comes up -- i.e. the whole GESTURE,
+// not just the part of it where the picker is drawn.
+//
+// ⚠️ THE GAP BETWEEN THE TWO IS WHERE THE CURSOR WAS ESCAPING. The picker only appears after
+// GPUI_AIM_TAP_MS (220 ms) of holding, and the right-stick cursor was gated on gpui_aim_body_on
+// alone -- so for that fifth of a second the stick still drove the WORLD cursor. Anyone who starts
+// turning the stick as they pull the trigger, which is the natural way to do it, shoved the hex
+// cursor across the map first and then wondered why the body markers were not tracking: "objevi se
+// kurzor a hybu pak s kurzorem". Claiming the stick for the whole gesture closes it.
+static bool gpui_aim_gesture = false;
 
 // Forward-declared up with the quick-use wheel, which must not steal B while this is up.
 static bool gpui_aim_picker_active()
@@ -3670,8 +4385,8 @@ static int gpui_aimbody_classify(Object* target, int px, int py)
 // vertical parts disproportionately hard to reach.
 static int gpui_aimbody_pick(Object* target, float sx, float sy, int curLoc)
 {
-    if (sx * sx + sy * sy < 0.18f * 0.18f) {
-        return curLoc; // stick at rest: hold the selection
+    if (sx * sx + sy * sy < GPUI_AIM_STICK_MIN * GPUI_AIM_STICK_MIN) {
+        return curLoc; // stick at rest (or barely nudged): hold the selection
     }
     if (target == NULL || !gpui_aimbody_anchors_valid) {
         return curLoc;
@@ -3719,6 +4434,12 @@ static int gpui_aimbody_pick(Object* target, float sx, float sy, int curLoc)
 // here so the suppressed cursor can never be left hidden.
 static void gpui_aim_picker_close()
 {
+    // ⚠️ CLEARED BEFORE THE EARLY RETURN, NOT AFTER IT. The gesture flag is set as soon as the
+    // trigger goes down, which is long before the picker itself appears -- so "close the picker"
+    // is routinely called while gpui_aim_body_on is still false, and leaving the clear below that
+    // guard stranded the flag at true with nothing able to reset it.
+    gpui_aim_gesture = false;
+
     if (!gpui_aim_body_on) {
         return;
     }
@@ -3727,15 +4448,147 @@ static void gpui_aim_picker_close()
     gmouse_set_cursor_suppressed(false);
 }
 
-// LB tap/hold aimed shot. TAP (< GPUI_AIM_TAP_MS) fires instantly at the last-used part; HOLD brings
+// LT tap/hold aimed shot. TAP (< GPUI_AIM_TAP_MS) fires instantly at the last-used part; HOLD brings
 // up the on-body green markers (right stick selects), release fires the selected part -- or B
 // cancels, which is the only way out that does NOT spend the shot.
+// --- "USE THE THING IN MY HAND ON THAT" (hold A) ------------------------------------------------
+//
+// His design, and it turned out the engine already has the whole flow -- only the pad had no way in.
+//
+// Put the item in the active hand, HOLD A -> the use-on crosshair arms; aim; press A -> it is used
+// on whatever is under the cursor. Rope on the elevator, lockpick on a door, dynamite on a locker.
+//
+// Both halves are vanilla:
+//   * arming is `intface_use_item()` (intface.cc) -- the same call the USE button on the interface
+//     bar's item slot makes. For an item with `proto_action_can_use_on` it sets
+//     MOUSE_CURSOR_USE_CROSSHAIR + GAME_MOUSE_MODE_USE_CROSSHAIR and stops there.
+//   * applying is already wired: a left click in that mode goes to gmouse.cc:987, which reads the
+//     ACTIVE HAND item via intface_get_current_item and calls action_use_an_item_on_object -- the
+//     same function the action-ring backpack icon ends up in. That branch is already realtime-aware
+//     (it charges combat_rt's AP pool), so nothing new is needed for the second A at all.
+//
+// This is the same shape the skill wheel uses: arm an engine cursor mode, then let the player aim
+// and click with A. No new targeting code, no cached Object* to dangle.
+//
+// ⚠️ GATED ON THE HELD ITEM being use-on-able. With anything else in hand -- a gun, nothing, a
+// stimpak -- hold A keeps meaning exactly what it means today (the engine's hold-to-open action
+// ring), so no existing gesture is taken away. intface_use_item() is deliberately NOT called in
+// those cases: for a WEAPON it would flip the interface into attack/crosshair mode, which is not
+// what holding A should ever do.
+static bool gpui_useon_item_in_hand()
+{
+    Object* item = NULL;
+    if (intface_get_current_item(&item) == -1 || item == NULL) {
+        return false;
+    }
+
+    return proto_action_can_use_on(item->pid);
+}
+
+static void gpui_useon_arm(SDL_GameController* pad)
+{
+    static bool prevA = false;
+    static unsigned int aDownTime = 0;
+    static bool aHandled = false; // this hold already armed; don't retry every frame
+
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool aEdge = aNow && !prevA;
+    bool aReleased = !aNow && prevA;
+    prevA = aNow;
+
+    if (aEdge) {
+        aDownTime = get_time();
+        aHandled = false;
+    }
+
+    if (aReleased) {
+        // Let A click again. Held down, the press that armed the cursor must not ALSO reach the
+        // world -- otherwise the same hold arms the mode and immediately spends it on whatever the
+        // cursor happened to be over.
+        if (aHandled) {
+            gamepad_ui_set_suppress_a_click(false);
+        }
+
+        // The press never became a hold, so it was a TAP after all: run the interaction that
+        // gpui_action_buttons held back. interact_prompt_request only QUEUES the action (it is
+        // performed by interact_prompt_tick), so this is safe from the frame tick.
+        if (gpui_a_interact_deferred) {
+            gpui_a_interact_deferred = false;
+            if (!aHandled && !gamepad_ui_menu_active() && !dialog_active() && !inven_any_open()) {
+                interact_prompt_request();
+            }
+        }
+
+        aHandled = false;
+        return;
+    }
+
+    if (!aNow || aHandled) {
+        return;
+    }
+
+    // Nothing to arm from, or somewhere A means something else entirely.
+    if (radial_wheel_is_open() || gamepad_ui_menu_active() || dialog_active() || inven_any_open()
+        || !intface_is_enabled() || gpui_aim_picker_active() || gpui_self_nav) {
+        return;
+    }
+
+    // Already in a use-on cursor: a second hold would just re-arm it. Leave it be so the player can
+    // hold A while lining the shot up without the mode flickering.
+    if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        return;
+    }
+
+    if (get_time() - aDownTime < GPUI_QUICK_HOLD_MS) {
+        return;
+    }
+
+    if (!gpui_useon_item_in_hand()) {
+        return; // hold A keeps its normal meaning
+    }
+
+    aHandled = true;
+    // The press turned out to be a hold, so the interaction gpui_action_buttons deferred is
+    // cancelled outright -- arming REPLACES it, it does not follow it.
+    gpui_a_interact_deferred = false;
+    gamepad_ui_set_suppress_a_click(true);
+    gsound_play_sfx_file("ib1p1xx1");
+    intface_use_item();
+
+    // Show the cursor you just armed. It is also what makes the confirming A land at all: a world
+    // click at a HIDDEN cursor is dropped on purpose (gpui_action_buttons), so an armed crosshair
+    // nobody can see would refuse every press.
+    gpui_cursor_show_time = get_time();
+}
+
+// ⚠️ THE AIMED SHOT IS ON THE LEFT TRIGGER, NOT LB (swapped with RUN, 2026-08-29). The local names below
+// still read `lb*` on purpose: they are the tap/hold edge machinery, and renaming a dozen of them
+// buys nothing while making this diff unreadable against the history that explains the tap-vs-hold
+// split. Only the SOURCE of the press changed.
+//
+// LT is an ANALOG axis, not a button, so the read is a threshold rather than a boolean -- the one
+// real difference the swap introduced. Everything downstream (GPUI_AIM_TAP_MS, the B-cancel
+// handshake, gpui_aim_canceled) is untouched.
 static void gpui_aim_wheel(SDL_GameController* pad)
 {
     static bool prevLb = false;
     static bool prevB = false;
     static unsigned int lbDownTime = 0;
-    bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+
+    // Settle latch: which part the stick is currently ARGUING for, and since when. Statics rather
+    // than fields because the picker is a singleton -- one target, one selection, at a time.
+    static int aimPendPart = -1;
+    static unsigned int aimPendSince = 0;
+
+    // ⚠️ DEFAULTED FALSE HERE, BEFORE ANY EARLY RETURN, AND RE-ASSERTED LOWER DOWN.
+    // This function has seven early returns above the point where the flag used to be computed,
+    // so any of them left the previous frame's value standing. Stuck at true it claims the right
+    // stick permanently -- and because the guards that read it live in the MOUSE HOOK, which runs
+    // inside every modal loop, that killed the cursor everywhere: inventory, barter, dialogue.
+    // "joystick ani dpad vubec nereaguje". A per-frame flag must never depend on which branch ran.
+    gpui_aim_gesture = false;
+    static bool lbLatch = false;
+    bool lbNow = gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, &lbLatch);
     bool lbEdge = lbNow && !prevLb;
     bool lbReleased = !lbNow && prevLb;
     prevLb = lbNow;
@@ -3754,42 +4607,67 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     // inventory / disabled bar over the screen.
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_can_aim();
 
-    // Picker already up (LB held past the tap threshold): move the selection with the right stick and
+    // Picker already up (LT held past the tap threshold): move the selection with the right stick and
     // redraw the markers; on release fire the selected part. Blocked / target gone -> tear down.
     if (gpui_aim_body_on) {
+        // The picker owns the stick for as long as it is up; this branch returns before the
+        // assignment further down, so it has to say so itself.
+        gpui_aim_gesture = true;
         Object* target = combat_rt_aim_target();
         if (blocked || target == NULL) {
             gpui_aim_picker_close();
         } else if (bPressed) {
-            // CANCEL. Before this the picker had no exit but the shot: releasing LB always fired,
+            // CANCEL. Before this the picker had no exit but the shot: releasing LT always fired,
             // so bringing the markers up to LOOK at a target -- or changing your mind about the
             // part -- cost you an aimed attack. B is the cancel everywhere else in this UI.
             // gpui_aim_swallow_b keeps the same press from also cycling the weapon's firing mode
-            // in gpui_button_shortcuts, and gpui_aim_canceled eats the LB release still to come.
+            // in gpui_button_shortcuts, and gpui_aim_canceled eats the LT release still to come.
             gpui_aim_picker_close();
             gpui_aim_canceled = true;
             gpui_aim_swallow_b = true;
-        } else if (lbReleased) {
+        } else if (lbReleased || gpui_wheel_a_edge) {
             gpui_aim_picker_close();
             combat_rt_aimed_attack(gpui_aim_last_part);
         } else {
             float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / GPUI_AXIS_MAX;
             float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / GPUI_AXIS_MAX;
-            gpui_aim_last_part = gpui_aimbody_pick(target, x, y, gpui_aim_last_part);
+
+            // SETTLE BEFORE COMMITTING. want = what the stick points at right now; the selection
+            // only follows once that same answer has held for GPUI_AIM_SETTLE_MS. Sweeping past a
+            // part therefore costs nothing, and a boundary tremor cannot flip anything, because the
+            // timer restarts every time the candidate changes.
+            int want = gpui_aimbody_pick(target, x, y, gpui_aim_last_part);
+            if (want == gpui_aim_last_part) {
+                aimPendPart = want; // already there -- nothing pending
+            } else if (want != aimPendPart) {
+                aimPendPart = want;
+                aimPendSince = get_time();
+            } else if (get_time() - aimPendSince >= GPUI_AIM_SETTLE_MS) {
+                gpui_aim_last_part = want;
+            }
+
             gpui_aimbody_draw(target, gpui_aim_last_part);
         }
         return;
     }
 
-    // Picker not up yet -- TAP vs HOLD on LB:
+    // Picker not up yet -- TAP vs HOLD on LT:
     //  - TAP (press+release under GPUI_AIM_TAP_MS): fire immediately at the last-used part.
     //  - HOLD (past the threshold): bring up the on-body markers to pick a different part.
     if (lbEdge) {
         lbDownTime = get_time();
         gpui_aim_canceled = false; // a fresh press starts a fresh aim
     }
+
+    // The stick belongs to the aim for as long as the trigger is down and the aim is still live.
+    // Dropped the moment it is cancelled or refused, so a blocked trigger never holds the cursor
+    // hostage.
+    if (lbNow && !blocked && !gpui_aim_canceled) {
+        gpui_aim_gesture = true;
+    }
     if (lbNow && !blocked && !gpui_aim_canceled && get_time() - lbDownTime >= GPUI_AIM_TAP_MS) {
         gpui_aim_body_on = true;
+        aimPendPart = gpui_aim_last_part; // a fresh picker starts settled on what it shows
         // The crosshair art is a big red reticle painted over the middle of the body -- exactly
         // where the outline and label we are about to draw need to be readable.
         gmouse_set_cursor_suppressed(true);
@@ -3848,15 +4726,16 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     // Edge-triggered with a re-centre arm (same shape as rt_directional_lock): one push steps
     // exactly one object and a held stick does not spin through the room.
     bool ipPickTook = false;
-    if (!lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_self_nav
+    if (!lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_aim_gesture && !gpui_self_nav
         && !gamepad_ui_menu_active() && !dialog_active() && !inven_any_open()
+        && !gpui_targeting_cursor_armed()
         && interact_prompt_candidate_count() >= 2) {
         // ⚠️ THE PICKER OWNS THE STICK OUTRIGHT while it is available -- at EVERY deflection, not
         // just past the aim threshold. Claiming only the decisive band left every gentle push
         // falling through to the cursor path, which summons the red iso pointer for two full
-        // seconds ("stále vidím červený kurzor"). Same rule the enemy lock already follows: while
+        // seconds ("stÃÂÃÂ¡le vidÃÂÃÂ­m ÃÂÃÂervenÃÂÃÂ½ kurzor"). Same rule the enemy lock already follows: while
         // something is selected, the right stick selects, full stop.
-        ipPickTook = mag > GPUI_STICK_DEADZONE;
+        ipPickTook = mag > gpui_stick_deadzone;
 
         // CONTINUOUS, not edge-triggered: re-aimed every frame the stick is out, so circling the
         // stick sweeps the selection round with it. The arm/re-centre ratchet this replaced made
@@ -3874,12 +4753,39 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         }
     }
 
-    if (mag > GPUI_STICK_DEADZONE && !ipPickTook && !lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_self_nav) {
-        float t = (mag - GPUI_STICK_DEADZONE) / (1.0f - GPUI_STICK_DEADZONE);
+    // ⚠️ IN THE WORLD, THE RIGHT STICK DOES NOT DRIVE THE POINTER. It picks things -- enemies while
+    // locked, interactables otherwise -- and when there is nothing to pick it must do NOTHING.
+    //
+    // It used to fall through to this cursor path instead, which is how a push with no candidate
+    // around handed him the iso movement pointer: the stick started steering a walk-here cursor he
+    // never asked for, over the top of a game where walking is the LEFT stick's job. Pointing at
+    // empty ground is not a request to move there.
+    //
+    // Screens are the opposite case and keep it: the Pip-Boy, the character sheet, dialogue and the
+    // menus have no pad navigation of their own, so there the pointer IS the only way to reach a
+    // button. gpui_in_dpad_screen covers the ones that are not modal windows (the Pip-Boy and the
+    // char sheet are WINDOW_MOVE_ON_TOP, so the modal test alone misses them).
+    // ⚠️ EXCEPT WITH A TARGETING CURSOR ARMED, and that exception is not optional. Holding A with a
+    // use-on item (the ROPE, a lockpick, a skill from the L3 wheel) arms the engine's aim cursor,
+    // and that cursor is aimed with the POINTER -- there is no other way to say which object you
+    // mean. Suppressing the stick there took the rope's aiming away entirely: armed the cursor,
+    // then nothing moved ("chtÃÂÃÂl jsem pouÃÂÃÂ¾ÃÂÃÂ­t provaz, ale najednou right joystick nefungoval").
+    // The picker already stands aside for the same reason a few lines below.
+    bool inWorld = !gamepad_ui_menu_active()
+        && !in_main_menu
+        && !dialog_active()
+        && !inven_any_open()
+        && !gpui_in_dpad_screen
+        && !gpui_targeting_cursor_armed()
+        && select_window_id == -1
+        && intface_is_enabled();
+
+    if (mag > gpui_stick_deadzone && !inWorld && !ipPickTook && !lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_aim_gesture && !gpui_self_nav) {
+        float t = (mag - gpui_stick_deadzone) / (1.0f - gpui_stick_deadzone);
         if (t > 1.0f) {
             t = 1.0f;
         }
-        float speed = t * t * GPUI_CURSOR_MAX_SPEED;
+        float speed = t * t * gpui_cursor_max_speed;
         *dx += (int)(x / mag * speed);
         *dy += (int)(y / mag * speed);
 
@@ -3918,12 +4824,11 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     // mid-selection. (Both are driven from gamepad_ui_tick, not here.)
     if (!radial_wheel_is_open() && !gpui_aim_body_on) {
         // A/Y -> left mouse button (interact/attack arbitration) and left-stick
-        // navigation of hold-drag action popups. Suppressed under self_nav: a screen
-        // driving its own nav (main menu, options, load/save) reads A directly and must
-        // not also get a synthetic click.
-        if (!gpui_self_nav) {
-            gpui_action_buttons(pad, dx, dy, buttons);
-        }
+        // navigation of hold-drag action popups. Called UNCONDITIONALLY: it suppresses
+        // itself under self_nav, but only after updating its press edges -- see the note
+        // at the top of it for why skipping the call outright leaked a click into the
+        // world every time a self-nav screen was closed with A.
+        gpui_action_buttons(pad, dx, dy, buttons);
 
         // START/BACK shortcuts last: these may open a modal screen (and re-enter this
         // hook), so let this frame's cursor/click deltas resolve first. NOT gated on
@@ -3938,6 +4843,37 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         // through a file read is not, and nothing below this point reads from disk.
         gpui_in_mouse_hook = false;
         gpui_button_shortcuts(pad);
+    }
+
+    // ⚠️ HARD VETO, LAST WORD IN THE HOOK. Gating the individual emitters was not enough: on the
+    // character editor A kept pressing whatever GNW button the pointer sat on (PRINT, then DONE),
+    // three fixes deep, which means SOME path here sets the left button that I have not found by
+    // reading. So a screen that declares "A is mine" now gets the bit STRIPPED after everything
+    // has had its say, whoever set it.
+    //
+    // Scoped so it cannot cost anything else: only while A is actually held, and never while RT is
+    // -- RT is the deliberate click, and holding it must still work for the buttons the pad nav
+    // does not step through (PRINT / DONE / OPTIONS).
+    //
+    // The trace fires once per veto with a backtrace, so the emitter finally names itself.
+    if (gpui_suppress_a_click && (*buttons & MOUSE_STATE_LEFT_BUTTON_DOWN) != 0) {
+        // NOT conditioned on A being held. An emitter that sets the bit on the RELEASE frame, or
+        // one frame late off a latch, would walk straight through such a test -- and after three
+        // failed fixes I am not assuming anything about WHEN it is set. The deliberate click is the
+        // only one this screen is allowed to produce, so everything else goes.
+        bool rtHeldNow = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > GPUI_TRIGGER_THRESHOLD;
+        if (!rtHeldNow) {
+            *buttons &= ~MOUSE_STATE_LEFT_BUTTON_DOWN;
+            static unsigned int lastVetoLog = 0;
+            if (get_time() - lastVetoLog > 250) {
+                lastVetoLog = get_time();
+                int mx = 0;
+                int my = 0;
+                mouse_get_position(&mx, &my);
+                trace_event(TRACE_WARN, "a-click-vetoed", "x=%d y=%d", mx, my);
+                trace_backtrace("a-click-vetoed");
+            }
+        }
     }
 }
 
@@ -3987,6 +4923,26 @@ static void gpui_trace_buttons(SDL_GameController* pad)
             prev[b] = now;
         }
     }
+
+    // ⚠️ TRIGGERS ARE NOT BUTTONS AND WERE THEREFORE INVISIBLE. SDL_CONTROLLER_BUTTON_MAX does not
+    // cover the two axes, so every LT/RT press was missing from the log -- which is exactly why the
+    // "aiming sometimes catches" report could not be answered from a trace and had to be reasoned
+    // out of the source instead. Logged with the RAW axis value, not just up/down: a burst of edges
+    // whose values all sit near the threshold is the signature of dither, and that is unreadable
+    // from a boolean. Uses the same hysteresis as the gesture, so the log shows what it saw.
+    {
+        static bool prevTrig[2] = { false, false };
+        const SDL_GameControllerAxis axes[2] = { SDL_CONTROLLER_AXIS_TRIGGERLEFT, SDL_CONTROLLER_AXIS_TRIGGERRIGHT };
+        const char* names[2] = { "LT", "RT" };
+        for (int t = 0; t < 2; t++) {
+            bool was = prevTrig[t];
+            bool now = gpui_trigger_held(pad, axes[t], &prevTrig[t]);
+            if (now != was) {
+                trace_event(TRACE_INPUT, "trig", "%s %s raw=%d", names[t], now ? "down" : "up",
+                    SDL_GameControllerGetAxis(pad, axes[t]));
+            }
+        }
+    }
 }
 
 void gamepad_ui_tick()
@@ -4011,11 +4967,43 @@ void gamepad_ui_tick()
     // the query reads protos off disk and the hook can run from inside the engine's file I/O.
     gpui_hostile_in_range_cached = combat_rt_hostile_in_attack_range();
 
+    // A = SELECT for every radial wheel, sampled ONCE here so all five wheels share one edge.
+    // Sampled every tick whether or not a wheel is open, and that is the point: A doubles as the
+    // world attack/use button, so a press carried in from gameplay must already be counted as
+    // "down" by the time a wheel opens, or it would select on the wheel's first frame. Releasing
+    // the button that holds the wheel open still selects too -- A is the visible alternative, and
+    // it is the one the panel advertises (radial_wheel.cc, wheel_draw_hint).
+    {
+        static bool prevA = false;
+        bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+        gpui_wheel_a_edge = aNow && !prevA;
+        prevA = aNow;
+    }
+
+    // Keep the interface-bar heal slot in step with the pack. Polled rather than pushed: a
+    // stimpak can leave the inventory through looting, bartering, a script or a load, and this
+    // is the one place that sees all of them. intface_update_heal_slot is a no-op unless the
+    // item or the count actually changed.
+    {
+        int healCount;
+        Object* heal = gpui_next_heal(&healCount);
+        intface_update_heal_slot(heal, healCount);
+    }
+
+    // LB+B heal, drained before the wheels: it is a completed gesture, not an overlay, and
+    // doing it here keeps every item use on the same safe tick.
+    if (gpui_heal_pending) {
+        gpui_heal_pending = false;
+        gpui_use_best_heal();
+    }
+
     gpui_skill_wheel(pad);
     gpui_quick_wheel(pad);
     gpui_weapon_wheel(pad);
     gpui_ammo_wheel(pad);
     gpui_aim_wheel(pad);
+    gpui_useon_arm(pad);
+    gpui_wheel_a_edge = false; // consumed by whichever wheel was open
 
     // PAUSE THE WORLD WHILE A WHEEL IS UP. combat_rt freezes its own clock (see combat_rt_update),
     // but critter animations and scripts run off the engine's background processes, so without this
@@ -4080,6 +5068,26 @@ static bool gpui_hide_cursor_predicate()
 
 void gamepad_ui_init()
 {
+    // Cursor feel. Clamped so a bad cfg can't make the cursor immovable or uncontrollable, and the
+    // deadzone is capped well below 1 so there is always a usable band left above it.
+    double cursorSpeed = GPUI_CURSOR_MAX_SPEED;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CURSOR_SPEED_KEY, &cursorSpeed);
+    if (cursorSpeed < 1.0) {
+        cursorSpeed = 1.0;
+    } else if (cursorSpeed > 60.0) {
+        cursorSpeed = 60.0;
+    }
+    gpui_cursor_max_speed = (float)cursorSpeed;
+
+    double cursorDead = GPUI_STICK_DEADZONE;
+    config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CURSOR_DEADZONE_KEY, &cursorDead);
+    if (cursorDead < 0.0) {
+        cursorDead = 0.0;
+    } else if (cursorDead > 0.8) {
+        cursorDead = 0.8;
+    }
+    gpui_stick_deadzone = (float)cursorDead;
+
     // Keep delivering controller input when the window isn't focused. SDL gates
     // joystick/controller input on focus by default, so an overlay or a brief
     // focus blink mid-fight (Steam/Discord/Xbox Game Bar, a notification) would

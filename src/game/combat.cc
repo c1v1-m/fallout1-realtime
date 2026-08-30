@@ -3206,6 +3206,12 @@ static int attack_crit_failure(Attack* attack)
 
     if ((attack->attackerFlags & DAM_LOSE_TURN) != 0) {
         attack->attacker->data.critter.combat.ap = 0;
+
+        // ⚠️ ...and the pool that realtime ACTUALLY reads. combat.ap above is held pinned at max by
+        // combat_rt so movement stays free, so on its own this effect was a no-op and a critical
+        // failure cost nothing but the miss. No turns to lose here -- you lose the points instead
+        // and wait out the regen, which is the same tempo hit in the currency this model uses.
+        combat_rt_zero_ap(attack->attacker);
     }
 
     if ((attack->attackerFlags & DAM_LOSE_AMMO) != 0) {
@@ -4238,6 +4244,18 @@ bool combat_commit_pending_attack()
     // while a realtime fight is live (see intface_hp_roll_tick) and only uses the blocking
     // one outside combat, where nothing is moving anyway.
     apply_damage(&main_ctd, true);
+
+    // Aggro the witnesses of a victim this hit KILLED. apply_damage's own
+    // combatai_notify_onlookers(defender) is inert in realtime (it iterates curr_crit_list, which
+    // only exists in turn-based combat), and combat_rt's replacement spread needs a LIVE seed
+    // hostile -- which an instantly-killed victim never becomes. Result: a one-shot kill was
+    // silent to the critter standing right next to it. Extras are included; a burst can kill a
+    // bystander outright and leave the same hole. No-op outside realtime, and a no-op whenever
+    // the victim survived (the spread owns that case).
+    combat_rt_notify_victim(main_ctd.attacker, main_ctd.defender);
+    for (int extraIndex = 0; extraIndex < main_ctd.extrasLength; extraIndex++) {
+        combat_rt_notify_victim(main_ctd.attacker, main_ctd.extras[extraIndex]);
+    }
 
     Object* attacker = main_ctd.attacker;
     if (attacker == obj_dude && combat_highlight == 2) {

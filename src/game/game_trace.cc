@@ -133,7 +133,37 @@ static void trace_flush_pending()
     trace_write_line(g_pend_cat, g_pend_sub, g_pend_msg, g_pend_count, g_pend_first_ms, g_pend_last_ms);
 }
 
+// --- AddressSanitizer defaults --------------------------------------------
+
+// Baked-in ASAN_OPTIONS for the sanitizer build. The runtime calls this at startup, so the
+// options hold NO MATTER HOW THE EXE IS LAUNCHED -- double-clicked, from a shortcut, from a
+// debugger -- instead of only through the launcher script that sets the env var.
+//
+// This is not a nicety, it is the difference between a report and silence: the game is a WIN32
+// GUI app, so ASan's stderr goes nowhere. Without log_path a detected error halts the process
+// with NO window, NO event-log entry and NO file -- the trace just stops mid-line and looks
+// exactly like a hard crash that ate its own black box. (Cost one play-test on 2026-08-27.)
+//
+// log_path stays RELATIVE on purpose: ASAN_OPTIONS is colon separated, so a "C:\..." value makes
+// the flag parser bail out ("expected '=' in ASAN_OPTIONS") and the process exits before main.
+// Relative means "next to the working directory", which for a double-clicked exe is its folder.
+#if defined(__SANITIZE_ADDRESS__)
+extern "C" __declspec(dllexport) const char* __asan_default_options()
+{
+    return "log_path=asan.log:halt_on_error=1:print_stacktrace=1:alloc_dealloc_mismatch=0:detect_stack_use_after_return=0";
+}
+#endif
+
 // --- Crash digest ---------------------------------------------------------
+
+// How many crash digests this session has written. Both the first-chance vectored handler and
+// the unhandled filter can fire for the SAME fault, and a first-chance fault that something else
+// legitimately handles must not be able to spam the log.
+static int g_crash_digests = 0;
+
+// Thread that called trace_init (i.e. the game loop). A crash on any OTHER thread -- the audio
+// mixer, an SDL worker -- means a completely different suspect list, so the digest says which.
+static unsigned long g_main_tid = 0;
 
 static void trace_write_digest_body()
 {
@@ -321,25 +351,76 @@ void trace_backtrace(const char* label)
     fflush(g_file);
 }
 
+// Faults worth a digest. Everything else a first-chance handler sees (C++ throws, debugger
+// breakpoints, OutputDebugString, driver-internal probes) is normal traffic and stays out.
+static bool trace_seh_is_fatal(DWORD code)
+{
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+    case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_STACK_OVERFLOW:
+        return true;
+    default:
+        return false;
+    }
+}
+
+// One fault -> one digest. `kind` says which handler caught it.
+//
+// ORDER MATTERS: the ring tail is written BEFORE the symbolic stack, because DbgHelp allocates
+// and can die itself when the fault IS memory corruption -- and the last 256 events are worth
+// more than the backtrace. Learned 2026-08-27 23:34: an ACCESS_VIOLATION inside ntdll's own
+// exception dispatch left the log with NO digest at all, because the unhandled filter never got
+// to run. Hence the vectored handler below, which runs first-chance, before that dispatch.
+static void trace_write_crash(const char* kind, EXCEPTION_POINTERS* ep)
+{
+    if (g_file == NULL || ep == NULL || ep->ExceptionRecord == NULL) {
+        return;
+    }
+
+    if (g_crash_digests >= 3) {
+        return;
+    }
+    g_crash_digests++;
+
+    trace_flush_pending();
+
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    fprintf(g_file, "=== CRASH (%s) ===\n", kind);
+    fprintf(g_file, "exception: %s @ 0x%llx\n", trace_seh_describe(er->ExceptionCode),
+        (unsigned long long)(uintptr_t)er->ExceptionAddress);
+    if ((er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || er->ExceptionCode == EXCEPTION_IN_PAGE_ERROR)
+        && er->NumberParameters >= 2) {
+        fprintf(g_file, "access: %s 0x%llx\n",
+            er->ExceptionInformation[0] == 0 ? "read" : (er->ExceptionInformation[0] == 1 ? "write" : "exec"),
+            (unsigned long long)er->ExceptionInformation[1]);
+    }
+    fprintf(g_file, "thread: %lu (game loop %lu)\n", GetCurrentThreadId(), g_main_tid);
+    fflush(g_file);
+
+    trace_write_digest_body();
+    trace_seh_stack(ep->ContextRecord);
+}
+
+// First-chance handler: runs at the moment of the fault, before Windows unwinds anything, so it
+// still reports when the unwinder itself walks into a smashed stack. It never handles anything --
+// the normal crash path (and any real handler) still runs.
+static LONG WINAPI trace_veh(EXCEPTION_POINTERS* ep)
+{
+    if (ep != NULL && ep->ExceptionRecord != NULL && trace_seh_is_fatal(ep->ExceptionRecord->ExceptionCode)) {
+        trace_write_crash("first-chance", ep);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static LONG WINAPI trace_seh_filter(EXCEPTION_POINTERS* ep)
 {
-    if (g_file != NULL && ep != NULL && ep->ExceptionRecord != NULL) {
-        trace_flush_pending();
-
-        EXCEPTION_RECORD* er = ep->ExceptionRecord;
-        fputs("=== CRASH ===\n", g_file);
-        fprintf(g_file, "exception: %s @ 0x%llx\n", trace_seh_describe(er->ExceptionCode),
-            (unsigned long long)(uintptr_t)er->ExceptionAddress);
-        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
-            fprintf(g_file, "access: %s 0x%llx\n",
-                er->ExceptionInformation[0] == 0 ? "read" : (er->ExceptionInformation[0] == 1 ? "write" : "exec"),
-                (unsigned long long)er->ExceptionInformation[1]);
-        }
-        fflush(g_file);
-
-        trace_seh_stack(ep->ContextRecord);
-        trace_write_digest_body();
-    }
+    trace_write_crash("unhandled", ep);
     // Let the normal crash path proceed (so any debugger / Windows error UI still runs).
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -347,6 +428,7 @@ static LONG WINAPI trace_seh_filter(EXCEPTION_POINTERS* ep)
 static void trace_posix_handler(int sig)
 {
     if (g_file != NULL) {
+        g_crash_digests++;
         trace_flush_pending();
         fputs("=== CRASH ===\n", g_file);
         fprintf(g_file, "signal: %d\n", sig);
@@ -360,6 +442,9 @@ static void trace_posix_handler(int sig)
 static void trace_install_crash_handlers()
 {
 #ifdef _WIN32
+    // First (the 1 = call before any previously registered vectored handler), so a fault is
+    // recorded even when exception dispatch dies before reaching the unhandled filter.
+    AddVectoredExceptionHandler(1, trace_veh);
     SetUnhandledExceptionFilter(trace_seh_filter);
 #else
     signal(SIGSEGV, trace_posix_handler);
@@ -405,6 +490,19 @@ void trace_init()
     }
 
     g_enabled = true;
+#ifdef _WIN32
+    g_main_tid = GetCurrentThreadId();
+
+    // Keep stack in RESERVE for the crash handler. A STACK_OVERFLOW otherwise leaves so little
+    // room that the digest's DbgHelp walk cannot run -- and that is precisely the crash where the
+    // frames matter most, because an overflow IS a runaway recursion and the repeating cycle in
+    // the backtrace names the culprit outright. Seen 2026-08-28: the digest came out, the stack
+    // did not. 256 KB is ample for StackWalk64 + SymFromAddr.
+    {
+        ULONG guarantee = 256 * 1024;
+        SetThreadStackGuarantee(&guarantee);
+    }
+#endif
     g_start_ms = (double)SDL_GetTicks();
     g_heartbeat_ms = 0.0;
 

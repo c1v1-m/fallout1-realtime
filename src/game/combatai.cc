@@ -52,7 +52,9 @@ static void ai_sort_list(Object** critterList, int length, Object* origin);
 static Object* ai_find_nearest_team(Object* critter, Object* other, int flags);
 static int ai_find_attackers(Object* critter, Object** a2, Object** a3, Object** a4);
 static Object* ai_have_ammo(Object* critter, Object* weapon);
-static Object* ai_best_weapon(Object* weapon1, Object* weapon2);
+// Exported (combatai.h) so realtime combat can ask vanilla's own question -- "is this weapon
+// an upgrade on the one in the hand?" -- instead of inventing a second ranking.
+Object* ai_best_weapon(Object* weapon1, Object* weapon2);
 static bool ai_can_use_weapon(Object* critter, Object* weapon, int hitMode);
 static Object* ai_search_environ(Object* critter, int itemType);
 static Object* ai_retrieve_object(Object* critter, Object* item);
@@ -659,7 +661,7 @@ static Object* ai_have_ammo(Object* critter, Object* weapon)
 }
 
 // 0x4251B0
-static Object* ai_best_weapon(Object* weapon1, Object* weapon2)
+Object* ai_best_weapon(Object* weapon1, Object* weapon2)
 {
     int attack_type1;
     int attack_type2;
