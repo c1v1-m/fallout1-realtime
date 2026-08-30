@@ -199,6 +199,8 @@ static int PrintAMList(int a1);
 static void PipArchives(int a1);
 static int ListArchive(int a1);
 static void ShowControls();
+static void ShowControls2();
+static void ShowControlsPage(const char* title, const PipboyControl* lines, int count);
 static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
 static void DrawAlarmText(int a1);
@@ -465,11 +467,11 @@ static const PipboyControl ctrl_lines[] = {
     { "Y", "Weapons" },
     { "L3", "Skills" },
     { NULL, NULL },
-    { NULL, "D-PAD - hold for a screen" },
+    { NULL, "D-PAD - HOLD each of these; a TAP cycles the action" },
     { "Up", "Pip-Boy" },
     { "Down", "Character sheet" },
     { "Left", "Automap" },
-    { "Right", "End combat" },
+    { "Right", "End combat (refused if enemies still want you)" },
     { "Tap", "Next action on the target" },
     { NULL, NULL },
     { NULL, "BARTER" },
@@ -487,9 +489,58 @@ static const PipboyControl ctrl_lines[] = {
     { "LB + Y", "Quick save" },
 };
 
+// SECOND CONTROLS PAGE. The first one is full: `bottom_line` is
+// PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / text_height() - 1, which at a 10px Pip-Boy font is 40 rows
+// against the 44 the world/combat table already wants -- it only fits today because the blank
+// separators get dropped (see `spacious`). Anything past that is piled onto the bottom line, so
+// the modal screens get their own archive entry instead of a longer page.
+//
+// ⚠️ A CONTROL THAT IS NOT WRITTEN DOWN DOES NOT EXIST. Barter's "even out with caps" and the
+// split-stack picker sat unused for weeks for exactly this reason, and the end-combat hold was
+// pressed once and never found again. Everything on this page was reachable and undocumented.
+static const PipboyControl ctrl2_lines[] = {
+    { NULL, "TALKING" },
+    { "Up / Down", "Pick a reply" },
+    { "A", "Say it" },
+    { "X", "Ask me about" },
+    { "Y", "Barter" },
+    { "B", "Leave" },
+    { NULL, NULL },
+    { NULL, "CHARACTER SHEET" },
+    { "Stick / D-pad", "Move the cursor" },
+    { "LB / RB", "Jump to the next column" },
+    { "A", "Spend a point" },
+    { "A (hold)", "Done" },
+    { "X", "Take a point back" },
+    { "Y", "Spend them all" },
+    { "B", "Cancel" },
+    { NULL, NULL },
+    { NULL, "INVENTORY AND LOOT" },
+    { "X", "Put it in the left hand" },
+    { "B", "Right hand (loot: close)" },
+    { "Y", "Take the whole stack" },
+    { "BACK", "Close" },
+    { NULL, NULL },
+    { NULL, "WORLD MAP" },
+    { "D-pad", "Pick where to go" },
+    { "A", "Travel, or enter this place" },
+    { NULL, NULL },
+    { NULL, "PREFERENCES" },
+    { "D-pad", "Move between settings" },
+    { "LB / RB", "Change the value" },
+    { "A", "Press the button" },
+    { "Y", "Done" },
+    { "B", "Cancel" },
+    { NULL, NULL },
+    { NULL, "ANYWHERE ELSE" },
+    { "A / B", "Yes / no in a prompt" },
+    { "A", "Skip the death scene" },
+};
+
 // Title of the CONTROLS page, and the archive entry that opens it -- one string so the list
 // and the page it leads to can never drift apart.
-static const char* ctrl_entry = "CONTROLS";
+static const char* ctrl_entry = "CONTROLS - WORLD";
+static const char* ctrl2_entry = "CONTROLS - SCREENS";
 
 // 0x662A70
 static Size ginfo[PIPBOY_FRM_COUNT];
@@ -1855,11 +1906,17 @@ static void PipArchives(int a1)
 
         ListArchive(a1);
 
-        // CONTROLS is the last entry of the list, and it is not a movie.
-        if (a1 == view_page) {
+        // The two CONTROLS pages are the last entries of the list, and neither is a movie.
+        // view_page is the line count ListArchive returned, so SCREENS sits at view_page and
+        // WORLD one line above it.
+        if (a1 == view_page || a1 == view_page - 1) {
             pause_for_tocks(200);
             NixHotLines();
-            ShowControls();
+            if (a1 == view_page) {
+                ShowControls2();
+            } else {
+                ShowControls();
+            }
             AddHotLines(0, 0, true);
             // ⚠️ Vanilla never sets this, so its own BACK button (the holodisk reader) leaks
             // one registered button per open. Ours is claimed properly, so NixHotLines takes
@@ -1948,6 +2005,16 @@ static int ListArchive(int a1)
     pip_print(ctrl_entry, 0, color);
     cursor_line++;
 
+    // ...and the screens page right behind it, so the two read as one pair in the list.
+    if (line++ == a1 - 1) {
+        color = colorTable[32747];
+    } else {
+        color = colorTable[992];
+    }
+
+    pip_print(ctrl2_entry, 0, color);
+    cursor_line++;
+
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
@@ -1985,6 +2052,17 @@ static void pip_ctrl_line(const char* button, const char* action, int color)
 // 0x000000 (not vanilla)
 static void ShowControls()
 {
+    ShowControlsPage(ctrl_entry, ctrl_lines, (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0])));
+}
+
+static void ShowControls2()
+{
+    ShowControlsPage(ctrl2_entry, ctrl2_lines, (int)(sizeof(ctrl2_lines) / sizeof(ctrl2_lines[0])));
+}
+
+// Both pages render through here: same layout, only the title and the table differ.
+static void ShowControlsPage(const char* title, const PipboyControl* lines, int count)
+{
     buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
         PIPBOY_WINDOW_CONTENT_VIEW_WIDTH,
         PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT,
@@ -1992,15 +2070,13 @@ static void ShowControls()
         scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
         PIPBOY_WINDOW_WIDTH);
 
-    int count = (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0]));
-
     // Where the second column starts: past the widest button label, never so far right that a
     // description would run out of the 350px text area. Measured rather than hardcoded so the
     // page survives a different font (the Pip-Boy font is a data file, not ours).
     ctrl_col = 0;
     for (int index = 0; index < count; index++) {
-        if (ctrl_lines[index].button != NULL) {
-            int width = text_width(ctrl_lines[index].button);
+        if (lines[index].button != NULL) {
+            int width = text_width(lines[index].button);
             if (width > ctrl_col) {
                 ctrl_col = width;
             }
@@ -2022,11 +2098,10 @@ static void ShowControls()
         cursor_line = 0;
     }
 
-    // CONTROLS
-    pip_print(ctrl_entry, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
+    pip_print(title, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
 
     for (int index = 0; index < count; index++) {
-        const PipboyControl* entry = &(ctrl_lines[index]);
+        const PipboyControl* entry = &(lines[index]);
 
         if (entry->button == NULL && entry->action == NULL) {
             if (spacious) {
