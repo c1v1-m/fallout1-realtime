@@ -1267,6 +1267,17 @@ static unsigned int gpui_reload_pending_since = 0;
 // the tick hands them back.
 static bool gpui_reload_charged = false;
 
+// KEYBOARD & MOUSE (2026-10-10). V, or a right-click on the enemy the mouse is aiming at, opens the
+// called-shot window the pad opens on R3. That window is modal, so the key only asks and the safe
+// tick opens it (gpui_drain_requests) -- the same deferral every item use here gets.
+static bool gpui_called_shot_pending = false;
+
+// When the player last moved the REAL mouse or pressed one of its buttons (see gpui_mouse_hook_impl).
+// The mouse only aims and attacks while it is actually being used: a pad player whose cursor merely
+// rests over a raider must not have the mouse layer claim that raider -- see gamepad_ui_mouse_in_use.
+static unsigned int gpui_real_mouse_time = 0;
+#define GPUI_MOUSE_IN_USE_MS 4000
+
 // NOTE: RB fired aimed shots until 2026-10-09 (a tap, then a held repeat). It is the HEAL now, set
 // through gpui_heal_pending above; the aimed shot is the weapon slot's AIMED mode, fired by RT.
 
@@ -1392,6 +1403,57 @@ static void gpui_dpad_forget()
 {
     gpui_dpad_held = -1;
     gpui_dpad_handled = false;
+}
+
+// THE RELOAD, for both LB (its release, gpui_button_shortcuts) and the keyboard's R. Why every way
+// it can say no is audible and traced is explained at the LB call.
+static void gpui_request_reload()
+{
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "reload-refused", "why=ap ap=%d", combat_rt_player_ap());
+    } else if (anim_get_reload_anim()) {
+        // MODS "Reload animation": the weapon's handling loop plays first and the magazine
+        // fills at its END (gpui_reload_anim_start). Asked here, done on the safe tick --
+        // it registers an animation, which the hook must never do. Refused NOW if there is
+        // nothing to load, so the buzz still answers the press it belongs to.
+        //
+        // A press while the reload is already running is NOT a new reload: it used to be
+        // read as "the body is only fidgeting", cut the loop and start it over -- so an
+        // impatient second tap made the reload take longer, and looked like it.
+        if (combat_rt_is_reloading(obj_dude)) {
+            // already on it
+        } else if (intface_can_reload_weapon()) {
+            gpui_reload_pending = true;
+            gpui_reload_pending_since = get_time();
+        } else {
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
+        }
+    } else if (intface_reload_weapon() == 0) {
+        combat_rt_spend_ap(2);
+        trace_event(TRACE_ACTION, "reload", "ap=%d", combat_rt_player_ap());
+    } else {
+        // intface_reload_weapon says no: no weapon in hand, it takes no ammo, there is
+        // none in the pack, or the magazine is already full. It does not tell us which,
+        // so neither do we -- but the player hears that nothing happened.
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
+    }
+}
+
+// THE FIRING MODE (single -> AIMED -> burst), for LT+Y and the keyboard's F. A weapon with nothing
+// to switch to buzzes.
+static void gpui_cycle_fire_mode(const char* src)
+{
+    bool can = intface_item_can_toggle_state();
+    if (can) {
+        gsound_play_sfx_file("ib1p1xx1");
+        intface_toggle_item_state();
+    } else {
+        gsound_play_sfx_file("iisxxxx1");
+    }
+    trace_event(TRACE_INPUT, "fire-mode", "src=%s ok=%d", src, can ? 1 : 0);
 }
 
 static void gpui_button_shortcuts(SDL_GameController* pad)
@@ -1806,14 +1868,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // (gamepad_ui_aim_trigger_held), so "held" here means exactly what "aiming" means there.
     if (yPressed && gamepad_ui_aim_trigger_held() && !radial_wheel_is_open()) {
         gpui_consumed_y = true;
-        bool can = intface_item_can_toggle_state();
-        if (can) {
-            gsound_play_sfx_file("ib1p1xx1");
-            intface_toggle_item_state();
-        } else {
-            gsound_play_sfx_file("iisxxxx1");
-        }
-        trace_event(TRACE_INPUT, "fire-mode", "src=lt+y ok=%d", can ? 1 : 0);
+        gpui_cycle_fire_mode("lt+y");
     }
     if (xReleased) {
         // Nothing to do on a plain release any more -- just clear the spent flag so the next press
@@ -1850,37 +1905,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
             //
             // The sound is the vanilla refusal buzz, the same one every other refused gamepad
             // action uses. No console line -- the buzz already says it (see the console rule).
-            if (combat_rt_player_ap() < 2) {
-                gsound_play_sfx_file("iisxxxx1");
-                trace_event(TRACE_INPUT, "reload-refused", "why=ap ap=%d", combat_rt_player_ap());
-            } else if (anim_get_reload_anim()) {
-                // MODS "Reload animation": the weapon's handling loop plays first and the magazine
-                // fills at its END (gpui_reload_anim_start). Asked here, done on the safe tick --
-                // it registers an animation, which the hook must never do. Refused NOW if there is
-                // nothing to load, so the buzz still answers the press it belongs to.
-                //
-                // A press while the reload is already running is NOT a new reload: it used to be
-                // read as "the body is only fidgeting", cut the loop and start it over -- so an
-                // impatient second tap made the reload take longer, and looked like it.
-                if (combat_rt_is_reloading(obj_dude)) {
-                    // already on it
-                } else if (intface_can_reload_weapon()) {
-                    gpui_reload_pending = true;
-                    gpui_reload_pending_since = get_time();
-                } else {
-                    gsound_play_sfx_file("iisxxxx1");
-                    trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
-                }
-            } else if (intface_reload_weapon() == 0) {
-                combat_rt_spend_ap(2);
-                trace_event(TRACE_ACTION, "reload", "ap=%d", combat_rt_player_ap());
-            } else {
-                // intface_reload_weapon says no: no weapon in hand, it takes no ammo, there is
-                // none in the pack, or the magazine is already full. It does not tell us which,
-                // so neither do we -- but the player hears that nothing happened.
-                gsound_play_sfx_file("iisxxxx1");
-                trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
-            }
+            gpui_request_reload();
         }
     }
 
@@ -6761,6 +6786,12 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     bool realMouseMoved = (*dx != 0 || *dy != 0);
     bool realLeftDown = (*buttons & MOUSE_STATE_LEFT_BUTTON_DOWN) != 0;
 
+    // The player is using the mouse (gamepad_ui_mouse_in_use). Stamped BEFORE the no-pad return
+    // below: without a pad the answer is always yes anyway, but the stamp must not depend on it.
+    if (realMouseMoved || *buttons != 0) {
+        gpui_real_mouse_time = get_time();
+    }
+
     SDL_GameController* pad = gamepad_ui_get_controller();
     if (pad == NULL) {
         return;
@@ -7100,6 +7131,166 @@ static void gpui_trace_buttons(SDL_GameController* pad)
     }
 }
 
+// The requests the pad's hook and the keyboard leave for the safe tick: the stimpack, the reload with
+// its animation, the run to the exit and the called-shot window. All of them use an item, register
+// an animation or open a modal window, none of which the input hook may do. Drained with or without
+// a controller -- a keyboard player has none.
+static void gpui_drain_requests()
+{
+    // The heal, drained before the rest: it is a completed gesture, not an overlay, and doing it here
+    // keeps every item use on the same safe tick.
+    if (gpui_heal_pending) {
+        gpui_heal_pending = false;
+        gpui_use_best_heal();
+    }
+
+    // The reload with its animation (MODS "Reload animation"). Waits for the body to come
+    // free -- a swing tail, a step -- but not forever: past GPUI_RELOAD_WAIT_MS the press is stale,
+    // and acting on it seconds later would read as the game reloading by itself. The drop is AUDIBLE,
+    // because a reload that silently never happened is exactly the "Jak je reload?" question again.
+    // A reload that took its points and then did not finish -- the loop was replaced by a knockdown,
+    // or the player walked or fired out of it -- gives them back. Checked BEFORE a new start below,
+    // so a loop registered this very tick is never judged before it has drawn a frame.
+    if (gpui_reload_charged && !combat_rt_is_reloading(obj_dude)) {
+        gpui_reload_charged = false;
+        combat_rt_refund_ap(2);
+        trace_event(TRACE_INPUT, "reload-cut", "refund=2 ap=%d anim=%d", combat_rt_player_ap(),
+            obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1);
+    }
+
+    if (gpui_reload_pending) {
+        if (gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()) {
+            gpui_reload_pending = false;
+        } else if (gpui_reload_anim_start()) {
+            gpui_reload_pending = false;
+        } else if (elapsed_time(gpui_reload_pending_since) >= GPUI_RELOAD_WAIT_MS) {
+            gpui_reload_pending = false;
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "reload-refused", "why=busy anim=%d stick=%d",
+                obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1, combat_rt_stick_walking() ? 1 : 0);
+        }
+    }
+
+    // RB NO LONGER REPEATS AN AIMED SHOT (2026-10-09). The aimed shot is the weapon slot's AIMED
+    // mode now and RT fires it (rt_player_called_loc in combat_rt); RB is the heal, read on its press
+    // edge in gpui_button_shortcuts and drained above with the other item uses.
+
+    if (gpui_exit_nav_pending) {
+        gpui_exit_nav_pending = false;
+        gpui_run_to_exit();
+    }
+
+    // The keyboard's called shot (V, or a right-click on an enemy). The same window and the same
+    // binding as the pad's R3 in gpui_aim_wheel: choosing a part binds it and puts the weapon slot
+    // on AIMED, nothing is fired here. It opens on the enemy the mouse is aiming at, or failing that
+    // on whoever the pad's aim would pick.
+    if (gpui_called_shot_pending) {
+        gpui_called_shot_pending = false;
+        Object* target = combat_rt_mouse_target();
+        if (target == NULL) {
+            target = combat_rt_aim_target();
+        }
+        bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_can_aim();
+        if (blocked || target == NULL) {
+            const char* why = blocked ? combat_rt_aim_refusal() : "no-target";
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "aim-refused", "why=%s src=key", why != NULL ? why : "?");
+        } else {
+            int part = combat_called_shot_pick(target, combat_rt_player_hit_mode(), gpui_aim_last_part);
+            trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d src=key", part, target->pid);
+            if (part >= 0) {
+                gpui_aim_last_part = part;
+                bool aimed = intface_item_set_aiming();
+                trace_event(TRACE_INPUT, "aim-bind", "part=%d slot-aimed=%d", part, aimed ? 1 : 0);
+                gsound_play_sfx_file("ib1p1xx1");
+            }
+        }
+    }
+}
+
+bool gamepad_ui_mouse_in_use()
+{
+    return gamepad_ui_get_controller() == NULL || elapsed_time(gpui_real_mouse_time) < GPUI_MOUSE_IN_USE_MS;
+}
+
+void gamepad_ui_request_called_shot()
+{
+    gpui_called_shot_pending = true;
+}
+
+// ⚠️ KEYBOARD & MOUSE (2026-10-10). *"mouse and keyboard nefunguje bráško, to musíme vymyslet pro
+// hráče bez controllerů"*, and of the two designs he picked "2", twin-stick: W/A/S/D walk the way the
+// left stick does (combat_rt_poll_gamepad reads the held keys, Shift runs), the mouse aims and its
+// left button attacks (rt_mouse_update), and these keys do what the pad's buttons do -- through the
+// same requests, so the two can never drift apart:
+//
+//   Q stimpack (RB)            R reload (LB)            F firing mode (LT+Y)
+//   E use what is lit up (A)   V called shot (R3)       G run to the nearest exit (BACK held)
+//
+// W/A/S/D are SWALLOWED here, before vanilla sees them: its A (enter combat, already dead under
+// realtime) and S (the Skilldex) sat on them, so the Skilldex moves to K. Runs from the main loop
+// only, so a text field (a save name, the character's name) never gets here. Returns true when the
+// key was used; may rewrite the key (K) and return false to let vanilla act on the new one.
+bool gamepad_ui_handle_key(int* keyCode)
+{
+    int key = *keyCode;
+    if (key < 0 || obj_dude == NULL || gamepad_ui_menu_active()) {
+        return false;
+    }
+
+    switch (key) {
+    case KEY_LOWERCASE_W:
+    case KEY_UPPERCASE_W:
+    case KEY_LOWERCASE_A:
+    case KEY_UPPERCASE_A:
+    case KEY_LOWERCASE_S:
+    case KEY_UPPERCASE_S:
+    case KEY_LOWERCASE_D:
+    case KEY_UPPERCASE_D:
+        return true;
+    case KEY_LOWERCASE_K:
+    case KEY_UPPERCASE_K:
+        *keyCode = KEY_LOWERCASE_S;
+        return false;
+    case KEY_LOWERCASE_Q:
+    case KEY_UPPERCASE_Q:
+        if (!radial_wheel_is_open() && !inven_any_open()) {
+            gpui_heal_pending = true;
+            trace_event(TRACE_INPUT, "heal-press", "src=key");
+        }
+        return true;
+    case KEY_LOWERCASE_R:
+    case KEY_UPPERCASE_R:
+        trace_event(TRACE_INPUT, "kbm-key", "key=R");
+        gpui_request_reload();
+        return true;
+    case KEY_LOWERCASE_F:
+    case KEY_UPPERCASE_F:
+        if (!radial_wheel_is_open()) {
+            gpui_cycle_fire_mode("key");
+        }
+        return true;
+    case KEY_LOWERCASE_E:
+    case KEY_UPPERCASE_E: {
+        bool queued = interact_prompt_request();
+        trace_event(TRACE_INPUT, "kbm-key", "key=E queued=%d", queued ? 1 : 0);
+        return true;
+    }
+    case KEY_LOWERCASE_V:
+    case KEY_UPPERCASE_V:
+        trace_event(TRACE_INPUT, "kbm-key", "key=V");
+        gpui_called_shot_pending = true;
+        return true;
+    case KEY_LOWERCASE_G:
+    case KEY_UPPERCASE_G:
+        trace_event(TRACE_INPUT, "kbm-key", "key=G");
+        gpui_exit_nav_pending = true;
+        return true;
+    }
+
+    return false;
+}
+
 void gamepad_ui_tick()
 {
     SDL_GameController* pad = gamepad_ui_get_controller();
@@ -7111,6 +7302,17 @@ void gamepad_ui_tick()
         }
         // No controller -> restore the pointer (a mouse/keyboard player needs it).
         gmouse_set_move_cursor_hidden(false);
+
+        // ...and everything a keyboard player asks for still needs this tick: the heal slot beside
+        // the bar, the requests (Q, R, G, V) and the E "use" prompt.
+        {
+            int healCount;
+            Object* heal = gpui_next_heal(&healCount);
+            intface_update_heal_slot(heal, healCount);
+        }
+        intface_update_aim_part(gpui_aim_last_part);
+        gpui_drain_requests();
+        interact_prompt_tick();
         return;
     }
 
@@ -7150,48 +7352,8 @@ void gamepad_ui_tick()
     // Also a no-op unless it changed, so polling costs a compare.
     intface_update_aim_part(gpui_aim_last_part);
 
-    // The Y-tap heal, drained before the wheels: it is a completed gesture, not an overlay, and
-    // doing it here keeps every item use on the same safe tick.
-    if (gpui_heal_pending) {
-        gpui_heal_pending = false;
-        gpui_use_best_heal();
-    }
-
-    // The LB-tap reload with its animation (MODS "Reload animation"). Waits for the body to come
-    // free -- a swing tail, a step -- but not forever: past GPUI_RELOAD_WAIT_MS the press is stale,
-    // and acting on it seconds later would read as the game reloading by itself. The drop is AUDIBLE,
-    // because a reload that silently never happened is exactly the "Jak je reload?" question again.
-    // A reload that took its points and then did not finish -- the loop was replaced by a knockdown,
-    // or the player walked or fired out of it -- gives them back. Checked BEFORE a new start below,
-    // so a loop registered this very tick is never judged before it has drawn a frame.
-    if (gpui_reload_charged && !combat_rt_is_reloading(obj_dude)) {
-        gpui_reload_charged = false;
-        combat_rt_refund_ap(2);
-        trace_event(TRACE_INPUT, "reload-cut", "refund=2 ap=%d anim=%d", combat_rt_player_ap(),
-            obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1);
-    }
-
-    if (gpui_reload_pending) {
-        if (gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()) {
-            gpui_reload_pending = false;
-        } else if (gpui_reload_anim_start()) {
-            gpui_reload_pending = false;
-        } else if (elapsed_time(gpui_reload_pending_since) >= GPUI_RELOAD_WAIT_MS) {
-            gpui_reload_pending = false;
-            gsound_play_sfx_file("iisxxxx1");
-            trace_event(TRACE_INPUT, "reload-refused", "why=busy anim=%d stick=%d",
-                obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1, combat_rt_stick_walking() ? 1 : 0);
-        }
-    }
-
-    // RB NO LONGER REPEATS AN AIMED SHOT (2026-10-09). The aimed shot is the weapon slot's AIMED
-    // mode now and RT fires it (rt_player_called_loc in combat_rt); RB is the heal, read on its press
-    // edge in gpui_button_shortcuts and drained above with the other item uses.
-
-    if (gpui_exit_nav_pending) {
-        gpui_exit_nav_pending = false;
-        gpui_run_to_exit();
-    }
+    // The requests from the hook and the keyboard (heal, reload, exit run, called shot).
+    gpui_drain_requests();
 
     gpui_skill_wheel(pad);
     gpui_quick_wheel(pad);

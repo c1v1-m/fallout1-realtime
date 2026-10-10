@@ -202,6 +202,7 @@ static int ListArchive(int a1);
 static void ShowControls();
 static void ShowControls2();
 static void ShowControls3();
+static void ShowControls4();
 static void ShowControlsPage(const char* title, const PipboyControl* lines, int count);
 static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
@@ -592,11 +593,46 @@ static const PipboyControl ctrl3_lines[] = {
     { "A / B / START", "Skip the death scene" },
 };
 
+// FOURTH CONTROLS PAGE: keyboard and mouse (2026-10-10, twin-stick -- his pick "2"). Everything the
+// pad's world page lists, for a player with no pad: W/A/S/D walk like the left stick, the mouse aims
+// and attacks, and each pad button has a key (gamepad_ui_handle_key, rt_mouse_update). The vanilla
+// keys that still work are listed too, because a keyboard player has no other way to find them.
+static const PipboyControl ctrl4_lines[] = {
+    { NULL, "MOVE AND FIGHT" },
+    { "W A S D", "Walk" },
+    { "Shift (hold)", "Run" },
+    { "Mouse", "Aim at an enemy" },
+    { "Left button", "Attack (hold to keep attacking)" },
+    { "Right button", "Called shot on that enemy" },
+    { "F", "Firing mode: single / aimed / burst" },
+    { "V", "Called shot" },
+    { "R", "Reload" },
+    { "Q", "Stimpack - best one" },
+    { "B", "Swap active hand" },
+    { NULL, NULL },
+    { NULL, "AROUND YOU" },
+    { "E", "Use what is lit up" },
+    { "Left click", "Use, talk, pick up (not on enemies)" },
+    { "G", "Run to the nearest way out" },
+    { "K", "Skilldex" },
+    { "1 - 8", "Skills, as in the original" },
+    { NULL, NULL },
+    { NULL, "SCREENS" },
+    { "I", "Inventory" },
+    { "C", "Character sheet" },
+    { "P", "Pip-Boy" },
+    { "Tab", "Automap" },
+    { "Esc", "Pause menu" },
+    { "Enter", "End combat" },
+    { "F6 / F7", "Quick save / quick load" },
+};
+
 // Titles of the CONTROLS pages, and the archive entries that open them -- one string each so the
 // list and the page it leads to can never drift apart.
 static const char* ctrl_entry = "CONTROLS - WORLD";
 static const char* ctrl2_entry = "CONTROLS - SCREENS";
 static const char* ctrl3_entry = "CONTROLS - MENUS";
+static const char* ctrl4_entry = "CONTROLS - KEYBOARD";
 
 // 0x662A70
 static Size ginfo[PIPBOY_FRM_COUNT];
@@ -2201,15 +2237,18 @@ static void PipArchives(int a1)
 
         ListArchive(a1);
 
-        // The three CONTROLS pages are the last entries of the list, and none of them is a movie.
-        // view_page is the line count ListArchive returned, so MENUS sits at view_page, SCREENS one
-        // line above it and WORLD one above that -- the same order ListArchive prints them in.
-        if (a1 >= view_page - 2) {
+        // The four CONTROLS pages are the last entries of the list, and none of them is a movie.
+        // view_page is the line count ListArchive returned, so KEYBOARD sits at view_page, MENUS one
+        // line above it, SCREENS one above that and WORLD above SCREENS -- the same order ListArchive
+        // prints them in.
+        if (a1 >= view_page - 3) {
             pause_for_tocks(200);
             NixHotLines();
             if (a1 == view_page) {
-                ShowControls3();
+                ShowControls4();
             } else if (a1 == view_page - 1) {
+                ShowControls3();
+            } else if (a1 == view_page - 2) {
                 ShowControls2();
             } else {
                 ShowControls();
@@ -2323,6 +2362,16 @@ static int ListArchive(int a1)
     pip_print(ctrl3_entry, 0, color);
     cursor_line++;
 
+    // ...and the keyboard page after it (2026-10-10). Same rule: this order is PipArchives' dispatch.
+    if (line++ == a1 - 1) {
+        color = colorTable[32747];
+    } else {
+        color = colorTable[992];
+    }
+
+    pip_print(ctrl4_entry, 0, color);
+    cursor_line++;
+
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
@@ -2371,6 +2420,11 @@ static void ShowControls2()
 static void ShowControls3()
 {
     ShowControlsPage(ctrl3_entry, ctrl3_lines, (int)(sizeof(ctrl3_lines) / sizeof(ctrl3_lines[0])));
+}
+
+static void ShowControls4()
+{
+    ShowControlsPage(ctrl4_entry, ctrl4_lines, (int)(sizeof(ctrl4_lines) / sizeof(ctrl4_lines[0])));
 }
 
 // All three pages render through here: same layout, only the title and the table differ.

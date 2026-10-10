@@ -6,7 +6,7 @@
 
 Fallout 1 where nobody waits for their turn. You walk with the stick, hold the left trigger to lock onto an enemy and pull the right one to shoot, while the raiders and mutants come at you at the same time. Action points are still there. They refill as you fight, faster when the enemy is close, so standing back and kiting does not pay.
 
-It is made for a controller, from the first screen to the ending, and you can play it from start to finish. For now you need one: mouse and keyboard play is being worked on.
+It is made for a controller, from the first screen to the ending, and you can play it from start to finish. On a PC it also plays with keyboard and mouse: W A S D to walk, the mouse to aim and shoot.
 
 You need your own copy of Fallout from [Steam](https://store.steampowered.com/app/38400) or [GOG](https://www.gog.com/game/fallout).
 
@@ -15,6 +15,7 @@ You need your own copy of Fallout from [Steam](https://store.steampowered.com/ap
 - Realtime combat. Everyone moves and attacks at the same time.
 - Your stats decide how fast you swing, aim and reload. Agility brings your action points back faster.
 - The whole game plays on a gamepad: fighting, looting, barter, dialogue, the Pip-Boy, the character screen.
+- Or with keyboard and mouse, twin-stick style.
 - Radial menus for skills, weapons, ammo and drugs. A stimpack is one press of RB.
 - On the Steam Deck it starts straight from the Steam library, in Game Mode.
 - Widescreen at the original scale, smooth movement and VSync.
@@ -47,6 +48,8 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 
 ## Controls
 
+### Controller
+
 | Button | What it does |
 |---|---|
 | Left stick | Walk, hold X to run |
@@ -60,6 +63,23 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 | L3, Y, B | Skill, weapon and item wheels |
 | BACK | Inventory, hold to run to the nearest exit |
 | START (hold) | Quick save |
+
+### Keyboard and mouse
+
+| Key | What it does |
+|---|---|
+| W A S D | Walk, hold Shift to run |
+| Mouse | Aim at an enemy |
+| Left button | Attack, hold to keep attacking |
+| F | Firing mode: single, aimed, burst |
+| Right button or V | Called shot |
+| R | Reload |
+| Q | Stimpack |
+| E | Use what is lit up |
+| G | Run to the nearest exit |
+| K | Skilldex (S walks now) |
+| I, C, P, Tab | Inventory, character, Pip-Boy, automap |
+| F6 / F7 | Quick save / quick load |
 
 Every screen has its own list in the game: Pip-Boy, Archives, CONTROLS.
 

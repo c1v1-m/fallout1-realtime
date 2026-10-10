@@ -466,9 +466,10 @@ static void main_game_loop()
         }
 #endif
 
-        // Route input to realtime combat first (WASD movement, click-to-attack);
-        // anything it doesn't consume falls through to normal handling.
-        bool rtConsumed = combat_rt_handle_input(keyCode);
+        // Keyboard & mouse (2026-10-10) first: W/A/S/D, Q, R, F, E, V, G and K belong to the pad layer
+        // (gamepad_ui_handle_key; K comes back rewritten as vanilla's Skilldex key). Then realtime
+        // combat (mouse attack, right-click called shot); anything left falls through to vanilla.
+        bool rtConsumed = gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
         if (keyCode != -1) {
             trace_event(TRACE_INPUT, "key", "code=%d rt=%d", keyCode, rtConsumed ? 1 : 0);
         }

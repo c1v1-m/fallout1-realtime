@@ -10178,6 +10178,181 @@ static bool rt_step_is_free(int rotation)
     return obj_blocking_at(obj_dude, tile_num_in_direction(obj_dude->tile, rotation, 1), map_elevation) == NULL;
 }
 
+// W/A/S/D AS A STICK (keyboard & mouse, 2026-10-10): the held keys as a full-deflection vector in
+// SDL stick space (+y is down). Read by KEY SYMBOL, the same way gamepad_ui_handle_key swallows them,
+// so the keys that walk are exactly the keys vanilla no longer sees. Nothing while Ctrl or Alt is
+// down, which keeps vanilla's Ctrl+S / Ctrl+L and Alt+Enter from walking the dude.
+static bool rt_keyboard_walk(float* outX, float* outY)
+{
+    if ((SDL_GetModState() & (KMOD_CTRL | KMOD_ALT)) != 0) {
+        return false;
+    }
+
+    const Uint8* keys = SDL_GetKeyboardState(NULL);
+    if (keys == NULL) {
+        return false;
+    }
+
+    float x = 0.0f;
+    float y = 0.0f;
+    if (keys[SDL_GetScancodeFromKey(SDLK_w)]) {
+        y -= 1.0f;
+    }
+    if (keys[SDL_GetScancodeFromKey(SDLK_s)]) {
+        y += 1.0f;
+    }
+    if (keys[SDL_GetScancodeFromKey(SDLK_a)]) {
+        x -= 1.0f;
+    }
+    if (keys[SDL_GetScancodeFromKey(SDLK_d)]) {
+        x += 1.0f;
+    }
+    if (x == 0.0f && y == 0.0f) {
+        return false;
+    }
+
+    float len = sqrtf(x * x + y * y);
+    *outX = x / len;
+    *outY = y / len;
+    return true;
+}
+
+// --- KEYBOARD & MOUSE: THE MOUSE AIMS, ITS LEFT BUTTON ATTACKS (2026-10-10) ------------------------
+//
+// His pick of two designs, "2", twin-stick (the keys are in gamepad_ui_handle_key). The enemy under
+// the cursor -- or the nearest one within RT_MOUSE_AIM_RADIUS of it, because hitting a walking sprite
+// pixel-exactly is a test of the hand, not of the character -- is the mouse's target: its to-hit is
+// drawn over it, a held left button keeps attacking it exactly like a held RT (the cooldown paces
+// it), and a right-click opens the called-shot window on it (combat_rt_handle_input).
+//
+// HOSTILES ONLY: a click on a peaceful townsman stays vanilla's -- talk, look, use -- and is never an
+// attack. Only while the mouse is actually in use (gamepad_ui_mouse_in_use), so a pad player's resting
+// cursor claims nothing, and never while the pad holds a lock, which owns the cursor and glues it to
+// its own target.
+static Object* rt_mouse_target = NULL;
+static bool rt_mouse_prev_lmb = false;
+static bool rt_mouse_armed = false; // the current press began over the world, not over the bar
+// This press has attacked. Until the button comes up, every left-button event stays ours, even with
+// no target under the cursor any more: a raider who drops mid-hold would otherwise hand the still-held
+// button to vanilla, which reads a held click on the ground as "walk there" -- the dude would set off
+// for the corpse on his own.
+static bool rt_mouse_hold_claimed = false;
+#define RT_MOUSE_AIM_RADIUS 24 // game pixels from a sprite's box that still count as "on" it
+
+static bool rt_point_in_world(int x, int y)
+{
+    return display_win != -1 && win_get_top_win(x, y) == display_win;
+}
+
+static Object* rt_pick_mouse_target(int mx, int my)
+{
+    Object* under = object_under_mouse(OBJ_TYPE_CRITTER, false, map_elevation);
+    if (under != NULL && under != obj_dude && rt_in_registry(under) && rt_is_hostile(under) && rt_is_targetable(under)) {
+        return under;
+    }
+
+    // Nearest by distance to the sprite's BOX (0 anywhere on it), ties broken by the box centre --
+    // two raiders overlapping on screen go to the one the cursor is nearer the middle of.
+    Object* best = NULL;
+    long bestScore = (long)(RT_MOUSE_AIM_RADIUS * RT_MOUSE_AIM_RADIUS + 1) * 100000L;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (critter == NULL || critter == obj_dude || critter->elevation != map_elevation
+            || (critter->flags & OBJECT_HIDDEN) != 0 || !rt_is_hostile(critter) || !rt_is_targetable(critter)) {
+            continue;
+        }
+
+        Rect b;
+        obj_bound(critter, &b);
+        int dx = mx < b.ulx ? b.ulx - mx : (mx > b.lrx ? mx - b.lrx : 0);
+        int dy = my < b.uly ? b.uly - my : (my > b.lry ? my - b.lry : 0);
+        int cx = (b.ulx + b.lrx) / 2 - mx;
+        int cy = (b.uly + b.lry) / 2 - my;
+        long score = (long)(dx * dx + dy * dy) * 100000L + (long)(cx * cx + cy * cy);
+        if (score < bestScore) {
+            bestScore = score;
+            best = critter;
+        }
+    }
+    return best;
+}
+
+static void rt_mouse_update()
+{
+    // REAL left button only (SDL's own state, not the game's): the pad's A arrives in the game's mouse
+    // state as a synthesised click, and A must never become an attack. Sampled before any return so
+    // the edge is never stale.
+    bool lmb = (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) != 0;
+    bool lmbEdge = lmb && !rt_mouse_prev_lmb;
+    rt_mouse_prev_lmb = lmb;
+    if (!lmb) {
+        rt_mouse_armed = false;
+        rt_mouse_hold_claimed = false;
+    }
+
+    Object* previous = rt_mouse_target;
+    rt_mouse_target = NULL;
+
+    if (rt_lock_target != NULL || !gamepad_ui_mouse_in_use()) {
+        return;
+    }
+
+    // A skill or "use item on" cursor (the 1-8 keys, a rope, a lockpick) means the next click is that
+    // skill's, even on an enemy -- steal from him, patch him up. Only the plain cursors aim.
+    int cursorMode = gmouse_3d_get_mode();
+    if (cursorMode != GAME_MOUSE_MODE_MOVE && cursorMode != GAME_MOUSE_MODE_ARROW && cursorMode != GAME_MOUSE_MODE_CROSSHAIR) {
+        return;
+    }
+
+    int mx;
+    int my;
+    mouse_get_position(&mx, &my);
+    bool inWorld = rt_point_in_world(mx, my);
+    if (lmbEdge) {
+        rt_mouse_armed = inWorld;
+    }
+    if (!inWorld) {
+        return;
+    }
+
+    rt_mouse_target = rt_pick_mouse_target(mx, my);
+    if (rt_mouse_target == NULL) {
+        return;
+    }
+
+    if (rt_mouse_target != previous) {
+        trace_event(TRACE_INPUT, "mouse-aim", "target=%d id=%d dist=%d t=%.2f", rt_mouse_target->pid,
+            rt_mouse_target->id, obj_dist(obj_dude, rt_mouse_target), rt_clock);
+    }
+
+    // The to-hit over the target every frame -- the same indicator the pad's lock drives, and for the
+    // same reason: the engine's own only paints after the cursor has rested ~250 ms.
+    gmouse_3d_show_to_hit(rt_mouse_target);
+
+    // A press that began over the bar and slid into the world is not a shot.
+    if (lmb && rt_mouse_armed) {
+        rt_mouse_hold_claimed = true;
+        int hitMode = rt_player_hit_mode();
+        // AIMED MODE in the weapon slot = this click goes to the bound part, as RT's does.
+        int loc = rt_player_called_loc(hitMode);
+        if (obj_dist(obj_dude, rt_mouse_target) <= item_w_range(obj_dude, hitMode)) {
+            rt_set_player_intent(rt_mouse_target, hitMode, loc);
+            if (lmbEdge) {
+                trace_event(TRACE_ACTION, "attack", "target=%d hm=%d loc=%d locked=0 src=mouse t=%.2f",
+                    rt_mouse_target->pid, hitMode, loc, rt_clock);
+            }
+        } else if (lmbEdge) {
+            trace_event(TRACE_INPUT, "attack-far", "target=%d dist=%d range=%d src=mouse t=%.2f",
+                rt_mouse_target->pid, obj_dist(obj_dude, rt_mouse_target), item_w_range(obj_dude, hitMode), rt_clock);
+        }
+    }
+}
+
+Object* combat_rt_mouse_target()
+{
+    return rt_mouse_target;
+}
+
 void combat_rt_poll_gamepad()
 {
     if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {
@@ -10205,13 +10380,13 @@ void combat_rt_poll_gamepad()
         return;
     }
 
-    // Borrow the shared controller handle owned by gamepad_ui.
+    // Borrow the shared controller handle owned by gamepad_ui. NULL is fine since the keyboard &
+    // mouse layer (2026-10-10): W/A/S/D walk and the mouse aims without one, and every read of the
+    // pad below checks for it.
     SDL_GameController* rt_gamepad = gamepad_ui_get_controller();
-    if (rt_gamepad == NULL) {
-        return;
+    if (rt_gamepad != NULL) {
+        SDL_GameControllerUpdate();
     }
-
-    SDL_GameControllerUpdate();
 
     // Left stick -> continuous walking in chained multi-tile segments while
     // held. The analog angle becomes a HEADING (see FREE WALK ANGLE), which the
@@ -10219,8 +10394,23 @@ void combat_rt_poll_gamepad()
     // the free angle switched off it falls back to bucketing the angle into 6
     // sectors of 60 degrees, one per hex rotation. SDL's Y axis is +down, so -y
     // makes "up" positive; atan2 then gives up = +90 deg, right = 0 deg.
-    float x = SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTX) / RT_GAMEPAD_AXIS_MAX;
-    float y = SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTY) / RT_GAMEPAD_AXIS_MAX;
+    float x = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTX) / RT_GAMEPAD_AXIS_MAX : 0.0f;
+    float y = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTY) / RT_GAMEPAD_AXIS_MAX : 0.0f;
+
+    // W/A/S/D WALK EXACTLY LIKE THE STICK (keyboard & mouse, 2026-10-10): eight ways at full
+    // deflection, into the same heading code below -- doorway assist, crowd assist, free movement and
+    // the AP model all apply unchanged. Only while the stick is idle, so a pad player resting a hand
+    // on the keyboard is never fought.
+    bool kbWalk = false;
+    if (x * x + y * y <= RT_GAMEPAD_DEADZONE * RT_GAMEPAD_DEADZONE) {
+        float kx;
+        float ky;
+        if (rt_keyboard_walk(&kx, &ky)) {
+            x = kx;
+            y = ky;
+            kbWalk = true;
+        }
+    }
 
     // RUN instead of walk. IN COMBAT running drains the AP
     // pool (rt_run_ap_cost), so when it's empty -- or recovering while rt_run_blocked
@@ -10232,7 +10422,8 @@ void combat_rt_poll_gamepad()
     // that LT-held; X could not stay a hold because holding X opens the weapon wheel. The local
     // keeps its name because every gait test below reads it as "the run key", but there is no key
     // being held any more -- gamepad_ui owns the state and this just asks for it.
-    bool ltHeld = gamepad_ui_run_on();
+    // ...and on the keyboard Shift is the run, held like X.
+    bool ltHeld = gamepad_ui_run_on() || (kbWalk && (SDL_GetModState() & KMOD_SHIFT) != 0);
     // The Bonus Move reserve pays for running as well -- it is movement, which is all it is for.
     bool run = ltHeld && (!rt_engaged || ((rt_player_ap > 0 || rt_bonus_move_ap > 0) && !rt_run_blocked));
 
@@ -10507,8 +10698,8 @@ void combat_rt_poll_gamepad()
     // it on unlock (and don't clobber a crosshair the player set themselves).
     static bool rt_lock_set_crosshair = false;
     if (rt_lock_target != NULL) {
-        float rx = SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTX) / RT_GAMEPAD_AXIS_MAX;
-        float ry = SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTY) / RT_GAMEPAD_AXIS_MAX;
+        float rx = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTX) / RT_GAMEPAD_AXIS_MAX : 0.0f;
+        float ry = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTY) / RT_GAMEPAD_AXIS_MAX : 0.0f;
         float rmag = sqrtf(rx * rx + ry * ry);
         // CONTINUOUS aiming -- no arm/re-centre ratchet. Sweep the stick and the lock sweeps with
         // it, matching the interact picker exactly so both selections feel like one gesture.
@@ -10648,6 +10839,9 @@ void combat_rt_poll_gamepad()
             }
         }
     }
+
+    // The mouse: aim at what it points at, attack with its left button (keyboard & mouse).
+    rt_mouse_update();
 
     // B button: cancel / no action for now (reserved).
 }
@@ -12143,30 +12337,29 @@ bool combat_rt_handle_input(int keyCode)
     // this here (before input) guarantees a WASD move never starts AP-starved.
     obj_dude->data.critter.combat.ap = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
 
-    // WASD tile movement (4 of the 6 iso directions for now).
-    int rotation = -1;
-    switch (keyCode) {
-    case KEY_LOWERCASE_W:
-    case KEY_UPPERCASE_W:
-        rotation = ROTATION_NE;
-        break;
-    case KEY_LOWERCASE_S:
-    case KEY_UPPERCASE_S:
-        rotation = ROTATION_SW;
-        break;
-    case KEY_LOWERCASE_A:
-    case KEY_UPPERCASE_A:
-        rotation = ROTATION_W;
-        break;
-    case KEY_LOWERCASE_D:
-    case KEY_UPPERCASE_D:
-        rotation = ROTATION_E;
-        break;
-    }
+    // (W/A/S/D used to step single tiles here, four of the six directions. They are a stick now --
+    // combat_rt_poll_gamepad -- and the keys are swallowed in gamepad_ui_handle_key before this runs.)
 
-    if (rotation != -1) {
-        rt_player_move(rotation);
+    // KEYBOARD & MOUSE: a REAL click on the enemy the mouse is aiming at belongs to the attack, which
+    // rt_mouse_update fires, tapped or held -- never to vanilla, which would try to talk to him or
+    // open its turn-based combat. A real right-click on him opens the called-shot window (R3 on the
+    // pad). rt_mouse_target is only ever set while the mouse is in use, so a pad's synthesised click
+    // never gets here with one.
+    if (keyCode == -2 && rt_mouse_hold_claimed && (mouse_get_buttons() & (MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT | MOUSE_EVENT_LEFT_BUTTON_UP)) != 0) {
         return true;
+    }
+    if (keyCode == -2 && rt_mouse_target != NULL) {
+        Uint32 real = SDL_GetMouseState(NULL, NULL);
+        int buttons = mouse_get_buttons();
+        if ((real & SDL_BUTTON_RMASK) != 0 && (buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
+            trace_event(TRACE_INPUT, "kbm-key", "key=RMB target=%d", rt_mouse_target->pid);
+            gamepad_ui_request_called_shot();
+            return true;
+        }
+        if ((buttons & MOUSE_EVENT_LEFT_BUTTON_UP) != 0
+            || ((buttons & MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT) != 0 && (real & SDL_BUTTON_LMASK) != 0)) {
+            return true;
+        }
     }
 
     // Left-click on a HOSTILE critter in range -> attack it. A click on a
