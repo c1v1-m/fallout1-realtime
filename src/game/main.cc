@@ -46,6 +46,7 @@
 #include "game/selfrun.h"
 #include "game/tile.h"
 #include "game/wordwrap.h"
+#include "game/version.h"
 #include "game/worldmap.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
@@ -325,7 +326,7 @@ int gnw_main(int argc, char** argv)
 // 0x4728CC
 static bool main_init_system(int argc, char** argv)
 {
-    if (game_init("FALLOUT", false, 0, 0, argc, argv) == -1) {
+    if (game_init(REALTIME_WINDOW_TITLE, false, 0, 0, argc, argv) == -1) {
         return false;
     }
 

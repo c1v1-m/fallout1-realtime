@@ -112,7 +112,12 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MEDIC_HP_FRACTION_KEY, 0.5);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MEDIC_ALLY_TILES_KEY, 3);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MEDIC_COOLDOWN_KEY, 6.0);
+#ifdef FALLOUT_RELEASE
+    // The public build records nothing unless asked (trace_log=1 in fallout.cfg, for a bug report).
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TRACE_LOG_KEY, 0);
+#else
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TRACE_LOG_KEY, 1);
+#endif
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TEXT_BASE_DELAY_KEY, 3.5);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TEXT_LINE_DELAY_KEY, 1.399994);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_BRIGHTNESS_KEY, 1.0);

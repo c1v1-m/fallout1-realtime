@@ -462,7 +462,11 @@ void trace_init()
         return; // idempotent
     }
 
+#ifdef FALLOUT_RELEASE
+    int on = 0; // the public build: off unless fallout.cfg says trace_log=1
+#else
     int on = 1;
+#endif
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TRACE_LOG_KEY, &on);
     if (!on) {
         return;

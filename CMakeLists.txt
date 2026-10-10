@@ -22,6 +22,11 @@ set(CMAKE_CXX_EXTENSIONS NO)
 
 option(ASAN "Enable address sanitizer" OFF)
 option(UBSAN "Enable undefined behaviour sanitizer" OFF)
+# Fallout 1 Realtime: the PUBLIC build. Same source as the development build; the diagnostics stay
+# compiled in but default OFF (trace_log=1 in fallout.cfg still turns the flight recorder on for a
+# bug report), and the exe is named fallout1-realtime. Configure it into its own tree:
+#   cmake -S . -B build-release -DFALLOUT_RELEASE=ON
+option(FALLOUT_RELEASE "Fallout 1 Realtime public build: diagnostics default off" OFF)
 
 if (ANDROID)
     add_library(${EXECUTABLE_NAME} SHARED)
@@ -318,6 +323,13 @@ if(WIN32)
         winmm
         dbghelp
     )
+endif()
+
+if(FALLOUT_RELEASE)
+    target_compile_definitions(${EXECUTABLE_NAME} PRIVATE FALLOUT_RELEASE=1)
+    if(NOT APPLE)
+        set_target_properties(${EXECUTABLE_NAME} PROPERTIES OUTPUT_NAME "fallout1-realtime")
+    endif()
 endif()
 
 # Emit a PDB even for Release so the game_trace crash handler can resolve symbolic

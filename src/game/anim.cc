@@ -4493,6 +4493,11 @@ static WalkSpeedProfile* walk_profile_get(Object* object, int anim)
 // next to the exe (truncate per run). STRIP once the radscorpion NW speed is confirmed.
 static void walk_log(const char* fmt, ...)
 {
+#ifdef FALLOUT_RELEASE
+    // Not in the public build: it writes rt_walk.log next to the exe on every run.
+    (void)fmt;
+    return;
+#endif
     static FILE* f = NULL;
     static bool tried = false;
     if (!tried) {

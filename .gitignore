@@ -397,3 +397,6 @@ build-asan/
 
 # Generated preview renders (the scripts that make them are tracked)
 .claude/tools/sideart_preview/*.png
+
+# The public release build tree (cmake -S . -B build-release -DFALLOUT_RELEASE=ON)
+build-release/
