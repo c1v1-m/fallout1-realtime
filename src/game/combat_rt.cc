@@ -930,6 +930,19 @@ static float rt_walk_ap_drain = 0.0f;
 //
 // rt_speed_mult is re-sampled once per frame at the top of combat_rt_update (not cached at
 // init) so moving the slider takes effect immediately, without a restart.
+//
+// ⚠️ 2026-10-11: THE SLIDER NOW SPEEDS UP THE WHOLE FIGHT, not just the AP economy. On a Deck at
+// slider 50 with vanilla's "Affect player speed" ticked the dude ran about six times faster than
+// everyone else ("dude běhá během combatu rychle"): vanilla adds the slider to the dude's walk fps,
+// and only the NPCs' copy of that bonus was being cancelled by walk_dir_slowdown. His pick of the
+// options offered: the slider speeds up EVERYTHING in a fight, for everyone alike, so faster never
+// means unfair. It is now a time scale (rt_game_speed, applied in combat_rt_time_scale) -- the same
+// mechanism the aimed-shot slow motion uses, run the other way: the combat clock (AP regen, drains,
+// cooldowns, every timer) and the animation clock (compute_tpf: walking, running, swings,
+// projectiles) both run faster by the same factor, so nothing goes out of step. rt_speed_mult is
+// therefore 1.0 for good -- scaling the AP economy on top would count the slider twice -- and the
+// vanilla walk-fps bonus is skipped in realtime (compute_tpf). Only while a fight is on: exploring
+// is untouched. combat_speed_ap_max is the top speed (2.0 = twice as fast at slider 50).
 // AIMED-SHOT SLOW MOTION. While the on-body limb picker is up (LB held), the world runs at this
 // fraction of normal speed.
 //
@@ -949,7 +962,8 @@ static float rt_aim_slowmo = RT_AIM_SLOWMO;
 #define RT_COMBAT_SPEED_AP_MAX 2.0f // AP tempo at slider 50 (1.0 = disable the coupling)
 #define RT_COMBAT_SPEED_SLIDER_MAX 50.0f
 static float rt_combat_speed_ap_max = RT_COMBAT_SPEED_AP_MAX;
-static float rt_speed_mult = 1.0f;
+static float rt_speed_mult = 1.0f; // stays 1.0 since the slider became a time scale (see above)
+static float rt_game_speed = 1.0f;  // the Combat Speed slider as a time scale, sampled per frame
 
 // LEAVING A MAP MID-FIGHT. In realtime you can walk onto a map-exit grid while something is still
 // fighting you; map_leave_map arms this (combat_rt_arm_map_exit) and rt_update_map_exit tears the
@@ -2631,7 +2645,7 @@ static void rt_regen_ap(Object* critter, int* ap, float* accum, int maxAp, float
         return;
     }
 
-    // The Combat Speed slider shortens the interval (see rt_speed_mult). Floored so a
+    // rt_speed_mult is 1.0 now (the Combat Speed slider scales dt instead). Floored so a
     // pathological cfg can never produce a zero/negative interval = infinite loop below.
     float interval = rt_regen_interval(critter) / rt_speed_mult;
     if (interval < 0.01f) {
@@ -2763,8 +2777,8 @@ static int rt_dude_nearest_hostile_dist()
 // remain all FAVOUR the NPC -- it never spends below its one-attack reserve, and it has the
 // run_winded latch -- so a chaser can always still swing on arrival.
 //
-// The Combat Speed slider scales the cost in step with the regen it is netted against, so the
-// sprint lasts the same number of AP but a proportionally shorter wall-clock time.
+// (rt_speed_mult is 1.0 since 2026-10-11: the Combat Speed slider is a time scale on the whole fight
+// now, which already runs this drain and the regen it is netted against faster together.)
 static float rt_effective_run_cost(Object* runner)
 {
     float cost = rt_run_ap_cost - stat_level(runner, STAT_ENDURANCE) * rt_run_ap_endurance_factor;
@@ -2797,10 +2811,11 @@ static void rt_sample_speed_mult()
     }
 
     // Linear from 1.0 at slider 0 (stock tempo -- the vanilla default, so an untouched
-    // install behaves exactly as before) to rt_combat_speed_ap_max at slider 50.
-    rt_speed_mult = 1.0f + (combatSpeed / RT_COMBAT_SPEED_SLIDER_MAX) * (rt_combat_speed_ap_max - 1.0f);
-    if (rt_speed_mult < 1.0f) {
-        rt_speed_mult = 1.0f;
+    // install behaves exactly as before) to rt_combat_speed_ap_max at slider 50. A TIME SCALE now
+    // (combat_rt_time_scale), so rt_speed_mult is left at 1.0.
+    rt_game_speed = 1.0f + (combatSpeed / RT_COMBAT_SPEED_SLIDER_MAX) * (rt_combat_speed_ap_max - 1.0f);
+    if (rt_game_speed < 1.0f) {
+        rt_game_speed = 1.0f;
     }
 }
 
@@ -11406,13 +11421,21 @@ float combat_rt_get_cam_smooth()
 
 float combat_rt_time_scale()
 {
+    if (!rt_enabled) {
+        return 1.0f;
+    }
+
+    // The Combat Speed slider: the whole fight runs this much faster (see rt_game_speed). Only
+    // while one is on -- exploring and talking keep their normal pace.
+    float scale = rt_engaged ? rt_game_speed : 1.0f;
+
     // Floored at a small positive value rather than allowed to reach 0. A zero scale would stop
     // rt_clock dead while the picker is up, which is the full freeze this feature deliberately is
     // not -- and it would divide by zero in compute_tpf's caller.
-    if (rt_enabled && gamepad_ui_aim_body_active()) {
-        return rt_aim_slowmo < 0.05f ? 0.05f : rt_aim_slowmo;
+    if (gamepad_ui_aim_body_active()) {
+        scale *= rt_aim_slowmo < 0.05f ? 0.05f : rt_aim_slowmo;
     }
-    return 1.0f;
+    return scale;
 }
 
 void combat_rt_update(float dt)
@@ -11434,7 +11457,9 @@ void combat_rt_update(float dt)
     // ...but the LIMB PICKER only SLOWS it. Scaling dt here rather than returning is what makes it
     // a slow-motion: rt_clock, AP regen, the movement drains, attack cooldowns, initiative and the
     // in-flight commit timers are all keyed off this one number, so every one of them stretches by
-    // the same factor and nothing goes out of step with anything else.
+    // the same factor and nothing goes out of step with anything else. The Combat Speed slider
+    // rides the same number the other way (rt_game_speed), so it is sampled first.
+    rt_sample_speed_mult();
     dt *= combat_rt_time_scale();
 
     rt_clock += dt;
@@ -11489,9 +11514,7 @@ void combat_rt_update(float dt)
         return;
     }
 
-    // Sample the Combat Speed slider into rt_speed_mult once for the whole frame, ahead of
-    // every AP regen and drain below (both the player's and, via rt_update_actor, the NPCs').
-    rt_sample_speed_mult();
+    // (The Combat Speed slider is sampled at the top of this function now, before dt is scaled.)
 
     // Age the movement-input timer; movement handlers reset it to 0 this frame
     // (keyboard via handle_input before this tick, stick via poll_gamepad below).

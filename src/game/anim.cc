@@ -5161,7 +5161,11 @@ unsigned int compute_tpf(Object* object, int fid)
         fps = 10;
     }
 
-    if (isInCombat()) {
+    // Vanilla's Combat Speed bonus: extra walk fps in combat, for NPCs, and for the dude only with
+    // "Affect player speed" ticked. NOT in realtime (2026-10-11): there the slider is a time scale
+    // for the whole fight (combat_rt_time_scale, applied below), and this bonus on top made the dude
+    // alone run about six times faster at slider 50.
+    if (isInCombat() && !combat_rt_enabled()) {
         if (FID_ANIM_TYPE(fid) == ANIM_WALK) {
             int playerSpeedup = 0;
             config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PLAYER_SPEEDUP_KEY, &playerSpeedup);
@@ -5258,10 +5262,13 @@ unsigned int compute_tpf(Object* object, int fid)
     //
     // ⚠️ RATIO-SAFE. walk_dir_slowdown and run_speed_scale compare an NPC's compute_tpf against
     // the DUDE's; a factor applied to both cancels in the quotient, so normalisation is unaffected.
+    //
+    // ⚠️ AND THE COMBAT SPEED SLIDER (2026-10-11) is the same scale above 1: a duration divided by 2
+    // runs twice as fast. Rounded, never below one tick.
     {
-        float aimScale = combat_rt_time_scale();
-        if (aimScale < 1.0f) {
-            tpf = (unsigned int)(tpf / aimScale);
+        float timeScale = combat_rt_time_scale();
+        if (timeScale != 1.0f) {
+            tpf = (unsigned int)(tpf / timeScale + 0.5f);
             if (tpf < 1) {
                 tpf = 1;
             }
