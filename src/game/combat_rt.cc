@@ -1339,6 +1339,11 @@ struct RtInFlight {
     float tAnimStart;    // the attacker's fid first became a real ATTACK pose
     float tAnimEnd;      // it left the attack pose (recoil/UNPOINT, or the projectile's flight)
 
+    // The weapon's ACTION FRAME has been seen at least once (2026-10-11). Latched because the commit
+    // cannot act on it before RT_MIN_SWING_SECONDS, and a short fire animation is over by then --
+    // see actionReached in the resolve loop.
+    bool actionSeen;
+
     // An EXPLOSIVE projectile (rocket, grenade) this attack put in the air, and the explosion art it
     // turns into on arrival (action_take_explosive_projectile). Such an attack commits when the blast
     // goes off, not when the trigger is pulled -- see `landed` in the resolve loop. NULLed by the
@@ -6116,6 +6121,7 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     f->started = rt_clock;
     f->playerApCost = 0; // set by the player-fire path; NPC attacks charge at fire as before
     f->tAnimStart = -1.0f;
+    f->actionSeen = false;
     f->tAnimEnd = -1.0f;
     f->projectile = action_take_explosive_projectile(&f->explosionFid);
     combat_clear_pending_attack();
@@ -11584,6 +11590,7 @@ void combat_rt_update(float dt)
         f->started = rt_clock;
         f->playerApCost = 0; // scripted/orphan attack -- not the player's AP-tracked swing
         f->tAnimStart = -1.0f;
+        f->actionSeen = false;
         f->tAnimEnd = -1.0f;
         f->projectile = action_take_explosive_projectile(&f->explosionFid);
         combat_clear_pending_attack();
@@ -11703,7 +11710,17 @@ void combat_rt_update(float dt)
         bool explosive = f->explosionFid != -1;
         bool landed = explosive && (f->projectile == NULL || f->projectile->fid == f->explosionFid);
 
-        bool actionReached = !thrown && !explosive && rt_attack_action_frame_reached(f->attacker);
+        // ⚠️ LATCHED (2026-10-11, on a Deck: "puška vystřelí a je tam delay zásahu"). The Hunting
+        // Rifle's fire animation is 4 frames, about 0.26 s, and its action frame is the first quarter
+        // of it -- so the frame IS reached, but long before the RT_MIN_SWING_SECONDS floor lets the
+        // commit act, and by then the pose is over and the live test answers "no". The commit then
+        // fell through to swingDone, i.e. the whole sequence including the rifle being LOWERED: 0.78 s
+        // from fire to hit in the trace, against the ~0.35 s the unauthored-frame rule above was set
+        // to. Remembering the frame once seen puts the hit back on the shot.
+        if (!thrown && !explosive && !f->actionSeen && rt_attack_action_frame_reached(f->attacker)) {
+            f->actionSeen = true;
+        }
+        bool actionReached = !thrown && !explosive && f->actionSeen;
 
         // For a projectile attack, commit when the FIRING POSE ENDS rather than when the whole
         // sequence does. The sequence also carries the projectile's flight and, since 2026-08-10,

@@ -407,6 +407,9 @@ static float anim_attack_stat_factor = 0.09f;
 // about BALANCE (this touches no throughput, hit chance or damage) but was wrong about READABILITY.
 // A cosmetic lever cannot be tuned in isolation from the pacing lever it renders.
 #define ANIM_ATTACK_STAT_HIGH_BIAS 1.0f
+
+// How much faster a shot's own projectile flies in realtime (see compute_tpf).
+#define RT_PROJECTILE_SPEEDUP 4.0f
 static float anim_attack_stat_high_bias = ANIM_ATTACK_STAT_HIGH_BIAS;
 
 void anim_init()
@@ -5265,6 +5268,19 @@ unsigned int compute_tpf(Object* object, int fid)
     //
     // ⚠️ AND THE COMBAT SPEED SLIDER (2026-10-11) is the same scale above 1: a duration divided by 2
     // runs twice as fast. Rounded, never below one tick.
+    //
+    // ⚠️ ENERGY BOLTS AND ROCKETS FLY FASTER IN REALTIME (2026-10-11, his pick "1" of three). A visible
+    // projectile crosses the gap at its art's own walking pace, one tile per frame -- a beat you never
+    // notice between turns and a lag in a realtime fight. The ones the game CREATES for the shot (laser,
+    // plasma, the Alien Blaster, a rocket: obj_new with no pid, MISC art) now fly RT_PROJECTILE_SPEEDUP
+    // times faster; a THROWN weapon is the item itself (it keeps its pid) and keeps its pace, because
+    // watching the spear or the grenade arc across is the point. Bullet guns have no projectile at all.
+    if (combat_rt_enabled() && object != NULL && object->pid == -1 && FID_TYPE(object->fid) == OBJ_TYPE_MISC) {
+        tpf = (unsigned int)(tpf / RT_PROJECTILE_SPEEDUP + 0.5f);
+        if (tpf < 1) {
+            tpf = 1;
+        }
+    }
     {
         float timeScale = combat_rt_time_scale();
         if (timeScale != 1.0f) {
