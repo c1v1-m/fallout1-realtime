@@ -91,6 +91,13 @@ Version 0.1.0, the first public release, so expect some rough edges. If somethin
 
 Known: on some PCs (seen with an AMD graphics card) the Steam overlay does not show. On the Steam Deck it works.
 
+## What's next
+
+- Polish, everywhere it still feels rough.
+- New hand-made animations, starting with reloading.
+- Choosing your own keys on the MODS page.
+- The Steam overlay on the PCs where it does not show yet.
+
 ## Building
 
 Windows, with Visual Studio 2026 and CMake:
