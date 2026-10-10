@@ -6,7 +6,7 @@
 
 Fallout 1 where nobody waits for their turn. You walk with the stick, hold the left trigger to lock onto an enemy and pull the right one to shoot, while the raiders and mutants come at you at the same time. Action points are still there. They refill as you fight, faster when the enemy is close, so standing back and kiting does not pay.
 
-It is made for a controller, from the first screen to the ending, and you can play it from start to finish. Mouse and keyboard still work.
+It is made for a controller, from the first screen to the ending, and you can play it from start to finish. For now you need one: mouse and keyboard play is being worked on.
 
 You need your own copy of Fallout from [Steam](https://store.steampowered.com/app/38400) or [GOG](https://www.gog.com/game/fallout).
 
@@ -52,6 +52,7 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 | Left stick | Walk, hold X to run |
 | LT (hold) | Lock onto the nearest enemy |
 | RT | Attack, hold to keep attacking |
+| LT + Y | Firing mode: single, aimed, burst |
 | R3 | Called shot |
 | LB | Reload |
 | RB | Stimpack |
