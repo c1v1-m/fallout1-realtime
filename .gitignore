@@ -394,3 +394,6 @@ FodyWeavers.xsd
 
 # Local ASan build tree (see the asan-build note); build output, never source.
 build-asan/
+
+# Generated preview renders (the scripts that make them are tracked)
+.claude/tools/sideart_preview/*.png
