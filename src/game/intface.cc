@@ -1331,7 +1331,7 @@ void intface_update_heal_slot(Object* item, int count)
         return;
     }
 
-    // The label names the key that heals: RB with a pad, Q on the keyboard (2026-10-10). Part of the
+    // The label names the key that heals: RB with a pad, H on the keyboard (2026-10-10). Part of the
     // change test, so plugging a pad in or out repaints it.
     static int heal_slot_pad = -1;
     int pad = gamepad_ui_get_controller() != NULL ? 1 : 0;
@@ -1377,7 +1377,7 @@ void intface_update_heal_slot(Object* item, int count)
     // The binding, then the count -- same reading order as the weapon slot's mode label above
     // its ammo counter. Yellow for the label, green for a usable count, red for empty, matching
     // the colours the rest of the bar already uses for those three meanings.
-    const char* label = pad ? "RB" : "Q";
+    const char* label = pad ? "RB" : "H";
     int labelY = 4 + iconH;
     int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
     text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch, colorTable[32747]);

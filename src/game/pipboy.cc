@@ -593,29 +593,30 @@ static const PipboyControl ctrl3_lines[] = {
     { "A / B / START", "Skip the death scene" },
 };
 
-// FOURTH CONTROLS PAGE: keyboard and mouse (2026-10-10, twin-stick -- his pick "2"). Everything the
-// pad's world page lists, for a player with no pad: W/A/S/D walk like the left stick, the mouse aims
-// and attacks, and each pad button has a key (gamepad_ui_handle_key, rt_mouse_update). The vanilla
-// keys that still work are listed too, because a keyboard player has no other way to find them.
+// FOURTH CONTROLS PAGE: the keyboard (2026-10-10). The keyboard is a controller -- his design,
+// *"chůze šipkami, akce mezerníkem, ctrl útok, alt běh ... prostě myš vůbec"* -- so this page is the
+// world page again with a key where each pad button was (gamepad_ui_handle_key, combat_rt_poll_gamepad).
+// The vanilla keys that still work are listed too, because a keyboard player has no other way to find
+// them, and so is the optional mouse aim.
 static const PipboyControl ctrl4_lines[] = {
     { NULL, "MOVE AND FIGHT" },
-    { "W A S D", "Walk" },
-    { "Shift (hold)", "Run" },
-    { "Mouse", "Aim at an enemy" },
-    { "Left button", "Attack (hold to keep attacking)" },
-    { "Right button", "Called shot on that enemy" },
+    { "Arrows", "Walk" },
+    { "Alt (hold)", "Run" },
+    { "Ctrl (hold)", "Attack (keeps attacking)" },
+    { "Shift (hold)", "Aim: lock the enemy in front" },
+    { "Q / E", "Lock the next enemy left / right" },
     { "F", "Firing mode: single / aimed / burst" },
-    { "V", "Called shot" },
+    { "V", "Called shot: pick a body part" },
     { "R", "Reload" },
-    { "Q", "Stimpack - best one" },
+    { "H", "Stimpack - best one" },
     { "B", "Swap active hand" },
     { NULL, NULL },
     { NULL, "AROUND YOU" },
-    { "E", "Use what is lit up" },
-    { "Left click", "Use, talk, pick up (not on enemies)" },
+    { "Space", "Use what is lit up" },
     { "G", "Run to the nearest way out" },
-    { "K", "Skilldex" },
+    { "S", "Skilldex" },
     { "1 - 8", "Skills, as in the original" },
+    { "Mouse", "Optional: aim, left button attacks" },
     { NULL, NULL },
     { NULL, "SCREENS" },
     { "I", "Inventory" },

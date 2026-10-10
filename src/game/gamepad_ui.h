@@ -65,8 +65,8 @@ int gamepad_ui_aim_part();
 // trigger plus hard-zero debounce, which is why it is exported rather than re-read there.
 bool gamepad_ui_aim_trigger_held();
 
-// Keyboard & mouse (2026-10-10): the main loop offers every key here first (gamepad_ui.cc explains
-// the layout); the mouse counts as aiming only while it is actually being used.
+// The keyboard as a controller (2026-10-10): the main loop offers every key here first (gamepad_ui.cc
+// has the layout); the mouse, still able to aim, counts only while it is actually being used.
 bool gamepad_ui_handle_key(int* keyCode);
 bool gamepad_ui_mouse_in_use();
 void gamepad_ui_request_called_shot();

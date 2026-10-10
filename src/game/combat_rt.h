@@ -135,8 +135,10 @@ bool combat_rt_can_aim();
 // wheel hub.
 Object* combat_rt_aim_target();
 
-// Keyboard & mouse (2026-10-10): the hostile the mouse is aiming at, or NULL (combat_rt.cc).
+// Keyboard & mouse (2026-10-10): the hostile the mouse is aiming at, or NULL (combat_rt.cc), and the
+// keyboard's Q / E lock step (-1 left, +1 right).
 Object* combat_rt_mouse_target();
+void combat_rt_request_lock_step(int dir);
 
 // To-hit % for a called shot at `hitLocation` (a HIT_LOCATION_* specific value)
 // against the current aim target, clamped to 0..999. 0 if there is no target. Used to

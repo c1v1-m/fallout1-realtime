@@ -10178,16 +10178,12 @@ static bool rt_step_is_free(int rotation)
     return obj_blocking_at(obj_dude, tile_num_in_direction(obj_dude->tile, rotation, 1), map_elevation) == NULL;
 }
 
-// W/A/S/D AS A STICK (keyboard & mouse, 2026-10-10): the held keys as a full-deflection vector in
-// SDL stick space (+y is down). Read by KEY SYMBOL, the same way gamepad_ui_handle_key swallows them,
-// so the keys that walk are exactly the keys vanilla no longer sees. Nothing while Ctrl or Alt is
-// down, which keeps vanilla's Ctrl+S / Ctrl+L and Alt+Enter from walking the dude.
+// THE ARROWS AS THE LEFT STICK (the keyboard as a controller, 2026-10-10 -- the layout is in
+// gamepad_ui_handle_key): the held arrows as a full-deflection vector in SDL stick space (+y is
+// down), eight ways with two held. NOT gated on Ctrl/Alt/Shift: those are attack, run and the aim
+// lock, all of which are held WHILE walking.
 static bool rt_keyboard_walk(float* outX, float* outY)
 {
-    if ((SDL_GetModState() & (KMOD_CTRL | KMOD_ALT)) != 0) {
-        return false;
-    }
-
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     if (keys == NULL) {
         return false;
@@ -10195,16 +10191,16 @@ static bool rt_keyboard_walk(float* outX, float* outY)
 
     float x = 0.0f;
     float y = 0.0f;
-    if (keys[SDL_GetScancodeFromKey(SDLK_w)]) {
+    if (keys[SDL_SCANCODE_UP]) {
         y -= 1.0f;
     }
-    if (keys[SDL_GetScancodeFromKey(SDLK_s)]) {
+    if (keys[SDL_SCANCODE_DOWN]) {
         y += 1.0f;
     }
-    if (keys[SDL_GetScancodeFromKey(SDLK_a)]) {
+    if (keys[SDL_SCANCODE_LEFT]) {
         x -= 1.0f;
     }
-    if (keys[SDL_GetScancodeFromKey(SDLK_d)]) {
+    if (keys[SDL_SCANCODE_RIGHT]) {
         x += 1.0f;
     }
     if (x == 0.0f && y == 0.0f) {
@@ -10353,6 +10349,21 @@ Object* combat_rt_mouse_target()
     return rt_mouse_target;
 }
 
+// Q / E on the keyboard step the lock one enemy left / right of the current one -- the right stick's
+// job (rt_directional_lock), one press per step. Asked from the key handler, done in the poll.
+static int rt_kb_lock_step = 0;
+
+void combat_rt_request_lock_step(int dir)
+{
+    rt_kb_lock_step = dir;
+}
+
+// The held keyboard modifiers that stand in for pad buttons (gamepad_ui_handle_key has the layout).
+static bool rt_kb_mod_held(SDL_Keymod mask)
+{
+    return (SDL_GetModState() & mask) != 0;
+}
+
 void combat_rt_poll_gamepad()
 {
     if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {
@@ -10397,10 +10408,10 @@ void combat_rt_poll_gamepad()
     float x = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTX) / RT_GAMEPAD_AXIS_MAX : 0.0f;
     float y = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_LEFTY) / RT_GAMEPAD_AXIS_MAX : 0.0f;
 
-    // W/A/S/D WALK EXACTLY LIKE THE STICK (keyboard & mouse, 2026-10-10): eight ways at full
-    // deflection, into the same heading code below -- doorway assist, crowd assist, free movement and
-    // the AP model all apply unchanged. Only while the stick is idle, so a pad player resting a hand
-    // on the keyboard is never fought.
+    // THE ARROWS WALK EXACTLY LIKE THE STICK (the keyboard as a controller, 2026-10-10): eight ways at
+    // full deflection, into the same heading code below -- doorway assist, crowd assist, free movement
+    // and the AP model all apply unchanged. Only while the stick is idle, so a pad player resting a
+    // hand on the keyboard is never fought.
     bool kbWalk = false;
     if (x * x + y * y <= RT_GAMEPAD_DEADZONE * RT_GAMEPAD_DEADZONE) {
         float kx;
@@ -10422,8 +10433,8 @@ void combat_rt_poll_gamepad()
     // that LT-held; X could not stay a hold because holding X opens the weapon wheel. The local
     // keeps its name because every gait test below reads it as "the run key", but there is no key
     // being held any more -- gamepad_ui owns the state and this just asks for it.
-    // ...and on the keyboard Shift is the run, held like X.
-    bool ltHeld = gamepad_ui_run_on() || (kbWalk && (SDL_GetModState() & KMOD_SHIFT) != 0);
+    // ...and on the keyboard Alt is the run, held like X.
+    bool ltHeld = gamepad_ui_run_on() || (kbWalk && rt_kb_mod_held(KMOD_ALT));
     // The Bonus Move reserve pays for running as well -- it is movement, which is all it is for.
     bool run = ltHeld && (!rt_engaged || ((rt_player_ap > 0 || rt_bonus_move_ap > 0) && !rt_run_blocked));
 
@@ -10664,7 +10675,8 @@ void combat_rt_poll_gamepad()
     // Read through the Schmitt helper, never a bare threshold: a held trigger reports occasional
     // hard zeros, and each one would read as "let go" and drop the aim for a frame.
     static bool rt_lt_owns_lock = false;
-    bool ltAim = gamepad_ui_aim_trigger_held();
+    // ...or Shift held on the keyboard, which is LT there.
+    bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT);
 
     if (ltAim && rt_lock_target == NULL) {
         rt_lock_target = rt_lock_pick_initial();
@@ -10697,6 +10709,25 @@ void combat_rt_poll_gamepad()
     // Tracks whether WE forced the crosshair cursor for a lock, so we only revert
     // it on unlock (and don't clobber a crosshair the player set themselves).
     static bool rt_lock_set_crosshair = false;
+
+    // The keyboard's Q / E: one step left / right of the current target, anchored on it exactly the
+    // way a fresh right-stick push is. Nothing to step from without a lock -- hold Shift first.
+    if (rt_kb_lock_step != 0) {
+        int dir = rt_kb_lock_step;
+        rt_kb_lock_step = 0;
+        if (rt_lock_target != NULL) {
+            rt_lock_push_anchor = rt_lock_target;
+            if (rt_directional_lock((float)dir, 0.0f)) {
+                gsound_play_sfx_file("ib1p1xx1");
+                trace_event(TRACE_INPUT, "aim", "target=%d id=%d dist=%d src=key dir=%d t=%.2f",
+                    rt_lock_target != NULL ? rt_lock_target->pid : -1,
+                    rt_lock_target != NULL ? rt_lock_target->id : -1,
+                    rt_lock_target != NULL ? obj_dist(obj_dude, rt_lock_target) : -1, dir, rt_clock);
+            }
+            rt_lock_push_anchor = NULL;
+        }
+    }
+
     if (rt_lock_target != NULL) {
         float rx = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTX) / RT_GAMEPAD_AXIS_MAX : 0.0f;
         float ry = rt_gamepad != NULL ? SDL_GameControllerGetAxis(rt_gamepad, SDL_CONTROLLER_AXIS_RIGHTY) / RT_GAMEPAD_AXIS_MAX : 0.0f;
@@ -10807,7 +10838,9 @@ void combat_rt_poll_gamepad()
     // ⚠️ NOT WHILE THE AIMED-SHOT PICKER IS UP: there RT means "fire at the part I chose", and
     // gamepad_ui commits that shot itself. Without this gate the same pull would also start an
     // ordinary attack at whatever the auto-target picked.
-    bool attack = gamepad_ui_attack_held() && !gamepad_ui_aim_gesture_active();
+    bool attack = (gamepad_ui_attack_held() && !gamepad_ui_aim_gesture_active())
+        // ...or Ctrl held on the keyboard, which is RT there.
+        || rt_kb_mod_held(KMOD_CTRL);
     // Only trace the attack intent on the RT PRESS EDGE, not every held frame -- each actual fire
     // is already logged as [COMBAT/attack], so a per-frame ACTION line would be pure spam.
     static bool rt_prev_attack_btn = false;
@@ -12337,8 +12370,8 @@ bool combat_rt_handle_input(int keyCode)
     // this here (before input) guarantees a WASD move never starts AP-starved.
     obj_dude->data.critter.combat.ap = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
 
-    // (W/A/S/D used to step single tiles here, four of the six directions. They are a stick now --
-    // combat_rt_poll_gamepad -- and the keys are swallowed in gamepad_ui_handle_key before this runs.)
+    // (W/A/S/D used to step single tiles here, four of the six directions. Walking on the keyboard is
+    // the arrows now, read as a stick in combat_rt_poll_gamepad; see gamepad_ui_handle_key.)
 
     // KEYBOARD & MOUSE: a REAL click on the enemy the mouse is aiming at belongs to the attack, which
     // rt_mouse_update fires, tapped or held -- never to vanilla, which would try to talk to him or

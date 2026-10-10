@@ -7218,19 +7218,24 @@ void gamepad_ui_request_called_shot()
     gpui_called_shot_pending = true;
 }
 
-// ⚠️ KEYBOARD & MOUSE (2026-10-10). *"mouse and keyboard nefunguje bráško, to musíme vymyslet pro
-// hráče bez controllerů"*, and of the two designs he picked "2", twin-stick: W/A/S/D walk the way the
-// left stick does (combat_rt_poll_gamepad reads the held keys, Shift runs), the mouse aims and its
-// left button attacks (rt_mouse_update), and these keys do what the pad's buttons do -- through the
-// same requests, so the two can never drift apart:
+// ⚠️ THE KEYBOARD IS A CONTROLLER (2026-10-10). First *"mouse and keyboard nefunguje bráško, to
+// musíme vymyslet pro hráče bez controllerů"*; a twin-stick layout (W/A/S/D + mouse aim) lived for
+// one build, then his own design replaced it: *"udělat to stejně jako fallout na controlleru, chůze
+// šipkami, akce mezerníkem, ctrl útok, alt běh ... prostě myš vůbec"*. So every key stands in for a
+// pad button and goes through the very code that button uses -- the pad itself is not touched:
 //
-//   Q stimpack (RB)            R reload (LB)            F firing mode (LT+Y)
-//   E use what is lit up (A)   V called shot (R3)       G run to the nearest exit (BACK held)
+//   arrows  walk (left stick)        Alt (hold)    run (X)          Ctrl (hold)  attack (RT)
+//   Shift (hold)  aim lock (LT)      Q / E         lock target left / right (right stick)
+//   Space   use what is lit up (A)   H  stimpack (RB)   R  reload (LB)   F  firing mode (LT+Y)
+//   V       called shot (R3)         G  run to the nearest exit (BACK held)
 //
-// W/A/S/D are SWALLOWED here, before vanilla sees them: its A (enter combat, already dead under
-// realtime) and S (the Skilldex) sat on them, so the Skilldex moves to K. Runs from the main loop
-// only, so a text field (a save name, the character's name) never gets here. Returns true when the
-// key was used; may rewrite the key (K) and return false to let vanilla act on the new one.
+// The held keys (arrows, Ctrl, Alt, Shift) are read live in combat_rt_poll_gamepad; this function
+// takes the presses. Ctrl and Alt are HELD while the others are pressed, so their combined codes
+// (Ctrl+R = 18, Alt+R = 275, ...) count as the plain key -- otherwise reloading while attacking
+// would do nothing, and Ctrl+Q would ask whether to QUIT the game in the middle of a fight. Ctrl+H
+// is the one left out: its code is Backspace's, and Backspace must not burn a stimpack. Arrow codes
+// are swallowed too, or vanilla would scroll the map under the walking dude. Runs from the main loop
+// only, so a text field (a save name) never gets here. Returns true when the key was used.
 bool gamepad_ui_handle_key(int* keyCode)
 {
     int key = *keyCode;
@@ -7239,21 +7244,39 @@ bool gamepad_ui_handle_key(int* keyCode)
     }
 
     switch (key) {
-    case KEY_LOWERCASE_W:
-    case KEY_UPPERCASE_W:
-    case KEY_LOWERCASE_A:
-    case KEY_UPPERCASE_A:
-    case KEY_LOWERCASE_S:
-    case KEY_UPPERCASE_S:
-    case KEY_LOWERCASE_D:
-    case KEY_UPPERCASE_D:
+    case KEY_ARROW_UP:
+    case KEY_ARROW_DOWN:
+    case KEY_ARROW_LEFT:
+    case KEY_ARROW_RIGHT:
+    case KEY_CTRL_ARROW_UP:
+    case KEY_CTRL_ARROW_DOWN:
+    case KEY_CTRL_ARROW_LEFT:
+    case KEY_CTRL_ARROW_RIGHT:
+    case KEY_ALT_ARROW_UP:
+    case KEY_ALT_ARROW_DOWN:
+    case KEY_ALT_ARROW_LEFT:
+    case KEY_ALT_ARROW_RIGHT:
         return true;
-    case KEY_LOWERCASE_K:
-    case KEY_UPPERCASE_K:
-        *keyCode = KEY_LOWERCASE_S;
-        return false;
+    case KEY_SPACE: {
+        bool queued = interact_prompt_request();
+        trace_event(TRACE_INPUT, "kbm-key", "key=SPACE queued=%d", queued ? 1 : 0);
+        return true;
+    }
     case KEY_LOWERCASE_Q:
     case KEY_UPPERCASE_Q:
+    case KEY_CTRL_Q:
+    case KEY_ALT_Q:
+        combat_rt_request_lock_step(-1);
+        return true;
+    case KEY_LOWERCASE_E:
+    case KEY_UPPERCASE_E:
+    case KEY_CTRL_E:
+    case KEY_ALT_E:
+        combat_rt_request_lock_step(1);
+        return true;
+    case KEY_LOWERCASE_H:
+    case KEY_UPPERCASE_H:
+    case KEY_ALT_H:
         if (!radial_wheel_is_open() && !inven_any_open()) {
             gpui_heal_pending = true;
             trace_event(TRACE_INPUT, "heal-press", "src=key");
@@ -7261,28 +7284,30 @@ bool gamepad_ui_handle_key(int* keyCode)
         return true;
     case KEY_LOWERCASE_R:
     case KEY_UPPERCASE_R:
+    case KEY_CTRL_R:
+    case KEY_ALT_R:
         trace_event(TRACE_INPUT, "kbm-key", "key=R");
         gpui_request_reload();
         return true;
     case KEY_LOWERCASE_F:
     case KEY_UPPERCASE_F:
+    case KEY_CTRL_F:
+    case KEY_ALT_F:
         if (!radial_wheel_is_open()) {
             gpui_cycle_fire_mode("key");
         }
         return true;
-    case KEY_LOWERCASE_E:
-    case KEY_UPPERCASE_E: {
-        bool queued = interact_prompt_request();
-        trace_event(TRACE_INPUT, "kbm-key", "key=E queued=%d", queued ? 1 : 0);
-        return true;
-    }
     case KEY_LOWERCASE_V:
     case KEY_UPPERCASE_V:
+    case KEY_CTRL_V:
+    case KEY_ALT_V:
         trace_event(TRACE_INPUT, "kbm-key", "key=V");
         gpui_called_shot_pending = true;
         return true;
     case KEY_LOWERCASE_G:
     case KEY_UPPERCASE_G:
+    case KEY_CTRL_G:
+    case KEY_ALT_G:
         trace_event(TRACE_INPUT, "kbm-key", "key=G");
         gpui_exit_nav_pending = true;
         return true;
@@ -7304,7 +7329,7 @@ void gamepad_ui_tick()
         gmouse_set_move_cursor_hidden(false);
 
         // ...and everything a keyboard player asks for still needs this tick: the heal slot beside
-        // the bar, the requests (Q, R, G, V) and the E "use" prompt.
+        // the bar, the requests (H, R, G, V) and the use prompt Space acts on.
         {
             int healCount;
             Object* heal = gpui_next_heal(&healCount);
