@@ -2819,11 +2819,15 @@ static void gpui_skill_wheel(SDL_GameController* pad)
         return;
     }
 
+    // ⚠️ L3 OPENS THE GAME'S OWN SKILLDEX NOW (2026-10-11, on a Deck: "mám problémy vybrat s L3 skill.
+    // Udělej to podobně jako R3"). R3 opens the original called-shot window; L3 now opens the original
+    // Skilldex the same way, by handing vanilla its own key (S). It is a modal window, so the pad's
+    // generic menu navigation drives it -- the stick steps between the skill buttons, A presses one,
+    // B closes -- and the skill it returns arms the same cursor the wheel's pick did. The wheel above
+    // is kept but no longer opened from here; nothing else opens it either.
     if (l3Edge && !blocked) {
-        gpui_open_skill_wheel();
-        if (radial_wheel_is_open()) {
-            gpui_wheel_owner = GPUI_WHEEL_SKILL;
-        }
+        trace_event(TRACE_INPUT, "skilldex-open", "src=l3");
+        GNW_add_input_buffer(KEY_LOWERCASE_S);
     }
 }
 
