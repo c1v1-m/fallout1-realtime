@@ -1,125 +1,90 @@
 # Fallout 1 Realtime
 
-**This is a modified version of [Fallout Community Edition](https://github.com/alexbatalov/fallout1-ce) by Alexander Batalov.** It replaces the turn-based combat with realtime combat and adds full gamepad play, on a PC and on a Steam Deck. Everything changed after upstream commit `0609bcf` is the work of c1v1-m. The original license, the Sustainable Use License in [LICENSE.md](LICENSE.md), applies unchanged: free, non-commercial use and distribution only.
+**Fallout 1 in realtime for Steam Deck and PC.**
 
-You need your own copy of Fallout (Steam or GOG) to play. The installer and release notes will be published under Releases.
+<!-- TODO: a screenshot or a short GIF of a fight goes here -->
 
-The original Fallout Community Edition README follows.
+Fallout 1 where nobody waits for their turn. You walk with the stick, hold the left trigger to lock onto an enemy and pull the right one to shoot, while the raiders and mutants come at you at the same time. Action points are still there. They refill as you fight, faster when the enemy is close, so standing back and kiting does not pay.
 
----
+It is made for a controller, from the first screen to the ending, and you can play it from start to finish. Mouse and keyboard still work.
 
-# Fallout Community Edition
+You need your own copy of Fallout from [Steam](https://store.steampowered.com/app/38400) or [GOG](https://www.gog.com/game/fallout).
 
-Fallout Community Edition is a fully working re-implementation of Fallout, with the same original gameplay, engine bugfixes, and some quality of life improvements, that works (mostly) hassle-free on multiple platforms.
+## What is new
 
-There is also [Fallout 2 Community Edition](https://github.com/alexbatalov/fallout2-ce).
+- Realtime combat. Everyone moves and attacks at the same time.
+- Your stats decide how fast you swing, aim and reload. Agility brings your action points back faster.
+- The whole game plays on a gamepad: fighting, looting, barter, dialogue, the Pip-Boy, the character screen.
+- Radial menus for skills, weapons, ammo and drugs. A stimpack is one press of RB.
+- On the Steam Deck it starts straight from the Steam library, in Game Mode.
+- Widescreen at the original scale, smooth movement and VSync.
+- A MODS page in the options, where most of this can be switched back toward the original.
 
-## Installation
+## Install
 
-You must own the game to play. Purchase your copy on [GOG](https://www.gog.com/game/fallout) or [Steam](https://store.steampowered.com/app/38400). Download latest [release](https://github.com/alexbatalov/fallout1-ce/releases) or build from source. You can also check latest [debug](https://github.com/alexbatalov/fallout1-ce/actions) build intended for testers.
+Download the latest zip from [Releases](../../releases) and unzip it.
 
-### Windows
+### Steam on a PC
 
-Download and copy `fallout-ce.exe` to your `Fallout` folder. It serves as a drop-in replacement for `falloutw.exe`.
+1. Run `Fallout1-Realtime-Setup.exe` and click **Install**. It finds your Steam copy of Fallout by itself.
+2. Press **Play** on Fallout in Steam.
 
-### Linux
+### Steam Deck
 
-- Use Windows installation as a base - it contains data assets needed to play. Copy `Fallout` folder somewhere, for example `/home/john/Desktop/Fallout`.
+1. Switch to Desktop Mode and unzip the download.
+2. Open the `steamdeck` folder, right-click inside it, choose **Open Terminal Here** and type `bash install-steamdeck.sh`.
+3. Go back to Game Mode and press **Play** on Fallout.
 
-- Alternatively you can extract the needed files from the GoG installer:
+If the buttons act like a mouse, open Fallout's controller settings in Steam and pick the **Gamepad** layout.
 
-```console
-$ sudo apt install innoextract
-$ innoextract ~/Downloads/setup_fallout_2.1.0.18.exe -I app
-$ mv app Fallout
+### GOG or a CD copy
+
+Run `Fallout1-Realtime-Setup.exe`, click **Browse...**, choose your Fallout folder and click **Install**. Then start `fallout1-realtime.exe` from that folder.
+
+### Uninstall
+
+Run the installer again and click **Uninstall**. On the Deck it is `bash install-steamdeck.sh uninstall`. Steam's **Verify integrity of game files** brings the original back as well. Your saves and settings are never touched.
+
+## Controls
+
+| Button | What it does |
+|---|---|
+| Left stick | Walk, hold X to run |
+| LT (hold) | Lock onto the nearest enemy |
+| RT | Attack, hold to keep attacking |
+| R3 | Called shot |
+| LB | Reload |
+| RB | Stimpack |
+| A | Use what is lit up |
+| L3, Y, B | Skill, weapon and item wheels |
+| BACK | Inventory, hold to run to the nearest exit |
+| START (hold) | Quick save |
+
+Every screen has its own list in the game: Pip-Boy, Archives, CONTROLS.
+
+## Status
+
+Version 0.1.0, the first public release, so expect some rough edges. If something breaks, please open an [issue](../../issues). It helps a lot if you put `trace_log=1` under `[preferences]` in `fallout.cfg`, play until it happens again and attach the newest `trace_*.log` from the game folder.
+
+Known: on some PCs (seen with an AMD graphics card) the Steam overlay does not show. On the Steam Deck it works.
+
+## Building
+
+Windows, with Visual Studio 2026 and CMake:
+
+```
+cmake -S . -B build-release -G "Visual Studio 18 2026" -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DFALLOUT_RELEASE=ON
+cmake --build build-release --config Release --target fallout1-realtime-setup
 ```
 
-- Download and copy `fallout-ce` to this folder.
+That builds `fallout1-realtime.exe` and the installer. Leave out `-DFALLOUT_RELEASE=ON` for the development build, which keeps every diagnostic on.
 
-- Install [SDL2](https://libsdl.org/download-2.0.php):
+## Credits
 
-```console
-$ sudo apt install libsdl2-2.0-0
-```
+Fallout 1 Realtime is a modified version of [Fallout Community Edition](https://github.com/alexbatalov/fallout1-ce) by Alexander Batalov, which re-implements the original engine. Everything changed after upstream commit `0609bcf` is the work of c1v1-m.
 
-- Run `./fallout-ce`.
-
-### macOS
-
-> **NOTE**: macOS 10.11 (El Capitan) or higher is required. Runs natively on Intel-based Macs and Apple Silicon.
-
-- Use Windows installation as a base - it contains data assets needed to play. Copy `Fallout` folder somewhere, for example `/Applications/Fallout`.
-
-- Alternatively you can use Fallout from MacPlay/The Omni Group as a base - you need to extract game assets from the original bundle. Mount CD/DMG, right click `Fallout` -> `Show Package Contents`, navigate to `Contents/Resources`. Copy `GameData` folder somewhere, for example `/Applications/Fallout`.
-
-- Or if you're a Terminal user and have Homebrew installed you can extract the needed files from the GoG installer:
-
-```console
-$ brew install innoextract
-$ innoextract ~/Downloads/setup_fallout_2.1.0.18.exe -I app
-$ mv app /Applications/Fallout
-```
-
-- Download and copy `fallout-ce.app` to this folder.
-
-- Run `fallout-ce.app`.
-
-### Android
-
-> **NOTE**: Fallout was designed with mouse in mind. There are many controls that require precise cursor positioning, which is not possible with fingers. Current control scheme resembles trackpad usage:
-> - One finger moves mouse cursor around.
-> - Tap one finger for left mouse click.
-> - Tap two fingers for right mouse click (switches mouse cursor mode).
-> - Move two fingers to scroll current view (map view, worldmap view, inventory scrollers).
-
-> **NOTE**: From Android standpoint release and debug builds are different apps. Both apps require their own copy of game assets and have their own savegames. This is intentional. As a gamer just stick with release version and check for updates.
-
-- Use Windows installation as a base - it contains data assets needed to play. Copy `Fallout` folder to your device, for example to `Downloads`. You need `master.dat`, `critter.dat`, and `data` folder. Watch for file names - keep (or make) them lowercased (see [Configuration](#configuration)).
-
-- Download `fallout-ce.apk` and copy it to your device. Open it with file explorer, follow instructions (install from unknown source).
-
-- When you run the game for the first time it will immediately present file picker. Select the folder from the first step. Wait until this data is copied. A loading dialog will appear, just wait for about 30 seconds. The game will start automatically.
-
-### iOS
-
-> **NOTE**: See Android note on controls.
-
-- Download `fallout-ce.ipa`. Use sideloading applications ([AltStore](https://altstore.io/) or [Sideloadly](https://sideloadly.io/)) to install it to your device. Alternatively you can always build from source with your own signing certificate.
-
-- Run the game once. You'll see error message saying "Could not find the master datafile...". This step is needed for iOS to expose the game via File Sharing feature.
-
-- Use Finder (macOS Catalina and later) or iTunes (Windows and macOS Mojave or earlier) to copy `master.dat`, `critter.dat`, and `data` folder to "Fallout" app ([how-to](https://support.apple.com/HT210598)). Watch for file names - keep (or make) them lowercased (see [Configuration](#configuration)).
-
-## Configuration
-
-The main configuration file is `fallout.cfg`. There are several important settings you might need to adjust for your installation. Depending on your Fallout distribution main game assets `master.dat`, `critter.dat`, and `data` folder might be either all lowercased, or all uppercased. You can either update `master_dat`, `critter_dat`, `master_patches` and `critter_patches` settings to match your file names, or rename files to match entries in your `fallout.cfg`.
-
-The `sound` folder (with `music` folder inside) might be located either in `data` folder, or be in the Fallout folder. Update `music_path1` setting to match your hierarchy, usually it's `data/sound/music/` or `sound/music/`. Make sure it match your path exactly (so it might be `SOUND/MUSIC/` if you've installed Fallout from CD). Music files themselves (with `ACM` extension) should be all uppercased, regardless of `sound` and `music` folders.
-
-The second configuration file is `f1_res.ini`. Use it to change game window size and enable/disable fullscreen mode.
-
-```ini
-[MAIN]
-SCR_WIDTH=1280
-SCR_HEIGHT=720
-WINDOWED=1
-```
-
-Recommendations:
-- **Desktops**: Use any size you see fit.
-- **Tablets**: Set these values to logical resolution of your device, for example iPad Pro 11 is 1668x2388 (pixels), but it's logical resolution is 834x1194 (points).
-- **Mobile phones**: Set height to 480, calculate width according to your device screen (aspect) ratio, for example Samsung S21 is 20:9 device, so the width should be 480 * 20 / 9 = 1067.
-
-In time this stuff will receive in-game interface, right now you have to do it manually.
-
-## Contributing
-
-Here is a couple of current goals. Open up an issue if you have suggestion or feature request.
-
-- **Update to v1.2**. This project is based on Reference Edition which implements v1.1 released in November 1997. There is a newer v1.2 released in March 1998 which at least contains important multilingual support.
-
-- **Backport some Fallout 2 features**. Fallout 2 (with some Sfall additions) added many great improvements and quality of life enhancements to the original Fallout engine. Many deserve to be backported to Fallout 1. Keep in mind this is a different game, with slightly different gameplay balance (which is a fragile thing on its own).
+Fallout is a trademark of Bethesda Softworks. This project contains no game data.
 
 ## License
 
-The source code is this repository is available under the [Sustainable Use License](LICENSE.md).
+The source code is available under the [Sustainable Use License](LICENSE.md), the same as Fallout Community Edition: free, non-commercial use and distribution only.
