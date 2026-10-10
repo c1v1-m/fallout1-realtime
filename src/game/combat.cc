@@ -4411,8 +4411,16 @@ bool combat_late_lethal_upgrade(Attack* attack)
 void combat_anim_begin()
 {
     if (++combat_turn_running == 1 && obj_dude == main_ctd.attacker) {
-        game_ui_disable(1);
-        gmouse_set_cursor(26);
+        // ⚠️ NOT IN REALTIME (2026-10-11, on a Deck: "při střelbě se přehrála animace a viděl jsem budík
+        // jak se tiká ... dej to pryč"). The turn-based game locks the whole UI for the dude's swing and
+        // shows the waiting clock; in realtime the world keeps going, combat_rt re-enables the UI the
+        // next frame anyway, and all this did was flash the clock -- and blank the pointer -- on every
+        // attack (the earlier "při akcích občas problikne kurzor"). combat_anim_finished skips the
+        // matching enable.
+        if (!combat_rt_enabled()) {
+            game_ui_disable(1);
+            gmouse_set_cursor(26);
+        }
         if (combat_highlight == 2) {
             combat_outline_off();
         }
@@ -4427,7 +4435,7 @@ void combat_anim_finished()
         return;
     }
 
-    if (obj_dude == main_ctd.attacker) {
+    if (obj_dude == main_ctd.attacker && !combat_rt_enabled()) {
         game_ui_enable();
     }
 
@@ -5049,7 +5057,16 @@ bool combat_to_hit(Object* target, int* accuracy)
         return false;
     }
 
-    *accuracy = determine_to_hit(obj_dude, target, HIT_LOCATION_UNCALLED, hitMode);
+    // ⚠️ THE AIMED PART'S CHANCE WHILE AIMING (2026-10-11, on a Deck: "můžou při aimed shots procenta
+    // ukazovat aimed shots u dané končetiny při míření?"). In realtime the weapon slot's AIMED mode
+    // fires at the part bound in the called-shot window (rt_player_called_loc), so the percentage over
+    // the target -- the lock-on's and the mouse's -- is that part's chance, eyes and groin penalties
+    // included, not the uncalled one the shot will never use. Turn-based keeps vanilla's number.
+    int location = HIT_LOCATION_UNCALLED;
+    if (combat_rt_enabled() && aiming && item_w_called_shot(obj_dude, hitMode)) {
+        location = gamepad_ui_aim_part();
+    }
+    *accuracy = determine_to_hit(obj_dude, target, location, hitMode);
 
     return true;
 }
