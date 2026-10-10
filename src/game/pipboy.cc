@@ -531,6 +531,8 @@ static const PipboyControl ctrl2_lines[] = {
     { "X", "Take a point back" },
     { "Y", "Spend them all" },
     { "B", "Cancel" },
+    // The name box (2026-10-11): it took only Enter until a Deck player got stuck in it.
+    { "Name box", "Steam+X types it, A confirms" },
     { NULL, NULL },
     { NULL, "INVENTORY AND LOOT" },
     { "A", "Use / equip to A (loot: take one)" },

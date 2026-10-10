@@ -2741,6 +2741,18 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
 
     beginTextInput();
 
+    // ⚠️ THE PAD CONFIRMS TOO (2026-10-11, on a Steam Deck: "napsal jsem si jméno, když jsem tvořil
+    // postavu, ale nemohl jsem potvrdit nick"). This loop only ever took Enter or a click on the
+    // window's little red Done button, and with a controller there is neither: the name is typed on
+    // Steam's keyboard (Steam + X) and then A did nothing. A or START now confirm like Enter, B
+    // cancels like Esc. Edges only, starting from whatever is held as the box opens, so a button
+    // carried in never closes it on its first frame; the epoch bump on the way out does the same
+    // for the screen underneath (see ce_pad_poll).
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    bool padPrevA = pad != NULL && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool padPrevStart = pad != NULL && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+    bool padPrevB = pad != NULL && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+
     int blinkingCounter = 3;
     bool blink = false;
 
@@ -2751,6 +2763,25 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
         frame_time = get_time();
 
         int keyCode = get_input();
+
+        pad = gamepad_ui_get_controller();
+        if (pad != NULL) {
+            SDL_GameControllerUpdate();
+            bool padA = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool padStart = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
+            bool padB = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+            if (keyCode == -1) {
+                if ((padA && !padPrevA) || (padStart && !padPrevStart)) {
+                    keyCode = KEY_RETURN;
+                } else if (padB && !padPrevB) {
+                    keyCode = KEY_ESCAPE;
+                }
+            }
+            padPrevA = padA;
+            padPrevStart = padStart;
+            padPrevB = padB;
+        }
+
         if (keyCode == cancelKeyCode) {
             rc = 0;
         } else if (keyCode == KEY_RETURN) {
@@ -2805,6 +2836,9 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
     }
 
     endTextInput();
+
+    // The A / START / B that closed the box is still held as the screen underneath resumes.
+    gamepad_ui_bump_input_epoch();
 
     if (rc == 0 || nameLength > 0) {
         copy[nameLength] = '\0';

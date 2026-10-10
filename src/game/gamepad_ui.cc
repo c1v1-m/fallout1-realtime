@@ -1256,6 +1256,14 @@ static bool gpui_consumed_rb = false; // RB: a press already spent (paging a whe
 // registers an animation. Same deferral the wheels use -- see gpui_use_best_heal.
 static bool gpui_heal_pending = false;
 
+// ⚠️ WHEN THE HEAL WAS ASKED FOR (2026-10-11). The press is read in the mouse hook, which runs in EVERY
+// loop -- the character editor, the main menu -- but only the gameplay tick drains it. An RB pressed
+// while creating the character (seen in a Deck trace: heal-press src=rb at s=38, the game started a
+// minute later) would sit there and burn a stimpak on the first frame of the game. A request older
+// than this is dropped instead (gpui_drain_requests).
+static unsigned int gpui_heal_pending_since = 0;
+#define GPUI_HEAL_STALE_MS 1500
+
 // LB-tap reload with MODS "Reload animation" on: requested from the hook, started on the safe tick
 // (it registers an animation), and dropped if the dude stays busy past GPUI_RELOAD_WAIT_MS.
 static bool gpui_reload_pending = false;
@@ -1922,6 +1930,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // nothing to leave.
     if (rbPressed && !radial_wheel_is_open() && !inven_any_open()) {
         gpui_heal_pending = true;
+        gpui_heal_pending_since = get_time();
         trace_event(TRACE_INPUT, "heal-press", "src=rb");
     }
     if (rbReleased) {
@@ -1998,6 +2007,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         gpui_consumed_b = true;
         gpui_consumed_lb = true;
         gpui_heal_pending = true;
+        gpui_heal_pending_since = get_time();
         trace_event(TRACE_INPUT, "heal-press", "src=lb+b");
     }
 }
@@ -7141,7 +7151,11 @@ static void gpui_drain_requests()
     // keeps every item use on the same safe tick.
     if (gpui_heal_pending) {
         gpui_heal_pending = false;
-        gpui_use_best_heal();
+        if (elapsed_time(gpui_heal_pending_since) <= GPUI_HEAL_STALE_MS) {
+            gpui_use_best_heal();
+        } else {
+            trace_event(TRACE_INPUT, "heal-stale", "age=%u", elapsed_time(gpui_heal_pending_since));
+        }
     }
 
     // The reload with its animation (MODS "Reload animation"). Waits for the body to come
@@ -7279,6 +7293,7 @@ bool gamepad_ui_handle_key(int* keyCode)
     case KEY_ALT_H:
         if (!radial_wheel_is_open() && !inven_any_open()) {
             gpui_heal_pending = true;
+            gpui_heal_pending_since = get_time();
             trace_event(TRACE_INPUT, "heal-press", "src=key");
         }
         return true;
