@@ -2,6 +2,19 @@ cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
+# Fallout 1 Realtime release: link the C/C++ runtime STATICALLY, so the exe runs on a PC without the
+# Visual C++ redistributable (otherwise: "MSVCP140.dll was not found"). CMP0091 decides how the
+# runtime flags are made and must be NEW before project(); the policy default carries it into SDL2
+# and the other subprojects, whose own cmake_minimum_required predates it. Release tree only -- the
+# development build is untouched. FALLOUT_RELEASE is read here from the -D on the command line.
+if(FALLOUT_RELEASE)
+    if(POLICY CMP0091)
+        cmake_policy(SET CMP0091 NEW)
+    endif()
+    set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(EXECUTABLE_NAME fallout-ce)
 
 if (APPLE)
@@ -330,6 +343,35 @@ if(FALLOUT_RELEASE)
     if(NOT APPLE)
         set_target_properties(${EXECUTABLE_NAME} PROPERTIES OUTPUT_NAME "fallout1-realtime")
     endif()
+endif()
+
+# Fallout 1 Realtime's Windows installer: ONE exe carrying the game and data\aimmask.dat as
+# resources, which installs them into an existing Fallout 1 (on Steam it takes FalloutLauncher.exe's
+# place, so Steam's Play button starts the game -- see installer/setup.cc). Release tree only:
+#   cmake --build build-release --config Release --target fallout1-realtime-setup
+# The payload .rc is generated per configuration because it names the game exe of THAT build.
+if(FALLOUT_RELEASE AND WIN32)
+    set(FALLOUT_RT_AIMMASK "${CMAKE_SOURCE_DIR}/build/Release/data/aimmask.dat" CACHE FILEPATH
+        "The painted aim masks (data/aimmask.dat) packed into the installer")
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/setup_payload_$<CONFIG>.rc" CONTENT
+"1 ICON \"${CMAKE_SOURCE_DIR}/os/windows/fallout-ce.ico\"
+101 RCDATA \"$<TARGET_FILE:${EXECUTABLE_NAME}>\"
+102 RCDATA \"${FALLOUT_RT_AIMMASK}\"
+")
+    add_executable(fallout1-realtime-setup WIN32
+        "installer/setup.cc"
+        "installer/setup.manifest"
+        "${CMAKE_CURRENT_BINARY_DIR}/setup_payload_$<CONFIG>.rc"
+    )
+    target_include_directories(fallout1-realtime-setup PRIVATE "src")
+    target_compile_definitions(fallout1-realtime-setup PRIVATE
+        UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(fallout1-realtime-setup comctl32 ole32 shell32 advapi32 uuid)
+    set_target_properties(fallout1-realtime-setup PROPERTIES OUTPUT_NAME "Fallout1-Realtime-Setup")
+    # The payload is the game exe: build it first, and re-pack whenever it changes.
+    add_dependencies(fallout1-realtime-setup ${EXECUTABLE_NAME})
+    set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/setup_payload_$<CONFIG>.rc" PROPERTIES
+        OBJECT_DEPENDS "$<TARGET_FILE:${EXECUTABLE_NAME}>;${FALLOUT_RT_AIMMASK}")
 endif()
 
 # Emit a PDB even for Release so the game_trace crash handler can resolve symbolic

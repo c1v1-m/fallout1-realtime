@@ -1,3 +1,13 @@
+# Fallout 1 Realtime
+
+**This is a modified version of [Fallout Community Edition](https://github.com/alexbatalov/fallout1-ce) by Alexander Batalov.** It replaces the turn-based combat with realtime combat and adds full gamepad play, on a PC and on a Steam Deck. Everything changed after upstream commit `0609bcf` is the work of c1v1-m. The original license, the Sustainable Use License in [LICENSE.md](LICENSE.md), applies unchanged: free, non-commercial use and distribution only.
+
+You need your own copy of Fallout (Steam or GOG) to play. The installer and release notes will be published under Releases.
+
+The original Fallout Community Edition README follows.
+
+---
+
 # Fallout Community Edition
 
 Fallout Community Edition is a fully working re-implementation of Fallout, with the same original gameplay, engine bugfixes, and some quality of life improvements, that works (mostly) hassle-free on multiple platforms.
