@@ -11,6 +11,7 @@
 #include "game/cycle.h"
 #include "game/game.h"
 #include "game/gconfig.h"
+#include "game/message.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
@@ -297,7 +298,7 @@ void endgame_movie()
     map_disable_bk_processes();
     palette_fade_to(black_palette);
     endgame_maybe_done = 0;
-    add_bk_process(endgame_movie_bk_process);
+    add_bk_process(endgame_movie_bk_process, "endgame");
     gsound_background_callback_set(endgame_movie_callback);
     gsound_background_play("maybe", 12, 14, 15);
     pause_for_tocks(3000);
@@ -374,8 +375,10 @@ static int endgame_init()
         return 0;
     }
 
-    char* language;
-    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language)) {
+    // Through the latch, like every other .msg: the subtitles must not be the one thing that
+    // follows a language switched mid-run (see message_language).
+    const char* language = message_language();
+    if (language == NULL) {
         endgame_do_subtitles = false;
         return 0;
     }

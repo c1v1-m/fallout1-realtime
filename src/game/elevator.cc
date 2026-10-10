@@ -6,16 +6,21 @@
 #include "game/art.h"
 #include "game/cycle.h"
 #include "game/gmouse.h"
+#include "game/game_trace.h"
+#include "game/gamepad_ui.h"
 #include "game/gsound.h"
+#include "game/interact_prompt.h"
 #include "game/intface.h"
 #include "game/map.h"
 #include "game/pipboy.h"
 #include "game/scripts.h"
+#include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/rect.h"
 #include "plib/gnw/svga.h"
 
@@ -238,13 +243,109 @@ static unsigned char* grphbmp[ELEVATOR_FRM_COUNT];
 // Presents elevator dialog for player to pick a desired level.
 //
 // 0x437E8C
+// SELECTION FRAME. ⚠️ Parking the cursor on the chosen button was not enough -- "ted se při výběru
+// patra neukazuje kurzor" -- and it is the same lesson Preferences already learned: a cursor is a
+// pointer, not a statement about which control you are editing, and on this screen it is not even
+// reliably visible. So the selected floor button is marked on the panel itself (since 2026-10-09 with
+// its own pressed-button art, not a frame -- see below).
+//
+// ⚠️ SAVE-UNDER, because this window is painted ONCE (background + panel art in elevator_start) and
+// keeps no clean copy to erase against: rubbing the frame out with background colour would take the
+// panel art with it. Keep the pixels the mark covers and put them back before anything
+// else draws. That only stays consistent if nothing draws while the frame is up, so the loop is
+// strictly ERASE -> input -> DRAW.
+#define ELEV_HL_MAX 64
+
+// ⚠️ NO YELLOW FRAME ANY MORE (2026-10-09): *"highlighted žlutě floors u výtahu, I fucking hate that"*
+// -- the same verdict as the yellow interact outline on 2026-10-04. The selected floor now shows the
+// panel's OWN pressed-button art (ELEVATOR_FRM_BUTTON_DOWN), the frame the button shows under a
+// mouse click: the selection is visible, and it is the game's art, not ours. Same save-under rule as
+// the frame had: the whole button rect is saved, the pressed art drawn, and the saved pixels put
+// back before anything else can draw.
+static unsigned char elev_hl_save[ELEV_HL_MAX * ELEV_HL_MAX];
+static int elev_hl_x = -1;
+static int elev_hl_y;
+static int elev_hl_w;
+static int elev_hl_h;
+
+static void elevator_hl_erase()
+{
+    if (elev_hl_x < 0 || win_buf == NULL) {
+        return;
+    }
+
+    int pitch = GInfo[ELEVATOR_FRM_BACKGROUND].width;
+    for (int i = 0; i < elev_hl_h; i++) {
+        memcpy(win_buf + pitch * (elev_hl_y + i) + elev_hl_x, elev_hl_save + elev_hl_w * i, elev_hl_w);
+    }
+
+    elev_hl_x = -1;
+}
+
+static void elevator_hl_draw(int level)
+{
+    if (win_buf == NULL || grphbmp[ELEVATOR_FRM_BUTTON_DOWN] == NULL) {
+        return;
+    }
+
+    // Exactly where elevator_start registers the button: x 13, y 40 + 60 per level.
+    int x = 13;
+    int y = 40 + 60 * level;
+    int w = GInfo[ELEVATOR_FRM_BUTTON_DOWN].width;
+    int h = GInfo[ELEVATOR_FRM_BUTTON_DOWN].height;
+
+    int pitch = GInfo[ELEVATOR_FRM_BACKGROUND].width;
+    if (x < 0 || y < 0 || x + w > pitch || y + h > GInfo[ELEVATOR_FRM_BACKGROUND].height) {
+        return;
+    }
+    if (w < 1 || h < 1 || w > ELEV_HL_MAX || h > ELEV_HL_MAX) {
+        return;
+    }
+
+    for (int i = 0; i < h; i++) {
+        memcpy(elev_hl_save + w * i, win_buf + pitch * (y + i) + x, w);
+    }
+
+    trans_buf_to_buf(grphbmp[ELEVATOR_FRM_BUTTON_DOWN], w, h, w, win_buf + pitch * y + x, pitch);
+
+    elev_hl_x = x;
+    elev_hl_y = y;
+    elev_hl_w = w;
+    elev_hl_h = h;
+}
+
+// Park the cursor on floor button `level`. The buttons are registered at x 13, y 40 + 60 per
+// level (elevator_start), so the centre is that plus half the button art.
+static void elevator_pad_point(int level)
+{
+    Rect winRect;
+    if (win_get_rect(elev_win, &winRect) != 0) {
+        return;
+    }
+
+    mouse_set_position(winRect.ulx + 13 + GInfo[ELEVATOR_FRM_BUTTON_DOWN].width / 2,
+        winRect.uly + 40 + 60 * level + GInfo[ELEVATOR_FRM_BUTTON_DOWN].height / 2);
+}
+
 int elevator_select(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
 {
     if (elevator < 0 || elevator >= ELEVATOR_COUNT) {
+        trace_event(TRACE_WARN, "elev-refused", "why=type type=%d count=%d", elevator, ELEVATOR_COUNT);
         return -1;
     }
 
+    // ⚠️ Take the world prompt down BEFORE the panel paints -- the same rule the Pip-Boy / character
+    // sheet / automap already follow (gpui_open_dpad_screen). The floating hand and the target
+    // outline live in their OWN always-on-top window, and interact_prompt_tick -- the only thing
+    // that ever hides them -- runs from gamepad_ui_tick, which does not run inside this screen's own
+    // get_input loop. So the hand that was highlighting the elevator when you pressed A stayed
+    // painted over the floor buttons for as long as the panel was up ("ta ruka mě sere při výtahu").
+    // The tick's own suppression list cannot help here either: it keys on menus, dialogue, wheels
+    // and the inventory, and the elevator is none of those.
+    interact_prompt_reset();
+
     if (elevator_start(elevator) == -1) {
+        trace_event(TRACE_WARN, "elev-refused", "why=start type=%d", elevator);
         return -1;
     }
 
@@ -280,10 +381,122 @@ int elevator_select(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
         GInfo[ELEVATOR_FRM_BACKGROUND].width);
     win_draw(elev_win);
 
+    // ⚠️ THE PANEL HAD NO GAMEPAD AT ALL. Its only inputs were ESC and the four floor BUTTONS,
+    // which a pad can reach solely by happening to leave the world cursor on top of one -- so on a
+    // controller the elevator opened, refused every button, and closed again: "PROSTE TEN VYTAH
+    // NEJDE NIKAM JENOM SE ZAVIRAJI VETSINU CASU DVERE". The doors were the only part of it that
+    // ever worked.
+    //
+    // Same shape as every other modal this pad drives: self_nav so the gameplay layer stops
+    // synthesising world clicks behind the panel, D-pad picks, A confirms, B cancels -- and the
+    // SELECTION IS SHOWN BY PARKING THE CURSOR on the chosen button, exactly as the world map's
+    // town list does, because this window is painted once and keeps no clean background copy to
+    // erase a highlight against.
+    int sel = *elevationPtr;
+    if (sel < 0 || sel >= btncnt[elevator]) {
+        sel = 0;
+    }
+
+    SDL_GameController* elevPad = gamepad_ui_get_controller();
+    if (elevPad != NULL) {
+        gamepad_ui_set_self_nav(true);
+        elevator_pad_point(sel);
+        elevator_hl_draw(sel);
+        win_draw(elev_win);
+    }
+
+    bool prevUp = false;
+    bool prevDown = false;
+    bool prevA = false;
+    bool prevB = false;
+    bool aArmed = false; // both buttons must be seen RELEASED before they count -- see below
+    bool bArmed = false;
+    unsigned int lastStep = 0;
+
     bool done = false;
     int keyCode;
     while (!done) {
         sharedFpsLimiter.mark();
+
+        // ⚠️ The frame comes down BEFORE anything can draw, and goes back up at the bottom of the
+        // frame: the save-under underneath it is only valid while nothing else has touched those
+        // pixels.
+        elevator_hl_erase();
+
+        if (elevPad != NULL) {
+            gamepad_ui_set_self_nav(true); // re-assert: nothing else may take the pad while we are up
+
+            SDL_GameControllerUpdate();
+            bool upNow = SDL_GameControllerGetButton(elevPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+            bool downNow = SDL_GameControllerGetButton(elevPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
+            bool aNow = SDL_GameControllerGetButton(elevPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            bool bNow = SDL_GameControllerGetButton(elevPad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+            // Held D-pad repeats after a beat, like every other list on this pad.
+            bool repeat = (upNow || downNow) && elapsed_time(lastStep) >= 220;
+
+            int step = 0;
+            if ((upNow && !prevUp) || (upNow && repeat)) {
+                step = -1;
+            } else if ((downNow && !prevDown) || (downNow && repeat)) {
+                step = 1;
+            } else {
+                // The left stick does it too -- it is the thing your thumb is already on.
+                step = gamepad_ui_menu_stick_step();
+            }
+
+            if (step != 0) {
+                lastStep = get_time();
+                int next = sel + step;
+                if (next >= 0 && next < btncnt[elevator]) {
+                    sel = next;
+                    gsound_play_sfx_file("ib1p1xx1");
+                    elevator_pad_point(sel);
+                }
+            }
+
+            // ⚠️⚠️ THE PRESS THAT OPENED THIS SCREEN IS STILL DOWN, AND IT USED TO CONFIRM.
+            //
+            // This is the whole bug behind "aktivuji vytah a misto toho, abych se dostal k ikonce s
+            // patry, se zavrou dvere", and why it was intermittent: A is physically held from the
+            // world action that ran the elevator script, the panel opens in the same frame, prevA
+            // is a LOCAL that starts false -- so the very first iteration reads a fresh press edge,
+            // confirms the floor you are already on, and closes the panel again. All you ever see
+            // is the door animation. Let go fast enough and you keep the panel; hold a moment
+            // longer and it vanishes.
+            //
+            // (An earlier comment here argued this could not happen because "the press was consumed
+            // by the world action". It is not -- nothing consumes a physical button, and the edge
+            // is measured against a local that knows nothing about the world frame.)
+            //
+            // So each button must be RELEASED ONCE before it means anything on this screen. Same
+            // rule every screen that opens on a held button already follows.
+            if (!aNow) {
+                aArmed = true;
+            }
+            if (!bNow) {
+                bArmed = true;
+            }
+
+            if (aArmed && aNow && !prevA) {
+                keyCode = 500 + sel;
+                done = true;
+            } else if (bArmed && bNow && !prevB) {
+                keyCode = KEY_ESCAPE;
+                done = true;
+            }
+
+            prevUp = upNow;
+            prevDown = downNow;
+            prevA = aNow;
+            prevB = bNow;
+
+            if (done) {
+                renderPresent();
+                sharedFpsLimiter.throttle();
+                break;
+            }
+        }
 
         keyCode = get_input();
         if (keyCode == KEY_ESCAPE) {
@@ -302,9 +515,25 @@ int elevator_select(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
             }
         }
 
+        if (!done && elevPad != NULL) {
+            elevator_hl_draw(sel);
+            win_draw(elev_win);
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    // Down for good: the travel animation below repaints the gauge and must not find a frame it
+    // knows nothing about sitting in the buffer.
+    elevator_hl_erase();
+    win_draw(elev_win);
+
+    // How the panel was left: which floor, and whether it was chosen or escaped. A picked= that
+    // equals the floor you were already on, one frame after it opened, is the held-A signature.
+    trace_event(TRACE_FLOW, "elev-closed", "picked=%d from=%d escaped=%d pad=%d",
+        keyCode == KEY_ESCAPE ? -1 : keyCode - 500, *elevationPtr, keyCode == KEY_ESCAPE ? 1 : 0,
+        elevPad != NULL ? 1 : 0);
 
     if (keyCode != KEY_ESCAPE) {
         keyCode -= 500;
@@ -354,6 +583,12 @@ int elevator_select(int elevator, int* mapPtr, int* elevationPtr, int* tilePtr)
     }
 
     elevator_end();
+
+    // Hand the pad back. ⚠️ A leaked self_nav means the controller is dead in the game world, so it
+    // is cleared on the ONE exit this function has past the panel.
+    if (elevPad != NULL) {
+        gamepad_ui_set_self_nav(false);
+    }
 
     if (keyCode != KEY_ESCAPE) {
         const ElevatorDescription* description = &(elevatorDescription[keyCode]);

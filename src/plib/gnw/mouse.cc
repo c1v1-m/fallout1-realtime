@@ -317,7 +317,7 @@ int mouse_set_anim_frames(unsigned char* frames, int num_frames, int start_frame
     mouse_curr_frame = start_frame;
     mouse_speed = speed;
 
-    add_bk_process(mouse_anim);
+    add_bk_process(mouse_anim, "mouse");
 
     return 0;
 }

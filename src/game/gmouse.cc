@@ -10,6 +10,7 @@
 #include "game/combat_rt.h"
 #include "game/critter.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gsound.h"
@@ -17,9 +18,12 @@
 #include "game/item.h"
 #include "game/map.h"
 #include "game/object.h"
+#include "game/perk.h"
+#include "game/perk_defs.h"
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/skilldex.h"
+#include "game/stat.h"
 #include "game/tile.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -48,6 +52,7 @@ static int gmouse_3d_set_flat_fid(int fid, Rect* rect);
 static int gmouse_3d_reset_flat_fid(Rect* rect);
 static int gmouse_3d_move_to(int x, int y, int elevation, Rect* a4);
 static int gmouse_check_scrolling(int x, int y, int cursor);
+static void gmouse_3d_put_to_hit_frame(Object* target);
 
 // 0x505258
 static bool gmouse_initialized = false;
@@ -244,6 +249,11 @@ static int gmouse_3d_modes_enabled = 1;
 
 // 0x505394
 static int gmouse_3d_current_mode = GAME_MOUSE_MODE_MOVE;
+
+// CE: PID of an item to use with the current use-on crosshair INSTEAD of the hand item (-1 = the
+// hand item, as vanilla). Set by the pad's quick-use page (gmouse_set_use_on_item) so a lockpick or
+// a first aid kit can be aimed at something without swapping the gun out of your hand.
+static int gmouse_use_on_override_pid = -1;
 
 // When true the MOVE cursor object (obj_mouse) is kept turned OFF so the red iso "walk"
 // cursor isn't drawn -- used to hide the pointer during gamepad free-play. This works
@@ -742,25 +752,7 @@ void gmouse_bk_process()
             } else if (gmouse_3d_current_mode == GAME_MOUSE_MODE_CROSSHAIR) {
                 Object* pointedObject = object_under_mouse(OBJ_TYPE_CRITTER, false, map_elevation);
                 if (pointedObject != NULL) {
-                    int color;
-                    int accuracy;
-                    char formattedAccuracy[8];
-                    if (combat_to_hit(pointedObject, &accuracy)) {
-                        snprintf(formattedAccuracy, sizeof(formattedAccuracy), "%d%%", accuracy);
-                        color = colorTable[32767];
-                    } else {
-                        snprintf(formattedAccuracy, sizeof(formattedAccuracy), " %c ", 'X');
-                        color = colorTable[31744];
-                    }
-
-                    if (gmouse_3d_build_to_hit_frame(formattedAccuracy, color) == 0) {
-                        Rect tmp;
-                        int fid = art_id(OBJ_TYPE_INTERFACE, 284, 0, 0, 0);
-                        // NOTE: Uninline.
-                        if (gmouse_3d_set_flat_fid(fid, &tmp) == 0) {
-                            tile_refresh_rect(&tmp, map_elevation);
-                        }
-                    }
+                    gmouse_3d_put_to_hit_frame(pointedObject);
 
                     if (last_object != pointedObject) {
                         last_object = pointedObject;
@@ -888,6 +880,21 @@ void gmouse_bk_process()
 }
 
 // 0x443AA0
+
+// Which object an armed cursor's click went to, and why: the pad's glued pick or the pixel. Both are
+// logged because the complaint was exactly "it used it on something else" -- with no line naming
+// the object there was nothing to check that against.
+static void gmouse_trace_use_on(const char* what, Object* pixel, Object* pick)
+{
+    Object* used = pick != NULL ? pick : pixel;
+    trace_event(TRACE_ACTION, "use-on", "%s target=%s pid=%d id=%d tile=%d src=%s pixel=%s",
+        what,
+        used != NULL ? object_name(used) : "-", used != NULL ? used->pid : -1, used != NULL ? used->id : -1,
+        used != NULL ? used->tile : -1,
+        pick != NULL ? "pick" : "pixel",
+        pixel != NULL ? object_name(pixel) : "-");
+}
+
 void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
 {
     if (!gmouse_initialized) {
@@ -1018,15 +1025,46 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
 
         if (gmouse_3d_current_mode == GAME_MOUSE_MODE_USE_CROSSHAIR) {
             Object* target = object_under_mouse(-1, true, map_elevation);
+
+            // CE: the pad steps this crosshair from object to object and glues it on the one it means
+            // -- then THAT is the target, not whatever happens to be drawn topmost at the pixel (the
+            // rope kept landing on something else). NULL = no pick, the pixel decides as ever.
+            Object* padPick = gamepad_ui_targeting_pick();
+            gmouse_trace_use_on("item", target, padPick);
+            if (padPick != NULL) {
+                target = padPick;
+            }
+
+            // CE: the crosshair may have been armed from the pad's quick-use page for an item that is
+            // NOT in the hand (a lockpick, a first aid kit) -- see gmouse_set_use_on_item. Taken here,
+            // looked up again by PID, and cleared whatever happens, so it can never outlive this one
+            // click and silently hijack the next crosshair armed the ordinary way.
+            int overridePid = gmouse_use_on_override_pid;
+            gmouse_use_on_override_pid = -1;
+
             if (target != NULL) {
-                Object* weapon;
-                if (intface_get_current_item(&weapon) != -1) {
+                Object* weapon = NULL;
+                int itemFound = -1;
+                if (overridePid != -1) {
+                    Inventory* inv = &(obj_dude->data.inventory);
+                    for (int i = 0; i < inv->length; i++) {
+                        if (inv->items[i].item != NULL && inv->items[i].item->pid == overridePid) {
+                            weapon = inv->items[i].item;
+                            itemFound = 0;
+                            break;
+                        }
+                    }
+                } else {
+                    itemFound = intface_get_current_item(&weapon);
+                }
+                if (itemFound != -1) {
                     if (isInCombat()) {
                         int hitMode = intface_is_item_right_hand()
                             ? HIT_MODE_RIGHT_WEAPON_PRIMARY
                             : HIT_MODE_LEFT_WEAPON_PRIMARY;
 
-                        int actionPointsRequired = item_mp_cost(obj_dude, hitMode, false);
+                        // A quick-use item is not the hand item: using it costs the plain 2 AP of using an item.
+                        int actionPointsRequired = overridePid != -1 ? 2 : item_mp_cost(obj_dude, hitMode, false);
                         // Realtime holds engine combat.ap maxed, so charge combat_rt's
                         // pool instead (using an item on a world object mid-fight costs
                         // AP like vanilla). Free out of combat; refuses when unaffordable.
@@ -1063,6 +1101,11 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
             || gmouse_3d_current_mode == GAME_MOUSE_MODE_USE_SCIENCE
             || gmouse_3d_current_mode == GAME_MOUSE_MODE_USE_REPAIR) {
             Object* target = object_under_mouse(-1, 1, map_elevation);
+            Object* padPick = gamepad_ui_targeting_pick(); // see the USE_CROSSHAIR case above
+            gmouse_trace_use_on("skill", target, padPick);
+            if (padPick != NULL) {
+                target = padPick;
+            }
             if (target == NULL || action_use_skill_on(obj_dude, target, gmouse_skill_table[gmouse_3d_current_mode - FIRST_GAME_MOUSE_MODE_SKILL]) != -1) {
                 // Vanilla disarms the skill cursor after one application (mouse play re-arms it
                 // from the skilldex in two clicks). A pad has no such shortcut -- re-arming means
@@ -1380,6 +1423,11 @@ int gmouse_3d_modes_are_enabled()
 }
 
 // 0x4444AC
+void gmouse_set_use_on_item(int pid)
+{
+    gmouse_use_on_override_pid = gmouse_3d_current_mode == GAME_MOUSE_MODE_USE_CROSSHAIR ? pid : -1;
+}
+
 void gmouse_3d_set_mode(int mode)
 {
     if (!gmouse_initialized) {
@@ -1388,6 +1436,12 @@ void gmouse_3d_set_mode(int mode)
 
     if (!gmouse_3d_modes_enabled) {
         return;
+    }
+
+    // Leaving the use-on crosshair by any road (cancelled, another mode armed) drops a quick-use
+    // item it was armed for -- the next crosshair belongs to whatever arms it.
+    if (mode != GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        gmouse_use_on_override_pid = -1;
     }
 
     if (mode == gmouse_3d_current_mode) {
@@ -1468,6 +1522,42 @@ void gmouse_3d_show_to_hit(Object* target)
         return;
     }
 
+    gmouse_3d_put_to_hit_frame(target);
+}
+
+// AWARENESS IN REALTIME. The perk's whole payoff is reading a target's hit points, and vanilla prints
+// them only on an Examine: a deliberate look at one critter, which a turn-based game gives you for
+// free and a realtime fight does not -- on the controller the eye is never even offered on an enemy
+// that is fighting you. So with the perk the hit points ride along with the to-hit percentage, on a
+// second line under it, wherever the percentage is shown (the controller lock-on and the mouse
+// crosshair alike) and refreshed with it every frame, so they count down as you hit.
+//
+// Same numbers and the same critters as the Examine text (protinst.cc): current/maximum HP, alive,
+// never the dude. Green so it reads as a different thing from the white percentage. The canvas they
+// are drawn on is widened in art.cc -- the original one has room for "75%" only.
+#define GMOUSE_AWARENESS_HP_COLOR colorTable[992]
+
+static bool gmouse_3d_awareness_hp(Object* target, char* buf, size_t size)
+{
+    if (target == NULL || target == obj_dude || FID_TYPE(target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    if (perk_level(PERK_AWARENESS) == 0 || critter_is_dead(target)) {
+        return false;
+    }
+
+    snprintf(buf, size, "%d/%d",
+        stat_level(target, STAT_CURRENT_HIT_POINTS),
+        stat_level(target, STAT_MAXIMUM_HIT_POINTS));
+    return true;
+}
+
+// Build the to-hit cursor for `target` -- the percentage, or a red X when the shot is impossible,
+// plus the Awareness HP line -- and put it on the mouse. Shared by the mouse crosshair hover and the
+// controller lock-on, which used to carry two copies of the first half.
+static void gmouse_3d_put_to_hit_frame(Object* target)
+{
     int color;
     int accuracy;
     char formattedAccuracy[8];
@@ -1479,7 +1569,12 @@ void gmouse_3d_show_to_hit(Object* target)
         color = colorTable[31744];
     }
 
-    if (gmouse_3d_build_to_hit_frame(formattedAccuracy, color) == 0) {
+    char hitPoints[24];
+    bool showHitPoints = gmouse_3d_awareness_hp(target, hitPoints, sizeof(hitPoints));
+
+    if (gmouse_3d_build_to_hit_frame(formattedAccuracy, color,
+            showHitPoints ? hitPoints : NULL, GMOUSE_AWARENESS_HP_COLOR)
+        == 0) {
         Rect tmp;
         int fid = art_id(OBJ_TYPE_INTERFACE, 284, 0, 0, 0);
         // NOTE: Uninline.
@@ -2030,7 +2125,7 @@ int gmouse_3d_highlight_menu_frame(int menuItemIndex)
 }
 
 // 0x445200
-int gmouse_3d_build_to_hit_frame(const char* string, int color)
+int gmouse_3d_build_to_hit_frame(const char* string, int color, const char* line2, int color2)
 {
     CacheEntry* crosshairFrmHandle;
     int fid = art_id(OBJ_TYPE_INTERFACE, gmouse_3d_mode_nums[GAME_MOUSE_MODE_CROSSHAIR], 0, 0, 0);
@@ -2059,6 +2154,20 @@ int gmouse_3d_build_to_hit_frame(const char* string, int color)
         gmouse_3d_to_hit_frame_width - crosshairFrmWidth,
         gmouse_3d_to_hit_frame_width,
         color);
+
+    // Optional second line straight under the first (the Awareness hit points). The canvas is 21 px
+    // tall and font 101 is 9, so two lines with a one-pixel gap fit exactly; the guard only matters
+    // if someone swaps the font.
+    if (line2 != NULL) {
+        int lineY = 1 + text_height() + 1;
+        if (lineY + text_height() <= gmouse_3d_to_hit_frame_height) {
+            text_to_buf(gmouse_3d_to_hit_frame_data + gmouse_3d_to_hit_frame_width * lineY + crosshairFrmWidth + 1,
+                line2,
+                gmouse_3d_to_hit_frame_width - crosshairFrmWidth,
+                gmouse_3d_to_hit_frame_width,
+                color2);
+        }
+    }
 
     buf_outline(gmouse_3d_to_hit_frame_data + crosshairFrmWidth,
         gmouse_3d_to_hit_frame_width - crosshairFrmWidth,
@@ -2489,6 +2598,18 @@ static int gmouse_check_scrolling(int x, int y, int cursor)
         return -1;
     }
 
+    // ⚠️ NO EDGE SCROLL WHILE THE CAMERA FOLLOWS THE DUDE (2026-10-08): *"ta sračka mě tahá kameru
+    // stále doleva, ať přestane, prostě to vypni"*. Realtime always centres the camera on the dude
+    // (rt_follow_cam, every frame), so the vanilla scroll-at-the-screen-edge can only fight it: with a
+    // pad the pointer is hidden but keeps its position, and once it sits on an edge (the Deck's
+    // trackpad, a parked cursor) the map is shoved that way, the follow-cam drags it back, and so on
+    // forever -- a whole-screen redraw each time (trace_2026-10-08_215600: 171 full redraws done
+    // inside the cursor process during the escape). Nothing is lost: the follow-cam undid every
+    // scroll anyway.
+    if (combat_rt_enabled()) {
+        return -1;
+    }
+
     int flags = 0;
 
     if (x <= scr_size.ulx) {
@@ -2583,7 +2704,17 @@ void gmouse_remove_item_outline(Object* object)
 void gameMouseRefreshImmediately()
 {
     gmouse_bk_process();
-    renderPresent();
+
+    // ⚠️ AT MOST ~20 PRESENTS A SECOND. This runs every 8 KB a map load reads (map, protos, every
+    // critter's art), and on the Steam Deck each present waits on the compositor even with the swap
+    // interval off: MSTRLR34 took 9.8 s to load there (deck trace_2026-10-08_155209) against ~0.1 s
+    // on the PC. The cursor only needs to look alive while the map loads.
+    static unsigned int lastPresent = 0;
+    unsigned int now = get_time();
+    if (now - lastPresent >= 50) {
+        lastPresent = now;
+        renderPresent();
+    }
 }
 
 } // namespace fallout

@@ -72,6 +72,10 @@ bool combat_commit_snapshot(const Attack* snap, bool callDisplay);
 // or the death fall is picked from the stale flags and the corpse snaps flat with no fall.
 bool combat_late_lethal_upgrade(Attack* attack);
 int combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool aiming);
+
+// The vanilla called-shot window, opened for the pad: returns the hit location the player chose, or
+// -1 on cancel. `initialLocation` is where its selection starts.
+int combat_called_shot_pick(Object* critter, int hitMode, int initialLocation);
 bool combat_to_hit(Object* target, int* accuracy);
 void combat_attack_this(Object* a1);
 void combat_outline_on();

@@ -25,6 +25,9 @@ void tile_disable_refresh();
 void tile_enable_refresh();
 void tile_refresh_rect(Rect* rect, int elevation);
 void tile_refresh_display();
+// Frame-pacing meter: redraws since the last call (count, pixels, ms), then zeroed.
+void tile_take_refresh_stats(int* count, long long* pixels, double* ms);
+int tile_take_full_refreshes();
 int tile_set_center(int tile, int flags);
 int tile_set_center_offset(int tile, int flags, int offsetX, int offsetY);
 void tile_toggle_roof(int a1);

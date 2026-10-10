@@ -82,7 +82,7 @@ int text_object_init(unsigned char* windowBuffer, int width, int height)
     display_height = height;
     text_object_index = 0;
 
-    add_bk_process(text_object_bk);
+    add_bk_process(text_object_bk, "floaters");
 
     if (!config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TEXT_BASE_DELAY_KEY, &textBaseDelay)) {
         textBaseDelay = 3.5;
@@ -116,7 +116,7 @@ int text_object_reset()
     }
 
     text_object_index = 0;
-    add_bk_process(text_object_bk);
+    add_bk_process(text_object_bk, "floaters");
 
     return 0;
 }

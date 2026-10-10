@@ -2,6 +2,9 @@
 
 #include <limits.h>
 #include <stdio.h>
+#include <string.h>
+
+#include <SDL.h>
 
 #include "audio_engine.h"
 #include "platform_compat.h"
@@ -40,6 +43,8 @@ typedef struct inputdata {
 typedef struct funcdata {
     unsigned int flags;
     BackgroundProcess* f;
+    // Name for the frame meter ([ANIM/hitch] bk=...); NULL pools it under "other".
+    const char* label;
     struct funcdata* next;
 } funcdata;
 
@@ -90,6 +95,38 @@ static int input_my;
 
 // 0x671ED8
 static FuncPtr bk_list;
+
+// Frame diagnostics for the [ANIM/hitch] line: milliseconds each background process spent
+// since the last bk_take_times(), keyed by its label, plus the OS event pump. A slow frame's
+// "in" section is mostly these, and without the split it could not say WHICH one.
+#define BK_TIMING_MAX 16
+static const char* bk_timing_label[BK_TIMING_MAX];
+static double bk_timing_ms[BK_TIMING_MAX];
+static int bk_timing_count;
+static double bk_pump_ms;
+
+static double bk_ms_since(Uint64 start)
+{
+    return (double)(SDL_GetPerformanceCounter() - start) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+}
+
+static void bk_timing_add(const char* label, double ms)
+{
+    if (label == NULL) {
+        label = "other";
+    }
+    for (int index = 0; index < bk_timing_count; index++) {
+        if (strcmp(bk_timing_label[index], label) == 0) {
+            bk_timing_ms[index] += ms;
+            return;
+        }
+    }
+    if (bk_timing_count < BK_TIMING_MAX) {
+        bk_timing_label[bk_timing_count] = label;
+        bk_timing_ms[bk_timing_count] = ms;
+        bk_timing_count++;
+    }
+}
 
 // 0x671EE0
 static bool game_paused;
@@ -186,7 +223,9 @@ int get_input()
 {
     int v3;
 
+    Uint64 pumpStart = SDL_GetPerformanceCounter();
     GNW95_process_message();
+    bk_pump_ms += bk_ms_since(pumpStart);
 
     if (!GNW95_isActive) {
         GNW95_lost_focus();
@@ -344,7 +383,9 @@ void GNW_do_bk_process()
 
             mem_free(curr);
         } else {
+            Uint64 start = SDL_GetPerformanceCounter();
             curr->f();
+            bk_timing_add(curr->label, bk_ms_since(start));
             currPtr = &(curr->next);
         }
         curr = next;
@@ -352,7 +393,7 @@ void GNW_do_bk_process()
 }
 
 // 0x4B35BC
-void add_bk_process(BackgroundProcess* f)
+void add_bk_process(BackgroundProcess* f, const char* label)
 {
     FuncPtr fp;
 
@@ -361,6 +402,7 @@ void add_bk_process(BackgroundProcess* f)
         if (fp->f == f) {
             if ((fp->flags & 0x01) != 0) {
                 fp->flags &= ~0x01;
+                fp->label = label;
                 return;
             }
         }
@@ -370,8 +412,37 @@ void add_bk_process(BackgroundProcess* f)
     fp = (FuncPtr)mem_malloc(sizeof(*fp));
     fp->flags = 0;
     fp->f = f;
+    fp->label = label;
     fp->next = bk_list;
     bk_list = fp;
+}
+
+// "pump=0.4 anim=12.3 sound=1.1" -- every entry of at least 0.5 ms since the last call, or "-" --
+// then starts over. Called every frame by the frame meter, so the numbers are one frame's.
+void bk_take_times(char* out, size_t size)
+{
+    size_t used = 0;
+    if (out != NULL && size > 0) {
+        out[0] = '\0';
+        if (bk_pump_ms >= 0.5) {
+            int n = snprintf(out, size, "pump=%.1f", bk_pump_ms);
+            used = n > 0 ? (size_t)n : 0;
+        }
+        for (int index = 0; index < bk_timing_count && used < size; index++) {
+            if (bk_timing_ms[index] >= 0.5) {
+                int n = snprintf(out + used, size - used, "%s%s=%.1f", used > 0 ? " " : "", bk_timing_label[index], bk_timing_ms[index]);
+                used += n > 0 ? (size_t)n : 0;
+            }
+        }
+        if (used == 0) {
+            snprintf(out, size, "-");
+        }
+    }
+
+    bk_pump_ms = 0.0;
+    for (int index = 0; index < bk_timing_count; index++) {
+        bk_timing_ms[index] = 0.0;
+    }
 }
 
 // 0x4B360C

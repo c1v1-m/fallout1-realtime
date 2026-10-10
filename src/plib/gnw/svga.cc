@@ -1,5 +1,10 @@
 #include "plib/gnw/svga.h"
 
+#include <math.h>
+
+#include <SDL_opengl.h>
+
+#include "game/gconfig.h"
 #include "plib/gnw/crt_shader.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
@@ -25,6 +30,135 @@ SDL_Surface* gSdlTextureSurface = NULL;
 
 // TODO: Remove once migration to update-render cycle is completed.
 FpsLimiter sharedFpsLimiter;
+
+// --- VSYNC (MODS "VSync", cfg vsync; 2026-10-08) ----------------------------------------------------
+//
+// ⚠️ WITHOUT IT NOTHING ON SCREEN CAN MOVE SMOOTHLY, however smooth the motion itself is. The renderer
+// was created with no present-vsync and the loop slept to 1000/60 = 16 WHOLE ms -- 62.5 frames a
+// second, handed to the display whenever they were ready. His panel runs 240 Hz: a frame stayed up
+// for 4 refreshes, sometimes 3, in no fixed rhythm, so a camera gliding at a constant speed was shown
+// moving in uneven jerks (and with no vsync at all, torn).
+//
+// With it: the swap interval is round(refresh / 60) -- 4 at 240 Hz, 2 at 120/144, 1 at 60 -- so the
+// game still runs ~60 fps and everything tuned per frame stays tuned, but every frame is on screen for
+// exactly the same number of refreshes. glFinish after the swap keeps the driver from queueing frames
+// ahead (that would be input lag, and uneven again), and FpsLimiter steps back to a floor.
+//
+// ⚠️ A DRIVER CAN REFUSE (the panel's "wait for vertical refresh: off", an occluded window). Frames then
+// arrive faster than the display shows them; the check below sees that and hands the pacing back to
+// the sleep for good -- until the row is toggled or the renderer is rebuilt.
+static bool vsync_wanted = false;
+static bool vsync_dirty = true; // apply at the next present, with the renderer's GL context current
+static int vsync_interval = 0; // swap interval in force; 0 = not waiting for the display
+static int vsync_refresh = 0;
+static double vsync_period_ms = 0.0;
+static bool vsync_effective = false;
+// A map is loading (svga_vsync_suspend). Its reads present a frame every 8 KB to keep the cursor
+// alive, and with each present waiting for the display that turned into seconds of extra loading.
+static bool vsync_suspended = false;
+static bool vsync_suspend_applied = false;
+static Uint64 vsync_last_present = 0;
+static double vsync_acc_ms = 0.0;
+static int vsync_acc_frames = 0;
+
+typedef void(APIENTRY* SvgaGlFinishProc)(void);
+static SvgaGlFinishProc vsync_gl_finish = NULL;
+
+static void svga_vsync_apply()
+{
+    vsync_dirty = false;
+    vsync_interval = 0;
+    vsync_period_ms = 0.0;
+    vsync_effective = false;
+    vsync_last_present = 0;
+    vsync_acc_ms = 0.0;
+    vsync_acc_frames = 0;
+
+    if (!vsync_wanted || gSdlWindow == NULL) {
+        SDL_GL_SetSwapInterval(0);
+        sharedFpsLimiter.setVsyncPeriod(0.0);
+        return;
+    }
+
+    int refresh = 60;
+    SDL_DisplayMode mode;
+    int display = SDL_GetWindowDisplayIndex(gSdlWindow);
+    if (SDL_GetCurrentDisplayMode(display >= 0 ? display : 0, &mode) == 0 && mode.refresh_rate > 0) {
+        refresh = mode.refresh_rate;
+    }
+
+    int interval = (int)floor(refresh / 60.0 + 0.5);
+    if (interval < 1) {
+        interval = 1;
+    }
+
+    if (SDL_GL_SetSwapInterval(interval) != 0) {
+        // Some drivers take only 0/1. One refresh per frame on a fast panel is still tear-free.
+        if (interval == 1 || SDL_GL_SetSwapInterval(1) != 0) {
+            sharedFpsLimiter.setVsyncPeriod(0.0);
+            return;
+        }
+        interval = 1;
+    }
+
+    if (vsync_gl_finish == NULL) {
+        vsync_gl_finish = (SvgaGlFinishProc)SDL_GL_GetProcAddress("glFinish");
+    }
+
+    vsync_refresh = refresh;
+    vsync_interval = interval;
+    vsync_period_ms = interval * 1000.0 / refresh;
+    vsync_effective = true; // until the check says otherwise
+    sharedFpsLimiter.setVsyncPeriod(vsync_period_ms);
+}
+
+// Is the display really pacing us? Averaged over two seconds of presents.
+static void svga_vsync_check()
+{
+    Uint64 now = SDL_GetPerformanceCounter();
+    if (vsync_last_present != 0) {
+        double ms = (double)(now - vsync_last_present) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+        if (ms < 250.0) {
+            vsync_acc_ms += ms;
+            vsync_acc_frames++;
+        }
+    }
+    vsync_last_present = now;
+
+    if (vsync_acc_frames >= 120) {
+        double avg = vsync_acc_ms / vsync_acc_frames;
+        if (vsync_effective && avg < vsync_period_ms - 1.5) {
+            // Faster than the display can show them: the interval is not being honoured.
+            vsync_effective = false;
+            sharedFpsLimiter.setVsyncPeriod(0.0);
+        }
+        vsync_acc_ms = 0.0;
+        vsync_acc_frames = 0;
+    }
+}
+
+void svga_vsync_suspend(bool on)
+{
+    vsync_suspended = on;
+}
+
+void svga_set_vsync(bool on)
+{
+    vsync_wanted = on;
+    vsync_dirty = true;
+}
+
+bool svga_get_vsync()
+{
+    return vsync_wanted;
+}
+
+void svga_vsync_state(int* interval, int* refresh, bool* effective)
+{
+    *interval = vsync_interval;
+    *refresh = vsync_refresh;
+    *effective = vsync_interval > 0 && vsync_effective;
+}
 
 // 0x4CB310
 void GNW95_SetPaletteEntries(unsigned char* palette, int start, int count)
@@ -158,6 +292,12 @@ bool svga_init(VideoOptions* video_options)
     // keys are readable. The GL objects themselves are built lazily on the first present.
     crt_init();
 
+    // MODS "VSync" -- default OFF, the original sleep-paced present. Applied at the first present,
+    // when the renderer's GL context is current.
+    int vsync = 0;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VSYNC_KEY, &vsync);
+    svga_set_vsync(vsync != 0);
+
     return true;
 }
 
@@ -210,6 +350,9 @@ static bool createRenderer(int width, int height)
     if (gSdlTextureSurface == NULL) {
         return false;
     }
+
+    // A new renderer is a new GL context, born with its own swap interval.
+    vsync_dirty = true;
 
     return true;
 }
@@ -304,7 +447,31 @@ void renderPresent()
         SDL_RenderCopy(gSdlRenderer, gSdlTexture, NULL, NULL);
     }
 
+    // The renderer's GL context is current here -- it has just drawn -- which makes this the one
+    // safe place to change its swap interval.
+    if (vsync_dirty) {
+        svga_vsync_apply();
+        vsync_suspend_applied = false;
+    }
+
+    // Loading: present at once, as without VSync. Back on with the first present after it.
+    if (vsync_interval > 0 && vsync_suspend_applied != vsync_suspended) {
+        SDL_GL_SetSwapInterval(vsync_suspended ? 0 : vsync_interval);
+        vsync_suspend_applied = vsync_suspended;
+        vsync_last_present = 0;
+        vsync_acc_ms = 0.0;
+        vsync_acc_frames = 0;
+    }
+
     SDL_RenderPresent(gSdlRenderer);
+
+    if (vsync_interval > 0 && !vsync_suspended) {
+        // Wait for the swap itself, so the driver never queues frames ahead of the display.
+        if (vsync_gl_finish != NULL) {
+            vsync_gl_finish();
+        }
+        svga_vsync_check();
+    }
 }
 
 } // namespace fallout

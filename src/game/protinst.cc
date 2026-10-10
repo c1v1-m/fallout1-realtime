@@ -9,6 +9,7 @@
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/game_trace.h"
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "game/item.h"
@@ -1289,17 +1290,28 @@ int obj_use_door(Object* a1, Object* a2, int a3)
         gsound_play_sfx_file(sfx);
     }
 
-    if (obj_sid(a2, &sid) != -1) {
-        scr_set_objs(sid, a1, a2);
-        exec_script_proc(sid, SCRIPT_PROC_USE);
+    // ⚠️ THE LAST UNTRACED LINK IN THE ELEVATOR CHAIN. A door with NO SCRIPT (sid == -1) just
+    // animates -- which from the player side is indistinguishable from an elevator that refused:
+    // "the doors close and nothing happens". This says which of the two it was.
+    int doorSid = -1;
+    bool hasSid = obj_sid(a2, &doorSid) != -1;
+
+    if (hasSid) {
+        scr_set_objs(doorSid, a1, a2);
+        exec_script_proc(doorSid, SCRIPT_PROC_USE);
 
         Script* script;
-        if (scr_ptr(sid, &script) == -1) {
+        if (scr_ptr(doorSid, &script) == -1) {
+            trace_event(TRACE_WARN, "door-use", "pid=%d sid=%d why=scr_ptr-failed", a2->pid, doorSid);
             return -1;
         }
 
         scriptOverrides = script->scriptOverrides;
+        sid = doorSid;
     }
+
+    trace_event(TRACE_FLOW, "door-use", "pid=%d sid=%d hasScript=%d overrides=%d byDude=%d",
+        a2->pid, doorSid, hasSid ? 1 : 0, scriptOverrides ? 1 : 0, a1 == obj_dude ? 1 : 0);
 
     if (!scriptOverrides) {
         int start;

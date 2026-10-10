@@ -623,6 +623,51 @@ static bool show_damage_defender_split(Attack* attack, int a2, int delay)
     return register_end() == 0;
 }
 
+// CE: the explosive projectile (rocket, grenade) the LAST action_ranged put in the air, and the
+// explosion art it turns into when it lands. combat_rt takes it straight after the attack is issued
+// (action_take_explosive_projectile) and commits the blast when the projectile wears that art.
+static Object* action_rt_explosive_projectile = NULL;
+static int action_rt_explosion_fid = -1;
+
+Object* action_take_explosive_projectile(int* explosionFid)
+{
+    Object* projectile = action_rt_explosive_projectile;
+    if (explosionFid != NULL) {
+        *explosionFid = action_rt_explosion_fid;
+    }
+    action_rt_explosive_projectile = NULL;
+    action_rt_explosion_fid = -1;
+    return projectile;
+}
+
+// Public entry for combat_rt: register the reactions of every OTHER critter the attack caught (a
+// burst's cone, a blast's ring) at the commit, beside action_defender_reaction. Realtime only --
+// turn-based registers them from action_melee / action_ranged as it always did.
+//
+// A victim the blow kills or knocks down gets whatever it was doing cut first, the way the main
+// defender does in action_attack: a fall that cannot register on a busy body is exactly how the
+// splash victims ended up snapped flat with no animation at all.
+void action_extras_reaction(Attack* attack)
+{
+    if (attack == NULL || !combat_rt_enabled() || attack->extrasLength <= 0) {
+        return;
+    }
+
+    for (int index = 0; index < attack->extrasLength; index++) {
+        Object* extra = attack->extras[index];
+        if (extra == NULL || FID_TYPE(extra->fid) != OBJ_TYPE_CRITTER) {
+            continue;
+        }
+        if ((attack->extrasFlags[index] & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT)) != 0
+            && !critter_is_prone(extra)
+            && (extra->data.critter.combat.results & DAM_DEAD) == 0) {
+            anim_force_clear(extra);
+        }
+    }
+
+    show_damage_extras(attack);
+}
+
 // Public entry for combat_rt: register the defender's damage reaction (its fall / knockdown /
 // death, the weapon-drop callbacks and the show_death corpse settle) as the DEFENDER's OWN
 // sequence, at the moment the attack COMMITS. Realtime only -- turn-based keeps everything in the
@@ -736,7 +781,16 @@ int action_attack(Attack* attack)
         }
     }
 
-    if (register_clear(attack->defender) == -2) {
+    // ⚠️ A RELOADING DEFENDER KEEPS RELOADING THROUGH THE TRIGGER PULL (2026-10-06: "ať můžu
+    // reloadnout když na mě útočí, takhle jsem stunlocklej"). In realtime nothing of an attack needs
+    // the defender's slot at its START -- the dodge and the hit reaction are registered at the commit
+    // (action_defender_reaction / rt_reaction_flinch), sized to what actually landed -- yet this clear
+    // ended the reload anyway, at the moment the enemy fired, hit or miss: trace_2026-10-06_005347,
+    // seven reloads died exactly on an enemy's COMBAT/attack line, two of them to clean misses. His
+    // rule since: only a hit that makes you FLINCH (through-damage >= flinch_dt_factor x DT) or a
+    // knockdown ends a reload, and both are decided at the commit, where the damage is known.
+    bool keepDefenderReload = combat_rt_enabled() && combat_rt_is_reloading(attack->defender);
+    if (!keepDefenderReload && register_clear(attack->defender) == -2) {
         // The defender is in a PRIORITIZED sequence -- almost always its OWN attack swing.
         // Turn-based can't reach here (you can't be attacked mid-swing), but realtime can, and
         // failing the attack means "enemies can't hit me while I'm attacking" (and vice versa).
@@ -769,6 +823,10 @@ int action_attack(Attack* attack)
     }
 
     for (int index = 0; index < attack->extrasLength; index++) {
+        // Same rule for a body caught in the burst: its reload is only a hit's to end, at the commit.
+        if (combat_rt_enabled() && combat_rt_is_reloading(attack->extras[index])) {
+            continue;
+        }
         if (register_clear(attack->extras[index]) == -2) {
             // ⚠️ SAME TRAP AS THE DEFENDER ABOVE, ONE LOOP LOWER -- and it survived the 2026-08-09
             // fix because that fix only touched the defender line. `extras` are the OTHER critters
@@ -964,9 +1022,10 @@ static int action_melee(Attack* attack, int anim)
     // of the blow -- the exact bug that got the split disabled. combat_rt calls
     // action_defender_reaction() at its commit point instead. (splitDefender is only ever true
     // under combat_rt, so the turn-based path already registered the reaction inline.)
-    (void)splitDefender;
-
-    show_damage_extras(attack);
+    // The extras likewise -- combat_rt calls action_extras_reaction() at the same commit.
+    if (!splitDefender) {
+        show_damage_extras(attack);
+    }
 
     return 0;
 }
@@ -996,6 +1055,10 @@ static int action_ranged(Attack* attack, int anim)
     Object* projectile = NULL;
     Object* v50 = NULL;
     int weaponFid = -1;
+
+    // Nothing explosive in the air yet from THIS attack (see action_take_explosive_projectile).
+    action_rt_explosive_projectile = NULL;
+    action_rt_explosion_fid = -1;
 
     Proto* weaponProto;
     Object* weapon = attack->weapon;
@@ -1130,6 +1193,11 @@ static int action_ranged(Attack* attack, int anim)
                         int explosionFid = art_id(OBJ_TYPE_MISC, explosionFrmId, 0, 0, 0);
                         register_object_change_fid(projectile, explosionFid, -1);
 
+                        // For combat_rt: the blast goes off the moment this projectile wears that
+                        // art, which is when the attack commits (`landed` in its resolve loop).
+                        action_rt_explosive_projectile = projectile;
+                        action_rt_explosion_fid = explosionFid;
+
                         const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_HIT, weapon, attack->hitMode, attack->defender);
                         register_object_play_sfx(projectile, sfx, 0);
 
@@ -1251,6 +1319,9 @@ static int action_ranged(Attack* attack, int anim)
 
     if (register_end() == -1) {
         debug_printf("Something went wrong with a ranged attack sequence!\n");
+        // No attack, so no blast for combat_rt to wait for -- and the projectile is about to go.
+        action_rt_explosive_projectile = NULL;
+        action_rt_explosion_fid = -1;
         if (projectile != NULL && (isGrenade || damageType == DAMAGE_TYPE_EXPLOSION || anim != ANIM_THROW_ANIM)) {
             obj_erase_object(projectile, NULL);
         }
@@ -1265,10 +1336,15 @@ static int action_ranged(Attack* attack, int anim)
     }
 
     // Deferred to combat_rt's commit point -- see the matching note in action_melee.
-    (void)splitDefender;
     (void)defenderDelay;
 
-    show_damage_extras(attack);
+    // The OTHER critters the attack caught (a burst's cone, a blast's ring) react at the commit
+    // too, in realtime -- action_extras_reaction, called beside action_defender_reaction. Registered
+    // here, at the trigger pull, they fell before anything was decided and mostly did not take at
+    // all (busy bodies), leaving the corpse reap to snap them flat with no fall.
+    if (!splitDefender) {
+        show_damage_extras(attack);
+    }
 
     return 0;
 }

@@ -7,6 +7,7 @@
 #include "game/game.h"
 #include "game/gamepad_ui.h"
 #include "game/gconfig.h"
+#include "game/message.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
 #include "game/moviefx.h"
@@ -266,10 +267,13 @@ static char* gmovie_subtitle_func(char* movie_file_path)
     // 0x595226
     static char full_path[COMPAT_MAX_PATH];
 
-    char* language;
+    // The latched language, like every other .msg -- not a fresh read of the cfg.
+    const char* language = message_language();
     char* separator;
 
-    config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language);
+    if (language == NULL) {
+        return NULL;
+    }
 
     separator = strrchr(movie_file_path, '\\');
     if (separator != NULL) {

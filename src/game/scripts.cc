@@ -6,7 +6,9 @@
 #include <time.h>
 
 #include "game/actions.h"
+#include "game/anim.h"
 #include "game/automap.h"
+#include "game/game_trace.h"
 #include "game/combat.h"
 #include "game/combat_rt.h"
 #include "game/critter.h"
@@ -592,8 +594,15 @@ static void script_chk_critters()
     // Ambient CRITTER scripts are suspended during a fight so they cannot interfere with it. That
     // is right, but the test has to be "is a fight happening to the player", not isInCombat():
     // realtime keeps the combat bit warm while any critter anywhere is still chasing, so this
-    // stopped every NPC's idle script on the whole map, indefinitely. (Note the SCRIPT_PROC_COMBAT
-    // branch below has always been dead code -- this gate excludes the only case that would pick it.)
+    // stopped every NPC's idle script on the whole map, indefinitely.
+    //
+    // ⚠️ AND SO THE HEARTBEAT IS ALWAYS critter_p_proc NOW. Vanilla picked SCRIPT_PROC_COMBAT here
+    // whenever isInCombat(), which its own gate made dead code. This gate is narrower, so a warm fight
+    // that is not after the player let it through -- calling combat_p_proc on every scripted critter
+    // in turn, with whatever fixed_param was left over. Once realtime started handing out turn
+    // starts (fixed_param 4, rt_script_turn_tick) that would have re-run them on every heartbeat:
+    // the Master calling his horde as fast as the heartbeat reached him. Combat events come from
+    // combat_rt now, and only from there.
     if (!dialog_active() && !combat_rt_under_threat()) {
         ScriptList* scriptList;
         ScriptListExtent* scriptListExtent;
@@ -613,7 +622,7 @@ static void script_chk_critters()
         }
 
         if (count < scriptsCount) {
-            int proc = isInCombat() ? SCRIPT_PROC_COMBAT : SCRIPT_PROC_CRITTER;
+            int proc = SCRIPT_PROC_CRITTER;
             int extentIndex = count / SCRIPT_LIST_EXTENT_SIZE;
             int scriptIndex = count % SCRIPT_LIST_EXTENT_SIZE;
 
@@ -669,9 +678,71 @@ static void script_chk_timed_events()
 
     if (elapsed_tocks(now, last_time) >= 100) {
         last_time = now;
-        if (!isInCombat()) {
-            fallout_game_time += 1;
+
+        // THE GAME CLOCK. One tick per 100 ms, and ten ticks are a game second -- so out of combat
+        // game time runs at exactly wall-clock speed. Everything scheduled in game time rides on
+        // this line: poison (10 * (505 - 5*poison) ticks between doses), radiation (4-18 game
+        // hours), the day/night cycle and every scripted timer.
+        //
+        // ⚠️ IN REALTIME THE CLOCK NEVER STOPS -- not even in a fight. Vanilla's clock does stop
+        // during combat, and vanilla compensates for it at the top of every round:
+        // `inc_game_time_in_seconds(5)` in combat_sequence (combat.cc:2085). A ten-second dynamite
+        // timer is therefore two rounds, and explosives work in a fight, which is the whole point
+        // of carrying them. Realtime has no rounds, so that increment simply vanished with them and
+        // game time stood COMPLETELY still for the length of a fight: "dal jsem dynamit a
+        // nevybuchnul". It was not lost, it was frozen -- `queue_add` schedules the blast in game
+        // ticks (protinst.cc), so it came due the moment the fight ended, one fight too late.
+        //
+        // Running the clock at wall-clock speed is both the simplest reading and the closest to
+        // vanilla's intent: 5 game seconds per round was always an estimate of how long a round
+        // "really" took, and in a realtime game that estimate is just the real elapsed time. HIS
+        // CALL, against a real-time schedule for explosives alone and against faking rounds.
+        // Poison, radiation and scripted timers now tick through a fight too -- all of them are
+        // measured in minutes or hours, so a fight moves them by a rounding error.
+        //
+        // ⚠️ TURN-BASED KEEPS THE VANILLA RULE, because there the per-round increment still runs
+        // and doing both would count the time twice.
+        if (combat_rt_enabled() || !combat_rt_under_threat()) {
+            // ⚠️ TIME KEEPS PACE WITH THE LEGS. Travel speed compresses the boring part of walking
+            // into less real time; without this the world's clock would not compress with it, so
+            // crossing a poisoned map at Very fast would cost half the poison of crossing it at
+            // Normal -- the setting would quietly be a difficulty lever. Scaled only WHILE HE IS
+            // ACTUALLY MOVING, because that is the only time the lever does anything: standing in a
+            // shop passes at ordinary speed whatever the setting says.
+            //
+            // The factor is a tile-TIME multiplier (0.5 = twice as fast), so the clock rate is its
+            // reciprocal. Fractional, hence the carry -- at Fast (0.67) that is 1.49 ticks per
+            // 100 ms and dropping the 0.49 would lose a third of it.
+            static float clock_carry = 0.0f;
+            float rate = 1.0f;
+
+            if (obj_dude != NULL) {
+                int anim = FID_ANIM_TYPE(obj_dude->fid);
+                if (anim == ANIM_WALK || anim == ANIM_RUNNING) {
+                    float travel = anim_travel_speed_in_effect();
+                    if (travel > 0.05f) {
+                        rate = 1.0f / travel;
+                    }
+                }
+            }
+
+            clock_carry += rate;
+            int whole = (int)clock_carry;
+            clock_carry -= (float)whole;
+            fallout_game_time += whole;
+
+            // Say it out loud when the rate changes, so "is the clock really keeping pace with the
+            // legs" is a grep and not a belief. An EDGE, not a heartbeat: the rate is a step
+            // function of one setting and one animation type, so it changes when you start or stop
+            // walking and never otherwise. gtime is in ticks, ten to the game second.
+            static float traced_rate = -1.0f;
+            if (rate != traced_rate) {
+                traced_rate = rate;
+                trace_event(TRACE_FLOW, "clock", "rate=%.2f gtime=%d travel=%.2f",
+                    rate, fallout_game_time, anim_travel_speed_in_effect());
+            }
         }
+
         should_process_queue = true;
     }
 
@@ -827,6 +898,8 @@ int scripts_check_state()
 
         scriptState.requests &= ~SCRIPT_REQUEST_ELEVATOR;
 
+        trace_event(TRACE_FLOW, "elev-open", "type=%d map=%d elev=%d", scriptState.elevatorType, map, elevation);
+
         if (elevator_select(scriptState.elevatorType, &map, &elevation, &tile) != -1) {
             automap_pip_save();
 
@@ -932,6 +1005,8 @@ int scripts_check_state_in_combat()
         int elevation = map_elevation;
         int tile = -1;
 
+        trace_event(TRACE_FLOW, "elev-open", "type=%d map=%d elev=%d", scriptState.elevatorType, map, elevation);
+
         if (elevator_select(scriptState.elevatorType, &map, &elevation, &tile) != -1) {
             automap_pip_save();
 
@@ -1031,6 +1106,13 @@ void scripts_request_worldmap()
 // 0x492828
 int scripts_request_elevator(int elevator)
 {
+    // ⚠️ THE CHAIN, TRACED END TO END, because three rounds of reasoning about it were wrong:
+    // A -> obj_use_door -> the door's SCRIPT -> here (a deferred REQUEST, not a call) ->
+    // scripts_check_state next frame -> elevator_select -> the panel. Any link can be the one that
+    // does not happen, and from the outside every failure looks identical: the doors close and
+    // nothing else. These three lines say which link it was.
+    trace_event(TRACE_FLOW, "elev-request", "type=%d", elevator);
+
     scriptState.elevatorType = elevator;
     scriptState.requests |= SCRIPT_REQUEST_ELEVATOR;
 
@@ -1423,7 +1505,7 @@ int scr_game_init()
     fallout_game_time = 1;
     water_movie_play_flag = 0;
     set_game_time_in_seconds(GAME_TIME_START_HOUR * 60 * 60 + GAME_TIME_START_MINUTE * 60);
-    add_bk_process(doBkProcesses);
+    add_bk_process(doBkProcesses, "scripts");
 
     if (scr_set_dude_script() == -1) {
         return -1;
@@ -1883,11 +1965,22 @@ int scr_load(DB_FILE* stream)
             }
 
             ScriptListExtent* extent = (ScriptListExtent*)mem_malloc(sizeof(*extent));
-            scriptList->head = extent;
-            scriptList->tail = extent;
             if (extent == NULL) {
                 return -1;
             }
+
+            // ⚠️ INITIALISE BEFORE PUBLISHING. scriptList->head used to be assigned to raw
+            // mem_malloc memory and only filled in by scr_read_ScriptNode below -- and that
+            // read pumps the mouse every 8 KB (db_fgetc -> gameMouseRefreshImmediately), so
+            // anything the engine calls from there walks this list while length and next are
+            // still garbage. scr_ptr then ran off a 0xffffffffffffffff extent and killed the
+            // game on the way into a town. The pad no longer looks (map_is_loading), but the
+            // list must not be walkable in pieces for whatever else the engine pumps next.
+            extent->length = 0;
+            extent->next = NULL;
+
+            scriptList->head = extent;
+            scriptList->tail = extent;
 
             if (scr_read_ScriptNode(extent, stream) != 0) {
                 return -1;

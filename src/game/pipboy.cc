@@ -14,6 +14,7 @@
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gmovie.h"
+#include "game/gamepad_ui.h"
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "game/map.h"
@@ -200,6 +201,7 @@ static void PipArchives(int a1);
 static int ListArchive(int a1);
 static void ShowControls();
 static void ShowControls2();
+static void ShowControls3();
 static void ShowControlsPage(const char* title, const PipboyControl* lines, int count);
 static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
@@ -435,7 +437,7 @@ static PipboyRenderProc* PipFnctn[5] = {
     PipAlarm,
 };
 
-// The gamepad layout, listed on its own page of the Pip-Boy archives.
+// The gamepad layout, listed on its own pages of the Pip-Boy archives.
 //
 // Hardcoded rather than added to pipboy.msg: that file lives inside MASTER.DAT, and adding a
 // handful of message ids would mean shipping a loose override of the WHOLE file, which would
@@ -443,64 +445,76 @@ static PipboyRenderProc* PipFnctn[5] = {
 //
 //   button == NULL, action != NULL -> section heading (underlined)
 //   both NULL                      -> blank spacer, dropped first if the page runs long
+//
+// ⚠️ EACH PAGE HAS A HARD 40-LINE BUDGET, and it is not a style preference -- pip_ctrl_line piles
+// every row past `bottom_line` onto the bottom line, so an overlong table does not scroll, it
+// smears. The budget is 1 (title) + as many entries as fit; blank spacers are dropped wholesale
+// first (`spacious` in ShowControlsPage), which buys back one line per section boundary. That is
+// why there are THREE pages: the world/combat table alone spends its whole 40.
 static const PipboyControl ctrl_lines[] = {
     { NULL, "MOVEMENT" },
     { "Left stick", "Walk" },
-    { "LB", "Run" },
+    { "X (hold)", "Run" },
     { "Right stick", "Cursor, pick a target" },
-    { "R3", "Lock on / off nearest enemy" },
+    { "LT (hold)", "Aim: lock the nearest enemy" },
+    { NULL, NULL },
+    { NULL, "FIGHTING" },
+    { "RT", "Attack (hold to keep attacking)" },
+    // ⚠️ 2026-10-09: the aimed shot is the weapon slot's AIMED mode (bullseye + its AP price), RT
+    // fires it; RB is the heal, LT + Y the firing mode. LB + B still heals but is not listed -- one row, one gesture.
+    { "R3", "Called shot: pick a body part" },
+    { "In that window", "A or R3: slot goes AIMED there" },
+    { "LB", "Reload" },
+    { "RB", "Stimpack - best one, one per injection" },
+    { "LT + Y", "Firing mode: single / aimed / burst" },
     { NULL, NULL },
     { NULL, "ACTION" },
-    { "A", "Attack, or use what is lit up" },
+    { "A", "Use what is lit up / confirm" },
+    { "A twice", "Loot the body you stand on" },
     { "A (hold)", "Aim held item at something" },
-    { "B", "Cancel / switch firing mode" },
-    { "X", "Reload" },
+    { "B", "Cancel / stop what you ordered" },
     { "Y", "Swap active hand" },
-    { "LT", "Aimed shot (hold: pick part)" },
-    { "RB", "Switch cursor mode" },
-    { "RT", "Click" },
-    { "LB + B", "Use best stimpack" },
     { NULL, NULL },
-    { NULL, "WHEELS - hold, aim with right stick" },
-    { "B", "Drugs and quick items" },
-    { "X", "Ammunition" },
-    { "Y", "Weapons" },
-    { "L3", "Skills" },
+    // ⚠️ THE STICK EACH WHEEL READS IS PART OF ITS ENTRY. A wheel is aimed with the thumb that is
+    // NOT holding it open, so the face-button wheels (Y, B) read the LEFT stick and L3 reads the
+    // RIGHT one. Naming the wrong stick is worse than naming none: it sends the player to the walk
+    // stick, which is the input the wheels arm against.
+    //
+    // ⚠️ AMMUNITION LOST ITS OWN ROW (2026-09-17) because it lost its own button -- RB had to be
+    // freed to become a held fire button. Since 2026-09-20 it is not a page you have to go looking
+    // for either: bare hands, Unload and every kind of round the gun takes are the FIRST segments
+    // of the weapon ring, so the entry says where they are rather than how to page to them.
+    { NULL, "WHEELS - hold the button (L3: press), aim, release to pick" },
+    // Since 2026-10-04 the drugs are this ring's LAST page too, and the paging wraps -- so from the
+    // first page they are a single LB away. That is the whole reason the entry spells LB out.
+    { "Y", "Weapons + ammo; LB = drugs, items (Stealth Boy...)" },
+    { "B", "Drugs and quick items - aim LEFT" },
+    { "L3 (press)", "Skills: stays open, RIGHT stick, A picks" },
+    { "A", "Take what is highlighted" },
     { NULL, NULL },
     { NULL, "D-PAD - HOLD each of these; a TAP cycles the action" },
     { "Up", "Pip-Boy" },
     { "Down", "Character sheet" },
     { "Left", "Automap" },
     { "Right", "End combat (refused if enemies still want you)" },
-    { "Tap", "Next action on the target" },
-    { NULL, NULL },
-    { NULL, "BARTER" },
-    { "LB / RB", "Step between items" },
-    { "D-pad", "Move within a column" },
-    { "A", "Move the whole stack" },
-    { "LT + A", "Move only some of it" },
-    { "X", "Even out the deal with caps" },
-    { "Y", "Offer the trade" },
-    { "B", "Leave" },
+    { "Tap", "Next action (on a follower: push past)" },
     { NULL, NULL },
     { NULL, "OTHER" },
     { "BACK", "Inventory" },
+    { "BACK (hold)", "Run to the nearest way out" },
     { "START", "Pause menu" },
-    { "LB + Y", "Quick save" },
+    { "START (hold)", "Quick save" },
 };
 
-// SECOND CONTROLS PAGE. The first one is full: `bottom_line` is
-// PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / text_height() - 1, which at a 10px Pip-Boy font is 40 rows
-// against the 44 the world/combat table already wants -- it only fits today because the blank
-// separators get dropped (see `spacious`). Anything past that is piled onto the bottom line, so
-// the modal screens get their own archive entry instead of a longer page.
+// SECOND CONTROLS PAGE: the screens you act IN -- talking, the character sheet, inventory, barter.
 //
 // ⚠️ A CONTROL THAT IS NOT WRITTEN DOWN DOES NOT EXIST. Barter's "even out with caps" and the
 // split-stack picker sat unused for weeks for exactly this reason, and the end-combat hold was
-// pressed once and never found again. Everything on this page was reachable and undocumented.
+// pressed once and never found again. The inventory's A -- a tap uses or equips, a hold opens the
+// whole Use / Drop / Look menu -- was the last big one still missing.
 static const PipboyControl ctrl2_lines[] = {
     { NULL, "TALKING" },
-    { "Up / Down", "Pick a reply" },
+    { "Stick / D-pad", "Pick a reply" },
     { "A", "Say it" },
     { "X", "Ask me about" },
     { "Y", "Barter" },
@@ -508,7 +522,9 @@ static const PipboyControl ctrl2_lines[] = {
     { NULL, NULL },
     { NULL, "CHARACTER SHEET" },
     { "Stick / D-pad", "Move the cursor" },
-    { "LB / RB", "Jump to the next column" },
+    // Not "column": the shoulders hop to the next GROUP of rows (stats, traits, skills...), which
+    // is what ce_focus_jump actually walks.
+    { "LB / RB", "Jump to the next section" },
     { "A", "Spend a point" },
     { "A (hold)", "Done" },
     { "X", "Take a point back" },
@@ -516,16 +532,52 @@ static const PipboyControl ctrl2_lines[] = {
     { "B", "Cancel" },
     { NULL, NULL },
     { NULL, "INVENTORY AND LOOT" },
+    { "A", "Use / equip to A (loot: take one)" },
+    { "A on worn armour", "Take it off" },
+    { "A (hold)", "Use / Drop / Look menu" },
     { "X", "Put it in the left hand" },
     { "B", "Right hand (loot: close)" },
-    { "Y", "Take the whole stack" },
+    { "Y", "Take the whole stack (loot)" },
     { "BACK", "Close" },
     { NULL, NULL },
+    { NULL, "BARTER" },
+    { "LB / RB", "Step between columns" },
+    { "D-pad", "Move between items" },
+    { "A", "Move one of them" },
+    { "A (hold)", "Look at the item" },
+    { "LT + A", "Move the whole stack" },
+    { "RT", "Choose how many" },
+    { "X", "Even out the deal with caps" },
+    { "Y", "Offer the trade" },
+    { "B", "Leave" },
+};
+
+// THIRD CONTROLS PAGE: the screens you only LOOK at or pick from. Split off the screens page
+// because that one had filled up, and for the same reason the second page exists at all -- a page
+// that overflows does not scroll, it stacks every extra row onto the bottom line.
+static const PipboyControl ctrl3_lines[] = {
+    { NULL, "PIP-BOY AND AUTOMAP" },
+    { "Stick", "Move the cursor" },
+    { "A", "Press what it is on" },
+    { "B or BACK", "Close" },
+    { "Up / Left", "Closes the one it opened" },
+    { NULL, NULL },
     { NULL, "WORLD MAP" },
-    { "D-pad", "Pick where to go" },
+    { "Up / Down", "Pick where to go" },
     { "A", "Travel, or enter this place" },
     { NULL, NULL },
+    { NULL, "TOWN MAP" },
+    { "Stick / D-pad", "Pick a way in" },
+    { "A", "Go in there" },
+    { "B", "Back to the world map" },
+    { NULL, NULL },
+    { NULL, "SAVE AND LOAD" },
+    { "Stick / D-pad", "Pick a slot" },
+    { "A", "Confirm" },
+    { "B", "Cancel" },
+    { NULL, NULL },
     { NULL, "PREFERENCES" },
+    { "X or M", "MODS - this build's own settings" },
     { "D-pad", "Move between settings" },
     { "LB / RB", "Change the value" },
     { "A", "Press the button" },
@@ -533,14 +585,18 @@ static const PipboyControl ctrl2_lines[] = {
     { "B", "Cancel" },
     { NULL, NULL },
     { NULL, "ANYWHERE ELSE" },
-    { "A / B", "Yes / no in a prompt" },
-    { "A", "Skip the death scene" },
+    { "Stick / D-pad", "Move the highlight" },
+    { "A", "Pick it, or yes in a prompt" },
+    { "B", "Back out, or no in a prompt" },
+    { "RT", "Click wherever the cursor is" },
+    { "A / B / START", "Skip the death scene" },
 };
 
-// Title of the CONTROLS page, and the archive entry that opens it -- one string so the list
-// and the page it leads to can never drift apart.
+// Titles of the CONTROLS pages, and the archive entries that open them -- one string each so the
+// list and the page it leads to can never drift apart.
 static const char* ctrl_entry = "CONTROLS - WORLD";
 static const char* ctrl2_entry = "CONTROLS - SCREENS";
+static const char* ctrl3_entry = "CONTROLS - MENUS";
 
 // 0x662A70
 static Size ginfo[PIPBOY_FRM_COUNT];
@@ -654,6 +710,126 @@ static unsigned char ctrl_flag;
 // ShowControls -- see pip_ctrl_line.
 static int ctrl_col;
 
+// GAMEPAD NAVIGATION FOR THE PIP-BOY.
+//
+// ⚠️ IT HAD NONE. Every page here is a list of HOT LINES -- registered buttons 350 px wide that
+// report 505 + index when clicked -- and the only way a pad ever reached one was to leave the world
+// cursor lying on top of it. Reading a holodisk or a quest log therefore meant nudging a cursor
+// around a screen that shows no cursor ("chci si přečíst logs, blbě se to ovládá").
+//
+// The shape is the one he asked for and the one the inventory already uses: start on the FIRST
+// entry, D-pad walks down them one at a time, A opens the one you are on. The selection is shown by
+// PARKING THE CURSOR on it -- the Pip-Boy repaints its content area wholesale on every page change
+// and keeps no clean copy to erase a highlight against, so a drawn marker would have to be undone
+// by hand against a background that no longer exists.
+static int pip_pad_sel = 0;
+
+// SELECTION FRAME. ⚠️ The cursor alone does not do this job -- the elevator proved it the same
+// evening ("ted se při výběru patra neukazuje kurzor"), and Preferences proved it before that: a
+// pointer is not a statement about which entry you are on, and on these screens it is not reliably
+// visible either. So the selected hot line gets a frame drawn round it.
+//
+// ⚠️ SAVE-UNDER, the same as Preferences and the elevator: the page under it was painted by
+// whichever PipFnctn drew it and there is no clean copy to erase against. Keep the four 1px strips
+// and put them back before anything else draws -- which means the loop is strictly
+// ERASE -> input (any of which may repaint the whole content area) -> DRAW.
+#define PIP_HL_MAX_W 380
+#define PIP_HL_MAX_H 32
+
+static unsigned char pip_hl_top[PIP_HL_MAX_W];
+static unsigned char pip_hl_bottom[PIP_HL_MAX_W];
+static unsigned char pip_hl_left[PIP_HL_MAX_H];
+static unsigned char pip_hl_right[PIP_HL_MAX_H];
+static int pip_hl_x = -1;
+static int pip_hl_y;
+static int pip_hl_w;
+static int pip_hl_h;
+
+static void pip_hl_erase()
+{
+    if (pip_hl_x < 0) {
+        return;
+    }
+
+    memcpy(scrn_buf + PIPBOY_WINDOW_WIDTH * pip_hl_y + pip_hl_x, pip_hl_top, pip_hl_w);
+    memcpy(scrn_buf + PIPBOY_WINDOW_WIDTH * (pip_hl_y + pip_hl_h - 1) + pip_hl_x, pip_hl_bottom, pip_hl_w);
+    for (int i = 0; i < pip_hl_h; i++) {
+        unsigned char* row = scrn_buf + PIPBOY_WINDOW_WIDTH * (pip_hl_y + i);
+        row[pip_hl_x] = pip_hl_left[i];
+        row[pip_hl_x + pip_hl_w - 1] = pip_hl_right[i];
+    }
+
+    pip_hl_x = -1;
+}
+
+static void pip_hl_draw(int k)
+{
+    if (hot_line_count <= 0 || k < 0 || k >= hot_line_count) {
+        return;
+    }
+
+    text_font(101);
+    int height = text_height();
+
+    // The hot line's own rectangle (x 254, 350 wide, one text line tall), two pixels of air.
+    int x = 252;
+    int y = PIPBOY_WINDOW_CONTENT_VIEW_Y + (hot_line_start + 2 * k) * height - 2;
+    int w = 354;
+    int h = height + 4;
+
+    if (x < 0 || y < 0 || x + w > PIPBOY_WINDOW_WIDTH || y + h > PIPBOY_WINDOW_HEIGHT) {
+        return;
+    }
+    if (w < 3 || h < 3 || w > PIP_HL_MAX_W || h > PIP_HL_MAX_H) {
+        return;
+    }
+
+    // Save the whole footprint BEFORE drawing any of it, or the corners come back coloured.
+    memcpy(pip_hl_top, scrn_buf + PIPBOY_WINDOW_WIDTH * y + x, w);
+    memcpy(pip_hl_bottom, scrn_buf + PIPBOY_WINDOW_WIDTH * (y + h - 1) + x, w);
+    for (int i = 0; i < h; i++) {
+        const unsigned char* row = scrn_buf + PIPBOY_WINDOW_WIDTH * (y + i);
+        pip_hl_left[i] = row[x];
+        pip_hl_right[i] = row[x + w - 1];
+    }
+
+    // colorTable[992] is the Pip-Boy's own green -- the colour every line on this screen is already
+    // printed in, so the frame belongs to the display rather than sitting on top of it.
+    unsigned char color = colorTable[992];
+    memset(scrn_buf + PIPBOY_WINDOW_WIDTH * y + x, color, w);
+    memset(scrn_buf + PIPBOY_WINDOW_WIDTH * (y + h - 1) + x, color, w);
+    for (int i = 0; i < h; i++) {
+        unsigned char* row = scrn_buf + PIPBOY_WINDOW_WIDTH * (y + i);
+        row[x] = color;
+        row[x + w - 1] = color;
+    }
+
+    pip_hl_x = x;
+    pip_hl_y = y;
+    pip_hl_w = w;
+    pip_hl_h = h;
+}
+
+// Where hot line k sits. AddHotLines registers them at x 254, first at hot_line_start * height,
+// then every SECOND text line (y += height * 2).
+static void pip_pad_point(int k)
+{
+    if (hot_line_count <= 0) {
+        return;
+    }
+
+    Rect winRect;
+    if (win_get_rect(pip_win, &winRect) != 0) {
+        return;
+    }
+
+    text_font(101);
+    int height = text_height();
+
+    mouse_set_position(winRect.ulx + 254 + 8,
+        winRect.uly + PIPBOY_WINDOW_CONTENT_VIEW_Y + (hot_line_start + 2 * k) * height + height / 2);
+}
+
 // 0x486A80
 int pipboy(int intent)
 {
@@ -665,10 +841,121 @@ int pipboy(int intent)
     mouseGetPositionInWindow(pip_win, &old_mouse_x, &old_mouse_y);
     wait_time = get_time();
 
+    // ⚠️ Every button must be seen RELEASED once before it acts in here, and these are LOCALS, not
+    // statics: a screen that opens while a button is physically down reads it as a fresh press on
+    // its first frame -- which on the elevator meant the panel confirmed the floor you were already
+    // standing on and vanished before you saw it. Statics would arm themselves permanently after
+    // the first visit and the guard would only work once.
+    bool pipArmedA = false;
+    bool pipArmedB = false;
+
     while (true) {
         sharedFpsLimiter.mark();
 
+        // ⚠️ The frame comes down before anything can draw -- input below may repaint the whole
+        // content area, and the save-under is only valid until it does.
+        pip_hl_erase();
+
         int keyCode = get_input();
+
+        // --- gamepad -------------------------------------------------------------------------
+        // Injects the very same event codes the mouse buttons report, so everything below this
+        // point stays exactly as it was and there is no second dispatch to keep in step.
+        {
+            static bool pipPrevUp = false;
+            static bool pipPrevDown = false;
+            static bool pipPrevA = false;
+            static bool pipPrevB = false;
+            static bool pipPrevLB = false;
+            static bool pipPrevRB = false;
+            static unsigned int pipLastStep = 0;
+
+
+            SDL_GameController* pipPad = gamepad_ui_get_controller();
+            if (pipPad != NULL) {
+                // ⚠️ NO self_nav HERE, AND THAT IS THE WHOLE CORRECTION. Every other modal wants the
+                // gameplay layer gone, but this screen was ALREADY fully playable with the stick
+                // cursor -- "pipboy se ovládal v pohodě s levým joystickem" -- and self_nav is
+                // exactly what takes that cursor away. Turning it on traded a screen where you could
+                // click anything for one where you could only reach the hot lines: not the tabs, not
+                // the sub-buttons, not WAIT. That is a net loss however good the list stepping is.
+                //
+                // So the pad only ADDS here: the D-pad and stick PARK THE CURSOR on entries (A then
+                // clicks them exactly as it always did, no injection, nothing to conflict with), and
+                // LB/RB switch pages.
+                SDL_GameControllerUpdate();
+                bool upNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+                bool downNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
+                bool aNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_A) != 0;
+                bool bNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_B) != 0;
+                bool lbNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+                bool rbNow = SDL_GameControllerGetButton(pipPad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+
+                if (!aNow) {
+                    pipArmedA = true;
+                }
+                if (!bNow) {
+                    pipArmedB = true;
+                }
+
+                bool repeat = (upNow || downNow) && elapsed_time(pipLastStep) >= 220;
+
+                int step = 0;
+                if ((upNow && !pipPrevUp) || (upNow && repeat)) {
+                    step = -1;
+                } else if ((downNow && !pipPrevDown) || (downNow && repeat)) {
+                    step = 1;
+                } else {
+                    // The left stick does it too -- it is the thing your thumb is already on.
+                    step = gamepad_ui_menu_stick_step();
+                }
+
+                if (step != 0 && hot_line_count > 0) {
+                    pipLastStep = get_time();
+                    int next = pip_pad_sel + step;
+                    if (next >= 0 && next < hot_line_count) {
+                        pip_pad_sel = next;
+                        pip_pad_point(pip_pad_sel);
+                    }
+                }
+
+                // LB / RB step between the PAGES, which is the other half of "blbě se to ovládá":
+                // the tabs are buttons too, and a pad could not press them either. 503 is CLOSE and
+                // is deliberately not in the ring -- you leave with B.
+                static const int pipTabs[] = { 500, 501, 502, 504 };
+                int tabStep = 0;
+                if (rbNow && !pipPrevRB) {
+                    tabStep = 1;
+                } else if (lbNow && !pipPrevLB) {
+                    tabStep = -1;
+                }
+
+                if (tabStep != 0) {
+                    int here = 0;
+                    for (int i = 0; i < 4; i++) {
+                        if (pipTabs[i] - 500 == crnt_func) {
+                            here = i;
+                            break;
+                        }
+                    }
+                    keyCode = pipTabs[(here + tabStep + 4) % 4];
+                } else if (pipArmedB && bNow && !pipPrevB) {
+                    // Back out of a sub-page if there is one to back out of, otherwise close.
+                    // ⚠️ A is deliberately NOT injected: the cursor is already parked on the
+                    // selected entry, so the ordinary A-click lands on it. Injecting as well would
+                    // fire the entry twice, and would also make A mean something different here
+                    // from everywhere else on this screen.
+                    keyCode = HotLines[BACK_BUTTON_INDEX] != -1 ? 528 : KEY_ESCAPE;
+                }
+
+                pipPrevUp = upNow;
+                pipPrevDown = downNow;
+                pipPrevA = aNow;
+                pipPrevB = bNow;
+                pipPrevLB = lbNow;
+                pipPrevRB = rbNow;
+            }
+        }
 
         if (intent == PIPBOY_OPEN_INTENT_REST) {
             keyCode = 504;
@@ -718,9 +1005,17 @@ int pipboy(int intent)
             break;
         }
 
+        // ...and back up at the bottom, over whatever the page looks like now.
+        if (gamepad_ui_get_controller() != NULL) {
+            pip_hl_draw(pip_pad_sel);
+            win_draw(pip_win);
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    pip_hl_erase();
 
     EndPipboy();
 
@@ -1906,13 +2201,15 @@ static void PipArchives(int a1)
 
         ListArchive(a1);
 
-        // The two CONTROLS pages are the last entries of the list, and neither is a movie.
-        // view_page is the line count ListArchive returned, so SCREENS sits at view_page and
-        // WORLD one line above it.
-        if (a1 == view_page || a1 == view_page - 1) {
+        // The three CONTROLS pages are the last entries of the list, and none of them is a movie.
+        // view_page is the line count ListArchive returned, so MENUS sits at view_page, SCREENS one
+        // line above it and WORLD one above that -- the same order ListArchive prints them in.
+        if (a1 >= view_page - 2) {
             pause_for_tocks(200);
             NixHotLines();
             if (a1 == view_page) {
+                ShowControls3();
+            } else if (a1 == view_page - 1) {
                 ShowControls2();
             } else {
                 ShowControls();
@@ -2015,6 +2312,17 @@ static int ListArchive(int a1)
     pip_print(ctrl2_entry, 0, color);
     cursor_line++;
 
+    // ...and the menus page last. The order here IS the dispatch order in PipArchives (which reads
+    // them off the end of the list as view_page, -1, -2), so the two must be changed together.
+    if (line++ == a1 - 1) {
+        color = colorTable[32747];
+    } else {
+        color = colorTable[992];
+    }
+
+    pip_print(ctrl3_entry, 0, color);
+    cursor_line++;
+
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
@@ -2060,7 +2368,12 @@ static void ShowControls2()
     ShowControlsPage(ctrl2_entry, ctrl2_lines, (int)(sizeof(ctrl2_lines) / sizeof(ctrl2_lines[0])));
 }
 
-// Both pages render through here: same layout, only the title and the table differ.
+static void ShowControls3()
+{
+    ShowControlsPage(ctrl3_entry, ctrl3_lines, (int)(sizeof(ctrl3_lines) / sizeof(ctrl3_lines[0])));
+}
+
+// All three pages render through here: same layout, only the title and the table differ.
 static void ShowControlsPage(const char* title, const PipboyControl* lines, int count)
 {
     buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
@@ -2280,6 +2593,10 @@ static void AddHotLines(int start, int count, bool add_back_button)
 
     hot_line_start = start;
     hot_line_count = count;
+
+    // A new list always starts on its first entry -- that is the whole gesture: open a page, the
+    // cursor is already on the first thing you could read.
+    pip_pad_sel = 0;
 
     if (count != 0) {
         int y = start * height + PIPBOY_WINDOW_CONTENT_VIEW_Y;

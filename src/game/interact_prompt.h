@@ -33,6 +33,17 @@ bool interact_prompt_cycle(int delta);
 // more -- with a single candidate there is nothing to choose and the stick must stay a cursor.
 int interact_prompt_candidate_count();
 
+// The nearest on-screen object the given SKILL would sensibly be aimed at, or NULL when nothing
+// nearby fits. Lets the pad park an armed skill cursor on the obvious target (first aid on the
+// dude, the lockpick on a locked chest) instead of leaving it wherever the pointer was abandoned.
+Object* interact_prompt_skill_target(int skill);
+
+// What an armed use-on / skill cursor may be stepped onto: the dude, any critter, and any item,
+// scenery or wall that is interactable or scripted (never HIDDEN staged content). The list form
+// returns the ones on screen within the picker's reach.
+bool interact_prompt_is_use_target(Object* obj);
+int interact_prompt_use_targets(Object** out, int max);
+
 // Move the prompt to the interactable lying in screen direction (dirX, dirY) from the CURRENT one
 // (a unit vector, y positive down). Returns false when nothing lies that way, so the caller can
 // refuse audibly. The choice overrides the automatic nearest-target pick until it goes out of reach,
@@ -51,6 +62,10 @@ bool interact_prompt_target_adjacent();
 
 // Drop the overlay + all cached pointers (map teardown, entering combat, shutdown). Idempotent.
 void interact_prompt_reset();
+
+// Drop any cached pointer to ONE object that is about to be freed (obj_erase_object).
+// Cheaper and less destructive than interact_prompt_reset(), which is for whole-map teardown.
+void interact_prompt_notify_object_freed(Object* obj);
 
 } // namespace fallout
 

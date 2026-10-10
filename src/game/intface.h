@@ -54,9 +54,20 @@ void intface_hp_roll_cancel();
 void intface_update_ac(bool animate);
 void intface_update_move_points(int actionPoints, int bonusMove);
 
-// Realtime heal slot (the LB+B stimpak indicator) -- see the block above intface_redraw.
+// Realtime heal slot (the RB stimpak indicator) -- see the block above intface_redraw.
 void intface_update_heal_slot(Object* item, int count);
 void intface_invalidate_heal_slot();
+// The part an aimed RT goes to, printed in the weapon slot beside its bullseye.
+void intface_update_aim_part(int hitLocation);
+// REALTIME: the end-turn box on the bar opens its combat curtains while a fight is live and closes
+// them when it is over, frame-stepped so nothing waits for it. Only when the heal slot has moved out
+// to the side panel (a screen wider than 640). Every frame from combat_rt_update.
+void intface_rt_combat_box_tick(bool engaged, float dt);
+void intface_rt_combat_box_reset();
+void intface_rt_combat_box_invalidate();
+// MODS "Combat box sound": the curtains open/close clunk and the lights chime. Default ON (vanilla).
+bool intface_get_combat_box_sound();
+void intface_set_combat_box_sound(bool on);
 // Repairs the dude's weapon animation code when a swap animation failed to finish (realtime can
 // cancel it). Cheap and idempotent; combat_rt calls it once a frame. See the note in intface.cc.
 void intface_reconcile_weapon_fid();
@@ -65,10 +76,16 @@ int intface_update_items(bool animated);
 int intface_toggle_items(bool animated);
 // Reloads the active-hand weapon from inventory ammo (controller reload button).
 int intface_reload_weapon();
+// Dry run of the above: true when a reload would actually load something (see intface.cc).
+bool intface_can_reload_weapon();
+// The active hand's item, NULL for an empty hand -- what intface_reload_weapon would reload.
+Object* intface_reload_target();
 int intface_toggle_item_state();
-// True when a toggle would reach a different firing mode. Realtime skips the aiming and reload
-// entries (they change nothing but the icon there), so a single-mode weapon has nothing to cycle.
+// True when a toggle would reach a different firing mode. Realtime skips the reload entry (it has
+// its own button), so a weapon with one mode and no called shot has nothing to cycle.
 bool intface_item_can_toggle_state();
+// Puts the active hand on its AIMED mode (the bullseye); false when this mode cannot be aimed.
+bool intface_item_set_aiming();
 void intface_use_item();
 int intface_is_item_right_hand();
 int intface_get_current_item(Object** itemPtr);

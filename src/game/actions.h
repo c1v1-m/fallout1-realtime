@@ -22,6 +22,11 @@ void show_damage(Attack* attack, int a2, int a3, bool splitDefender = false);
 // snapshot. Called by combat_rt at its (action-frame synchronised) commit point, so the attacker's
 // sequence never carries his victim's death and ends with his own swing. See actions.cc.
 bool action_defender_reaction(Attack* attack);
+// Realtime: the splash victims' reactions, at the same commit (see actions.cc).
+void action_extras_reaction(Attack* attack);
+// Realtime: take the explosive projectile the last ranged attack launched (NULL = none) and the
+// explosion art it becomes on arrival; combat_rt commits the blast then.
+Object* action_take_explosive_projectile(int* explosionFid);
 int action_attack(Attack* attack);
 int use_an_object(Object* item);
 int a_use_obj(Object* a1, Object* a2, Object* a3);

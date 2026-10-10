@@ -23,6 +23,9 @@ int init_message();
 void exit_message();
 bool message_init(MessageList* msg);
 bool message_exit(MessageList* msg);
+// The language every .msg is read from, latched on first use and fixed for the run.
+const char* message_language();
+
 bool message_load(MessageList* msg, const char* path);
 bool message_search(MessageList* msg, MessageListItem* entry);
 bool message_make_path(char* dest, size_t size, const char* path);

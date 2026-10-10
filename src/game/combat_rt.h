@@ -2,6 +2,7 @@
 #define FALLOUT_GAME_COMBAT_RT_H_
 
 #include "game/object_types.h"
+#include "plib/db/db.h" // DB_FILE, for the medic opt-out save chunk
 
 namespace fallout {
 
@@ -90,6 +91,38 @@ bool combat_rt_has_lock();
 // click-to-move path).
 bool combat_rt_stick_walking();
 
+// MODS page: live read/write of the two gamepad movement assists. The cfg is still where they are
+// LOADED from at init; these are how the settings screen changes them without a re-init.
+void combat_rt_set_cam_smooth(float k);
+// MODS "Camera leans to target": ease the view toward an aimed target that is off the screen.
+void combat_rt_set_cam_lean(bool on);
+bool combat_rt_get_cam_lean();
+// MODS "Hits stagger": the stagger chance factor (0 = every hit through armor staggers).
+void combat_rt_set_flinch_chance(float factor);
+float combat_rt_get_flinch_chance();
+float combat_rt_get_cam_smooth();
+void combat_rt_set_knockdown_agility(float factor);
+float combat_rt_get_knockdown_agility();
+void combat_rt_set_door_magnet(float strength);
+float combat_rt_get_door_magnet();
+void combat_rt_set_npc_slide(bool enabled);
+bool combat_rt_get_npc_slide();
+// MODS "Enemies look around" (cfg enemies_look_around): idle hostiles turn toward gunshots and
+// scan around, so a back turned to you is not a permanent blind spot. See rt_idle_look_around.
+void combat_rt_set_look_around(bool enabled);
+bool combat_rt_get_look_around();
+
+// MODS "Script combat turns" (cfg script_turns, default on = vanilla): every scripted critter on the
+// map gets the combat event vanilla gives it each turn -- the start of its turn while it fights, the
+// "do you join?" check while it does not. See rt_script_turn_tick.
+void combat_rt_set_script_turns(bool enabled);
+bool combat_rt_get_script_turns();
+void combat_rt_set_free_move(bool enabled);
+bool combat_rt_get_free_move();
+// Free movement: the offset the dude stands at on his tile, for dude_stand to keep instead of
+// re-centring him. False = re-centre as vanilla (free movement off, or he is on another tile).
+bool combat_rt_dude_rest_offset(int* x, int* y);
+
 // --- L3 aimed-shot wheel support (gamepad_ui drives the body-part overlay). ---
 
 // Whether an aimed shot is possible right now: the dude is in combat, the active
@@ -112,6 +145,10 @@ int combat_rt_aim_chance(int hitLocation);
 // cost), false if no valid target / the weapon can't aim / the location is invalid.
 bool combat_rt_aimed_attack(int hitLocation);
 
+// The hit mode the player's next attack would use. The called-shot window needs it to print the
+// right to-hit percentage per body part.
+int combat_rt_player_hit_mode();
+
 // Why an aimed shot is impossible right now, as a short player-facing phrase -- or NULL when it is
 // possible. Several of the reasons are VANILLA rules the player cannot see from the interface bar
 // (Fast Shot forbids called shots outright; burst and continuous modes cannot be aimed; neither can
@@ -123,6 +160,39 @@ const char* combat_rt_aim_refusal();
 // Called by the gamepad layer on aim-wheel open/close. No-op if there is no target.
 void combat_rt_aim_highlight_on();
 void combat_rt_aim_highlight_off();
+
+// Per-companion "stop patching me up", set from the dialogue. Keyed by object id so it survives
+// map changes and loads. Only the PLAYER is refused -- the medic still doses itself and other
+// allies. combat_rt_medic_optout_load treats a missing chunk as "not in this save" and defaults
+// to everyone healing you, which is what makes the save format change backward compatible.
+// "Give me some room": the follower WALKS a few tiles away from the dude. Queued rather than done
+// on the spot, because the dialogue that asks for it is modal -- it fires on the first update after
+// the conversation closes. Pass NULL to cancel a standing request.
+void combat_rt_request_step_back(Object* npc);
+
+bool combat_rt_medic_beat_enabled();
+bool combat_rt_medic_treats_player(Object* npc);
+void combat_rt_medic_set_treats_player(Object* npc, bool treats);
+void combat_rt_medic_optout_clear();
+int combat_rt_medic_optout_save(DB_FILE* stream);
+int combat_rt_medic_optout_load(DB_FILE* stream);
+
+// Rate of fire, for the character sheet to PRINT. Both go through the same helpers the fight
+// uses, so the card can never disagree with the combat model.
+//
+// combat_rt_skill_attack_speed: seconds between attacks for one of the six combat skills, at
+//   `skillLevel`, with `critter`'s current SPECIAL folded in -- plus the two multipliers that
+//   made it, so the card can say how much of the number is the skill's doing. The attack
+//   category comes from the skill, so no weapon needs to be in hand.
+// combat_rt_stat_attack_speed: the multiplier a SPECIAL level buys, for the one attack category
+//   that stat owns (STR melee, PE ranged, AGI thrown).
+//
+// Both return false when there is nothing true to print: turn-based mode, the cooldown disabled
+// by config, or a stat/skill that owns no attack category.
+bool combat_rt_skill_attack_speed(Object* critter, int skill, int skillLevel,
+    float* seconds, float* statMult, float* skillMult);
+bool combat_rt_stat_attack_speed(int stat, int statLevel, float* mult, int* attackType);
+float combat_rt_attack_cooldown_base();
 
 // Tap-A world loot: if an adjacent corpse or container is next to the dude, stash
 // it (opened by combat_rt_update) and return true so the gamepad layer routes A to
@@ -182,11 +252,17 @@ void combat_rt_validate_who_hit_me(Object* a, Object* b);
 // "in combat -> game_user_wants_to_quit = 1" path, which boots the player to the main menu.
 void combat_rt_end_for_map_exit();
 
+// op_terminate_combat in realtime: end the engagement unconditionally (the script decided), instead
+// of vanilla's game_user_wants_to_quit = 1, which only the dormant turn-based loop ever consumed --
+// under combat_rt it dropped the player to the main menu as if they had died.
+void combat_rt_terminate_from_script();
+
 // Called from map_leave_map() when the player steps onto a map-exit grid IN realtime combat.
-// Arms the escape-hold timer: the player must stay on the exit grid for RT_MAP_EXIT_DELAY
-// seconds of live combat before the map changes (anti-abuse -- no instant flee). combat_rt
-// drives the countdown and performs the transition on expiry; stepping off cancels it.
-void combat_rt_arm_map_exit();
+// Arms the exit: on its next frame combat_rt ends the fight so the queued transition fires --
+// immediately (the 10 s hold-position delay was removed 2026-10-06 at his request).
+// scripted = the transition did not come from stepping onto an exit grid (stairs, ladders and
+// elevators are scripted): it goes on the next frame instead of waiting for the dude to stand on one.
+void combat_rt_arm_map_exit(bool scripted = false);
 
 // Route a legacy player-attack request (combat_attack_this / the crosshair mouse path)
 // into the realtime intent system. Calling combat_attack() directly in realtime sets the
@@ -231,6 +307,13 @@ int combat_rt_player_ap();
 int combat_rt_critter_ap(Object* critter);
 int combat_rt_player_max_ap();
 bool combat_rt_spend_ap(int cost);
+// Return points an action took up front and then never did (a cut reload). No-op out of a fight.
+void combat_rt_refund_ap(int amount);
+// MODS "Reload animation": who is in the middle of a reload loop. begin/end bracket it; the query
+// also drops a body whose loop was replaced by something else (knockdown, walk, attack).
+void combat_rt_reload_begin(Object* critter);
+void combat_rt_reload_end(Object* critter);
+bool combat_rt_is_reloading(Object* critter);
 
 // Empty a critter's realtime pool. The realtime stand-in for vanilla's "lose your turn" critical
 // failure: there are no turns, so the cost is paid as points plus the wait for them to come back.
@@ -253,6 +336,11 @@ bool combat_rt_player_attack_busy();
 // paints the AP indicator RED for exactly this window, so the "you stop at 0, you move
 // again at 3" rule is on screen instead of being a silent loss of control.
 bool combat_rt_move_blocked();
+
+// The Bonus Move perk's movement-only reserve (2 points per rank): spent by walking and running
+// before the regular pool, refilled while the dude stands, never touched by anything else. 0
+// without the perk and 0 out of a fight. The interface bar draws it as the vanilla yellow bulbs.
+int combat_rt_bonus_move_ap();
 
 // How fast the world is currently running, as a fraction of normal. 1.0 nearly always; less than
 // that while the on-body limb picker is up, which slows the fight instead of pausing it.

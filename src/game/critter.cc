@@ -4,6 +4,9 @@
 #include <string.h>
 
 #include "game/anim.h"
+#include "game/config.h"
+#include "game/game_trace.h"
+#include "game/gconfig.h"
 #include "game/combat.h"
 #include "game/display.h"
 #include "game/editor.h"
@@ -331,6 +334,26 @@ int critter_get_rads(Object* obj)
 }
 
 // 0x427C18
+// cfg radaway_cancels / MODS row "RadAway clears dose". Lazily read, like every other cfg lever
+// that has no init hook of its own.
+static int critter_radaway_cancels = -1;
+
+bool critter_get_radaway_cancels()
+{
+    if (critter_radaway_cancels < 0) {
+        int v = 0;
+        config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RADAWAY_CANCELS_KEY, &v);
+        critter_radaway_cancels = v != 0 ? 1 : 0;
+    }
+
+    return critter_radaway_cancels != 0;
+}
+
+void critter_set_radaway_cancels(bool enabled)
+{
+    critter_radaway_cancels = enabled ? 1 : 0;
+}
+
 int critter_adjust_rads(Object* obj, int amount)
 {
     MessageListItem messageListItem;
@@ -346,7 +369,15 @@ int critter_adjust_rads(Object* obj, int amount)
         amount -= stat_level(obj, STAT_RADIATION_RESISTANCE) * amount / 100;
     }
 
-    if (amount > 0) {
+    // ⚠️ CRITTER_BARTER IS NOT ABOUT BARTER. It is vanilla's "rads changed, re-check me at the next
+    // hourly tick" flag (critter_check_rads returns immediately without it), and it is set ONLY when
+    // rads go UP. That is the whole reason four RadAways do not save you: the dose queued when you
+    // were irradiated carries the level you had THEN, and nothing re-evaluates it.
+    //
+    // With the lever on, any change re-checks -- so RadAway drops the counter, the next hourly tick
+    // recomputes the level, and queue_clear_type throws the pending dose away (or re-queues a
+    // milder one). Vanilla behaviour is the default; see the note at the cfg key.
+    if (amount > 0 || (amount < 0 && critter_get_radaway_cancels())) {
         proto->critter.data.flags |= CRITTER_BARTER;
     }
 
@@ -399,6 +430,15 @@ int critter_adjust_rads(Object* obj, int amount)
         obj->data.critter.radiation = 0;
     }
 
+    // ⚠️ THE WHOLE RADIATION CHAIN IS TRACED, because reasoning about it has now been wrong twice.
+    // This line is the counter moving; rad-check is the hourly re-grade; rad-dose is the damage
+    // landing. A dose that kills with no rad-check between the RadAway and it is the case that
+    // proves the lever is not reaching the grading at all.
+    trace_event(TRACE_FLOW, "rads", "amount=%d now=%d recheck=%d lever=%d",
+        amount, obj->data.critter.radiation,
+        (proto->critter.data.flags & CRITTER_BARTER) != 0 ? 1 : 0,
+        critter_get_radaway_cancels() ? 1 : 0);
+
     return 0;
 }
 
@@ -427,6 +467,7 @@ int critter_check_rads(Object* obj)
 
     proto_ptr(obj->pid, &proto);
     if ((proto->critter.data.flags & CRITTER_BARTER) == 0) {
+        trace_event(TRACE_FLOW, "rad-check", "skipped=no-flag rads=%d", critter_get_rads(obj));
         return 0;
     }
 
@@ -453,6 +494,16 @@ int critter_check_rads(Object* obj)
 
     if (stat_result(obj, STAT_ENDURANCE, bonus[radiation_level], NULL) <= ROLL_FAILURE) {
         radiation_level++;
+
+        // ⚠️ REAL OUT-OF-BOUNDS READ, FOUND IN HIS LOG: "[FLOW/rad-check] rads=2206 level=6".
+        // A failed Endurance roll bumps the level by one, and at FATAL (5) that lands on 6 -- one
+        // past the end of rad_bonus[RADIATION_LEVEL_COUNT][...], which process_rads then indexes
+        // for every effect. Whatever those eight ints happen to be is applied to the dude's stats.
+        // It has presumably always been there; you only reach it by walking around with more than
+        // 999 rads and failing the roll, which is a state most characters do not survive to enjoy.
+        if (radiation_level >= RADIATION_LEVEL_COUNT) {
+            radiation_level = RADIATION_LEVEL_COUNT - 1;
+        }
     }
 
     if (radiation_level > old_rad_level) {
@@ -465,6 +516,11 @@ int critter_check_rads(Object* obj)
         radiationEvent->radiationLevel = radiation_level;
         radiationEvent->isHealing = 0;
         queue_add(GAME_TIME_TICKS_PER_HOUR * roll_random(4, 18), obj, radiationEvent, EVENT_TYPE_RADIATION);
+        trace_event(TRACE_FLOW, "rad-check", "rads=%d level=%d queued=1", radiation, radiation_level);
+    } else {
+        // Nothing queued: either the level did not rise, or -- with the lever on -- RadAway took
+        // the counter down far enough that the dose cleared at the top of this function stays gone.
+        trace_event(TRACE_FLOW, "rad-check", "rads=%d level=%d queued=0", radiation, radiation_level);
     }
 
     proto->critter.data.flags &= ~(CRITTER_BARTER);

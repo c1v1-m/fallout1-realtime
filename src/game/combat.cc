@@ -15,8 +15,10 @@
 #include "game/game.h"
 #include "game/game_trace.h"
 #include "game/gconfig.h"
+#include "game/gamepad_ui.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
+#include "game/interact_prompt.h"
 #include "game/intface.h"
 #include "game/item.h"
 #include "game/loadsave.h"
@@ -83,7 +85,7 @@ char* combat_get_loc_name(Object* critter, int hitLocation);
 static void draw_loc_off(int a1, int a2);
 static void draw_loc_on(int a1, int a2);
 static void draw_loc(int eventCode, int color);
-static int get_called_shot_location(Object* critter, int* hitLocation, int hitMode);
+static int get_called_shot_location(Object* critter, int* hitLocation, int hitMode, int initialLocation);
 
 // TODO: Remove.
 //
@@ -1629,6 +1631,32 @@ int combat_load(DB_FILE* stream)
 
     if (db_freadUInt32(stream, &combat_state) == -1) return -1;
 
+    // RESCUE FOR THE SAVES ALREADY WRITTEN MID-FIGHT (see combat_save). Their turn-based block is the
+    // realtime build's junk -- list_total 0, cids never assigned -- so it is READ PAST to keep the
+    // stream aligned, never matched against the map; the warm bit is dropped, and the load carries on
+    // as an ordinary out-of-combat one. The fight resumes the realtime way once the game runs.
+    // A sanity bound on list_total, because a nonsense count would misalign every later chunk.
+    if (isInCombat() && combat_rt_enabled()) {
+        int skip;
+        int total;
+        if (db_freadInt32(stream, &skip) == -1) return -1; // combat_turn_running
+        if (db_freadInt32(stream, &skip) == -1) return -1; // combat_free_move
+        if (db_freadInt32(stream, &skip) == -1) return -1; // combat_exps
+        if (db_freadInt32(stream, &skip) == -1) return -1; // list_com
+        if (db_freadInt32(stream, &skip) == -1) return -1; // list_noncom
+        if (db_freadInt32(stream, &total) == -1) return -1; // list_total
+        if (db_freadInt32(stream, &skip) == -1) return -1; // the dude's cid
+        if (total < 0 || total > 4096) {
+            return -1;
+        }
+        for (int k = 0; k < total; k++) {
+            if (db_freadInt32(stream, &skip) == -1) return -1;
+        }
+
+        trace_event(TRACE_WARN, "combat-load-rt", "skipped a turn-based block from a mid-fight save (list_total=%d)", total);
+        combat_state &= ~COMBAT_STATE_0x01;
+    }
+
     if (!isInCombat()) {
         obj = obj_find_first();
         while (obj != NULL) {
@@ -1701,9 +1729,26 @@ int combat_save(DB_FILE* stream)
 {
     int index;
 
-    if (db_fwriteUInt32(stream, combat_state) == -1) return -1;
+    // ⚠️ A REALTIME FIGHT IS NOT SAVED AS A TURN-BASED ONE (2026-10-04, "stále není možné uložit hru
+    // v combatu. Save poté nelze načíst"). combat_rt raises the warm bit (COMBAT_STATE_0x01) for as
+    // long as anyone is fighting, so isInCombat() was true here and the save went on to write the
+    // TURN-BASED block below -- turn flags, list_com/noncom/total and combat_list's cids -- none of
+    // which realtime ever builds (combat_begin never runs; list_total is 0). combat_load then demands
+    // that list_total equal the number of critters on the map, which on any real map it does not,
+    // and fails: every save taken mid-fight was unloadable (trace_2026-10-04_233138: MBSTRG12.sav,
+    // continue-rc=-1 right after obj_load_dude).
+    //
+    // Nothing of a realtime fight lives in those fields anyway -- the fight is rebuilt from the
+    // world after a load, exactly as it is after a map change -- so realtime simply saves "no
+    // turn-based combat", and the loader never sees a block it cannot match.
+    unsigned int savedState = combat_state;
+    if (combat_rt_enabled()) {
+        savedState &= ~COMBAT_STATE_0x01;
+    }
 
-    if (!isInCombat()) return 0;
+    if (db_fwriteUInt32(stream, savedState) == -1) return -1;
+
+    if ((savedState & COMBAT_STATE_0x01) == 0) return 0;
 
     if (db_fwriteInt32(stream, combat_turn_running) == -1) return -1;
     if (db_fwriteInt32(stream, combat_free_move) == -1) return -1;
@@ -1808,7 +1853,7 @@ static void combat_over()
 {
     int index;
 
-    add_bk_process(dude_fidget);
+    add_bk_process(dude_fidget, "fidget");
 
     for (index = 0; index < list_noncom + list_com; index++) {
         Object* critter = combat_list[index];
@@ -3648,6 +3693,14 @@ static void check_for_death(Object* object, int damage, int* flags)
 // 0x422670
 static void set_new_results(Object* critter, int flags)
 {
+    // The dude's own cripples and blindness, named at the source (see the cripple line in
+    // combat_rt.cc, which only sees that a bit appeared). Blindness with no attack behind it was
+    // the 2026-10-08 puzzle; if this line is missing next to a "cripple" line, it was not a hit.
+    if (critter == obj_dude && (flags & DAM_CRIP & ~obj_dude->data.critter.combat.results) != 0) {
+        trace_event(TRACE_COMBAT, "dude-hit-cripple", "flags=0x%x results=0x%x",
+            flags & DAM_CRIP, obj_dude->data.critter.combat.results);
+    }
+
     if (critter == NULL) {
         return;
     }
@@ -4492,9 +4545,212 @@ static void draw_loc(int input, int color)
 }
 
 // 0x42382C
-static int get_called_shot_location(Object* critter, int* hit_location, int hit_mode)
+// --- A CONTROLLER IN THE VANILLA CALLED-SHOT WINDOW ---------------------------------------------
+//
+// His call, said three times so there is no mistaking it: *"chci jako to je ve vanilla, změníme to
+// úplně"*. The on-body picker -- eight stick-angle wedges painted onto the sprite -- is no longer
+// what the pad opens. LB brings up THIS window, the one the game has always had: the critter's
+// called-shot picture, eight named locations with the real to-hit chance beside each, and Cancel.
+//
+// ⚠️ THE WINDOW ITSELF IS UNTOUCHED VANILLA. This only teaches it a controller, and the highlight it
+// moves is the window's OWN hover paint (draw_loc, the very call its mouse handlers make), so a pad
+// selection and a mouse hover are the same pixels and there is no second drawing path to drift.
+//
+// Returns what to feed the window's loop: 0-7 for a chosen location, KEY_ESCAPE for cancel, or -1
+// for "nothing happened this frame".
+#define CALLED_SHOT_STICK_THRESHOLD 0.5f  // how far the stick has to go to count as a direction
+#define CALLED_SHOT_STICK_REPEAT_MS 180   // hold-to-repeat, brisk enough to run the list in one push
+
+static int called_shot_gamepad_input(int* sel, bool reset)
+{
+    static bool prevUp = false;
+    static bool prevDown = false;
+    static bool prevLeft = false;
+    static bool prevRight = false;
+    static bool prevA = false;
+    static bool prevB = false;
+    static bool prevBack = false;
+    static bool prevR3 = false;
+
+    if (reset) {
+        // ⚠️ A BUTTON ALREADY DOWN WHEN THE WINDOW OPENS IS NOT A PRESS MADE IN IT. Zeroing these
+        // (as this did) turned anything held into an edge on the first frame: a B still down from
+        // the LB+B heal combo cancelled the window the moment it appeared (2026-10-05). Sampling the
+        // pad here means only what is pressed from now on counts. LB keeps its own rule below.
+        SDL_GameController* resetPad = gamepad_ui_get_controller();
+        if (resetPad != NULL) {
+            SDL_GameControllerUpdate();
+            prevUp = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+            prevDown = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
+            prevLeft = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
+            prevRight = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+            prevA = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_A) != 0;
+            prevB = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_B) != 0;
+            prevBack = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_BACK) != 0;
+            // The R3 click that opened this window is still down on its first frame; sampled like
+            // the rest, so only a NEW click confirms.
+            prevR3 = SDL_GameControllerGetButton(resetPad, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+        } else {
+            prevUp = prevDown = prevLeft = prevRight = prevA = prevB = prevBack = prevR3 = false;
+        }
+        return -1;
+    }
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevUp = prevDown = prevLeft = prevRight = prevA = prevB = prevBack = false;
+        return -1;
+    }
+
+    SDL_GameControllerUpdate();
+
+    bool upNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+    bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
+    bool leftNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
+    bool rightNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool backNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0;
+
+    // ⚠️ R3 OPENS THIS WINDOW AND R3 (OR A) CONFIRMS IT (2026-10-09, his swap: "R3 bude vybírání
+    // končetin"; LB held is the target lock now). Until then the window opened on an LB hold and
+    // LETTING GO OF LB confirmed -- "držím tlačítko, najedu na tělo a po puštění…". That release is
+    // deliberately NOT kept: LB held is now the lock, so you may well be holding it when you click
+    // R3, and letting the lock go would have bound whatever part the cursor happened to be on.
+    // Choosing still binds rather than fires; the shot is RT's once the weapon slot is AIMED.
+    bool r3Now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+    bool r3Confirm = r3Now && !prevR3;
+    prevR3 = r3Now;
+
+    bool upEdge = upNow && !prevUp;
+    bool downEdge = downNow && !prevDown;
+    bool leftEdge = leftNow && !prevLeft;
+    bool rightEdge = rightNow && !prevRight;
+    bool aEdge = aNow && !prevA;
+    bool bEdge = bNow && !prevB;
+    bool backEdge = backNow && !prevBack;
+
+    prevUp = upNow;
+    prevDown = downNow;
+    prevLeft = leftNow;
+    prevRight = rightNow;
+    prevA = aNow;
+    prevB = bNow;
+    prevBack = backNow;
+
+    // ⚠️ THE RIGHT STICK PICKS TOO, and it has to feel like a stick rather than like eight separate
+    // flicks: *"nech mě i pravým joystickem vybrat, at se to vybírá líp, at je to svižné"*. So the
+    // first push steps AT ONCE and then repeats while it is held, which makes running to the bottom
+    // of the list one movement. The dominant axis wins outright -- a diagonal is never both a row
+    // change and a column change, which on a 2x4 grid would jump two entries at a time.
+    static int stickDir = 0; // 0 none, 1 up, 2 down, 3 left, 4 right
+    static unsigned int stickAt = 0;
+
+    float stickX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+    float stickY = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+    float absX = stickX < 0.0f ? -stickX : stickX;
+    float absY = stickY < 0.0f ? -stickY : stickY;
+
+    int dir = 0;
+    if (absY >= absX) {
+        if (stickY < -CALLED_SHOT_STICK_THRESHOLD) {
+            dir = 1;
+        } else if (stickY > CALLED_SHOT_STICK_THRESHOLD) {
+            dir = 2;
+        }
+    } else {
+        if (stickX < -CALLED_SHOT_STICK_THRESHOLD) {
+            dir = 3;
+        } else if (stickX > CALLED_SHOT_STICK_THRESHOLD) {
+            dir = 4;
+        }
+    }
+
+    bool stickStep = false;
+    if (dir == 0) {
+        stickDir = 0;
+    } else if (dir != stickDir) {
+        stickDir = dir;
+        stickAt = get_time();
+        stickStep = true;
+    } else if (elapsed_time(stickAt) >= CALLED_SHOT_STICK_REPEAT_MS) {
+        stickAt = get_time();
+        stickStep = true;
+    }
+
+    int was = *sel;
+
+    // Up/down walk the column the selection is in; left/right go to the other one at the same
+    // height. Four rows either side, so the row index is `sel % 4` for both columns; 0-3 is the
+    // left-hand list, 4-7 the right-hand one (draw_loc).
+    //
+    // ⚠️ NO WRAPPING, IN EITHER AXIS (2026-10-04): *"když budu dávat vlevo vlevo vlevo tak se nesmí
+    // stát, že budu vpravo mít kurzor"*. Left used to TOGGLE the column exactly like right did, so a
+    // second left jumped back to the right-hand list, and up/down ran off one end into the other. A
+    // direction now only ever moves that way and stops at the edge -- which also makes holding the
+    // stick run to the end of a column and stay there, instead of cycling round it.
+    if (upEdge || (stickStep && dir == 1)) {
+        if (*sel % 4 != 0) {
+            *sel -= 1;
+        }
+    }
+    if (downEdge || (stickStep && dir == 2)) {
+        if (*sel % 4 != 3) {
+            *sel += 1;
+        }
+    }
+    if (leftEdge || (stickStep && dir == 3)) {
+        if (*sel >= 4) {
+            *sel -= 4;
+        }
+    }
+    if (rightEdge || (stickStep && dir == 4)) {
+        if (*sel < 4) {
+            *sel += 4;
+        }
+    }
+
+    if (*sel != was) {
+        draw_loc(was, colorTable[992]);
+        draw_loc(*sel, colorTable[31744]);
+        win_draw(call_win);
+        gsound_play_sfx_file("ib1p1xx1");
+    }
+
+    if (aEdge || r3Confirm) {
+        return *sel;
+    }
+
+    if (bEdge || backEdge) {
+        return KEY_ESCAPE;
+    }
+
+    return -1;
+}
+
+// Which of the window's eight entries names this hit location. Torso when it names none, which is
+// both the commonest shot and the middle of the right-hand column.
+static int called_shot_index_for(int hitLocation)
+{
+    for (int i = 0; i < 4; i++) {
+        if (hit_loc_left[i] == hitLocation) {
+            return i;
+        }
+        if (hit_loc_right[i] == hitLocation) {
+            return i + 4;
+        }
+    }
+    return 4;
+}
+
+static int get_called_shot_location(Object* critter, int* hit_location, int hit_mode, int initialLocation)
 {
     call_target = critter;
+
+    // The gamepad's floating hand lives in an always-on-top window and showed straight through this
+    // one ("ruka na loot byla skrz to vidět") -- take it down before the window paints, the same rule
+    // the Pip-Boy and the elevator panel follow (see ip_overlay_guard in interact_prompt.cc).
+    interact_prompt_reset();
 
     int calledShotWindowX = (screenGetWidth() - CALLED_SHOT_WINDOW_WIDTH) / 2;
     int calledShotWindowY = screenGetHeight() != 480
@@ -4625,6 +4881,13 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         draw_loc_off(btn, index + 4);
     }
 
+    // Where the pad's selection starts: on the location it was last asked for, so repeating a shot
+    // is A and nothing else. The highlight is painted before the window is first drawn, so it is
+    // never shown unselected.
+    int padSel = called_shot_index_for(initialLocation);
+    draw_loc(padSel, colorTable[31744]);
+    called_shot_gamepad_input(&padSel, true); // forget every edge from before this window
+
     win_draw(call_win);
 
     bool gameUiWasDisabled = game_ui_is_disabled();
@@ -4635,11 +4898,25 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
     gmouse_disable(0);
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
+    // ⚠️ THIS SCREEN DRIVES ITS OWN NAVIGATION, so the pad's cursor layer must let go of the right
+    // stick: otherwise the same push both moves the selection here AND creeps the mouse across the
+    // window, where the buttons' own hover paint would light a SECOND location name. Same flag every
+    // other self-navigating screen sets (see the note on gpui_self_nav).
+    gamepad_ui_set_self_nav(true);
+
     int eventCode;
     while (true) {
         sharedFpsLimiter.mark();
 
         eventCode = get_input();
+
+        // Controller: moves the highlight as a side effect, and only ever RETURNS something when
+        // the player actually chose or cancelled -- so it must run every frame, and a real
+        // keyboard/mouse event always wins.
+        int padKey = called_shot_gamepad_input(&padSel, false);
+        if (eventCode == -1 && padKey != -1) {
+            eventCode = padKey;
+        }
 
         if (eventCode == KEY_ESCAPE) {
             break;
@@ -4657,6 +4934,8 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         sharedFpsLimiter.throttle();
     }
 
+    gamepad_ui_set_self_nav(false);
+
     gmouse_enable();
 
     if (gameUiWasDisabled) {
@@ -4669,6 +4948,13 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
     art_ptr_unlock(upHandle);
     win_delete(call_win);
 
+    // ⚠️ THIS RAN AN INPUT LOOP OF ITS OWN, so every pad edge tracked outside it now describes a
+    // world that is a window old: the A that chose a location is still physically DOWN, and so is
+    // the B that cancelled. Without this the confirming A leaks out as a world click and the
+    // cancelling B cycles the firing mode -- the exact bug family bmpdlog and the editor each had
+    // to fix. See gamepad_ui_bump_input_epoch.
+    gamepad_ui_bump_input_epoch();
+
     if (eventCode == KEY_ESCAPE) {
         return -1;
     }
@@ -4678,6 +4964,27 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
     gsound_play_sfx_file("icsxxxx1");
 
     return 0;
+}
+
+// Open the vanilla called-shot window and return the location the player chose, or -1 if they
+// cancelled. The realtime pad path uses this in place of the on-body picker: same window, same
+// numbers, same Cancel -- it is simply reachable from a controller now.
+//
+// ⚠️ IT RUNS A MODAL LOOP OF ITS OWN, so the world holds still while the choice is made (nothing
+// calls combat_rt_update from inside it) -- which is the same pause the radial wheels take, and the
+// reason picking a limb has never cost the player a beating.
+int combat_called_shot_pick(Object* critter, int hitMode, int initialLocation)
+{
+    if (critter == NULL) {
+        return -1;
+    }
+
+    int hitLocation = HIT_LOCATION_TORSO;
+    if (get_called_shot_location(critter, &hitLocation, hitMode, initialLocation) == -1) {
+        return -1;
+    }
+
+    return hitLocation;
 }
 
 // 0x423C2C
@@ -4853,7 +5160,7 @@ void combat_attack_this(Object* a1)
     }
 
     int hitLocation;
-    if (get_called_shot_location(a1, &hitLocation, hitMode) != -1) {
+    if (get_called_shot_location(a1, &hitLocation, hitMode, HIT_LOCATION_TORSO) != -1) {
         combat_attack(obj_dude, a1, hitMode, hitLocation);
     }
 }
@@ -4866,6 +5173,13 @@ void combat_outline_on()
     Object** critters;
     int critters_length;
     int outline_type;
+
+    // Realtime owns critter outlines (combat_rt's aim outlines: red / yellow / green while aiming).
+    // This vanilla pass outlined everybody only outside a fight and left them stuck when one began --
+    // "někdy jsou highlighted, někdy ne".
+    if (combat_rt_enabled()) {
+        return;
+    }
 
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TARGET_HIGHLIGHT_KEY, &target_highlight);
     if (target_highlight == TARGET_HIGHLIGHT_OFF) {
@@ -4912,6 +5226,12 @@ void combat_outline_off()
     int i;
     int v5;
     Object** v9;
+
+    // See combat_outline_on: in realtime the aim outlines are combat_rt's, and this must not strip
+    // them (its out-of-fight branch removes every critter's outline on the elevation).
+    if (combat_rt_enabled()) {
+        return;
+    }
 
     if (combat_state & 1) {
         for (i = 0; i < list_total; i++) {

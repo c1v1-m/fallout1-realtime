@@ -11,6 +11,10 @@ typedef enum AnimationRequestOptions {
     ANIMATION_REQUEST_NO_STAND = 0x04,
     ANIMATION_REQUEST_0x100 = 0x100,
     ANIMATION_REQUEST_INSIGNIFICANT = 0x200,
+    // A move that is one leg of a longer one (a chase segment, a flee leg): when it ends, hold the
+    // body in its stride for a beat instead of snapping it to ANIM_STAND, because the next leg is
+    // about to be registered. Stood after all if nothing follows. See anim_defer_stand in anim.cc.
+    ANIMATION_REQUEST_DEFER_STAND = 0x400,
 } AnimationRequestOptions;
 
 // Basic animations: 0-19
@@ -174,6 +178,8 @@ int register_object_play_sfx(Object* owner, const char* soundEffectName, int del
 int register_object_animate_forever(Object* owner, int anim, int delay);
 int register_ping(int a1, int a2);
 int make_path(Object* object, int from, int to, unsigned char* a4, int a5);
+// make_path with its own search budget (vanilla's was 2000 closed nodes) -- see anim.cc.
+int make_path_capped(Object* object, int from, int to, unsigned char* rotations, int a5, int maxClosed);
 int make_path_func(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback);
 int idist(int a1, int a2, int a3, int a4);
 int EST(int tile1, int tile2);
@@ -183,6 +189,27 @@ int anim_move_on_stairs(Object* obj, int tile, int elevation, int anim, int anim
 int check_for_falling(Object* obj, int anim, int a3);
 void object_animate();
 int check_move(int* a1);
+// MODS page: live travel-speed lever (see travel_speed_scale in anim.cc). 1.0 = vanilla speed.
+float anim_get_travel_speed();
+float anim_travel_speed_in_effect();
+void anim_set_travel_speed(float scale);
+// MODS "Reload animation" (cfg reload_anim): a reload plays the weapon's STAND loop (dude and NPCs)
+// and the dude stops idling. anim_set_reload_timing brackets the register_end that starts one.
+bool anim_get_reload_anim();
+void anim_set_reload_anim(bool on);
+void anim_set_reload_timing(Object* critter);
+// Brackets the registration (and the lock measurement) of a DRUG INJECTION: compute_tpf times it by
+// (AGI + INT + PE) / 3 on the reload/swap curve. See anim.cc.
+void anim_set_injection_timing(Object* critter);
+// The reload animation (inside register_begin/end): the weapon's STAND loop, or for a pistol a
+// holster-and-draw (put-away + take-out). anim_is_reload_pose: is the body still in it?
+int register_object_reload(Object* critter);
+bool anim_is_reload_pose(Object* critter);
+// The routing verdict of the last move that STARTED (make_path steps; 0 = no route, -1 = no move
+// for that object since the reset). A queued move's register_end cannot tell you this.
+void anim_reset_last_path();
+int anim_last_path_steps(Object* obj);
+
 int dude_move(int a1);
 int dude_run(int a1);
 void dude_fidget();
@@ -210,6 +237,36 @@ void anim_set_weapon_swap_stat_factor(float factor);
 // run animation so it keeps walking without restarting the frame cycle. Returns
 // 0 on success or a negative reason code (see definition in anim.cc).
 int anim_extend_move(Object* obj, int rotation, int count);
+int anim_move_pending_steps(Object* obj);
+int anim_move_repoint(Object* obj, const int* rots, int count, int* newDest);
+void anim_move_speed(Object* object, int anim, float* tilesPerSec, float* framesPerSec);
+
+// SMOOTH MOVEMENT (MODS row, cfg smooth_motion). A walking, running or flying object is DRAWN
+// gliding between the animation's own steps instead of jumping 10-20 times a second; its logical
+// position (tile, obj->x/y) is untouched. object.cc adds the offset wherever it draws, bounds or
+// hit-tests an object -- returns false (and 0,0) for anything that is not gliding.
+bool anim_smooth_offset(Object* obj, int* dx, int* dy);
+bool anim_get_smooth_motion();
+void anim_set_smooth_motion(bool on);
+// Every frame (a background process, after object_animate): advances the glides and redraws them.
+void anim_smooth_tick();
+// The map is being torn down: forget every glide and every held stride (no redraw).
+void anim_smooth_reset();
+
+// FRAME-PACING METER (main loop). Counters since the last call, then zeroed: path searches and
+// their cost, glides started/abandoned, strides held/stood, leg starts held for the cadence.
+typedef struct AnimSmoothStats {
+    int pathSearches;
+    double pathMs;
+    double pathMaxMs;
+    int glides;
+    int glideSnaps;
+    int liveGlides;
+    int strideHolds;
+    int strideStands;
+    int cadenceHolds;
+} AnimSmoothStats;
+void anim_smooth_take_stats(AnimSmoothStats* out);
 
 } // namespace fallout
 

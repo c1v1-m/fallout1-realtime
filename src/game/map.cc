@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "game/anim.h"
+#include "game/art.h"
 #include "game/automap.h"
 #include "game/combat.h"
 #include "game/combat_rt.h"
@@ -60,6 +61,7 @@ static void map_place_dude_and_mouse();
 static void square_init();
 static void square_reset();
 static int square_load(DB_FILE* stream, int a2);
+static void map_reset_background();
 static int map_write_MapData(MapHeader* ptr, DB_FILE* stream);
 static int map_read_MapData(MapHeader* ptr, DB_FILE* stream);
 
@@ -224,6 +226,9 @@ static unsigned int map_last_scroll_time = 0;
 
 // 0x505AE0
 static bool map_bk_enabled = false;
+
+// Set for exactly as long as map_load_file holds the db read callback -- see map_is_loading().
+static bool map_loading = false;
 
 // 0x505AE4
 int map_script_id = -1;
@@ -399,7 +404,7 @@ void map_init()
 void map_reset()
 {
     map_new_map();
-    add_bk_process(gmouse_bk_process);
+    add_bk_process(gmouse_bk_process, "cursor");
     gmouse_disable(0);
     win_show(display_win);
 }
@@ -421,8 +426,10 @@ void map_enable_bk_processes()
     if (!map_bk_enabled) {
         text_object_enable();
         gmouse_enable();
-        add_bk_process(object_animate);
-        add_bk_process(dude_fidget);
+        add_bk_process(object_animate, "anim");
+        // Right behind the stepper: the glides read the positions it just wrote (Smooth movement).
+        add_bk_process(anim_smooth_tick, "glide");
+        add_bk_process(dude_fidget, "fidget");
         scr_enable_critters();
         map_bk_enabled = true;
     }
@@ -437,6 +444,7 @@ bool map_disable_bk_processes()
 
     scr_disable_critters();
     remove_bk_process(dude_fidget);
+    remove_bk_process(anim_smooth_tick);
     remove_bk_process(object_animate);
     gmouse_disable(0);
     text_object_disable();
@@ -929,7 +937,15 @@ int map_load_file(DB_FILE* stream)
     partyMemberPrepLoad();
     gmouse_disable_scrolling();
     gmouse_set_cursor(MOUSE_CURSOR_WAIT_PLANET);
+    // ⚠️ THE WORLD IS NOT INSPECTABLE FROM HERE UNTIL THE CALLBACK IS DROPPED AGAIN (below).
+    // That callback pumps the mouse every 8 KB read, which reaches gpui_mouse_hook -- while
+    // obj_remove_all has already freed the map and scr_load is still building the script
+    // lists. See map_is_loading() in map.h.
+    map_loading = true;
     db_register_callback(gameMouseRefreshImmediately, 8192);
+    // ...and every one of those pumps PRESENTS a frame: with VSync each would wait for the display,
+    // dozens of times per map. Loading presents at once (svga.cc).
+    svga_vsync_suspend(true);
     tile_disable_refresh();
     anim_stop();
     scr_disable();
@@ -972,6 +988,9 @@ int map_load_file(DB_FILE* stream)
         if (map_load_local_vars(stream) != 0) break;
 
         if (square_load(stream, map_data.flags) != 0) break;
+
+        // New floor, new background: the filler is worked out again on first use.
+        map_reset_background();
 
         error = "Error reading scripts";
         if (scr_load(stream) != 0) break;
@@ -1075,11 +1094,20 @@ int map_load_file(DB_FILE* stream)
     }
 
     gtime_q_add();
+    map_loading = false;
     db_register_callback(NULL, 0);
+    svga_vsync_suspend(false);
     gmouse_enable_scrolling();
     gmouse_set_cursor(MOUSE_CURSOR_NONE);
 
     return rc;
+}
+
+// True from the moment map_load_file arms the db read callback until it drops it again.
+// map_load_file has ONE exit, so the flag cannot be left stuck on by an error path.
+bool map_is_loading()
+{
+    return map_loading;
 }
 
 // 0x474D14
@@ -1271,15 +1299,22 @@ int map_leave_map(MapTransition* transition)
     }
 
     if (isInCombat()) {
-        // Realtime lets the player flee a map mid-combat. Instead of the vanilla quit-to-menu
-        // guard (which can't fire in turn-based -- you can't reach an exit grid during combat
-        // -- but boots a realtime player to the menu), ARM the escape delay: the player must
-        // hold position on the exit grid for RT_MAP_EXIT_DELAY seconds of live combat before
-        // the transition happens (anti-abuse -- no instant escape). combat_rt drives the timer
-        // and, on expiry, ends combat so map_check_state (gated on !isInCombat()) loads the
-        // destination; map_state is already stored above and held until then.
+        // ⚠️ VANILLA LETS YOU LEAVE MID-COMBAT, AND THIS IS HOW. Stepping onto an exit grid during
+        // your turn lands here with the map_state stored; game_user_wants_to_quit = 1 then makes
+        // combat_input break out of your turn and return -1, the fight ends (combat_over) and
+        // map_check_state performs the transition -- an immediate exit. (An older note here said
+        // turn-based could never reach an exit grid in combat; that was wrong, and on 2026-10-06 it
+        // led to the claim that vanilla forbids leaving a fight. It does not.)
+        //
+        // Realtime has no combat_input loop to consume that flag, so the same flag meant "quit to
+        // the main menu". Instead combat_rt ends the fight on its next frame (combat_rt_arm_map_exit)
+        // so map_check_state (gated on !isInCombat()) loads the destination -- immediately, like
+        // vanilla. (A 10 s hold-position delay used to sit here; removed 2026-10-06 on request,
+        // which also put it back in line with vanilla.)
         if (combat_rt_enabled()) {
-            combat_rt_arm_map_exit();
+            // Not standing on an exit grid = a SCRIPTED transition (stairs, ladder, elevator,
+            // load_map): it must not wait for one (see rt_map_exit_scripted).
+            combat_rt_arm_map_exit(!obj_dude_on_exit_grid());
         } else {
             game_user_wants_to_quit = 1;
         }
@@ -1839,6 +1874,109 @@ static void map_place_dude_and_mouse()
 
     gmouse_3d_reset_fid();
     gmouse_3d_on();
+}
+
+// THE MAP'S BLACK BACKGROUND (2026-10-06, "utíkal a utíkal přes konec mapy černou část"). A Fallout
+// map sits in a sea of black, laid in one of two ways: no floor art at all (id 1), or -- on 93 of the
+// 97 map elevations that hold critters -- one very dark filler tile (cav4009, cav4010...) painted
+// over everything outside the rooms. Nothing stops a body walking on it, and vanilla never needed
+// anything to: turn-based combat ended before a runner could be chased out there. Realtime can chase
+// one, so this is the one place that knows what "off the map" means.
+//
+// The filler is an elevation's MOST COMMON floor art when that art is near-black (average palette
+// brightness under 27 of 189). Checked against every map in the game: on no elevation do even 30 %
+// of the critters its designers placed stand on it. A map whose most common floor is real ground (a
+// desert) has no filler, and nothing on it is off-limits. -1 = none, -2 = not worked out yet.
+static int map_background_floor[ELEVATION_COUNT] = { -2, -2, -2 };
+
+static void map_reset_background()
+{
+    for (int elevation = 0; elevation < ELEVATION_COUNT; elevation++) {
+        map_background_floor[elevation] = -2;
+    }
+}
+
+static int map_compute_background_floor(int elevation)
+{
+    if (square[elevation] == NULL) {
+        return -1;
+    }
+
+    static int counts[4096];
+    memset(counts, 0, sizeof(counts));
+    for (int index = 0; index < SQUARE_GRID_SIZE; index++) {
+        counts[square[elevation]->field_0[index] & 0xFFF]++;
+    }
+
+    int top = -1;
+    int topCount = 0;
+    for (int id = 0; id < 4096; id++) {
+        if (counts[id] > topCount) {
+            topCount = counts[id];
+            top = id;
+        }
+    }
+
+    if (top == 1) {
+        return 1; // the empty floor IS the background
+    }
+    if (top < 0) {
+        return -1;
+    }
+
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(art_id(OBJ_TYPE_TILE, top, 0, 0, 0), &handle);
+    if (art == NULL) {
+        return -1;
+    }
+
+    unsigned char* pixels = art_frame_data(art, 0, 0);
+    int width = art_frame_width(art, 0, 0);
+    int height = art_frame_length(art, 0, 0);
+    long sum = 0;
+    long lit = 0;
+    for (int index = 0; pixels != NULL && index < width * height; index++) {
+        if (pixels[index] != 0) {
+            unsigned char r;
+            unsigned char g;
+            unsigned char b;
+            getColorPaletteEntry(pixels[index], &r, &g, &b);
+            sum += r + g + b;
+            lit++;
+        }
+    }
+    art_ptr_unlock(handle);
+
+    return (lit > 0 && sum < 27 * lit) ? top : -1;
+}
+
+// Is `tile` out on the black -- empty floor or the elevation's background filler? Used by the
+// realtime flee (combatai_flee_tile) so a runner is cornered at the edge of the map instead of
+// running out across the dark. The square is found the way the renderer finds it: the hex's foot on
+// screen (tile_coord + 16, 8) handed to square_num.
+bool map_tile_is_background(int tile, int elevation)
+{
+    if (elevation < 0 || elevation >= ELEVATION_COUNT || !hexGridTileIsValid(tile) || square[elevation] == NULL) {
+        return false;
+    }
+
+    if (map_background_floor[elevation] == -2) {
+        map_background_floor[elevation] = map_compute_background_floor(elevation);
+    }
+
+    int x;
+    int y;
+    if (tile_coord(tile, &x, &y, elevation) != 0) {
+        return false;
+    }
+
+    int squareIndex = square_num(x + 16, y + 8, elevation);
+    if (squareIndex < 0 || squareIndex >= SQUARE_GRID_SIZE) {
+        return false;
+    }
+
+    int floor = square[elevation]->field_0[squareIndex] & 0xFFF;
+    return floor == 1 || floor == map_background_floor[elevation];
 }
 
 // 0x475F58

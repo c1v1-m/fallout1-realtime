@@ -169,11 +169,102 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
                 video_options.fullscreen = !windowed;
             }
 
-            int scaleValue;
-            if (config_get_value(&resolutionConfig, "MAIN", "SCALE_2X", &scaleValue)) {
-                video_options.scale = scaleValue + 1;
-                video_options.width /= video_options.scale;
-                video_options.height /= video_options.scale;
+            // ⚠️ WHAT THE GAME ACTUALLY RENDERS AT, and why it is not just a taste setting.
+            //
+            // SCR_WIDTH/SCR_HEIGHT above is the OUTPUT (the screen). What the engine draws into is
+            // output / scale, and SDL stretches that to fill the screen -- so the internal size is
+            // what decides how big everything LOOKS. The original shipped at 640x480, so 480
+            // internal lines reproduce its element size exactly, whatever the panel is; the width
+            // then just decides how much map you see left and right.
+            //
+            // SCALE_2X can only divide by a whole number, which is fine on a 1440p desktop (2560 /
+            // 3 = 853x480, the original's scaling in 16:9) and USELESS on a handheld: a Steam Deck
+            // is 1280x800, so scale 1 gives 1280x800 (elements ~0.6x, tiny on a 7" screen) and
+            // scale 2 gives 640x400 -- and 400 is BELOW the floor described next. There is no whole
+            // number that lands on 480 there. INTERNAL_WIDTH / INTERNAL_HEIGHT exist for exactly
+            // that: name the internal size outright, and give either one alone to have the other
+            // derived from the screen's own aspect ratio (INTERNAL_HEIGHT=480 is "original scaling,
+            // whatever this screen is" -- 768x480 on a Deck, 847x480 on a Vita).
+            //
+            // ⚠️ AND THE FLOOR IS 640x480, HARD. The full-screen interfaces are fixed-size windows
+            // (EDITOR_WINDOW_WIDTH/HEIGHT 640x480, the Pip-Boy, the world map), so an internal size
+            // below that does not scale them down -- it simply has nowhere to put them. Nothing
+            // used to check this: SCR_HEIGHT is floored at 480 BEFORE the division, so a Deck
+            // running SCALE_2X=1 sailed past it and broke the character screen with no warning.
+            int internalWidth = 0;
+            int internalHeight = 0;
+            config_get_value(&resolutionConfig, "MAIN", "INTERNAL_WIDTH", &internalWidth);
+            config_get_value(&resolutionConfig, "MAIN", "INTERNAL_HEIGHT", &internalHeight);
+
+            // ⚠️ FULLSCREEN IS THE SCREEN, WHATEVER SCR_* SAYS (2026-10-08, on a Steam Deck: "takhle
+            // to vypadá ... fix it"). Fullscreen is SDL_WINDOW_FULLSCREEN_DESKTOP, so the real output
+            // is always the desktop -- but the internal size below was derived from SCR_*'s ASPECT,
+            // and SCR 1280x720 on the Deck's 1280x800 panel rendered 16:9 and SDL letterboxed it:
+            // 40 px of black above and below, the whole game shrunk into the middle. In fullscreen the
+            // desktop's own size is the output; SCR_* only sizes the window.
+            if (video_options.fullscreen && SDL_InitSubSystem(SDL_INIT_VIDEO) == 0) {
+                SDL_DisplayMode desktop;
+                if (SDL_GetDesktopDisplayMode(0, &desktop) == 0 && desktop.w >= 640 && desktop.h >= 480) {
+                    if (desktop.w != video_options.width || desktop.h != video_options.height) {
+                        debug_printf("f1_res.ini: fullscreen uses the desktop's %dx%d, not SCR %dx%d.\n",
+                            desktop.w, desktop.h, video_options.width, video_options.height);
+                    }
+                    video_options.width = desktop.w;
+                    video_options.height = desktop.h;
+                }
+                // svga_init brings the subsystem up for real, with its render hints set first.
+                SDL_QuitSubSystem(SDL_INIT_VIDEO);
+            }
+
+            int outputWidth = video_options.width;
+            int outputHeight = video_options.height;
+
+            if (internalWidth > 0 || internalHeight > 0) {
+                // Either one on its own is enough: the missing half comes from the screen's aspect
+                // ratio, which is what keeps the picture undistorted.
+                if (internalWidth <= 0) {
+                    internalWidth = (int)((double)internalHeight * outputWidth / outputHeight + 0.5);
+                } else if (internalHeight <= 0) {
+                    internalHeight = (int)((double)internalWidth * outputHeight / outputWidth + 0.5);
+                }
+
+                video_options.width = internalWidth;
+                video_options.height = internalHeight;
+
+                // Only the WINDOWED window size is built from this (fullscreen is
+                // SDL_WINDOW_FULLSCREEN_DESKTOP and ignores it); the renderer's logical size is the
+                // internal resolution either way, and SDL is perfectly happy scaling it by a
+                // fraction. Biggest whole multiple that still fits the screen.
+                int fitX = outputWidth / internalWidth;
+                int fitY = outputHeight / internalHeight;
+                int fit = fitX < fitY ? fitX : fitY;
+                video_options.scale = fit < 1 ? 1 : fit;
+            } else {
+                int scaleValue;
+                if (config_get_value(&resolutionConfig, "MAIN", "SCALE_2X", &scaleValue)) {
+                    video_options.scale = scaleValue + 1;
+                    video_options.width /= video_options.scale;
+                    video_options.height /= video_options.scale;
+                }
+            }
+
+            // The floor, applied to whichever path produced the numbers. Clamping keeps the game
+            // playable (a slightly stretched picture) where the alternative is interfaces that do
+            // not fit on the screen at all -- and it says so, because a silently corrected config
+            // is a config nobody ever fixes.
+            if (video_options.width < 640 || video_options.height < 480) {
+                debug_printf("f1_res.ini: internal %dx%d is below the 640x480 floor the fixed-size "
+                             "interfaces need; clamping. Set INTERNAL_WIDTH/INTERNAL_HEIGHT (or a "
+                             "smaller SCALE_2X) for %dx%d output.\n",
+                    video_options.width, video_options.height, outputWidth, outputHeight);
+
+                if (video_options.width < 640) {
+                    video_options.width = 640;
+                }
+                if (video_options.height < 480) {
+                    video_options.height = 480;
+                }
+                video_options.scale = 1;
             }
         }
         config_exit(&resolutionConfig);

@@ -1,6 +1,7 @@
 #include "game/intface.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include "game/gmouse.h"
 #include "game/game_trace.h"
 #include "game/gsound.h"
+#include "game/inventry.h"
 #include "game/item.h"
 #include "game/object.h"
 #include "game/protinst.h"
@@ -229,6 +231,83 @@ static bool endWindowOpen = false;
 // 0x5055A0
 static Rect endWindowRect = { 580, 38, 637, 96 };
 
+// THE SIDE PANEL (2026-10-08). On a screen wider than 640 the bar sits centred with black on both
+// sides of it -- no window at all lives there. The realtime heal slot and the aimed-part readout
+// move into the strip on its RIGHT, which hands the bar its two boxes back: the SKILLDEX plate, and
+// the end-turn box, which shows the combat curtains again (intface_rt_combat_box_tick). -1 = the
+// screen is only 640 wide (or too narrow a strip): both widgets stay where they were on the bar.
+#define SIDE_PANEL_MIN_WIDTH 60
+static int sidePanelWindow = -1;
+static unsigned char* sidePanelBuffer = NULL;
+static int sidePanelWidth = 0;
+
+// THE SIDE ART (2026-10-08): *"prostě nahraď černý pruhy tímhle, nic nepřidávej a neměň"*. Mash's
+// High Resolution Patch -- shipped with the Steam release -- carries a metal strip for each side of
+// the 640 bar, art\intrface\HR_IFACELFT1.FRM / HR_IFACERHT1.FRM, 640x100 apiece, the Vault emblem at
+// the end that meets the bar. Laid the way fallout2-ce's sidePanelsInit lays them: each piece butts
+// against the bar and the screen edge crops its far end. The right one goes UNDER the side panel's
+// heal box and readout, which only ever paint their own rects. They are not in the game's own data:
+// without the files the strips stay black, exactly as before -- so there is no switch for it.
+static int sideArtLeftWindow = -1;
+static int sideArtRightWindow = -1;
+
+// Copies the end of a side piece nearest the bar into a strip `width` wide. `barOnRight` = this is
+// the LEFT strip, so the image's right edge meets the bar and its left end is what gets cropped.
+static void intface_side_art_paint(Art* art, bool barOnRight, unsigned char* dest, int destPitch, int width)
+{
+    int artW;
+    int artH;
+    if (art_frame_width_length(art, 0, 0, &artW, &artH) != 0) {
+        return;
+    }
+    unsigned char* data = art_frame_data(art, 0, 0);
+    if (data == NULL) {
+        return;
+    }
+
+    int copyW = std::min(width, artW);
+    int copyH = std::min(artH, INTERFACE_BAR_HEIGHT);
+    int srcX = barOnRight ? artW - copyW : 0;
+    int destX = barOnRight ? width - copyW : 0;
+    buf_to_buf(data + srcX, copyW, copyH, artW, dest + destX, destPitch);
+}
+
+// Fills the strips either side of the bar from the HRP pieces, when they are there. The right one
+// paints into the side panel if it exists, else into a window of its own; both follow the bar's
+// show/hide (intface_show / intface_hide) and die with it (intface_exit).
+static void intface_side_art_init(int barX, int barY)
+{
+    if (barX > 0) {
+        Art* art = load_frame("art\\intrface\\HR_IFACELFT1.FRM");
+        if (art != NULL) {
+            sideArtLeftWindow = win_add(0, barY, barX, INTERFACE_BAR_HEIGHT, colorTable[0], WINDOW_HIDDEN);
+            unsigned char* buf = sideArtLeftWindow != -1 ? win_get_buf(sideArtLeftWindow) : NULL;
+            if (buf != NULL) {
+                intface_side_art_paint(art, true, buf, barX, barX);
+            }
+            mem_free(art);
+        }
+    }
+
+    int rightX = barX + INTERFACE_BAR_WIDTH;
+    int rightW = screenGetWidth() - rightX;
+    if (rightW > 0) {
+        Art* art = load_frame("art\\intrface\\HR_IFACERHT1.FRM");
+        if (art != NULL) {
+            if (sidePanelWindow != -1) {
+                intface_side_art_paint(art, false, sidePanelBuffer, sidePanelWidth, sidePanelWidth);
+            } else {
+                sideArtRightWindow = win_add(rightX, barY, rightW, INTERFACE_BAR_HEIGHT, colorTable[0], WINDOW_HIDDEN);
+                unsigned char* buf = sideArtRightWindow != -1 ? win_get_buf(sideArtRightWindow) : NULL;
+                if (buf != NULL) {
+                    intface_side_art_paint(art, false, buf, rightW, rightW);
+                }
+            }
+            mem_free(art);
+        }
+    }
+}
+
 // 0x5055B0
 static int endTurnButton = -1;
 
@@ -252,6 +331,60 @@ static unsigned char* moveLightGreen = NULL;
 
 // 0x5055CC
 static unsigned char* moveLightYellow = NULL;
+
+// The yellow AP bulb actually drawn for Bonus Move points: the GREEN bulb re-tinted, built once in
+// intface_init by intface_build_yellow_light. Fallout 1's own HLYEL.FRM is a dull olive blob with
+// none of the green bulb's shading -- its left half is near-brown (72,56,4 / 112,120,32) -- and it
+// had to sit right beside the green ones now that Bonus Move works. His ask was the cleaner yellow
+// Fallout 2 shows ("inspiruj se žlutou z fallout 2"); F2's data is not on this machine, so this is
+// that look rebuilt from the green bulb itself: same shape, same highlight, yellow.
+static unsigned char moveLightYellowLit[5 * 5];
+
+// The LIGHT-GREEN AP bulb: one bulb worth TWO action points, for the AP a character has beyond the
+// ten the strip can show (AGI 10 + Action Boy and the like). His pick, 2026-10-04 ("udělej dvojku,
+// světle zelená za dva AP"), over leaving AP past ten invisible as both games did -- vanilla Fallout 2
+// clamps the count to ten -- and over sfall's widened 16-bulb bar, which needs new interface art.
+// Built from the green bulb like the yellow one; see intface_update_move_points for the layout.
+static unsigned char moveLightGreenLight[5 * 5];
+
+// Re-tint the green AP bulb into the two bulbs we add. The green bulb carries its shading in the G
+// channel and its whitish highlight in R and B.
+//   * YELLOW (moveLightYellowLit): G becomes both red AND green -- lifted by a third, because yellow
+//     at the same level reads muddier than green -- and the highlight becomes its blue.
+//   * LIGHT GREEN (moveLightGreenLight): every channel lifted toward white (+12 on red and blue, +8
+//     on green), so it stays green but reads clearly paler and brighter than its neighbours.
+// colorTable is Interplay's own nearest-colour table (the tail of COLOR.PAL), so every shade lands on
+// a real palette entry. On the stock palette: yellow 144,120,36 / 204,184,28 / 228,216,12 /
+// 252,252,124; light green 120,152,92 / 100,228,100 / 216,252,156 -- none of them a cycling colour.
+static void intface_build_ap_lights()
+{
+    for (int index = 0; index < 5 * 5; index++) {
+        unsigned char pixel = moveLightGreen[index];
+        if (pixel == 0) {
+            // Transparent stays transparent: both bulbs keep the green one's shape.
+            moveLightYellowLit[index] = 0;
+            moveLightGreenLight[index] = 0;
+            continue;
+        }
+
+        int rgb = Color2RGB(pixel);
+        int r = (rgb >> 10) & 0x1F;
+        int g = (rgb >> 5) & 0x1F;
+        int b = rgb & 0x1F;
+
+        int level = g + g / 3;
+        if (level > 0x1F) {
+            level = 0x1F;
+        }
+        int highlight = (r + b) / 2;
+        moveLightYellowLit[index] = colorTable[(level << 10) | (level << 5) | highlight];
+
+        int lr = r + 12 > 0x1F ? 0x1F : r + 12;
+        int lg = g + 8 > 0x1F ? 0x1F : g + 8;
+        int lb = b + 12 > 0x1F ? 0x1F : b + 12;
+        moveLightGreenLight[index] = colorTable[(lr << 10) | (lg << 5) | lb];
+    }
+}
 
 // 0x5055D0
 static unsigned char* moveLightRed = NULL;
@@ -415,6 +548,30 @@ int intface_init()
         // NOTE: Uninline.
         return intface_fatal_error(-1);
     }
+
+    // MODS "Combat box sound" -- default ON, the vanilla clunk and chime.
+    int boxSound = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_BOX_SOUND_KEY, &boxSound);
+    intface_set_combat_box_sound(boxSound != 0);
+
+    // The strip right of the bar, if there is room for the heal slot in it. Hidden with the bar.
+    {
+        int sideX = interfaceBarWindowX + INTERFACE_BAR_WIDTH;
+        int sideW = screenGetWidth() - sideX;
+        if (sideW >= SIDE_PANEL_MIN_WIDTH) {
+            sidePanelWindow = win_add(sideX, interfaceBarWindowY, sideW, INTERFACE_BAR_HEIGHT, colorTable[0], WINDOW_HIDDEN);
+            if (sidePanelWindow != -1) {
+                sidePanelBuffer = win_get_buf(sidePanelWindow);
+                sidePanelWidth = sideW;
+                if (sidePanelBuffer == NULL) {
+                    win_delete(sidePanelWindow);
+                    sidePanelWindow = -1;
+                }
+            }
+        }
+    }
+
+    intface_side_art_init(interfaceBarWindowX, interfaceBarWindowY);
 
     fid = art_id(OBJ_TYPE_INTERFACE, 16, 0, 0, 0);
     backgroundFrmData = art_ptr_lock_data(fid, 0, 0, &backgroundFrmHandle);
@@ -668,6 +825,9 @@ int intface_init()
         return intface_fatal_error(-1);
     }
 
+    // The Bonus Move bulb and the two-AP bulb, both built from the green one.
+    intface_build_ap_lights();
+
     buf_to_buf(interfaceBuffer + 640 * 14 + 316, 90, 5, 640, movePointBackground, 90);
 
     if (construct_box_bar_win() == -1) {
@@ -703,6 +863,9 @@ void intface_reset()
     reset_box_bar_win();
 
     itemCurrentItem = 0;
+
+    // A new game or a load: no fight is live, so the combat box shuts without its animation.
+    intface_rt_combat_box_reset();
 }
 
 // 0x453DB0
@@ -895,6 +1058,23 @@ void intface_exit()
             win_delete(interfaceWindow);
             interfaceWindow = -1;
         }
+
+        if (sidePanelWindow != -1) {
+            win_delete(sidePanelWindow);
+            sidePanelWindow = -1;
+            sidePanelBuffer = NULL;
+            sidePanelWidth = 0;
+        }
+
+        if (sideArtLeftWindow != -1) {
+            win_delete(sideArtLeftWindow);
+            sideArtLeftWindow = -1;
+        }
+
+        if (sideArtRightWindow != -1) {
+            win_delete(sideArtRightWindow);
+            sideArtRightWindow = -1;
+        }
     }
 
     deconstruct_box_bar_win();
@@ -979,6 +1159,15 @@ void intface_hide()
     if (interfaceWindow != -1) {
         if (!intfaceHidden) {
             win_hide(interfaceWindow);
+            if (sidePanelWindow != -1) {
+                win_hide(sidePanelWindow);
+            }
+            if (sideArtLeftWindow != -1) {
+                win_hide(sideArtLeftWindow);
+            }
+            if (sideArtRightWindow != -1) {
+                win_hide(sideArtRightWindow);
+            }
             intfaceHidden = 1;
         }
     }
@@ -994,6 +1183,15 @@ void intface_show()
             intface_update_hit_points(false);
             intface_update_ac(false);
             win_show(interfaceWindow);
+            if (sidePanelWindow != -1) {
+                win_show(sidePanelWindow);
+            }
+            if (sideArtLeftWindow != -1) {
+                win_show(sideArtLeftWindow);
+            }
+            if (sideArtRightWindow != -1) {
+                win_show(sideArtRightWindow);
+            }
             intfaceHidden = false;
         }
     }
@@ -1058,22 +1256,59 @@ bool intface_is_enabled()
 
 // --- REALTIME HEAL SLOT ----------------------------------------------------
 //
-// Shows the healing item LB+B would use NEXT, with its count, drawn where the END-TURN box
-// sits. That box is dead weight in realtime: its two buttons are only ever created by
-// intface_end_window_open, which is reached solely from combat_begin -- and realtime never
-// gets there, because combat() diverts to combat_rt_notify_attack and returns first. So all
-// that is behind us is decorative striped art.
+// Shows the healing item RB would use NEXT, with its count (RB since 2026-10-09; it was LB+B).
 //
-// ⚠️ Nothing else on the 640x100 bar is free, which is why it is here and not somewhere more
-// obvious: the left panel is the message console, the middle is the weapon slot with the AP
-// dots above it, and the right column is HP/AC plus the four screen buttons. Moving the widget
-// is just the four constants below.
+// ⚠️ WHERE IT LIVES (2026-10-08, his layout): in the SIDE PANEL, the black strip right of the bar,
+// with the aimed-part readout above it -- "dej ho vpravo vedle displaye, jak je ta černá část". That
+// gives the end-turn box back to the combat curtains it was made for (intface_rt_combat_box_tick).
+// On a screen only 640 wide there is no strip, and it falls back to its old spot ON that box: the
+// bar is otherwise full -- the left panel is the message console, the middle is the weapon slot
+// with the AP dots above it, and the right column is HP/AC plus the four screen buttons.
 #define HEAL_SLOT_X 580
 #define HEAL_SLOT_Y 38
 #define HEAL_SLOT_W 57
 #define HEAL_SLOT_H 58
 
-static Rect healSlotRect = { HEAL_SLOT_X, HEAL_SLOT_Y, HEAL_SLOT_X + HEAL_SLOT_W - 1, HEAL_SLOT_Y + HEAL_SLOT_H - 1 };
+// Where one of the two widgets is painted: which window, its buffer and pitch, and the top-left
+// corner in it. The side panel when there is one, the bar otherwise.
+typedef struct IntfaceSlot {
+    int window;
+    unsigned char* buffer;
+    int pitch;
+    int x;
+    int y;
+    bool side;
+} IntfaceSlot;
+
+static IntfaceSlot intface_slot_at(int barX, int y, int width)
+{
+    IntfaceSlot slot;
+    if (sidePanelWindow != -1) {
+        slot.window = sidePanelWindow;
+        slot.buffer = sidePanelBuffer;
+        slot.pitch = sidePanelWidth;
+        // ⚠️ A COLUMN BESIDE THE BAR, NOT THE MIDDLE OF THE STRIP. Centred, the widgets drifted off to
+        // the screen edge on any wide picture -- 1280 internal pixels wide leaves a 320 px strip, and
+        // on the Deck they sat alone in the corner, far from the bar they belong to. Both widgets
+        // share one column hugging the bar (the readout's width), each centred in it.
+        const int readoutW = 78; // the column width the aimed-part readout set (that readout is gone)
+        int columnW = readoutW < sidePanelWidth - 4 ? readoutW : sidePanelWidth - 4;
+        int columnX = sidePanelWidth >= columnW + 8 ? 4 : (sidePanelWidth - columnW) / 2;
+        slot.x = columnX + (columnW - width) / 2;
+        if (slot.x < 0) {
+            slot.x = 0;
+        }
+        slot.side = true;
+    } else {
+        slot.window = interfaceWindow;
+        slot.buffer = interfaceBuffer;
+        slot.pitch = 640;
+        slot.x = barX;
+        slot.side = false;
+    }
+    slot.y = y;
+    return slot;
+}
 
 // What is currently PAINTED, so the per-frame poll is free when nothing changed. -2 means
 // "never drawn", which is also what intface_redraw resets it to -- a full bar repaint wipes
@@ -1089,7 +1324,7 @@ void intface_invalidate_heal_slot()
 
 void intface_update_heal_slot(Object* item, int count)
 {
-    // Turn-based still owns that box (it is where END TURN / END COMBAT appear), so stay off it.
+    // Turn-based still owns the end-turn box (it is where END TURN / END COMBAT appear), so stay off.
     if (interfaceWindow == -1 || !combat_rt_enabled()) {
         return;
     }
@@ -1101,10 +1336,23 @@ void intface_update_heal_slot(Object* item, int count)
     heal_slot_pid = pid;
     heal_slot_count = count;
 
-    // Flat black plate, inset 2px so the bar's own bevel still frames it. The weapon slot does
+    IntfaceSlot slot = intface_slot_at(HEAL_SLOT_X, HEAL_SLOT_Y, HEAL_SLOT_W);
+    unsigned char* base = slot.buffer + slot.pitch * slot.y + slot.x;
+
+    if (slot.side) {
+        // Out in the black there is no bar art to frame it, so it brings its own: the end-turn
+        // box's closed frame, the very art it used to sit on -- it looks the same as it always did.
+        CacheEntry* frameHandle;
+        unsigned char* frame = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 104, 0, 0, 0), 0, 0, &frameHandle);
+        if (frame != NULL) {
+            buf_to_buf(frame, HEAL_SLOT_W, HEAL_SLOT_H, HEAL_SLOT_W, base, slot.pitch);
+            art_ptr_unlock(frameHandle);
+        }
+    }
+
+    // Flat black plate, inset 2px so the box's own bevel still frames it. The weapon slot does
     // the same thing for its item: a plain ground, or the striped art reads through the icon.
-    unsigned char* plate = interfaceBuffer + 640 * (HEAL_SLOT_Y + 2) + HEAL_SLOT_X + 2;
-    buf_fill(plate, HEAL_SLOT_W - 4, HEAL_SLOT_H - 4, 640, colorTable[0]);
+    buf_fill(base + slot.pitch * 2 + 2, HEAL_SLOT_W - 4, HEAL_SLOT_H - 4, slot.pitch, colorTable[0]);
 
     int oldFont = text_curr();
     text_font(101);
@@ -1116,30 +1364,561 @@ void intface_update_heal_slot(Object* item, int count)
         // scale_art fits the art inside the box preserving aspect, through trans_cscale, so the
         // 88x59 inventory frame lands centred with index 0 left alone -- which is why the plate
         // is drawn first rather than after.
-        scale_art(item_inv_fid(item),
-            interfaceBuffer + 640 * (HEAL_SLOT_Y + 4) + HEAL_SLOT_X + 4,
-            HEAL_SLOT_W - 8,
-            iconH,
-            640);
+        scale_art(item_inv_fid(item), base + slot.pitch * 4 + 4, HEAL_SLOT_W - 8, iconH, slot.pitch);
     }
 
     // The binding, then the count -- same reading order as the weapon slot's mode label above
     // its ammo counter. Yellow for the label, green for a usable count, red for empty, matching
     // the colours the rest of the bar already uses for those three meanings.
-    const char* label = "LB+B";
-    int labelY = HEAL_SLOT_Y + 4 + iconH;
-    int labelX = HEAL_SLOT_X + (HEAL_SLOT_W - text_width((char*)label)) / 2;
-    text_to_buf(interfaceBuffer + 640 * labelY + labelX, (char*)label, 640, 640, colorTable[32747]);
+    const char* label = "RB";
+    int labelY = 4 + iconH;
+    int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
+    text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch, colorTable[32747]);
 
     char countText[8];
     snprintf(countText, sizeof(countText), "%d", count);
     int countY = labelY + lineH;
-    int countX = HEAL_SLOT_X + (HEAL_SLOT_W - text_width(countText)) / 2;
-    text_to_buf(interfaceBuffer + 640 * countY + countX, countText, 640, 640,
+    int countX = (HEAL_SLOT_W - text_width(countText)) / 2;
+    text_to_buf(base + slot.pitch * countY + countX, countText, slot.pitch, slot.pitch,
         count > 0 ? colorTable[992] : colorTable[31744]);
 
     text_font(oldFont);
-    win_draw_rect(interfaceWindow, &healSlotRect);
+
+    Rect rect = { slot.x, slot.y, slot.x + HEAL_SLOT_W - 1, slot.y + HEAL_SLOT_H - 1 };
+    win_draw_rect(slot.window, &rect);
+}
+
+// --- AIMED-SHOT PART, IN THE WEAPON SLOT -----------------------------------
+//
+// Where an aimed RT goes: the part bound in the LB called-shot window (gpui_aim_last_part, default
+// HEAD), printed in the WEAPON SLOT left of its bullseye while the slot is on its AIMED mode
+// ("dej ty eyes a to kam mířím vedle toho terčíku… vlevo teda vedle toho terčíku", 2026-10-09).
+//
+// ⚠️ THE SIDE-PANEL READOUT IS GONE. From 2026-10-08 it printed "RB <part>" (later "AIM <part>")
+// above the heal slot; once the part sat next to the bullseye that was the same fact twice, and he
+// had it removed ("a zruš ho… tu duplicitu"). The slot is the only place it is shown now.
+
+// The part the slot prints; UNCALLED = nothing. Fed by intface_update_aim_part from the pad tick.
+static int aim_slot_weapon_part = HIT_LOCATION_UNCALLED;
+
+// Short enough to sit between the AP cost and the bullseye in the worn letters below.
+static const char* intface_aim_part_name(int hitLocation)
+{
+    switch (hitLocation) {
+    case HIT_LOCATION_HEAD:
+        return "HEAD";
+    case HIT_LOCATION_EYES:
+        return "EYES";
+    case HIT_LOCATION_TORSO:
+        return "TORSO";
+    case HIT_LOCATION_GROIN:
+        return "GROIN";
+    case HIT_LOCATION_LEFT_ARM:
+        return "L ARM";
+    case HIT_LOCATION_RIGHT_ARM:
+        return "R ARM";
+    case HIT_LOCATION_LEFT_LEG:
+        return "L LEG";
+    case HIT_LOCATION_RIGHT_LEG:
+        return "R LEG";
+    default:
+        return "BODY";
+    }
+}
+
+void intface_update_aim_part(int hitLocation)
+{
+    // Turn-based asks for the part on every shot; there is nothing bound to print.
+    if (interfaceWindow == -1 || !combat_rt_enabled()) {
+        return;
+    }
+
+    // Repaint the slot when the part changes, but only while it is AIMED -- otherwise it shows no
+    // part, and the next switch into the aimed mode repaints it anyway (intface_toggle_item_state /
+    // intface_item_set_aiming).
+    if (hitLocation != aim_slot_weapon_part) {
+        aim_slot_weapon_part = hitLocation;
+        int slotAction = itemButtonItems[itemCurrentItem].action;
+        if (slotAction == INTERFACE_ITEM_ACTION_PRIMARY_AIMING
+            || slotAction == INTERFACE_ITEM_ACTION_SECONDARY_AIMING) {
+            intface_redraw_items();
+        }
+    }
+}
+
+// --- THE WORN LETTERS ----------------------------------------------------------
+//
+// *"Můžeme to udělat, ať je to taky tak ošuntělé jako celej text ve hře?"* The words on the bar
+// (AP, SINGLE, BURST, THROW...) are not a font: they are hand-drawn art with thick strokes, each
+// stroke shaded darker at its edges and lighter down its middle, the pixels varying from stroke to
+// stroke. This label is drawn the same way, and it took five rounds to get there (2026-10-09/10):
+//   1. font 101 in the art's colour -- read as pasted on;
+//   2. letters cut from the word art, colours picked at random -- "pixelated, jiný styl": the
+//      bevel IS the style, noise destroys it;
+//   3. letters cut from the art with their own colours -- right, but 11 px, as big as SINGLE;
+//      then "ten text zmenši": shrunk to 3/4 with area averaging, which no pixel art survives --
+//   4. "je to blurry, proč je to blurry": every output pixel was a mix of up to four;
+//   5. NOW: small letters DRAWN AT SIZE, 8 rows with 2-px strokes in the bar's blocky hand, nothing
+//      resampled, so every pixel is a whole palette entry and the edges stay hard.
+//
+// The shading still comes from the original: every stroke row takes the colours of a real 3-px
+// vertical stroke of the word art at the matching row -- left edge / middle / right edge along a
+// longer run, the MIDDLE for both pixels of a 2-px stroke. Seven real strokes are used, one per
+// stroke of the label, so neighbouring strokes differ the way they do on the bar.
+//
+// ⚠️ ONLY BRIGHT STROKES, AND NO DARK EDGE ON A 2-PX STROKE (2026-10-10): *"torso poslední o vypadá
+// zvláštně"*. Giving a 2-px stroke the middle + RIGHT EDGE made every round letter's right side
+// darker than its left, and the sources first chosen included SINGLE's N right stem, ten of whose
+// eleven pixels are grey -- whichever letter drew that stroke came out half grey (TORSO's last O,
+// GROIN's O and I). Measured per column, the strokes kept are the ones with no grey middle. Then the
+// colours are moved onto the AP digits' (intface_worn_build_remap), because the word art is dimmer
+// than the AP cost the label sits next to: "moc tmavé oproti AP 4".
+//
+// Checked in renders from MASTER.DAT beside AP 4 under six guns before shipping
+// (.claude/tools/sideart_preview/slotpreview.js, env SMALL=1 MULTI=1 BRIGHT=1 TWO_MID=1 REMAP=1).
+//
+// ⚠️ NO SHADOW: the black one tried under it on a gun was "strašná".
+#define WORN_H 8
+#define WORN_SPACE 3
+#define WORN_GAP 1
+#define WORN_MAX_W 64
+
+typedef struct IntfaceWornGlyph {
+    char ch;
+    const char* rows[WORN_H];
+} IntfaceWornGlyph;
+
+static const IntfaceWornGlyph intface_worn_glyphs[] = {
+    { 'H', { "##...##", "##...##", "##...##", "#######", "#######", "##...##", "##...##", "##...##" } },
+    { 'E', { "######", "######", "##....", "#####.", "#####.", "##....", "######", "######" } },
+    { 'A', { "..###..", ".#####.", "##...##", "##...##", "#######", "#######", "##...##", "##...##" } },
+    { 'D', { "#####..", "######.", "##..###", "##...##", "##...##", "##..###", "######.", "#####.." } },
+    { 'Y', { "##..##", "##..##", "##..##", ".####.", "..##..", "..##..", "..##..", "..##.." } },
+    { 'S', { ".#####", "######", "##....", "#####.", ".#####", "....##", "######", "#####." } },
+    { 'T', { "######", "######", "..##..", "..##..", "..##..", "..##..", "..##..", "..##.." } },
+    { 'O', { ".#####.", "#######", "##...##", "##...##", "##...##", "##...##", "#######", ".#####." } },
+    { 'R', { "######.", "#######", "##...##", "#######", "######.", "##.###.", "##..###", "##...##" } },
+    { 'G', { ".#####.", "#######", "##.....", "##.....", "##..###", "##...##", "#######", ".#####." } },
+    { 'I', { "##", "##", "##", "##", "##", "##", "##", "##" } },
+    { 'N', { "##...##", "###..##", "###..##", "####.##", "##.####", "##..###", "##..###", "##...##" } },
+    { 'L', { "##....", "##....", "##....", "##....", "##....", "##....", "######", "######" } },
+    { 'M', { "##....##", "###..###", "########", "##.##.##", "##.##.##", "##....##", "##....##", "##....##" } },
+};
+
+// Real 3-px vertical strokes of the word art, 11 rows tall: { intrface.lst index, left column }.
+// SINGLE (43): E's stem, L's stem, N's left stem. THRUST (45): H's two stems. BURST (40): B's stem,
+// R's stem. (SINGLE's I at column 9 stays the fallback for a source row with a gap.)
+#define WORN_STROKE_ROWS 11
+#define WORN_STROKE_ARTS 3
+static const int intface_worn_stroke_arts[WORN_STROKE_ARTS] = { 43, 45, 40 };
+static const int intface_worn_strokes[][2] = {
+    { 43, 44 },
+    { 45, 10 },
+    { 45, 18 },
+    { 40, 0 },
+    { 40, 22 },
+    { 43, 36 },
+    { 43, 13 },
+};
+
+static const IntfaceWornGlyph* intface_worn_glyph(char ch)
+{
+    for (size_t i = 0; i < sizeof(intface_worn_glyphs) / sizeof(intface_worn_glyphs[0]); i++) {
+        if (intface_worn_glyphs[i].ch == ch) {
+            return &(intface_worn_glyphs[i]);
+        }
+    }
+    return NULL;
+}
+
+// Width in pixels; -1 when the text has a letter the set does not carry (the caller draws nothing
+// rather than a word with a hole in it).
+static int intface_worn_text_width(const char* text)
+{
+    int width = 0;
+    for (const char* p = text; *p != '\0'; p++) {
+        if (p != text) {
+            width += WORN_GAP;
+        }
+        if (*p == ' ') {
+            width += WORN_SPACE;
+            continue;
+        }
+        const IntfaceWornGlyph* glyph = intface_worn_glyph(*p);
+        if (glyph == NULL) {
+            return -1;
+        }
+        width += (int)strlen(glyph->rows[0]);
+    }
+    return width;
+}
+
+// ⚠️ RECOLOURED ONTO THE AP DIGITS' COLOURS (2026-10-10): *"moc tmavé oproti AP 4"*. The word art
+// the shading comes from (SINGLE, BURST...) is a dimmer mix with greys and browns in it; the digits
+// are a brighter yellow. Every pixel keeps its place in the bevel but takes the digits' colour at the
+// same BRIGHTNESS RANK: the darkest word-art pixels become the darkest digit pixels, the brightest the
+// brightest. Measured from the art at first use, not hard-coded -- a replaced interface FRM brings its
+// own colours along.
+static unsigned char intface_worn_remap[256];
+static bool intface_worn_remap_ready = false;
+
+static float intface_worn_luma(int index)
+{
+    return 0.299f * cmap[index * 3] + 0.587f * cmap[index * 3 + 1] + 0.114f * cmap[index * 3 + 2];
+}
+
+static void intface_worn_count(int artNum, unsigned int* counts)
+{
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, artNum, 0, 0, 0), &handle);
+    if (art == NULL) {
+        return;
+    }
+    int size = art_frame_width(art, 0, 0) * art_frame_length(art, 0, 0);
+    unsigned char* data = art_frame_data(art, 0, 0);
+    for (int i = 0; i < size; i++) {
+        if (data[i] != 0) {
+            counts[data[i]]++;
+        }
+    }
+    art_ptr_unlock(handle);
+}
+
+static void intface_worn_build_remap()
+{
+    for (int i = 0; i < 256; i++) {
+        intface_worn_remap[i] = (unsigned char)i;
+    }
+    intface_worn_remap_ready = true;
+
+    // Source: the bar's words (SINGLE, UNARMED, THRUST, BURST, THROW). Target: the ten AP digits
+    // (art 290), the brightest text on the slot.
+    unsigned int from[256] = { 0 };
+    unsigned int to[256] = { 0 };
+    static const int sourceArts[] = { 43, 287, 45, 40, 117 };
+    for (size_t i = 0; i < sizeof(sourceArts) / sizeof(sourceArts[0]); i++) {
+        intface_worn_count(sourceArts[i], from);
+    }
+    intface_worn_count(290, to);
+
+    unsigned int fromTotal = 0;
+    unsigned int toTotal = 0;
+    for (int i = 0; i < 256; i++) {
+        fromTotal += from[i];
+        toTotal += to[i];
+    }
+    if (fromTotal == 0 || toTotal == 0) {
+        return; // art missing: leave the colours as they are
+    }
+
+    // The target's palette entries from darkest to brightest (a 256-entry insertion sort, once).
+    int order[256];
+    int orderCount = 0;
+    for (int i = 0; i < 256; i++) {
+        if (to[i] == 0) {
+            continue;
+        }
+        int at = orderCount++;
+        while (at > 0 && intface_worn_luma(order[at - 1]) > intface_worn_luma(i)) {
+            order[at] = order[at - 1];
+            at--;
+        }
+        order[at] = i;
+    }
+
+    for (int v = 1; v < 256; v++) {
+        if (from[v] == 0) {
+            continue;
+        }
+        // v's rank among the source pixels: those darker, plus half of those exactly as bright.
+        float luma = intface_worn_luma(v);
+        unsigned int darker = 0;
+        unsigned int same = 0;
+        for (int u = 0; u < 256; u++) {
+            if (from[u] == 0) {
+                continue;
+            }
+            float l = intface_worn_luma(u);
+            if (l < luma) {
+                darker += from[u];
+            } else if (l == luma) {
+                same += from[u];
+            }
+        }
+        float rank = (darker + same * 0.5f) / fromTotal;
+
+        // ...and the target pixel at that rank.
+        unsigned int want = (unsigned int)(rank * toTotal);
+        if (want >= toTotal) {
+            want = toTotal - 1;
+        }
+        unsigned int seen = 0;
+        for (int k = 0; k < orderCount; k++) {
+            seen += to[order[k]];
+            if (seen > want) {
+                intface_worn_remap[v] = (unsigned char)order[k];
+                break;
+            }
+        }
+    }
+}
+
+// Paints `text` into `dest` (width x WORN_H, pitch == width, already zeroed: 0 is transparent, the
+// same convention as FRM data, so the result goes through trans_buf_to_buf like any art). False if
+// the stroke art could not be loaded -- the caller then draws nothing.
+static bool intface_worn_text_compose(const char* text, unsigned char* dest, int width)
+{
+    if (!intface_worn_remap_ready) {
+        intface_worn_build_remap();
+    }
+
+    // The words the strokes come from, locked once for the whole label. [0] is SINGLE, the fallback.
+    CacheEntry* handles[WORN_STROKE_ARTS];
+    Art* arts[WORN_STROKE_ARTS];
+    for (int i = 0; i < WORN_STROKE_ARTS; i++) {
+        arts[i] = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, intface_worn_stroke_arts[i], 0, 0, 0), &(handles[i]));
+        if (arts[i] == NULL) {
+            for (int j = 0; j < i; j++) {
+                art_ptr_unlock(handles[j]);
+            }
+            return false;
+        }
+    }
+    Art* single = arts[0];
+
+    bool ok = true;
+    int x = 0;
+    for (const char* p = text; *p != '\0'; p++) {
+        int index = (int)(p - text);
+        if (p != text) {
+            x += WORN_GAP;
+        }
+        if (*p == ' ') {
+            x += WORN_SPACE;
+            continue;
+        }
+        const IntfaceWornGlyph* glyph = intface_worn_glyph(*p);
+        if (glyph == NULL) {
+            ok = false;
+            break;
+        }
+
+        int glyphW = (int)strlen(glyph->rows[0]);
+        for (int y = 0; y < WORN_H; y++) {
+            const char* row = glyph->rows[y];
+            int sy = y * WORN_STROKE_ROWS / WORN_H;
+            for (int gx = 0; gx < glyphW && x + gx < width; gx++) {
+                if (row[gx] != '#') {
+                    continue;
+                }
+
+                // The run of stroke pixels this one sits in, and where in it.
+                int runStart = gx;
+                while (runStart > 0 && row[runStart - 1] == '#') {
+                    runStart--;
+                }
+                int runEnd = gx;
+                while (runEnd < glyphW - 1 && row[runEnd + 1] == '#') {
+                    runEnd++;
+                }
+                int column;
+                if (runEnd - runStart <= 1) {
+                    column = 1; // a 1- or 2-px stroke is all middle (see above)
+                } else {
+                    column = gx == runStart ? 0 : (gx == runEnd ? 2 : 1);
+                }
+
+                // One real stroke per stroke of the label (letter index and where the run starts).
+                const int* stroke = intface_worn_strokes[(index * 3 + runStart * 2) % (int)(sizeof(intface_worn_strokes) / sizeof(intface_worn_strokes[0]))];
+                Art* art = single;
+                for (int i = 0; i < WORN_STROKE_ARTS; i++) {
+                    if (intface_worn_stroke_arts[i] == stroke[0]) {
+                        art = arts[i];
+                    }
+                }
+                int artW = art_frame_width(art, 0, 0);
+                unsigned char* data = art_frame_data(art, 0, 0);
+                unsigned char v = data[sy * artW + stroke[1] + column];
+                if (v == 0) {
+                    // A gap in that stroke at this row: SINGLE's I is solid top to bottom.
+                    unsigned char* iData = art_frame_data(single, 0, 0);
+                    v = iData[sy * art_frame_width(single, 0, 0) + 9 + column];
+                }
+                if (v != 0) {
+                    dest[y * width + x + gx] = intface_worn_remap[v];
+                }
+            }
+        }
+        x += glyphW;
+    }
+
+    for (int i = 0; i < WORN_STROKE_ARTS; i++) {
+        art_ptr_unlock(handles[i]);
+    }
+    return ok;
+}
+
+// --- THE COMBAT BOX, BACK IN REALTIME (2026-10-08) -------------------------
+//
+// "Když budu v kombatu, tak se animace, že jsem v combatu, ukáže tam vpravo dole. Ta animace mě
+// nezpomalí ... jakmile podržím ukončit combat, pravý dpad, tak se ta animace změní zase na normál
+// -- prostě to políčko tak fungovalo ve Falloutu 1."
+//
+// Vanilla opens these curtains in combat_begin (intface_end_window_open), spinning its own loop until
+// the five frames are drawn while the world stands still. Here the same frames are stepped one per
+// tick from combat_rt_update: the same art, sounds and lights -- iciboxx1 as it opens, the GREEN
+// lights with icombat2 once it is open (in realtime it is always the dude's turn), icibcxx1 as it
+// closes. No END TURN / END COMBAT buttons are created: a fight ends on the held D-pad right, and
+// END TURN has nothing to end.
+//
+// ⚠️ ONLY WITH A SIDE PANEL: without one the heal slot still lives on this box.
+// ⚠️ CLOSING WAITS RT_BOX_CLOSE_DELAY after the fight goes cold. Realtime engagement can drop for a
+// beat and come straight back, and the curtains must not flap -- or chime -- with it.
+#define RT_BOX_CLOSE_DELAY 0.75f
+
+static int rt_box_frame = 0; // endanim frame painted now; 0 = closed, which is the bar's own art
+static int rt_box_dir = 0; // +1 opening, -1 closing, 0 settled
+static bool rt_box_want = false;
+static bool rt_box_lit = false;
+static bool rt_box_dirty = false; // a bar repaint may have wiped it: paint the current state again
+static float rt_box_accum = 0.0f;
+static float rt_box_cold_for = 0.0f;
+
+// MODS "Combat box sound" (cfg combat_box_sound): the open/close clunk and the lights chime. ON by
+// default because ON is vanilla -- "je dost otravnej, ale někdo si ho určitě rád nechá".
+static bool rt_box_sound = true;
+
+bool intface_get_combat_box_sound()
+{
+    return rt_box_sound;
+}
+
+void intface_set_combat_box_sound(bool on)
+{
+    rt_box_sound = on;
+}
+
+static void intface_rt_box_paint(Art* art, int frame, bool lights)
+{
+    unsigned char* src = art_frame_data(art, frame, 0);
+    if (src != NULL) {
+        buf_to_buf(src, 57, 58, 57, interfaceBuffer + 640 * 38 + 580, 640);
+    }
+
+    if (lights) {
+        // endltgrn.frm -- the green lights vanilla shows while it is your turn.
+        CacheEntry* lightsHandle;
+        unsigned char* lights = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 109, 0, 0, 0), 0, 0, &lightsHandle);
+        if (lights != NULL) {
+            trans_buf_to_buf(lights, 57, 58, 57, interfaceBuffer + 640 * 38 + 580, 640);
+            art_ptr_unlock(lightsHandle);
+        }
+    }
+
+    win_draw_rect(interfaceWindow, &endWindowRect);
+}
+
+void intface_rt_combat_box_tick(bool engaged, float dt)
+{
+    if (interfaceWindow == -1 || sidePanelWindow == -1 || !combat_rt_enabled()) {
+        return;
+    }
+
+    if (engaged) {
+        rt_box_want = true;
+        rt_box_cold_for = 0.0f;
+    } else if (rt_box_want) {
+        rt_box_cold_for += dt;
+        if (rt_box_cold_for >= RT_BOX_CLOSE_DELAY) {
+            rt_box_want = false;
+        }
+    }
+
+    // Settled and untouched is every frame of the game but a few: leave before touching the art.
+    bool settled = rt_box_dir == 0 && (rt_box_want ? rt_box_lit : rt_box_frame == 0);
+    if (settled && !rt_box_dirty) {
+        return;
+    }
+
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 104, 0, 0, 0), &handle);
+    if (art == NULL) {
+        return;
+    }
+
+    int last = art_frame_max_frame(art) - 1;
+    int target = rt_box_want ? last : 0;
+
+    if (rt_box_dirty) {
+        rt_box_dirty = false;
+        intface_rt_box_paint(art, rt_box_frame, rt_box_lit);
+    }
+
+    if (rt_box_frame != target) {
+        int dir = target > rt_box_frame ? 1 : -1;
+        if (dir != rt_box_dir) {
+            rt_box_dir = dir;
+            rt_box_accum = 0.0f;
+            if (rt_box_sound) {
+                gsound_play_sfx_file(dir > 0 ? "iciboxx1" : "icibcxx1");
+            }
+        }
+
+        int fps = art_frame_fps(art);
+        if (fps <= 0) {
+            fps = 10;
+        }
+
+        rt_box_accum += dt;
+        if (rt_box_accum >= 1.0f / (float)fps) {
+            // One frame per tick at most: a long frame never skips the curtains.
+            rt_box_accum = 0.0f;
+            rt_box_frame += dir;
+            rt_box_lit = false;
+            intface_rt_box_paint(art, rt_box_frame, false);
+        }
+    } else {
+        rt_box_dir = 0;
+        if (rt_box_want && !rt_box_lit) {
+            rt_box_lit = true;
+            if (rt_box_sound) {
+                gsound_play_sfx_file("icombat2");
+            }
+            intface_rt_box_paint(art, rt_box_frame, true);
+        }
+    }
+
+    art_ptr_unlock(handle);
+}
+
+// A new game or a load: shut at once, no animation, no sound.
+void intface_rt_combat_box_reset()
+{
+    bool painted = rt_box_frame != 0 || rt_box_lit;
+
+    rt_box_frame = 0;
+    rt_box_dir = 0;
+    rt_box_want = false;
+    rt_box_lit = false;
+    rt_box_dirty = false;
+    rt_box_accum = 0.0f;
+    rt_box_cold_for = 0.0f;
+
+    if (painted && interfaceWindow != -1) {
+        CacheEntry* handle;
+        Art* art = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 104, 0, 0, 0), &handle);
+        if (art != NULL) {
+            intface_rt_box_paint(art, 0, false);
+            art_ptr_unlock(handle);
+        }
+    }
+}
+
+void intface_rt_combat_box_invalidate()
+{
+    if (rt_box_frame != 0 || rt_box_lit) {
+        rt_box_dirty = true;
+    }
 }
 
 // 0x454528
@@ -1152,6 +1931,7 @@ void intface_redraw()
         refresh_box_bar_win();
         // The repaint above wiped our pixels; let the next poll put them back.
         intface_invalidate_heal_slot();
+        intface_rt_combat_box_invalidate();
         win_draw(interfaceWindow);
     }
     refresh_box_bar_win();
@@ -1544,6 +2324,12 @@ void intface_update_ac(bool animate)
     last_ac = armorClass;
 }
 
+// One bulb of the AP strip at position `slot` (0-9).
+static void intface_draw_ap_bulb(unsigned char* art, int slot)
+{
+    buf_to_buf(art, 5, 5, 5, interfaceBuffer + 14 * 640 + 316 + slot * 9, 640);
+}
+
 // 0x4547D4
 void intface_update_move_points(int actionPoints, int bonusMove)
 {
@@ -1555,10 +2341,14 @@ void intface_update_move_points(int actionPoints, int bonusMove)
 
     // Under realtime combat the engine combat.ap is held maxed so movement stays
     // free, so it can't drive the bar. Override every caller with the real RT pool
-    // (and no bonus-move bulbs) so the indicator shows AP being spent/regenerated.
+    // so the indicator shows AP being spent/regenerated -- and the Bonus Move reserve
+    // as vanilla's own yellow bulbs, instead of the turn-based combat_free_move that
+    // realtime never sets. Hidden while the dude is stopped on an empty pool: the reserve
+    // keeps refilling there, but it cannot move him until the red countdown below ends,
+    // and yellow lights beside the reds would say it could.
     if (combat_rt_enabled()) {
         actionPoints = combat_rt_player_ap();
-        bonusMove = 0;
+        bonusMove = combat_rt_move_blocked() ? 0 : combat_rt_bonus_move_ap();
     }
 
     buf_to_buf(movePointBackground, 90, 5, 90, interfaceBuffer + 14 * 640 + 316, 640);
@@ -1591,26 +2381,76 @@ void intface_update_move_points(int actionPoints, int bonusMove)
         }
     }
 
-    int circle = 0;
+    // ⚠️ THE STRIP HAS TEN BULBS AND NOW SHOWS UP TO TWENTY POINTS (2026-10-04). Vanilla -- Fallout 1
+    // AND Fallout 2 (fallout2-ce's interfaceRenderActionPoints clamps the AP to ten and trims the
+    // yellow to whatever room is left) -- simply dropped what did not fit, so a 10-AP character never
+    // saw his Bonus Move points and nobody ever saw an AP past the tenth. His rules, in order:
+    //   "11 a 12 budou prostě žluté od 1 a 2" / "žlutý bod se počítá za dva" -- overflow goes onto the
+    //     front of the strip, and such a bulb is worth two;
+    //   "sjednoť to" -- a plain wrap made yellow mean one point at the end of the strip and two at its
+    //     start (9 AP + 2 lit bulb 10 AND bulb 1), so: all-or-nothing;
+    //   "udělej dvojku, světle zelená za dva AP" -- AP past ten get the same treatment in light green.
+    //
+    // So, with A = action points and M = Bonus Move points:
+    //   * A + M <= 10 (it fits): A green, then M yellow -- ONE point per bulb, both games' own layout.
+    //   * otherwise, from the front of the strip:
+    //       M yellow      -- each worth TWO: the AP underneath plus the movement point on top;
+    //       A - 10 light  -- each worth TWO action points (only when A itself is past ten);
+    //       the rest green, one AP each; any bulbs left over stay dark.
+    //     10 + 2 = YY + 8 green.  9 + 2 = YY + 7 green + one dark.  11 + 2 = YY, one light, 7 green.
+    //     12 + 0 = two light + 8 green.  At any one moment every bulb of a colour means the same.
+    //   Capped at ten double bulbs (twenty points); 5 AP + 6 movement points, the one combination the
+    //   rule cannot fit, shows ten of the eleven -- vanilla showed five.
+    //
+    // While the dude is stopped on an empty pool the bonus is hidden (bonusMove == 0 here) and his AP
+    // are at most a couple of points, so the red countdown strip is never mixed with these bulbs.
+    int apUnits = actionPoints > 0 ? actionPoints : 0;
+    int moveUnits = bonusMove > 0 ? bonusMove : 0;
 
-    for (int index = 0; index < actionPoints && circle < 10; index++) {
-        buf_to_buf(frmData,
-            5,
-            5,
-            5,
-            interfaceBuffer + 14 * 640 + 316 + circle * 9,
-            640);
-        circle++;
+    int yellowDouble = 0;
+    int lightDouble = 0;
+    int greenSingle;
+    int yellowSingle = 0;
+
+    if (apUnits + moveUnits <= 10) {
+        greenSingle = apUnits;
+        yellowSingle = moveUnits;
+    } else {
+        // Every yellow needs an AP to sit on, and there are only ten bulbs.
+        yellowDouble = moveUnits;
+        if (yellowDouble > apUnits) {
+            yellowDouble = apUnits;
+        }
+        if (yellowDouble > 10) {
+            yellowDouble = 10;
+        }
+
+        lightDouble = apUnits > 10 ? apUnits - 10 : 0;
+        if (lightDouble > 10 - yellowDouble) {
+            lightDouble = 10 - yellowDouble;
+        }
+
+        greenSingle = apUnits - yellowDouble - 2 * lightDouble;
+        if (greenSingle > 10 - yellowDouble - lightDouble) {
+            greenSingle = 10 - yellowDouble - lightDouble;
+        }
+        if (greenSingle < 0) {
+            greenSingle = 0;
+        }
     }
 
-    for (int index = 0; index < bonusMove && circle < 10; index++) {
-        buf_to_buf(moveLightYellow,
-            5,
-            5,
-            5,
-            interfaceBuffer + 14 * 640 + 316 + circle * 9,
-            640);
-        circle++;
+    int slot = 0;
+    for (int index = 0; index < yellowDouble && slot < 10; index++) {
+        intface_draw_ap_bulb(moveLightYellowLit, slot++);
+    }
+    for (int index = 0; index < lightDouble && slot < 10; index++) {
+        intface_draw_ap_bulb(moveLightGreenLight, slot++);
+    }
+    for (int index = 0; index < greenSingle && slot < 10; index++) {
+        intface_draw_ap_bulb(frmData, slot++);
+    }
+    for (int index = 0; index < yellowSingle && slot < 10; index++) {
+        intface_draw_ap_bulb(moveLightYellowLit, slot++);
     }
 
     if (!insideInit) {
@@ -1767,16 +2607,14 @@ int intface_toggle_items(bool animated)
 // 0x454C28
 // Is `action` a mode this weapon can actually be switched INTO?
 //
-// ⚠️ REALTIME DROPS THE AIMING AND RELOAD ENTRIES (2026-08-10). Under combat_rt they are steps in
-// the cycle that change nothing but the icon:
-//   * AIMING -- combat_rt's rt_player_hit_mode() reads intface_get_attack() but DISCARDS its
-//     `aiming` output, and every `aiming` in the attack path is derived from the chosen HIT
-//     LOCATION instead (`loc != HIT_LOCATION_UNCALLED`), which only the LB on-body picker sets. So
-//     an aiming entry yields the identical hit mode, the same AP cost and the same uncalled hit.
-//     The real aimed shot is the picker; this was its dead turn-based twin.
-//   * RELOAD -- intface_get_attack() returns -1 for it, so combat_rt falls back to the primary
-//     attack and you simply keep firing. Reloading has its own binding.
-// Turn-based keeps all of them: there the interface flag IS how you aim.
+// ⚠️ REALTIME DROPS THE RELOAD ENTRY: intface_get_attack() returns -1 for it, so combat_rt falls
+// back to the primary attack and you simply keep firing. Reloading has its own binding (LB tap).
+//
+// ⚠️ THE AIMING ENTRIES ARE BACK IN REALTIME (2026-10-09). They were dropped on 2026-08-10 as a
+// dead twin of the picker, because nothing read the flag. Now combat_rt does
+// (rt_player_called_loc): with the slot on its bullseye, RT fires at the part bound in the LB
+// called-shot window, at the aimed price the slot prints. His idea -- it is how the original shows
+// and prices an aimed shot, and it freed RB for the heal.
 static bool intface_item_action_available(InterfaceItemState* itemState, int action)
 {
     bool realtime = combat_rt_enabled();
@@ -1786,14 +2624,13 @@ static bool intface_item_action_available(InterfaceItemState* itemState, int act
         // Always reachable -- this is what makes the cycle below terminate.
         return true;
     case INTERFACE_ITEM_ACTION_PRIMARY_AIMING:
-        return !realtime && item_w_called_shot(obj_dude, itemState->primaryHitMode);
+        return item_w_called_shot(obj_dude, itemState->primaryHitMode);
     case INTERFACE_ITEM_ACTION_SECONDARY:
         return itemState->secondaryHitMode != HIT_MODE_PUNCH
             && itemState->secondaryHitMode != HIT_MODE_KICK
             && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE;
     case INTERFACE_ITEM_ACTION_SECONDARY_AIMING:
-        return !realtime
-            && itemState->secondaryHitMode != HIT_MODE_PUNCH
+        return itemState->secondaryHitMode != HIT_MODE_PUNCH
             && itemState->secondaryHitMode != HIT_MODE_KICK
             && item_w_subtype(itemState->item, itemState->secondaryHitMode) != ATTACK_TYPE_NONE
             && item_w_called_shot(obj_dude, itemState->secondaryHitMode);
@@ -1804,8 +2641,8 @@ static bool intface_item_action_available(InterfaceItemState* itemState, int act
     }
 }
 
-// Would a toggle actually land on a DIFFERENT mode? Realtime drops the aiming/reload entries, so a
-// plain single-mode weapon has nothing to switch to -- the caller can refuse audibly instead of
+// Would a toggle actually land on a DIFFERENT mode? Realtime drops the reload entry, so a weapon with
+// one mode and no called shot (a flamer, Fast Shot) has nothing to switch to -- the caller can refuse audibly instead of
 // playing a confirmation for a cycle that changes nothing.
 bool intface_item_can_toggle_state()
 {
@@ -1855,6 +2692,44 @@ int intface_toggle_item_state()
     }
 
     return 0;
+}
+
+// CE: put the active hand on its AIMED mode -- what binding a part in the LB called-shot window
+// does, so the next RT goes there (see rt_player_called_loc). True when the slot shows the
+// bullseye afterwards. A mode that cannot be aimed (a burst, Fast Shot) is left alone.
+bool intface_item_set_aiming()
+{
+    if (interfaceWindow == -1) {
+        return false;
+    }
+
+    InterfaceItemState* itemState = &(itemButtonItems[itemCurrentItem]);
+    if (itemState->isWeapon == 0) {
+        return false;
+    }
+
+    int want;
+    switch (itemState->action) {
+    case INTERFACE_ITEM_ACTION_PRIMARY_AIMING:
+    case INTERFACE_ITEM_ACTION_SECONDARY_AIMING:
+        return true;
+    case INTERFACE_ITEM_ACTION_PRIMARY:
+        want = INTERFACE_ITEM_ACTION_PRIMARY_AIMING;
+        break;
+    case INTERFACE_ITEM_ACTION_SECONDARY:
+        want = INTERFACE_ITEM_ACTION_SECONDARY_AIMING;
+        break;
+    default:
+        return false;
+    }
+
+    if (!intface_item_action_available(itemState, want)) {
+        return false;
+    }
+
+    itemState->action = want;
+    intface_redraw_items();
+    return true;
 }
 
 // 0x454D20
@@ -2179,6 +3054,9 @@ static int intface_redraw_items()
 
     InterfaceItemState* itemState = &(itemButtonItems[itemCurrentItem]);
     int actionPoints = -1;
+    int aimPartBullseyeW = -1; // set when the bullseye is drawn: the slot is on its AIMED mode
+    int aimPartApRight = 7 + 17 + 7 + 10; // right edge of the AP cost's digit (MVEPNT.FRM + one digit)
+    int aimPartApH = 12;
 
     if (itemState->isDisabled == 0) {
         memcpy(itemButtonUp, itemButtonUpBlank, sizeof(itemButtonUp));
@@ -2253,6 +3131,8 @@ static int intface_redraw_items()
 
                     dark_trans_buf_to_buf(data, width, height, width, itemButtonDown, 181 - width + 1, v9, 188, 59641);
                     art_ptr_unlock(bullseyeFrmHandle);
+
+                    aimPartBullseyeW = width; // the part name goes up against its left edge, below
                 }
             }
 
@@ -2314,6 +3194,8 @@ static int intface_redraw_items()
             unsigned char* data = art_frame_data(art, 0, 0);
 
             trans_buf_to_buf(data, width, height, width, itemButtonUp + 188 * (60 - height) + 7, 188);
+            aimPartApRight = 7 + width + 7 + 10; // "AP", the gap, one 10-px digit (see below)
+            aimPartApH = height; // before the pressed frame trims it
 
             int v29 = 60 - height - 2;
             if (v29 < 0) {
@@ -2371,6 +3253,35 @@ static int intface_redraw_items()
 
             dark_trans_buf_to_buf(data, width, height, width, itemButtonDown, v46 + 1, v47, 188, 63571);
             art_ptr_unlock(itemFrmHandle);
+        }
+    }
+
+    // CE: realtime names the part an AIMED shot goes to, in small worn letters drawn at size
+    // (intface_worn_text_compose), only while the slot shows its bullseye.
+    // Turn-based has no bound part -- it asks every shot -- so nothing is printed there.
+    //
+    // ⚠️ RIGHT AFTER THE AP COST, centred on its height ("co to dát vedle číslice AP", 2026-10-10).
+    // It went beside the bullseye first ("vlevo vedle toho terčíku", then "výš… na stejnou řádku"),
+    // but that corner is exactly where a long gun's stock lies: rendered from the original art, a
+    // sniper rifle covered both the bullseye and the label there. The bottom-left corner stayed clear
+    // under every gun rendered (inventory art pistol, sniper, grifle, smgpstle, hrifle, shotgun6);
+    // the pistol's grip just touches the last letter.
+    //
+    // ON TOP OF THE ITEM, no shadow (see the worn letters). The pressed frame is drawn the way every
+    // word on the bar is: dark_trans_buf_to_buf at (+1, -2).
+    if (aimPartBullseyeW >= 0 && combat_rt_enabled() && aim_slot_weapon_part != HIT_LOCATION_UNCALLED) {
+        const char* partName = intface_aim_part_name(aim_slot_weapon_part);
+        int labelW = intface_worn_text_width(partName);
+        int labelX = aimPartApRight + 5;
+        int labelY = (60 - aimPartApH) + (aimPartApH - WORN_H + 1) / 2; // centred; an odd half-pixel goes down
+        bool fits = labelX + labelW <= 181 - aimPartBullseyeW - 3; // never under the bullseye
+        if (labelW > 0 && labelW <= WORN_MAX_W && fits && labelY >= 2 && labelY + WORN_H <= 67) {
+            unsigned char label[WORN_MAX_W * WORN_H];
+            memset(label, 0, sizeof(label));
+            if (intface_worn_text_compose(partName, label, labelW)) {
+                trans_buf_to_buf(label, labelW, WORN_H, labelW, itemButtonUp + 188 * labelY + labelX, 188);
+                dark_trans_buf_to_buf(label, labelW, WORN_H, labelW, itemButtonDown, labelX + 1, labelY - 2, 188, 59641);
+            }
         }
     }
 
@@ -2742,6 +3653,50 @@ static int intface_item_reload()
 // RELOAD and uses the toggle to step back off it, but a direct reload would have
 // the toggle just advance the firing mode (single/burst/aimed) as a side effect.
 // Reloading must not change the selected attack mode.
+// Would intface_reload_weapon do anything right now? The same three questions it answers by trying
+// -- a weapon in the active hand that takes ammo, a magazine that is not full, and a box in the pack
+// that fits -- asked WITHOUT loading anything. The reload animation needs the answer before it starts:
+// it plays first and loads at the end, and an animation for a reload that then refuses is a lie.
+bool intface_can_reload_weapon()
+{
+    if (interfaceWindow == -1 || obj_dude == NULL) {
+        return false;
+    }
+
+    Object* weapon = itemButtonItems[itemCurrentItem].item;
+    // ⚠️ The empty hand is (Object*)-1, not NULL (see intface_init_items), and a hand can hold a
+    // non-weapon -- every item_w_* below reads the weapon union blindly.
+    if (weapon == NULL || weapon == (Object*)-1 || item_get_type(weapon) != ITEM_TYPE_WEAPON) {
+        return false;
+    }
+
+    int capacity = item_w_max_ammo(weapon);
+    if (capacity <= 0 || item_w_curr_ammo(weapon) >= capacity) {
+        return false;
+    }
+
+    int index = -1;
+    Object* ammo;
+    while ((ammo = inven_find_type(obj_dude, ITEM_TYPE_AMMO, &index)) != NULL) {
+        if (item_w_can_reload(weapon, ammo)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// The object intface_reload_weapon would reload (the active hand's), or NULL when that hand is empty.
+Object* intface_reload_target()
+{
+    if (interfaceWindow == -1) {
+        return NULL;
+    }
+
+    Object* weapon = itemButtonItems[itemCurrentItem].item;
+    return weapon == (Object*)-1 ? NULL : weapon;
+}
+
 int intface_reload_weapon()
 {
     if (interfaceWindow == -1) {

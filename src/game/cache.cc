@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <SDL.h>
+
 #include "int/sound.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/memory.h"
@@ -99,6 +101,19 @@ int cache_query(Cache* cache, int key)
     return 1;
 }
 
+// Frame diagnostics ([ANIM/hitch] art=): entries loaded from disk since the last take, and the
+// time it took. A first-time load of an animation from the DAT happens in the middle of a frame.
+static int cache_miss_count;
+static double cache_miss_ms;
+
+void cache_take_miss_stats(int* count, double* ms)
+{
+    *count = cache_miss_count;
+    *ms = cache_miss_ms;
+    cache_miss_count = 0;
+    cache_miss_ms = 0.0;
+}
+
 // 0x41EAE8
 bool cache_lock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
 {
@@ -120,7 +135,11 @@ bool cache_lock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr)
             return false;
         }
 
-        if (!cache_add(cache, key, &index)) {
+        Uint64 missStart = SDL_GetPerformanceCounter();
+        bool added = cache_add(cache, key, &index);
+        cache_miss_count++;
+        cache_miss_ms += (double)(SDL_GetPerformanceCounter() - missStart) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+        if (!added) {
             return false;
         }
 

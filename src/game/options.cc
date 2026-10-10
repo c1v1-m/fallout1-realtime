@@ -2,6 +2,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 #include "game/gsound.h"
 #include "game/loadsave.h"
 #include "game/message.h"
+#include "game/mods_page.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
 #include "game/tile.h"
@@ -472,6 +474,42 @@ bool options_is_open()
 }
 
 // 0x481328
+// The preferences screen on its own, without the surrounding ESC menu. Exists for the MAIN MENU's
+// OPTIONS entry: there is no session there, so Save / Load / "exit to main menu" have nothing to act
+// on, while every setting on this screen -- and the MODS page behind X -- applies perfectly well
+// before a game is even loaded.
+int do_preferences()
+{
+    // ⚠️ EVERY LABEL ON THIS SCREEN COMES FROM options.msg, AND NOTHING HAD LOADED IT. The strings
+    // are getmsg(&optn_msgfl, ...), and that list is filled by OptnStart() and PauseWindow() --
+    // both of which are in-GAME screens. Reached straight from the main menu the list was empty, so
+    // the screen came up saying nothing at all: "options nic neukazují". Load it here when it is not
+    // already loaded, and give it back afterwards so the in-game path keeps owning its own copy.
+    bool loadedHere = false;
+    if (optn_msgfl.entries == NULL) {
+        if (!message_init(&optn_msgfl)) {
+            return -1;
+        }
+
+        char path[COMPAT_MAX_PATH];
+        snprintf(path, sizeof(path), "%s%s", msg_path, "options.msg");
+        if (!message_load(&optn_msgfl, path)) {
+            message_exit(&optn_msgfl);
+            return -1;
+        }
+
+        loadedHere = true;
+    }
+
+    int rc = do_prefscreen();
+
+    if (loadedHere) {
+        message_exit(&optn_msgfl);
+    }
+
+    return rc;
+}
+
 int do_options()
 {
     if (OptnStart() == -1) {
@@ -1533,6 +1571,7 @@ static int do_prefscreen()
     int prefAState = 0;
     int prefBState = 0;
     int prefYState = 0;
+    int prefXState = 0;
     unsigned int prefUpAt = 0;
     unsigned int prefDownAt = 0;
     unsigned int prefLeftAt = 0;
@@ -1542,6 +1581,7 @@ static int do_prefscreen()
     unsigned int prefAAt = 0;
     unsigned int prefBAt = 0;
     unsigned int prefYAt = 0;
+    unsigned int prefXAt = 0;
 
     // do_options blanks the cursor whenever a pad is connected; this screen needs it back
     // whether or not the pad is up, because a mouse user arrives here the same way.
@@ -1571,6 +1611,7 @@ static int do_prefscreen()
         prefAState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_A) != 0 ? 1 : 0;
         prefBState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_B) != 0 ? 1 : 0;
         prefYState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_Y) != 0 ? 1 : 0;
+        prefXState = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_X) != 0 ? 1 : 0;
     }
 
     int rc = -1;
@@ -1624,6 +1665,7 @@ static int do_prefscreen()
             bool aNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_A) != 0;
             bool bNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_B) != 0;
             bool yNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_Y) != 0;
+            bool xNow = SDL_GameControllerGetButton(prefPad, SDL_CONTROLLER_BUTTON_X) != 0;
 
             // Steering: all four directions, geometrically.
             int navX = 0;
@@ -1663,6 +1705,22 @@ static int do_prefscreen()
             if (prefs_nav_edge(bNow, &prefBState, &prefBAt, false)) {
                 GNW_add_input_buffer(KEY_ESCAPE);
             }
+            // X opens the MODS screen (this build's own settings).
+            //
+            // ⚠️ A BUTTON RATHER THAN A ROW ON THIS PANEL, AND NOT BY CHOICE. Every position on the
+            // Preferences screen is baked into its background art -- the headings are painted into
+            // the picture, not drawn as text -- and the one clear band left (y 64..90) already went
+            // to the CRT FILTER checkbox. There is no second gap to put a labelled control in
+            // without repainting the FRM. So the entry is a keypress, and the Pip-Boy CONTROLS page
+            // carries it: by the rule this project learned the hard way, a control that is not
+            // written down does not exist.
+            if (prefs_nav_edge(xNow, &prefXState, &prefXAt, false)) {
+                mods_page();
+                // The MODS window sat on top of this one and is gone now; repaint so the panel
+                // does not come back with a hole in it.
+                win_draw(prfwin);
+                prefs_nav_move(prefSel);
+            }
             // Y, not START: while the options menu is open the shared shortcut layer turns
             // START into ESCAPE, so binding DONE there would post an accept AND a cancel,
             // and the cancel would throw the changes away.
@@ -1694,6 +1752,12 @@ static int do_prefscreen()
         case KEY_MINUS:
         case KEY_UNDERSCORE:
             DecGamma();
+            break;
+        case KEY_UPPERCASE_M:
+        case KEY_LOWERCASE_M:
+            // Keyboard route to the MODS screen -- the pad has X (see the nav block above).
+            mods_page();
+            win_draw(prfwin);
             break;
         case KEY_F12:
             dump_screen();
@@ -1791,7 +1855,10 @@ static int PrefStart()
 
     text_font(103);
 
-    if (game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
+    // ⚠️ NO SESSION, NO GLOBALS. game_global_vars is NULL until a game is loaded (game.cc), and this
+    // screen is now reachable from the main menu, where that is the normal state rather than an
+    // error. Treat "not running" as the answer, which is also what it is.
+    if (game_global_vars != NULL && game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
         button_count = 5;
     } else {
         buf_to_buf(prfbmp[PREFERENCES_WINDOW_FRM_6],
@@ -1810,7 +1877,7 @@ static int PrefStart()
         text_to_buf(prefbuf + PREFERENCES_WINDOW_WIDTH * row1Ytab[i] + x, messageItemText, PREFERENCES_WINDOW_WIDTH, PREFERENCES_WINDOW_WIDTH, colorTable[18979]);
     }
 
-    if (!game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
+    if (game_global_vars == NULL || !game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
         messageItemId++;
     }
 
@@ -2324,7 +2391,8 @@ static void UpdateThing(int index)
 
         int primaryOptionIndex = index - FIRST_PRIMARY_PREF;
 
-        if (primaryOptionIndex == PREF_RUNNING_BURNING_GUY && !game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
+        if (primaryOptionIndex == PREF_RUNNING_BURNING_GUY
+            && (game_global_vars == NULL || !game_global_vars[GVAR_RUNNING_BURNING_GUY])) {
             return;
         }
 
@@ -2878,6 +2946,18 @@ int load_options(DB_FILE* stream)
     float brightness;
     float mouseSensitivity;
 
+    // ⚠️ THE SAVED GAME HAS NO OPINION ABOUT THE CRT FILTER, AND MUST NOT GET ONE.
+    //
+    // This record is vanilla's and its layout is shared with every save on disk, so `crt` is not
+    // in it and cannot be added. But SetDefaults() below sets crt_filter = 1 (on IS the default),
+    // nothing in the read that follows touches it again, and JustUpdate() at the end both applies
+    // crt_filter and calls crt_persist(). So every load turned the filter back on -- and wrote
+    // crt=1 into fallout.cfg on the way, destroying the player's setting for good rather than
+    // just for the session: "vypnul jsem crt a po loadu bylo stále on".
+    //
+    // The live flag is the truth here. Carry it across the whole function, error path included.
+    int crtWas = crt_is_enabled() ? 1 : 0;
+
     SetDefaults(false);
 
     if (db_freadInt(stream, &game_difficulty) == -1) goto err;
@@ -2905,6 +2985,7 @@ int load_options(DB_FILE* stream)
     mouse_sens = mouseSensitivity;
     text_delay = textBaseDelay;
 
+    crt_filter = crtWas;
     JustUpdate();
     SavePrefs(0);
 
@@ -2915,6 +2996,7 @@ err:
     debug_printf("\nOPTION MENU: Error loading option data!, using defaults.\n");
 
     SetDefaults(false);
+    crt_filter = crtWas;
     JustUpdate();
     SavePrefs(0);
 

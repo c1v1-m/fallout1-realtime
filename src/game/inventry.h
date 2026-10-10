@@ -60,6 +60,7 @@ bool inven_loot_cursor_over_panel();
 // True if the cursor is over the normal/use-on inventory item list; lets the
 // gamepad layer tell a quick equip/use from a button click such as Done.
 bool inven_normal_cursor_over_list();
+bool inven_normal_cursor_over_armor();
 bool inven_equip_under_cursor(int hand);
 // Controller shortcut: WEAR the inventory-list armor under the cursor (the armor
 // body slot), swapping out any currently-worn armor back to the list. Returns

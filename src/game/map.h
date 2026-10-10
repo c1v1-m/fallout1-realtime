@@ -113,6 +113,14 @@ void map_new_map();
 int map_load(char* fileName);
 int map_load_idx(int map_index);
 int map_load_file(DB_FILE* stream);
+// True while map_load_file is reading a map off disk -- i.e. while the object list and the
+// script lists are half torn down and half rebuilt. The engine pumps the mouse from inside
+// that read (db_fgetc -> gameMouseRefreshImmediately), so pad code that inspects the world
+// MUST stand down while this is set. See the guard in gpui_mouse_hook.
+bool map_is_loading();
+// Is `tile` out on the map's black background (empty floor, or the elevation's dark filler tile)?
+// See map.cc -- used to keep a fleeing critter on the map.
+bool map_tile_is_background(int tile, int elevation);
 int map_load_in_game(char* fileName);
 int map_leave_map(MapTransition* transition);
 void map_clear_pending_transition();

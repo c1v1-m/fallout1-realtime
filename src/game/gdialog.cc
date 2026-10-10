@@ -8,8 +8,12 @@
 
 #include "game/actions.h"
 #include "game/combat.h"
+#include "game/game_trace.h"
+#include "game/light.h"
 #include "game/combat_rt.h"
 #include "game/combatai.h"
+#include "game/config.h"
+#include "game/gconfig.h"
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/display.h"
@@ -23,6 +27,7 @@
 #include "game/lip_sync.h"
 #include "game/message.h"
 #include "game/object.h"
+#include "game/party.h" // isPartyMember, for the follower-only dialogue extras
 #include "game/perk.h"
 #include "game/proto.h"
 #include "game/reaction.h"
@@ -587,9 +592,27 @@ static unsigned int fidgetLastTime;
 // 0x5951DC
 static int fidgetFrameCounter;
 
+// MODS "Script lines as floating text" (cfg script_float_lines) -- see gDialogSayMessage.
+// ⚠️ DEFAULT ON, AND THAT IS HIS CALL, NOT THE MODS HOUSE RULE (every other row defaults to what
+// shipped): *"rovnou zapnuté a 1"* (2026-10-10), having seen what the vanilla path looks like.
+static bool gdialog_script_float = true;
+
+bool gdialog_get_script_float()
+{
+    return gdialog_script_float;
+}
+
+void gdialog_set_script_float(bool on)
+{
+    gdialog_script_float = on;
+}
+
 // 0x43DE08
 int gdialog_init()
 {
+    int scriptFloat = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SCRIPT_FLOAT_KEY, &scriptFloat);
+    gdialog_script_float = scriptFloat != 0;
     return 0;
 }
 
@@ -622,9 +645,27 @@ bool dialog_is_bartering()
 }
 
 // 0x43DE28
+// CE: Re-arm the conversation's own pad edge detection. A dialogue can open while a face button is
+// already HELD -- the commonest case by far is X, because X is RUN and scripts stop you mid-stride
+// ("držím běh xko a zastaví mě npc, že mi chce něco říct, tak se objeví okno, zda se ho chci na
+// něco zeptat"). The edge statics in gdialog_gamepad_keycode persist between conversations, so a
+// button that never went up still read as a fresh press on the first frame of the new one, and the
+// "ask me about" window opened before the NPC had said a word.
+//
+// Stamping the LIVE state at entry is the whole fix: a button held from the world is already spent,
+// and only a genuine press made INSIDE the conversation counts. Same rule the gameplay shortcuts
+// apply after every modal screen (gamepad_ui_bump_input_epoch), just local to this loop.
+static bool gdialog_pad_rearm = false;
+static bool gdialog_pad_rearm_cancel = false;
+
 void gdialog_enter(Object* target, int a2)
 {
     gdDialogWentOff = false;
+    gdialog_pad_rearm = true;
+    gdialog_pad_rearm_cancel = true;
+    // And invalidate the GAMEPLAY shortcut edges too, so a button held from the world cannot fire
+    // one of those on the frame the conversation opens.
+    gamepad_ui_bump_input_epoch();
 
     // Vanilla refused a conversation during a turn-based encounter -- you cannot start talking in
     // the middle of someone's turn. Realtime has no turns, and its combat bit stays warm for as
@@ -632,6 +673,11 @@ void gdialog_enter(Object* target, int a2)
     // talk to anyone while a fight is going on somewhere on the map" -- silently, with no message.
     // Ask the narrow question instead: is somebody actually coming for me?
     if (combat_rt_under_threat()) {
+        // A guard's "who goes there / intruder" conversation skipped because a fight is on: the
+        // other half of "they say nothing, they just shoot" (2026-10-09). Traced so it can be told
+        // apart from a script that never asked to talk at all.
+        trace_event(TRACE_FLOW, "dialog-refused", "pid=%d id=%d name=%s why=under-threat",
+            target->pid, target->id, object_name(target));
         return;
     }
 
@@ -808,7 +854,7 @@ void gdialog_free_speech()
 // 0x43E18C
 int gDialogEnableBK()
 {
-    add_bk_process(head_bk);
+    add_bk_process(head_bk, "head");
     return 0;
 }
 
@@ -831,6 +877,15 @@ int scr_dialogue_init(int headFid, int reaction)
     }
 
     anim_stop();
+
+    // Every conversation, named: who, which head (-1 = no head: the top window shows the world
+    // around the speaker instead), and whether a fight was on. 2026-10-09 "guards stop me while I
+    // run, but the whole dialogue window is grey and the art is missing" -- and no line in the trace
+    // said a conversation had even happened.
+    trace_event(TRACE_FLOW, "dialog-start", "pid=%d id=%d name=%s head=%d reaction=%d inCombat=%d light=%d display=%dx%d",
+        dialog_target != NULL ? dialog_target->pid : -1, dialog_target != NULL ? dialog_target->id : -1,
+        dialog_target != NULL ? object_name(dialog_target) : "-", headFid, reaction, isInCombat() ? 1 : 0,
+        light_get_ambient(), display_win != -1 ? win_width(display_win) : -1, display_win != -1 ? win_height(display_win) : -1);
 
     boxesWereDisabled = disable_box_bar_win();
     oldFont = text_curr();
@@ -857,7 +912,7 @@ int scr_dialogue_init(int headFid, int reaction)
     talk_need_to_center = 1;
 
     talk_to_create_head_window();
-    add_bk_process(head_bk);
+    add_bk_process(head_bk, "head");
     talk_to_set_up_fidget(headFid, reaction);
     gdialog_state = 1;
     gmouse_disable_scrolling();
@@ -1153,6 +1208,101 @@ int gDialogReplyStr(Program* program, int messageListId, const char* text)
     return 0;
 }
 
+// --- FOLLOWER ORDERS BOLTED ONTO A VANILLA CONVERSATION -----------------------------------------
+//
+// One extra reply line on a party member's dialogue: "stop patching me up" / "you can patch me up
+// again", toggling combat_rt's per-companion medic opt-out.
+//
+// ⚠️ NO SCRIPT IS TOUCHED, AND THAT IS THE POINT. Ian's dialogue lives in a COMPILED IAN.INT inside
+// MASTER.DAT; this project has a decompiler for those and no compiler, so adding a real script node
+// is not on the table. gDialogGo is the seam that makes it unnecessary: the script has finished
+// adding its own options by the time it runs, and gdAddOptionStr already exists for free-text
+// options (it is what the barter and "tell me about" paths use). The vanilla script never learns
+// the line was there, so nothing it does can be broken by it.
+//
+// ⚠️ MARKED IN THE ENTRY ITSELF, NOT BY REMEMBERING AN INDEX. Dialogue is reentrant -- a script
+// procedure can open a whole nested reply node (gdReenterLevel) -- so a static "our option is at
+// index N" would describe the wrong option set the moment a nested level returned. `messageId` is
+// dead storage for a free-text option: gdAddOptionStr writes -4 into it, and the only reader
+// (gDialogProcessUpdate) consults it solely when messageListId >= 0. So the marker travels with
+// the option, and nesting cannot confuse it.
+#define GD_OPTION_MEDIC_TOGGLE (-1001)
+#define GD_OPTION_STEP_BACK (-1002)
+
+static bool gd_is_extra_option(const GameDialogOptionEntry* entry, int marker)
+{
+    return entry != NULL && entry->messageListId == -4 && entry->messageId == marker;
+}
+
+// Append one free-text option of ours and stamp it with its marker. Silently does nothing when the
+// script has already filled the list -- its own options matter more than ours.
+static void gd_add_extra_option(const char* text, int marker)
+{
+    if (gdAddOptionStr(-4, text, GAME_DIALOG_REACTION_NEUTRAL) == -1) {
+        return;
+    }
+
+    GameDialogOptionEntry* entry = &(dialogBlock.options[gdNumOptions - 1]);
+    entry->messageId = marker;
+    entry->proc = 0; // ours to handle; there is no script procedure to run
+}
+
+static void gd_add_follower_options()
+{
+    // Followers only: this is an ORDER, and there is nobody else it would mean anything to.
+    if (dialog_target == NULL || !isPartyMember(dialog_target) || dialog_target == obj_dude) {
+        return;
+    }
+
+    // "Back off a few paces." Always offered -- unlike the medic line there is no feature switch
+    // it depends on, and being in the way is not a combat-only problem.
+    gd_add_extra_option("(Back off a few paces. You're in my way.)", GD_OPTION_STEP_BACK);
+
+    // Nothing to turn off when the beat that does the healing is off game-wide.
+    if (!combat_rt_medic_beat_enabled()) {
+        return;
+    }
+
+    gd_add_extra_option(combat_rt_medic_treats_player(dialog_target)
+            ? "(Stop patching me up. Save your supplies.)"
+            : "(You can patch me up again.)",
+        GD_OPTION_MEDIC_TOGGLE);
+}
+
+// Chosen. Flip it, then say so and leave a single way out -- gDialogProcessChoice ends the
+// conversation when an option set comes back empty, so the acknowledgement needs one option of its
+// own or the screen would simply vanish with no confirmation that anything happened.
+static void gd_run_follower_medic_option()
+{
+    bool treats = combat_rt_medic_treats_player(dialog_target);
+    combat_rt_medic_set_treats_player(dialog_target, !treats);
+
+    char reply[256];
+    snprintf(reply, sizeof(reply), treats
+            ? "%s shrugs, and puts the kit away."
+            : "%s nods, and checks what is left in the kit.",
+        object_name(dialog_target));
+
+    gDialogReplyStr(dialogBlock.program, -4, reply);
+    gdAddOptionStr(-4, "(Good.)", GAME_DIALOG_REACTION_NEUTRAL);
+    dialogBlock.options[gdNumOptions - 1].proc = 0;
+}
+
+// "Back off a few paces." The walk itself cannot happen here -- this runs inside the modal dialogue
+// loop, where the world is not ticking -- so it is queued and combat_rt starts it on the first
+// update after the conversation closes.
+static void gd_run_follower_step_back_option()
+{
+    combat_rt_request_step_back(dialog_target);
+
+    char reply[256];
+    snprintf(reply, sizeof(reply), "%s steps back to give you room.", object_name(dialog_target));
+
+    gDialogReplyStr(dialogBlock.program, -4, reply);
+    gdAddOptionStr(-4, "(Thanks.)", GAME_DIALOG_REACTION_NEUTRAL);
+    dialogBlock.options[gdNumOptions - 1].proc = 0;
+}
+
 // 0x43E878
 int gDialogGo()
 {
@@ -1161,6 +1311,10 @@ int gDialogGo()
     }
 
     int rc = 0;
+
+    // Appended AFTER the script's own options and BEFORE the empty-list fallback below, so ours
+    // never becomes the reason a node counts as having options.
+    gd_add_follower_options();
 
     if (gdNumOptions < 1) {
         dialogBlock.options[gdNumOptions].proc = 0;
@@ -1285,9 +1439,56 @@ static int gdAddReviewOptionChosenStr(const char* string)
     return 0;
 }
 
+// ⚠️ A MESSAGE WITH NO CONVERSATION OPEN IS FLOATED OVER THE SPEAKER (2026-10-10). Some vanilla scripts
+// say one line through gsay_message straight from talk_p_proc, without start_gdialog -- the Master's
+// vent guards (AIRGRD.INT, proc airgrd15) shout "Intruders!" that way and then attack. With no
+// start_gdialog, scr_dialogue_init never builds the dialogue frame, so the engine showed only the bare
+// reply and option windows in the window manager's default grey over the map, and stopped the game
+// until [Done]: *"šedý dialogue box intruder"*, screenshots 2026-10-10, sneaking past two of them.
+// That is how the original's code draws it; a shortcut in one script branch, not a designed look.
+// He chose to float such a line over the speaker like a combat taunt instead (MODS "Script lines as
+// floating text", default ON at his request): no box, no pause, the script runs on into its attack.
+//
+// Only a SHORT line is floated: a longer one is something to read, not a shout, and keeps the
+// vanilla box so it cannot scroll away unread.
+#define GDIALOG_FLOAT_MAX_CHARS 80
+
+static bool gdialog_float_say_message()
+{
+    if (!gdialog_script_float || gdialog_state == 1 || dialog_target == NULL) {
+        return false;
+    }
+    if (FID_TYPE(dialog_target->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    const char* text = NULL;
+    if (dialogBlock.replyMessageListId == -4) {
+        text = dialogBlock.replyText;
+    } else if (dialogBlock.replyMessageListId >= 0) {
+        text = scr_get_msg_str(dialogBlock.replyMessageListId, dialogBlock.replyMessageId);
+    }
+    if (text == NULL || text[0] == '\0' || strlen(text) > GDIALOG_FLOAT_MAX_CHARS) {
+        return false;
+    }
+
+    if (combatai_float_line(dialog_target, text) != 0) {
+        return false;
+    }
+    trace_event(TRACE_FLOW, "script-float", "pid=%d id=%d name=%s text=%s",
+        dialog_target->pid, dialog_target->id, object_name(dialog_target), text);
+    return true;
+}
+
 // 0x43EBB0
 int gDialogSayMessage()
 {
+    if (gdialog_float_say_message()) {
+        gdNumOptions = 0;
+        dialogBlock.replyMessageListId = -1;
+        return 0;
+    }
+
     mouse_show();
     gDialogGo();
 
@@ -1321,6 +1522,16 @@ static int gdialog_gamepad_keycode()
     bool yNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
     bool xNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
 
+    // ⚠️ FIRST FRAME OF A NEW CONVERSATION: adopt whatever is held instead of reading it as a
+    // press. See gdialog_pad_rearm -- X is the run button, so being stopped mid-run by a script is
+    // the normal way into a dialogue with X already down.
+    if (gdialog_pad_rearm) {
+        gdialog_pad_rearm = false;
+        prevY = yNow;
+        prevX = xNow;
+        return -1;
+    }
+
     int keyCode = -1;
     if (yNow && !prevY) {
         keyCode = KEY_LOWERCASE_B; // barter / trade
@@ -1352,6 +1563,15 @@ static int gdialog_gamepad_cancel_key()
     SDL_GameControllerUpdate();
     bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
     bool backNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0;
+
+    // Same first-frame adoption as gdialog_gamepad_keycode, for the same reason: a B held on the
+    // way into a conversation would otherwise close the sub-screen it just opened.
+    if (gdialog_pad_rearm_cancel) {
+        gdialog_pad_rearm_cancel = false;
+        prevB = bNow;
+        prevBack = backNow;
+        return -1;
+    }
 
     int keyCode = -1;
     if ((bNow && !prevB) || (backNow && !prevBack)) {
@@ -1394,6 +1614,12 @@ static void gdialog_tick_cursor(bool* shown, int* lastX, int* lastY, unsigned in
     *lastY = y;
 }
 
+// CE: the pad's reply selection is ENGAGED -- self_nav on, pointer blanked -- by SOME level of the
+// conversation. File scope rather than per gDialogProcess level, because the levels nest and engage
+// lazily (see the note at the top of gDialogProcess), and only the outermost exit may hand the pad
+// back; it has to know whether anybody took it.
+static bool gdPadNavEngaged = false;
+
 // Minimum gap between two accepted reply selections. Guards against one press being read as two
 // answers across consecutive reply sets -- a mistake with no undo, since the conversation has
 // already advanced. Well under deliberate reply pacing.
@@ -1431,6 +1657,19 @@ static int gdialog_gamepad_reply_nav(int* sel)
     bool upNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0 || ly < -16000;
     bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0 || ly > 16000;
     bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+
+    // A nested modal loop (the trade window, a dialog box) ran in between and these edges describe
+    // the pad from before it. Take the pad as it is NOW: whatever is still held is spent, and must
+    // be seen released before it can act -- the same neutral-first rule as the arming below.
+    static unsigned int seenEpoch = 0;
+    if (seenEpoch != gamepad_ui_input_epoch()) {
+        seenEpoch = gamepad_ui_input_epoch();
+        prevUp = upNow;
+        prevDown = downNow;
+        prevA = aNow;
+        aArmed = !aNow;
+        navArmed = !upNow && !downNow;
+    }
 
     // Neutral-first latch, same idea as the world map's wm_stick_armed. This loop is entered with
     // whatever the player was physically holding when the conversation opened -- A from the interact
@@ -1580,8 +1819,15 @@ static int gDialogProcess()
     // highlighted option is moved by the D-pad/stick (gdialog_gamepad_reply_nav). self_nav tells
     // the shared mouse hook to stop snapping the cursor / clicking on A so it doesn't fight that.
     // Barter keeps its pointer (it means pointing at items to trade).
-    bool gdCursorController = gamepad_ui_get_controller() != NULL && !dialog_is_bartering();
-    bool gdCursorShown = !gdCursorController;
+    //
+    // ⚠️ ENGAGED AT THE FIRST FRAME THAT IS NOT A TRADE, NOT ONCE AT ENTRY. A merchant's "let's
+    // trade" node calls gdialog_mod_barter BEFORE its gsay_end, so the reply level that node opens
+    // is entered already bartering. Deciding at entry left that whole level without the pad: after
+    // the trade its "[DONE]" sat there with nothing lit, A did nothing (self_nav from the level
+    // below still swallowed the click), and only RT on a pointer that happened to rest on it got
+    // you out ("když dokončím obchod, tak áčko nejde, musím zmáčknout RT").
+    bool gdCursorController = false;
+    bool gdCursorShown = true;
     int gdCursorX = -1;
     int gdCursorY = -1;
     unsigned int gdCursorMove = get_time();
@@ -1589,14 +1835,21 @@ static int gDialogProcess()
     // Deliberately NOT gdOptionGen: the first pass through the loop must see a mismatch and seed
     // the highlight, exactly as entering a nested level must re-seed for its own option set.
     unsigned int gdSeenOptionGen = gdOptionGen - 1;
-    if (gdCursorController) {
-        mouse_get_position(&gdCursorX, &gdCursorY);
-        gmouse_set_cursor(MOUSE_CURSOR_NONE);
-        gamepad_ui_set_self_nav(true);
-    }
 
     for (;;) {
         sharedFpsLimiter.mark();
+
+        // Before get_input, so the hook already runs under self_nav on the very frame this engages.
+        if (!gdCursorController && gamepad_ui_get_controller() != NULL && !dialog_is_bartering()) {
+            gdCursorController = true;
+            gdCursorShown = false;
+            mouse_get_position(&gdCursorX, &gdCursorY);
+            gdCursorMove = get_time();
+            gdSeenOptionGen = gdOptionGen - 1; // light this level's list the moment it is ours
+            gmouse_set_cursor(MOUSE_CURSOR_NONE);
+            gamepad_ui_set_self_nav(true);
+            gdPadNavEngaged = true;
+        }
 
         int keyCode = get_input();
 
@@ -1653,6 +1906,16 @@ static int gDialogProcess()
                 dialogue_state = 4;
                 barter_inventory(dialogueWindow, dialog_target, peon_table_obj, barterer_table_obj, gdBarterMod);
                 dialogue_barter_cleanup_tables();
+
+                // The trade ran its own input loop for as long as it lasted, so the reply nav's edge
+                // state is from BEFORE it -- typically "A down", from the press that picked "let's
+                // trade" -- and the first A back in the conversation was read as still held and
+                // swallowed. exit_inventory already bumps the input epoch on the way out; the reply
+                // nav now re-primes on it (gdialog_gamepad_reply_nav).
+                //
+                // And light the list again: the dialogue window is rebuilt around the trade, which
+                // repaints the options plain while gdReplySel still names one.
+                gdSeenOptionGen = gdOptionGen - 1;
 
                 int v5 = dialogue_state;
                 talk_to_destroy_barter_win();
@@ -1716,10 +1979,35 @@ static int gDialogProcess()
         }
 
         if (keyCode != -1) {
+            // ⚠️ WITH THE PAD DRIVING THERE IS ONE HIGHLIGHT, AND IT IS THE SELECTION.
+            //
+            // The option buttons still raise their mouse hover events (1200+i in, 1300+i out) under
+            // the BLANKED pointer -- and a fresh reply list that appears under a pointer resting
+            // where it was last left gets hovered without anything moving. That lit the option
+            // under the invisible pointer on top of the pad's own, two yellow lines at once ("neviditelný
+            // kurzor myši občas highlituje text a z toho má dva texty žluté"), and A then answered
+            // the one that was not the pointer's.
+            //
+            // So under the pad: a hover counts only while the pointer is really in use (shown --
+            // the mouse or a trackpad just moved it), and then it TAKES the selection instead of
+            // adding a second one. Leaving an option never unlights the selection: the pointer
+            // wandering off is not the player moving off it.
             if (keyCode >= 1200 && keyCode <= 1250) {
-                gDialogProcessHighlight(keyCode - 1200);
+                int hovered = keyCode - 1200;
+                if (!gdCursorController) {
+                    gDialogProcessHighlight(hovered);
+                } else if (gdCursorShown && hovered < gdNumOptions && hovered != gdReplySel) {
+                    if (gdReplySel >= 0 && gdReplySel < gdNumOptions) {
+                        gDialogProcessUnHighlight(gdReplySel);
+                    }
+                    gDialogProcessHighlight(hovered);
+                    gdReplySel = hovered;
+                }
             } else if (keyCode >= 1300 && keyCode <= 1330) {
-                gDialogProcessUnHighlight(keyCode - 1300);
+                int left = keyCode - 1300;
+                if (!gdCursorController || (left != gdReplySel && left < gdNumOptions)) {
+                    gDialogProcessUnHighlight(left);
+                }
             } else if (keyCode >= 48 && keyCode <= 57) {
                 int option = keyCode - 49;
                 if (option < gdNumOptions) {
@@ -1753,9 +2041,15 @@ static int gDialogProcess()
     // leave self_nav / the hidden pointer engaged for the level that entered it, or the
     // outer loop would resume with the cursor snapping and A clicking again. Leaving the
     // pointer visible afterwards matters -- a blanked cursor must never outlive the dialogue.
-    if (gdCursorController && gdReenterLevel == 1) {
+    //
+    // ⚠️ KEYED ON THE FILE-SCOPE gdPadNavEngaged, NOT THIS LEVEL'S OWN FLAG. Engaging is lazy now, so
+    // a nested level can engage while the outermost never did (the outer one was entered mid-trade
+    // and left straight after the nested one returned); testing the local flag here would then leak
+    // self_nav out of the conversation -- and a leaked self_nav is a dead pad in the whole world.
+    if (gdPadNavEngaged && gdReenterLevel == 1) {
         gamepad_ui_set_self_nav(false);
         gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+        gdPadNavEngaged = false;
     }
 
     gdReenterLevel -= 1;
@@ -1838,9 +2132,19 @@ static int gDialogProcessChoice(int a1)
     gDialogProcessHighlight(a1);
     talk_to_critter_reacts(v1);
 
+    bool extraMedic = gd_is_extra_option(dialogOptionEntry, GD_OPTION_MEDIC_TOGGLE);
+    bool extraStepBack = gd_is_extra_option(dialogOptionEntry, GD_OPTION_STEP_BACK);
+
     gdNumOptions = 0;
 
-    if (gdReenterLevel < 2) {
+    // Our own lines: no script procedure exists for either. They run after the gdNumOptions reset
+    // above because each builds a fresh reply and option of its own, and that count is what tells
+    // the caller the conversation is still alive.
+    if (extraMedic) {
+        gd_run_follower_medic_option();
+    } else if (extraStepBack) {
+        gd_run_follower_step_back_option();
+    } else if (gdReenterLevel < 2) {
         if (dialogOptionEntry->proc != 0) {
             executeProcedure(dialogBlock.program, dialogOptionEntry->proc);
         }
@@ -2797,7 +3101,7 @@ static int gdialog_review_init(int* win)
 // 0x44045C
 static int gdialog_review_exit(int* win)
 {
-    add_bk_process(head_bk);
+    add_bk_process(head_bk, "head");
 
     for (int index = 0; index < GAME_DIALOG_REVIEW_WINDOW_BUTTON_FRM_COUNT; index++) {
         if (reviewKeys[index] != INVALID_CACHE_ENTRY) {

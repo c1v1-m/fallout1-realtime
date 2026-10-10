@@ -38,7 +38,19 @@ static char bad_copy[MESSAGE_LIST_ITEM_FIELD_MAX_SIZE];
 // 0x4764E0
 int init_message()
 {
-    DB_FILE* stream = db_fopen("data\\badwords.txt", "rt");
+    // The bad-words list is language data too: text\<language>\badwords.txt first, the shipped
+    // data\badwords.txt after (see select_display_bio -- the Czech pack's list had been overriding the
+    // English one for every language from the patch folder).
+    DB_FILE* stream = NULL;
+    const char* language = message_language();
+    if (language != NULL) {
+        char localized[COMPAT_MAX_PATH];
+        snprintf(localized, sizeof(localized), "text\\%s\\badwords.txt", language);
+        stream = db_fopen(localized, "rt");
+    }
+    if (stream == NULL) {
+        stream = db_fopen("data\\badwords.txt", "rt");
+    }
     if (stream == NULL) {
         return -1;
     }
@@ -160,10 +172,39 @@ bool message_exit(MessageList* messageList)
     return true;
 }
 
+// THE LANGUAGE IS LATCHED FOR THE WHOLE RUN. Message lists are not loaded once at startup -- every
+// screen, dialog box and map load reads its own .msg when it is first needed -- so reading the cfg
+// on each load meant that changing the language mid-session translated whatever happened to load
+// AFTERWARDS and left everything already in memory alone: a Czech item card over an English
+// interface, and no way back without a restart. The setting says it takes effect on restart; this
+// is what makes that true. Latched on first use, which is after gconfig_init either way.
+const char* message_language()
+{
+    static char latched[32];
+    static bool have_latched = false;
+
+    if (!have_latched) {
+        char* language;
+        if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language)) {
+            return NULL;
+        }
+
+        if (language == NULL) {
+            return NULL;
+        }
+
+        strncpy(latched, language, sizeof(latched) - 1);
+        latched[sizeof(latched) - 1] = '\0';
+        have_latched = true;
+    }
+
+    return latched;
+}
+
 // 0x476814
 bool message_load(MessageList* messageList, const char* path)
 {
-    char* language;
+    const char* language;
     char localized_path[COMPAT_MAX_PATH];
     DB_FILE* file_ptr;
     char num[MESSAGE_LIST_ITEM_FIELD_MAX_SIZE];
@@ -183,7 +224,8 @@ bool message_load(MessageList* messageList, const char* path)
         return false;
     }
 
-    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language)) {
+    language = message_language();
+    if (language == NULL) {
         return false;
     }
 
@@ -274,7 +316,7 @@ bool message_search(MessageList* msg, MessageListItem* entry)
 // 0x476A20
 bool message_make_path(char* dest, size_t size, const char* path)
 {
-    char* language;
+    const char* language;
 
     if (dest == NULL) {
         return false;
@@ -284,7 +326,8 @@ bool message_make_path(char* dest, size_t size, const char* path)
         return false;
     }
 
-    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language)) {
+    language = message_language();
+    if (language == NULL) {
         return false;
     }
 

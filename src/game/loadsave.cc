@@ -14,6 +14,7 @@
 #include "game/bmpdlog.h"
 #include "game/combat.h"
 #include "game/combatai.h"
+#include "game/combat_rt.h" // the per-companion medic opt-out chunk
 #include "game/gamepad_ui.h"
 #include "game/critter.h"
 #include "game/cycle.h"
@@ -59,7 +60,14 @@ namespace fallout {
 
 #define LOAD_SAVE_SIGNATURE "FALLOUT SAVE FILE"
 #define LOAD_SAVE_DESCRIPTION_LENGTH 30
-#define LOAD_SAVE_HANDLER_COUNT 27
+// ⚠️ BUMPED FROM 27 TO 28 (2026-09-09). The new pair sits SECOND TO LAST, immediately before the
+// trailing DummyFunc/EndLoad, so it appends to the end of the file: the last save handler writes
+// nothing, so every save ever written ends where intface_save left off. Loading an OLD save
+// therefore reaches our loader at EOF, which reports "not in this save" and keeps the defaults --
+// see combat_rt_medic_optout_load. A NEW save read by an OLD build stops after intface_load and
+// ignores the trailing bytes. Both directions keep working; that is the whole reason for the
+// position.
+#define LOAD_SAVE_HANDLER_COUNT 28
 
 #define LSGAME_MSG_NAME "LSGAME.MSG"
 
@@ -329,6 +337,7 @@ static SaveGameHandler* master_save_list[LOAD_SAVE_HANDLER_COUNT] = {
     skill_use_slot_save,
     partyMemberSave,
     intface_save,
+    combat_rt_medic_optout_save,
     DummyFunc,
 };
 
@@ -360,6 +369,7 @@ static LoadGameHandler* master_load_list[LOAD_SAVE_HANDLER_COUNT] = {
     skill_use_slot_load,
     partyMemberLoad,
     intface_load,
+    combat_rt_medic_optout_load,
     EndLoad,
 };
 
@@ -2093,6 +2103,10 @@ static int LoadSlot(int slot)
         LoadGameHandler* handler = master_load_list[index];
         if (handler(flptr) == -1) {
             debug_printf("\nLOADSAVE: ** Error reading load function #%d data! **\n", index);
+            // Into the TRACE too: the debug log is not kept, and "the save will not load" was
+            // otherwise only a continue-rc=-1 with nothing saying WHICH chunk refused (11 is
+            // combat_load -- see master_load_list for the rest).
+            trace_event(TRACE_ERR, "load-handler-failed", "index=%d pos=%ld", index, pos);
             int v12 = db_ftell(flptr);
             debug_printf("LOADSAVE: Load function #%d data size read: %d bytes.\n", index, db_ftell(flptr) - pos);
             db_fclose(flptr);

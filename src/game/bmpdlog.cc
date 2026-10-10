@@ -574,6 +574,136 @@ int dialog_out(const char* title, const char** body, int bodyLength, int x, int 
     return rc;
 }
 
+// --- Gamepad navigation for the two file dialogs (LOAD / SAVE character, PRINT TO FILE). ---
+//
+// ⚠️ WITHOUT THIS THE SAVE DIALOG IS A DEAD END ON A PAD. Both dialogs are vanilla mouse-and-
+// keyboard screens: a line of the list is picked by CLICKING it (button code 502 + the pointer's y)
+// and confirmed by DOUBLE-clicking, while the arrow keys move the PAGE rather than the selection.
+// Neither is reachable from a controller -- the character editor PINS its pointer on dead panel
+// while the pad drives it (ce_park_cursor), precisely so a click cannot land on a button by
+// accident. So "save my character" opened a window the player could read and nothing else: "při
+// save mi nelze vybrat uloženou postavu v char sheetu".
+//
+// The pad therefore gets its own path, the plain thing a list is expected to do: up/down move the
+// SELECTION (an absolute index; the page follows it), A is DONE, B is CANCEL. In the save dialog a
+// move also copies the highlighted name into the edit field, because with no keyboard attached
+// picking from the list IS how the name gets typed.
+enum FileDialogPadAction {
+    FILE_DIALOG_PAD_NONE,
+    FILE_DIALOG_PAD_UP,
+    FILE_DIALOG_PAD_DOWN,
+    FILE_DIALOG_PAD_CONFIRM,
+    FILE_DIALOG_PAD_CANCEL,
+};
+
+#define FILE_DIALOG_PAD_REPEAT_DELAY_MS 350
+#define FILE_DIALOG_PAD_REPEAT_RATE_MS 90
+#define FILE_DIALOG_PAD_STICK_THRESHOLD 12000
+
+// Same discipline as dialog_pad_prime: the A that OPENED this dialog is still physically down when
+// the loop starts, and an edge detector that was not running is not merely stale, it is wrong --
+// unprimed, that hold reads as an immediate confirm and the dialog answers itself.
+static bool file_dialog_pad_prime = false;
+
+static int file_dialog_pad_action()
+{
+    static bool prevA = false;
+    static bool prevB = false;
+    static int prevDir = 0;
+    static unsigned int nextStepAt = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        prevA = false;
+        prevB = false;
+        prevDir = 0;
+        file_dialog_pad_prime = false;
+        return FILE_DIALOG_PAD_NONE;
+    }
+
+    SDL_GameControllerUpdate();
+    bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+
+    int axisY = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+    bool upNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
+        || axisY < -FILE_DIALOG_PAD_STICK_THRESHOLD;
+    bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
+        || axisY > FILE_DIALOG_PAD_STICK_THRESHOLD;
+    int dir = upNow ? 1 : (downNow ? 2 : 0);
+
+    if (file_dialog_pad_prime) {
+        file_dialog_pad_prime = false;
+        prevA = aNow;
+        prevB = bNow;
+        prevDir = dir;
+        nextStepAt = get_time() + FILE_DIALOG_PAD_REPEAT_DELAY_MS;
+        return FILE_DIALOG_PAD_NONE;
+    }
+
+    int action = FILE_DIALOG_PAD_NONE;
+    if (aNow && !prevA) {
+        action = FILE_DIALOG_PAD_CONFIRM;
+    } else if (bNow && !prevB) {
+        action = FILE_DIALOG_PAD_CANCEL;
+    } else if (dir != 0) {
+        // Held directions auto-repeat, same as the character sheet's own focus nav: one step per
+        // click of the stick is not how anyone reads a save list.
+        if (dir != prevDir) {
+            action = dir == 1 ? FILE_DIALOG_PAD_UP : FILE_DIALOG_PAD_DOWN;
+            nextStepAt = get_time() + FILE_DIALOG_PAD_REPEAT_DELAY_MS;
+        } else if (get_time() >= nextStepAt) {
+            action = dir == 1 ? FILE_DIALOG_PAD_UP : FILE_DIALOG_PAD_DOWN;
+            nextStepAt = get_time() + FILE_DIALOG_PAD_REPEAT_RATE_MS;
+        }
+    }
+
+    prevA = aNow;
+    prevB = bNow;
+    prevDir = dir;
+    return action;
+}
+
+// Move the highlight by `delta` over the WHOLE list, scrolling the page to follow. The vanilla
+// arrow-key branches move pageOffset and clamp the selection to the twelve visible lines instead,
+// which is why they cannot reach an entry the pad user can see.
+static void file_dialog_pad_step(int delta, int fileListLength, int* selectedFileIndex, int* pageOffset)
+{
+    if (fileListLength <= 0) {
+        return;
+    }
+
+    int index = *pageOffset + *selectedFileIndex + delta;
+    if (index < 0) {
+        index = 0;
+    }
+    if (index > fileListLength - 1) {
+        index = fileListLength - 1;
+    }
+
+    int maxOffset = fileListLength - FILE_DIALOG_LINE_COUNT;
+    if (maxOffset < 0) {
+        maxOffset = 0;
+    }
+
+    int offset = *pageOffset;
+    if (index < offset) {
+        offset = index;
+    }
+    if (index >= offset + FILE_DIALOG_LINE_COUNT) {
+        offset = index - FILE_DIALOG_LINE_COUNT + 1;
+    }
+    if (offset > maxOffset) {
+        offset = maxOffset;
+    }
+    if (offset < 0) {
+        offset = 0;
+    }
+
+    *pageOffset = offset;
+    *selectedFileIndex = index - offset;
+}
+
 // 0x41CC40
 int file_dialog(char* title, char** fileList, char* dest, int fileListLength, int x, int y, int flags)
 {
@@ -757,6 +887,8 @@ int file_dialog(char* title, char** fileList, char* dest, int fileListLength, in
     int doubleClickSelectedFileIndex = -2;
     int doubleClickTimer = FILE_DIALOG_DOUBLE_CLICK_DELAY;
 
+    file_dialog_pad_prime = true;
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
@@ -768,6 +900,19 @@ int file_dialog(char* title, char** fileList, char* dest, int fileListLength, in
         bool isScrolling = false;
 
         convertMouseWheelToArrowKey(&keyCode);
+
+        int padAction = file_dialog_pad_action();
+        if (padAction == FILE_DIALOG_PAD_CONFIRM) {
+            keyCode = 500; // DONE, which takes the highlighted line
+        } else if (padAction == FILE_DIALOG_PAD_CANCEL) {
+            keyCode = 501;
+        } else if (padAction == FILE_DIALOG_PAD_UP || padAction == FILE_DIALOG_PAD_DOWN) {
+            file_dialog_pad_step(padAction == FILE_DIALOG_PAD_UP ? -1 : 1,
+                fileListLength, &selectedFileIndex, &pageOffset);
+            PrntFlist(windowBuffer, fileList, pageOffset, fileListLength, selectedFileIndex, backgroundWidth);
+            doubleClickSelectedFileIndex = -2;
+            keyCode = -1; // the move IS this frame's input
+        }
 
         if (keyCode == 500) {
             if (fileListLength != 0) {
@@ -950,6 +1095,10 @@ int file_dialog(char* title, char** fileList, char* dest, int fileListLength, in
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    // The button that answered this dialog is very likely still down; tell the screen underneath
+    // (the character sheet runs its own edge detector) that its edges are stale.
+    gamepad_ui_bump_input_epoch();
 
     win_delete(win);
 
@@ -1176,6 +1325,8 @@ int save_file_dialog(char* title, char** fileList, char* dest, int fileListLengt
     int doubleClickSelectedFileIndex = -2;
     int doubleClickTimer = FILE_DIALOG_DOUBLE_CLICK_DELAY;
 
+    file_dialog_pad_prime = true;
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
@@ -1187,6 +1338,42 @@ int save_file_dialog(char* title, char** fileList, char* dest, int fileListLengt
         bool isScrolling = false;
 
         convertMouseWheelToArrowKey(&keyCode);
+
+        int padAction = file_dialog_pad_action();
+        if (padAction == FILE_DIALOG_PAD_CONFIRM) {
+            keyCode = KEY_RETURN; // DONE, saving under whatever is in the name field
+        } else if (padAction == FILE_DIALOG_PAD_CANCEL) {
+            keyCode = 501;
+        } else if (padAction == FILE_DIALOG_PAD_UP || padAction == FILE_DIALOG_PAD_DOWN) {
+            if (fileListLength != 0) {
+                file_dialog_pad_step(padAction == FILE_DIALOG_PAD_UP ? -1 : 1,
+                    fileListLength, &selectedFileIndex, &pageOffset);
+
+                // The highlighted name goes straight into the edit field, exactly as a single click
+                // does. On a pad there is no keyboard to type one with, so this IS the name entry;
+                // A then saves under it (overwriting that character, which is the point of picking
+                // an existing one).
+                buf_fill(fileNameBufferPtr, text_width(fileNameCopy), cursorHeight, backgroundWidth, 100);
+                strncpy(fileNameCopy, fileList[selectedFileIndex + pageOffset], 16);
+
+                int index;
+                for (index = 0; index < 12; index++) {
+                    if (fileNameCopy[index] == '.' || fileNameCopy[index] == '\0') {
+                        break;
+                    }
+                }
+
+                fileNameCopy[index] = '\0';
+                fileNameCopyLength = strlen(fileNameCopy);
+                fileNameCopy[fileNameCopyLength] = ' ';
+                fileNameCopy[fileNameCopyLength + 1] = '\0';
+
+                text_to_buf(fileNameBufferPtr, fileNameCopy, backgroundWidth, backgroundWidth, colorTable[992]);
+                PrntFlist(windowBuffer, fileList, pageOffset, fileListLength, selectedFileIndex, backgroundWidth);
+                doubleClickSelectedFileIndex = -2;
+            }
+            keyCode = -1; // the move IS this frame's input
+        }
 
         if (keyCode == 500) {
             rc = 0;
@@ -1435,6 +1622,9 @@ int save_file_dialog(char* title, char** fileList, char* dest, int fileListLengt
     }
 
     endTextInput();
+
+    // See file_dialog: the A that confirmed is still down when the character sheet resumes.
+    gamepad_ui_bump_input_epoch();
 
     if (rc == 0) {
         if (fileNameCopyLength != 0) {

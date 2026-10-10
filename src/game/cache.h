@@ -79,6 +79,7 @@ bool cache_init(Cache* cache, CacheSizeProc* sizeProc, CacheReadProc* readProc, 
 bool cache_exit(Cache* cache);
 int cache_query(Cache* cache, int key);
 bool cache_lock(Cache* cache, int key, void** data, CacheEntry** cacheEntryPtr);
+void cache_take_miss_stats(int* count, double* ms);
 bool cache_unlock(Cache* cache, CacheEntry* cacheEntry);
 int cache_discard(Cache* cache, int key);
 bool cache_flush(Cache* cache);

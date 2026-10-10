@@ -86,6 +86,7 @@ void gsound_speech_pause();
 void gsound_speech_unpause();
 int gsound_play_sfx_file_volume(const char* a1, int a2);
 Sound* gsound_load_sound(const char* name, Object* a2);
+void gsound_take_load_stats(int* count, double* ms);
 Sound* gsound_load_sound_volume(const char* a1, Object* a2, int a3);
 void gsound_delete_sfx(Sound* a1);
 int gsnd_anim_sound(Sound* sound, void* a2);

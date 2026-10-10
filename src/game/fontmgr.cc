@@ -3,10 +3,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "game/config.h"
+#include "game/gconfig.h"
 #include "int/memdbg.h"
 #include "plib/color/color.h"
 #include "plib/db/db.h"
 #include "plib/gnw/text.h"
+#include "platform_compat.h"
 
 namespace fallout {
 
@@ -31,6 +34,9 @@ typedef struct InterfaceFontDescriptor {
 } InterfaceFontDescriptor;
 
 static int FMLoadFont(int font);
+
+// Where the fonts actually came from, so a run can say it instead of being guessed at.
+static char fm_font_source[64] = "master.dat";
 static void swapUInt32(unsigned int* value);
 static void swapUInt16(unsigned short* value);
 
@@ -82,6 +88,11 @@ int FMInit()
 }
 
 // 0x43A7EC
+const char* FMFontSource()
+{
+    return fm_font_source;
+}
+
 void FMExit()
 {
     for (int font = 0; font < INTERFACE_FONT_MAX; font++) {
@@ -97,9 +108,30 @@ static int FMLoadFont(int font_index)
     InterfaceFontDescriptor* fontDescriptor = &(gFontCache[font_index]);
 
     char path[56];
-    snprintf(path, sizeof(path), "font%d.aaf", font_index);
 
-    DB_FILE* stream = db_fopen(path, "rb");
+    // A TRANSLATION'S FONTS BELONG TO THE TRANSLATION. A localisation ships its own font1-4.aaf --
+    // its alphabet is not the one in master.dat -- and unpacked into the patch folder those files
+    // answer to the bare name below, so they replaced the fonts for EVERY language: English came up
+    // in the Czech pack's type, which is a good deal wider than the original and overflowed the
+    // boxes it was measured for. The language folder is searched first, next to that language's
+    // .msg files, and the game's own fonts stay behind it untouched.
+    DB_FILE* stream = NULL;
+    char* language = NULL;
+    if (config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_LANGUAGE_KEY, &language)
+        && language != NULL
+        && compat_stricmp(language, ENGLISH) != 0) {
+        snprintf(path, sizeof(path), "text\\%s\\font%d.aaf", language, font_index);
+        stream = db_fopen(path, "rb");
+        if (stream != NULL) {
+            snprintf(fm_font_source, sizeof(fm_font_source), "text\\%s", language);
+        }
+    }
+
+    if (stream == NULL) {
+        snprintf(path, sizeof(path), "font%d.aaf", font_index);
+        stream = db_fopen(path, "rb");
+    }
+
     if (stream == NULL) {
         return -1;
     }

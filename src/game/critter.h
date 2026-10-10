@@ -68,6 +68,8 @@ int critter_adjust_poison(Object* obj, int amount);
 int critter_check_poison(Object* obj, void* data);
 int critter_get_rads(Object* critter);
 int critter_adjust_rads(Object* obj, int amount);
+bool critter_get_radaway_cancels();
+void critter_set_radaway_cancels(bool enabled);
 int critter_check_rads(Object* critter);
 int critter_process_rads(Object* obj, void* data);
 int critter_load_rads(DB_FILE* stream, void** data);

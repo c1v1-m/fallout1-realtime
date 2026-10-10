@@ -18,6 +18,8 @@ extern unsigned char light_GrayTable[256];
 extern unsigned char dark_GrayTable[256];
 
 int gdialog_init();
+bool gdialog_get_script_float();
+void gdialog_set_script_float(bool on);
 int gdialog_reset();
 int gdialog_exit();
 bool dialog_active();

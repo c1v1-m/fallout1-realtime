@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <SDL.h>
+
 #include "game/anim.h"
 #include "game/combat.h"
 #include "game/game_trace.h"
@@ -586,7 +588,7 @@ int gsound_init()
         return -1;
     }
 
-    add_bk_process(gsound_bkg_proc);
+    add_bk_process(gsound_bkg_proc, "sound");
     gsound_initialized = true;
 
     // Concurrent-SFX limiter strengths -- see gsound_sfx_limit. 0 (either one) restores vanilla
@@ -1528,7 +1530,30 @@ int gsound_play_sfx_file_volume(const char* a1, int a2)
 }
 
 // 0x448A0C
+static Sound* gsound_load_sound_impl(const char* name, Object* object);
+
+// Frame diagnostics ([ANIM/hitch] snd=): sound effects opened since the last take, and the time.
+static int gsound_load_count;
+static double gsound_load_ms;
+
+void gsound_take_load_stats(int* count, double* ms)
+{
+    *count = gsound_load_count;
+    *ms = gsound_load_ms;
+    gsound_load_count = 0;
+    gsound_load_ms = 0.0;
+}
+
 Sound* gsound_load_sound(const char* name, Object* object)
+{
+    Uint64 start = SDL_GetPerformanceCounter();
+    Sound* sound = gsound_load_sound_impl(name, object);
+    gsound_load_count++;
+    gsound_load_ms += (double)(SDL_GetPerformanceCounter() - start) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+    return sound;
+}
+
+static Sound* gsound_load_sound_impl(const char* name, Object* object)
 {
     if (!gsound_initialized) {
         return NULL;

@@ -7,6 +7,8 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 
+#include <SDL.h>
+
 #include "game/config.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
@@ -475,11 +477,45 @@ void tile_enable_refresh()
 }
 
 // 0x49DEA4
+// FRAME-PACING METER: how much drawing a frame did (main.cc reads and zeroes it every frame). Every
+// redraw of the world goes through these two, so their count, area and time are the whole bill.
+static int tile_stat_refreshes = 0;
+static long long tile_stat_pixels = 0;
+static double tile_stat_ms = 0.0;
+// Whole-display redraws (a camera move, a map change) among them -- each one repaints every pixel.
+static int tile_stat_full = 0;
+
+int tile_take_full_refreshes()
+{
+    int full = tile_stat_full;
+    tile_stat_full = 0;
+    return full;
+}
+
+void tile_take_refresh_stats(int* count, long long* pixels, double* ms)
+{
+    *count = tile_stat_refreshes;
+    *pixels = tile_stat_pixels;
+    *ms = tile_stat_ms;
+    tile_stat_refreshes = 0;
+    tile_stat_pixels = 0;
+    tile_stat_ms = 0.0;
+}
+
+static void tile_refresh_timed(Rect* rect, int elevation)
+{
+    Uint64 start = SDL_GetPerformanceCounter();
+    tile_refresh(rect, elevation);
+    tile_stat_ms += (double)(SDL_GetPerformanceCounter() - start) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+    tile_stat_refreshes++;
+    tile_stat_pixels += (long long)(rect->lrx - rect->ulx + 1) * (rect->lry - rect->uly + 1);
+}
+
 void tile_refresh_rect(Rect* rect, int elevation)
 {
     if (refresh_enabled) {
         if (elevation == map_elevation) {
-            tile_refresh(rect, elevation);
+            tile_refresh_timed(rect, elevation);
         }
     }
 }
@@ -488,7 +524,8 @@ void tile_refresh_rect(Rect* rect, int elevation)
 void tile_refresh_display()
 {
     if (refresh_enabled) {
-        tile_refresh(&buf_rect, map_elevation);
+        tile_stat_full++;
+        tile_refresh_timed(&buf_rect, map_elevation);
     }
 }
 

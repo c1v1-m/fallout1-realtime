@@ -59,13 +59,22 @@ Object* ai_best_weapon(Object* weapon1, Object* weapon2);
 void combat_ai_begin(int critters_count, Object** critters);
 void combat_ai_over();
 Object* combat_ai(Object* critter, Object* target);
+// Vanilla's flee decision and flee tile, for the realtime AI (combat_rt rt_flee_step) -- see
+// combatai.cc. Reason: 0 none, 1 FLEEING, 2 hurt_too_much, 3 below min_hp. Tile: -1 cornered,
+// -2 far enough (DISENGAGING set).
+int combatai_flee_reason(Object* critter);
+int combatai_flee_tile(Object* critter, int actionPoints);
+int combatai_max_dist(Object* critter);
 bool combatai_want_to_join(Object* critter);
 bool combatai_want_to_stop(Object* critter);
 int combatai_switch_team(Object* critter, int team);
 int combatai_msg(Object* critter, Attack* attack, int message_type, int delay);
+// Floats `text` over `critter` in its AI packet's font and colours -- the look of a combat taunt.
+int combatai_float_line(Object* critter, const char* text);
 Object* combat_ai_random_target(Attack* attack);
 void combatai_check_retaliation(Object* critter, Object* candidate);
 bool is_within_perception(Object* critter1, Object* critter2);
+bool is_within_perception_unsneaked(Object* critter1, Object* critter2);
 void combatai_refresh_messages();
 void combatai_notify_onlookers(Object* critter);
 void combatai_delete_critter(Object* critter);

@@ -9,6 +9,7 @@
 
 #include "game/art.h"
 #include "game/bmpdlog.h"
+#include "game/combat_rt.h" // rate of fire, printed on the stat and combat-skill cards
 #include "game/critter.h"
 #include "game/cycle.h"
 #include "game/game.h"
@@ -464,6 +465,112 @@ static EditorSortableEntry name_sort_list[DIALOG_PICKER_NUM_OPTIONS];
 
 // 0x56E580
 static char old_str1[48];
+
+// --- CARD FOOTER ------------------------------------------------------------
+//
+// Two optional lines DrawCard prints under the vanilla description. Set by DrawInfoWin just
+// before the call, consumed and cleared by DrawCard. See the note at the print site for why this
+// is a buffer and not a parameter.
+//
+// 40-odd characters is the practical width: the card text column is 348..613 at font 101, and
+// word_wrap is not applied to these, so an over-long line would run off the card art.
+#define CARD_FOOTER_LINES 2
+#define CARD_FOOTER_LEN 64
+static char card_footer[CARD_FOOTER_LINES][CARD_FOOTER_LEN];
+
+static void card_footer_clear()
+{
+    for (int i = 0; i < CARD_FOOTER_LINES; i++) {
+        card_footer[i][0] = '\0';
+    }
+}
+
+// --- RATE OF FIRE ON THE CARD -----------------------------------------------
+//
+// ⚠️ EVERYTHING HERE IS PHRASED AS A RATE, NEVER AS A DELAY. The cooldown itself is a duration, so
+// a "15% skill bonus" is 15% off the WAIT, which is +17.6% shots -- two different numbers for one
+// effect, and printing one while thinking of the other is how a readout starts lying. So the cards
+// say rate of fire throughout: bigger is always faster.
+//
+// The values come out of combat_rt, computed from obj_dude as it stands RIGHT NOW -- the editor
+// edits obj_dude in place, and DrawInfoWin is re-run after every point spent (see the calls in
+// StatButton / SkillButton), so the number on the card tracks the slider as you move it.
+
+static const char* card_attack_category(int attackType)
+{
+    switch (attackType) {
+    case ATTACK_TYPE_RANGED:
+        return "Ranged";
+    case ATTACK_TYPE_THROW:
+        return "Thrown";
+    default:
+        return "Melee";
+    }
+}
+
+// A multiplier ON THE COOLDOWN turned into the percentage change in RATE it represents.
+// mult 0.85 (15% less waiting) -> +18% shots.
+static int card_rate_pct(float coolMult)
+{
+    if (coolMult <= 0.0f) {
+        return 0;
+    }
+    float pct = (1.0f / coolMult - 1.0f) * 100.0f;
+    return (int)(pct + (pct >= 0.0f ? 0.5f : -0.5f));
+}
+
+// One of the six combat skills: what you actually attack at, and how much of it this skill bought.
+static void card_footer_for_skill(int skill)
+{
+    float seconds;
+    float statMult;
+    float skillMult;
+    if (!combat_rt_skill_attack_speed(obj_dude, skill, skill_level(obj_dude, skill),
+            &seconds, &statMult, &skillMult)) {
+        return;
+    }
+
+    // ⚠️ EVERY LINE HERE IS SHORT ENOUGH FOR ONE ROW ON THE NARROWEST CARD IT CAN APPEAR ON --
+    // 136 px for a skill (Energy Weapons), 141 px for a stat (Agility) -- measured with the
+    // engine's own rule, where a space is `wordSpacing` and every character adds `letterSpacing`.
+    // Wrapping is still honoured below, so a longer line is merely ugly rather than broken; this
+    // just keeps the footer to the two rows it is meant to be.
+    snprintf(card_footer[0], CARD_FOOTER_LEN, "Attack every %.2f s", seconds);
+
+    // Second line only when the skill term is actually doing something. At exactly 100 it is a
+    // no-op, and "+0%" on a line of its own reads as a bug rather than as a baseline.
+    int pct = card_rate_pct(skillMult);
+    if (pct != 0) {
+        snprintf(card_footer[1], CARD_FOOTER_LEN, "Skill bonus: %+d%% rate", pct);
+    }
+}
+
+// STR / PE / AGI: the bigger half of the same number. Printed as the multiplier plus the two
+// endpoints, because a bare "x1.99" says nothing about the seconds you will actually wait.
+static void card_footer_for_stat(int stat)
+{
+    float mult;
+    int attackType;
+    if (!combat_rt_stat_attack_speed(stat, stat_level(obj_dude, stat), &mult, &attackType)) {
+        return;
+    }
+
+    float base = combat_rt_attack_cooldown_base();
+    int pct = card_rate_pct(mult);
+
+    // At 5 the stat is the baseline the whole curve is measured from, and "+0% rate of fire" over
+    // "2.60 s -> 2.60 s" is two lines of nothing. Say the speed itself instead: the point of the
+    // card is still that THIS stat is the one driving that category.
+    if (pct == 0) {
+        snprintf(card_footer[0], CARD_FOOTER_LEN, "%s: every %.2f s",
+            card_attack_category(attackType), base * mult);
+        return;
+    }
+
+    snprintf(card_footer[0], CARD_FOOTER_LEN, "%s rate: %+d%%",
+        card_attack_category(attackType), pct);
+    snprintf(card_footer[1], CARD_FOOTER_LEN, "%.2f s -> %.2f s", base, base * mult);
+}
 
 // 0x56E5B0
 static char old_str2[48];
@@ -3775,12 +3882,20 @@ static void DrawInfoWin()
         return;
     }
 
+    // Belt and braces: DrawCard clears the footer as it prints it, but it has two early returns
+    // above that point (missing art, word_wrap overflow) and a stale footer would then be printed
+    // on the NEXT card, where it would be wrong rather than merely missing.
+    card_footer_clear();
+
     buf_to_buf(bckgnd + (640 * 267) + 345, 277, 170, 640, win_buf + (267 * 640) + 345, 640);
 
     if (info_line >= 0 && info_line < 7) {
         description = stat_description(info_line);
         title = stat_name(info_line);
         graphicId = stat_picture(info_line);
+        // info_line 0..6 IS the STAT_* index (STR, PE, EN, CH, IN, AG, LK, in that order); the
+        // footer helper ignores the four that own no attack category.
+        card_footer_for_stat(info_line);
         DrawCard(graphicId, title, NULL, description);
     } else if (info_line >= 7 && info_line < 10) {
         if (glblmode) {
@@ -3947,6 +4062,7 @@ static void DrawInfoWin()
         graphicId = skill_pic(skill);
         title = skill_name(skill);
         description = skill_description(skill);
+        card_footer_for_skill(skill); // a no-op for the twelve non-combat skills
         DrawCard(graphicId, title, formatted, description);
     } else if (info_line >= 79 && info_line < 82) {
         switch (info_line) {
@@ -5935,6 +6051,55 @@ static int DrawCard(int graphicId, const char* name, const char* attributes, cha
         description[ending] = c;
         y += descriptionFontLineHeight;
     }
+
+    // FOOTER: what this stat or skill does in THIS build, printed under the vanilla description
+    // with a blank line between them.
+    //
+    // ⚠️ IT IS NOT APPENDED TO `description`, AND THAT IS THE WHOLE REASON IT IS A SEPARATE
+    // MECHANISM. word_wrap has no notion of a hard break -- a '\n' is just another space to it and
+    // then gets drawn as a glyph -- so text glued onto the description would run into the middle of
+    // the last vanilla sentence and read as part of it. Printed here it gets its own paragraph.
+    //
+    // Passed through a file-scope buffer rather than a fifth parameter because DrawCard has ~30
+    // call sites, all of which would have to grow a NULL for a line only three of them want.
+    // Cleared as it is consumed, so a card that sets nothing can never inherit the last one's.
+    // ⚠️ WRAPPED AT THE CARD'S OWN WIDTH, `v9 + 136` -- THE SAME NUMBER THE DESCRIPTION USES.
+    // The text column is nothing like the 348..613 the card box suggests: DrawCard blits the
+    // picture at x 484, and v9 is how far into that picture its first dark pixel sits, so the
+    // usable width comes out between 136 px (Energy Weapons) and 165 px (Strength) depending on
+    // which art is up. A footer written to a hand-measured 265 px ran straight into the picture --
+    // which is exactly what it did. Asking word_wrap with the card's own width cannot be wrong
+    // for any art, including one we have never looked at.
+    int footerY = y + descriptionFontLineHeight; // one blank line after the description
+    for (int i = 0; i < CARD_FOOTER_LINES; i++) {
+        if (card_footer[i][0] == '\0') {
+            continue;
+        }
+
+        short footerBreaks[WORD_WRAP_MAX_COUNT];
+        short footerBreakCount;
+        if (word_wrap(card_footer[i], v9 + 136, footerBreaks, &footerBreakCount) != 0) {
+            continue;
+        }
+
+        for (short j = 0; j < footerBreakCount - 1; j++) {
+            // The card art ends at y 436; stop rather than paint over the frame. A long enough
+            // vanilla description therefore silently wins, which is the right precedence -- ours
+            // is the addition.
+            if (footerY + descriptionFontLineHeight > 436) {
+                break;
+            }
+
+            short beginning = footerBreaks[j];
+            short ending = footerBreaks[j + 1];
+            char c = card_footer[i][ending];
+            card_footer[i][ending] = '\0';
+            text_to_buf(win_buf + 640 * footerY + 348, card_footer[i] + beginning, 640, 640, colorTable[0]);
+            card_footer[i][ending] = c;
+            footerY += descriptionFontLineHeight;
+        }
+    }
+    card_footer_clear();
 
     if (graphicId != old_fid1 || strcmp(name, old_str1) != 0) {
         if (frstc_draw1) {

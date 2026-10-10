@@ -1364,6 +1364,24 @@ int obj_move_to_tile(Object* obj, int tile, int elevation, Rect* rect)
         return -1;
     }
 
+    // DIAG (the melee "teleport", 2026-09-24): EVERY tile change of the DUDE while realtime combat
+    // is running -- how far it went, what animation was playing, and where inside the tile the body
+    // was. A swing must never move him (rt_swing_keep_*), so a line here whose anim is an attack, or
+    // whose dist is 2+, IS the jump being reported, and the backtrace names whoever asked for it.
+    //
+    // ⚠️ THE ORDINARY CASE IS LOGGED TOO -- dist=1 while walking is most of this log. A measure that
+    // prints only when it already believes something is wrong cannot tell a fixed bug from a blind
+    // spot; three diagnostics in a row missed the very case being reported that way.
+    // Strip with `move-diag` once this is closed.
+    if (obj == obj_dude && tile != obj->tile && trace_enabled() && combat_rt_enabled()) {
+        int moved = tile_dist(obj->tile, tile);
+        trace_event(TRACE_FLOW, "dude-tile", "from=%d to=%d dist=%d anim=%d frame=%d x=%d y=%d",
+            obj->tile, tile, moved, FID_ANIM_TYPE(obj->fid), obj->frame, obj->x, obj->y);
+        if (moved >= 2) {
+            trace_backtrace("dude-tile-jump");
+        }
+    }
+
     ObjectListNode* node;
     ObjectListNode* prevNode;
     if (obj_node_ptr(obj, &node, &prevNode) == -1) {
@@ -2017,6 +2035,11 @@ int obj_erase_object(Object* object, Rect* rect)
     // freed pointer on the next frame. Must run BEFORE the free, like the combat_rt hook above.
     anim_notify_object_freed(object);
 
+    // ...and so does the interaction prompt: it caches ip_target / ip_pending as raw
+    // pointers and dereferences them next frame. obj_load_dude erases the OLD dude object
+    // on its way in, which is how a Continue lands here in the middle of a load.
+    interact_prompt_notify_object_freed(object);
+
 
     gmouse_remove_item_outline(object);
 
@@ -2135,6 +2158,9 @@ void obj_remove_all()
     // mid-combat map exit). Tell it to abandon any in-flight attack + drop those pointers
     // BEFORE they dangle, so a stale commit can't crash on freed memory.
     combat_rt_notify_objects_freed();
+
+    // The smoothing tables (glides, held strides, step cadence) hold raw pointers too.
+    anim_smooth_reset();
 
     // Drop the contextual interaction prompt's cached target/overlay before the objects it points
     // at are freed (its per-frame rescan would otherwise dereference a freed object).
@@ -2330,6 +2356,14 @@ void obj_bound(Object* obj, Rect* rect)
 
             tileScreenX += obj->x;
             tileScreenY += obj->y;
+
+            // Where it is DRAWN (Smooth movement, anim.cc) -- a dirty rect that missed the glide
+            // would leave the sprite smeared across the floor.
+            int glideX;
+            int glideY;
+            anim_smooth_offset(obj, &glideX, &glideY);
+            tileScreenX += glideX;
+            tileScreenY += glideY;
 
             rect->ulx = tileScreenX - width / 2;
             rect->uly = tileScreenY - height + 1;
@@ -2763,6 +2797,13 @@ int obj_intersects_with(Object* object, int x, int y)
 
                 tileScreenX += object->x;
                 tileScreenY += object->y;
+
+                // The pointer finds a gliding body where it is drawn.
+                int glideX;
+                int glideY;
+                anim_smooth_offset(object, &glideX, &glideY);
+                tileScreenX += glideX;
+                tileScreenY += glideY;
 
                 minX = tileScreenX - width / 2;
                 maxX = minX + width - 1;
@@ -4503,6 +4544,13 @@ static void obj_render_outline(Object* object, Rect* rect)
         x += object->x;
         y += object->y;
 
+        // The outline follows the glide, like the body it outlines (obj_render_object).
+        int glideX;
+        int glideY;
+        anim_smooth_offset(object, &glideX, &glideY);
+        x += glideX;
+        y += glideY;
+
         objectRect.ulx = x - frameWidth / 2;
         objectRect.uly = y - (frameHeight - 1);
         objectRect.lrx = objectRect.ulx + frameWidth - 1;
@@ -4742,6 +4790,14 @@ static void obj_render_object(Object* object, Rect* rect, int light)
 
         objectScreenX += object->x;
         objectScreenY += object->y;
+
+        // Smooth movement: drawn where its glide has got to (anim.cc). obj_bound and the hit test
+        // add the very same offset, so the dirty rects always cover what is on screen.
+        int glideX;
+        int glideY;
+        anim_smooth_offset(object, &glideX, &glideY);
+        objectScreenX += glideX;
+        objectScreenY += glideY;
 
         objectRect.ulx = objectScreenX - frameWidth / 2;
         objectRect.uly = objectScreenY - (frameHeight - 1);

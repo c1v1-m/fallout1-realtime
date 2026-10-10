@@ -7,6 +7,7 @@
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/combat.h"
+#include "game/game_trace.h"
 #include "game/config.h"
 #include "game/critter.h"
 #include "game/display.h"
@@ -457,6 +458,87 @@ static void ai_run_away(Object* critter)
     } else {
         combatData->maneuver |= CRITTER_MANEUVER_DISENGAGING;
     }
+}
+
+// REALTIME (combat_rt, rt_flee_step): vanilla's flee, split out of combat_ai and ai_run_away so the
+// realtime AI makes the SAME decisions without running a turn -- ai_run_away ends in
+// combat_turn_run(), which pumps the game loop and must never be entered from combat_rt_update.
+
+// Why combat_ai would run this critter away at the start of its turn (its very first test, before
+// drugs or attacks): 0 = it would not, 1 = already FLEEING (a script's critter_set_flee_state, or an
+// earlier run), 2 = hurt the way its AI packet cannot stand (hurt_too_much: crippled, blinded...),
+// 3 = below its packet's min_hp.
+int combatai_flee_reason(Object* critter)
+{
+    AiPacket* ai = ai_cap(critter);
+    CritterCombatData* combatData = &(critter->data.critter.combat);
+
+    if ((combatData->maneuver & CRITTER_MANUEVER_FLEEING) != 0) {
+        return 1;
+    }
+
+    if ((combatData->results & ai->hurt_too_much) != 0) {
+        return 2;
+    }
+
+    if (stat_level(critter, STAT_CURRENT_HIT_POINTS) < ai->min_hp) {
+        return 3;
+    }
+
+    return 0;
+}
+
+// ai_run_away's choice without the run: the tile to flee to with `actionPoints` to spend -- straight
+// away from the dude first, then 60 degrees either side, from the full distance down -- or -1 when
+// there is none (cornered), or -2 when it is already max_dist from the dude, where vanilla stops
+// running and leaves the fight. Sets FLEEING / DISENGAGING exactly as ai_run_away does.
+//
+// The candidates are tested with VANILLA'S 2000-node search (make_path_capped): ai_run_away asked
+// with that budget, and asking with this build's 12000 would turn every walled-off candidate into
+// a full-budget failure -- up to thirty of them in one choice.
+int combatai_flee_tile(Object* critter, int actionPoints)
+{
+    CritterCombatData* combatData = &(critter->data.critter.combat);
+    AiPacket* ai = ai_cap(critter);
+
+    if (obj_dist(critter, obj_dude) >= ai->max_dist) {
+        combatData->maneuver |= CRITTER_MANEUVER_DISENGAGING;
+        return -2;
+    }
+
+    combatData->maneuver |= CRITTER_MANUEVER_FLEEING;
+
+    // ⚠️ NEVER OUT ONTO THE BLACK (2026-10-06, "utíkal a utíkal přes konec mapy černou část"): a
+    // candidate on the map's background (map_tile_is_background -- empty floor or the dark filler)
+    // is no refuge. Vanilla's own choice had no such test and did not need one -- turn-based combat
+    // ended long before a runner could be followed that far -- but a realtime player can chase it,
+    // and in trace_2026-10-06_210502 a raider at 3 HP ran on across the dark filler for 25 s. With the
+    // edge refused, a runner backed up to the edge of the map is CORNERED (-1), as against a wall.
+    int rotation = tile_dir(obj_dude->tile, critter->tile);
+    int candidates[3];
+    for (int ap = actionPoints; ap > 0; ap--) {
+        candidates[0] = tile_num_in_direction(critter->tile, rotation, ap);
+        candidates[1] = tile_num_in_direction(critter->tile, (rotation + 1) % ROTATION_COUNT, ap);
+        candidates[2] = tile_num_in_direction(critter->tile, (rotation + 5) % ROTATION_COUNT, ap);
+
+        for (int index = 0; index < 3; index++) {
+            int destination = candidates[index];
+            if (map_tile_is_background(destination, critter->elevation)) {
+                continue;
+            }
+            if (make_path_capped(critter, critter->tile, destination, NULL, 1, 2000) > 0) {
+                return destination;
+            }
+        }
+    }
+
+    return -1;
+}
+
+// The AI packet's max_dist -- how far from the dude a fleeing critter runs before it stops (trace).
+int combatai_max_dist(Object* critter)
+{
+    return ai_cap(critter)->max_dist;
 }
 
 // Compare objects by distance to origin.
@@ -1467,6 +1549,12 @@ int combatai_msg(Object* critter, Attack* attack, int type, int delay)
     debug_printf("%s said message %d\n", object_name(critter), messageListItem.num);
     strcpy(string, messageListItem.text);
 
+    // The taunts ("Intruders!", "Kill the intruder!") were never traced, so "they don't say
+    // intruder any more, they just start shooting" (2026-10-09) could not be checked. Chosen here;
+    // shown or dropped in ai_print_msg.
+    trace_event(TRACE_COMBAT, "taunt", "pid=%d id=%d type=%d msg=%d text=%s",
+        critter->pid, critter->id, type, messageListItem.num, messageListItem.text);
+
     // TODO: Get rid of casts.
     return register_object_call(critter, (void*)type, (AnimationCallback*)ai_print_msg, delay);
 }
@@ -1479,6 +1567,9 @@ static int ai_print_msg(Object* critter, int type)
     Rect rect;
 
     if (text_object_count() > 0) {
+        // Vanilla shows one floating line at a time: a taunt is DROPPED while anything else floats.
+        trace_event(TRACE_COMBAT, "taunt-skip", "pid=%d id=%d why=text-on-screen count=%d",
+            critter->pid, critter->id, text_object_count());
         return 0;
     }
 
@@ -1498,6 +1589,27 @@ static int ai_print_msg(Object* critter, int type)
         tile_refresh_rect(&rect, critter->elevation);
     }
 
+    return 0;
+}
+
+// CE: a script's line floated over the speaker in the same font and colours as that critter's combat
+// taunts (its AI packet), for gDialogSayMessage's "message with no conversation open" case.
+//
+// ⚠️ NOT SUBJECT TO THE ONE-AT-A-TIME RULE THAT DROPS TAUNTS (ai_print_msg). A taunt is decoration and
+// vanilla throws it away while anything else floats; this line is the script speaking -- it would
+// otherwise have been a box you had to click away -- so it is always shown.
+int combatai_float_line(Object* critter, const char* text)
+{
+    if (critter == NULL || text == NULL || text[0] == '\0') {
+        return -1;
+    }
+
+    AiPacket* ai = ai_cap(critter);
+    Rect rect;
+    if (text_object_create(critter, (char*)text, ai->font, ai->color, ai->outline_color, &rect) != 0) {
+        return -1;
+    }
+    tile_refresh_rect(&rect, critter->elevation);
     return 0;
 }
 
@@ -1590,7 +1702,22 @@ void combatai_check_retaliation(Object* critter, Object* candidate)
 }
 
 // 0x4262A0
+static bool is_within_perception_impl(Object* critter1, Object* critter2, bool honorSneak);
+
 bool is_within_perception(Object* critter1, Object* critter2)
+{
+    return is_within_perception_impl(critter1, critter2, true);
+}
+
+// CE: the same test with the player's Sneak left out -- for a critter that is ALREADY fighting him.
+// See rt_wants_to_stop (combat_rt.cc): sneaking hides you from those who have not found you, it
+// does not make you vanish in front of the one shooting at you.
+bool is_within_perception_unsneaked(Object* critter1, Object* critter2)
+{
+    return is_within_perception_impl(critter1, critter2, false);
+}
+
+static bool is_within_perception_impl(Object* critter1, Object* critter2, bool honorSneak)
 {
     int distance;
     int perception;
@@ -1604,7 +1731,7 @@ bool is_within_perception(Object* critter1, Object* critter2)
             max_distance /= 2;
         }
 
-        if (critter2 == obj_dude) {
+        if (honorSneak && critter2 == obj_dude) {
             if (is_pc_sneak_working()) {
                 max_distance /= 4;
             }
@@ -1620,7 +1747,7 @@ bool is_within_perception(Object* critter1, Object* critter2)
             max_distance = perception;
         }
 
-        if (critter2 == obj_dude) {
+        if (honorSneak && critter2 == obj_dude) {
             if (is_pc_sneak_working()) {
                 max_distance /= 4;
             }

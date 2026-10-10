@@ -12,6 +12,7 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "game/amutex.h"
 #include "game/anim.h"
@@ -20,7 +21,9 @@
 #include "game/credits.h"
 #include "game/cycle.h"
 #include "game/endgame.h"
+#include "game/cache.h"
 #include "game/combat.h"
+#include "game/fontmgr.h"
 #include "game/game.h"
 #include "game/game_trace.h"
 #include "game/gamepad_ui.h"
@@ -28,6 +31,7 @@
 #include "game/gmouse.h"
 #include "game/gmovie.h"
 #include "game/gsound.h"
+#include "game/message.h"
 #include "game/loadsave.h"
 #include "game/mainmenu.h"
 #include "game/map.h"
@@ -65,6 +69,20 @@ static int main_load_new(char* fname);
 static int main_loadgame_new();
 static void main_unload_new();
 static void main_game_loop();
+static void main_frame_meter();
+
+// FRAME-PACING METER, per section of the main loop (ms, this frame). get_input also runs process_bk:
+// the animation stepper, the glides, the scripts' background procs, the sound pump.
+static double main_ms_input = 0.0;
+static double main_ms_rt = 0.0;
+static double main_ms_ui = 0.0;
+static double main_ms_state = 0.0;
+static double main_ms_present = 0.0;
+
+static double main_ms_since(Uint64 start)
+{
+    return (double)(SDL_GetPerformanceCounter() - start) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+}
 static bool main_selfrun_init();
 static void main_selfrun_exit();
 static void main_selfrun_record();
@@ -247,6 +265,31 @@ int gnw_main(int argc, char** argv)
             case MAIN_MENU_SCREENSAVER:
                 main_selfrun_play();
                 break;
+            case MAIN_MENU_OPTIONS:
+                // ⚠️ PREFERENCES, NOT THE IN-GAME OPTION MENU. do_options() is the ESC menu, and
+                // half of it (Save Game, Load Game, Exit to the main menu) means nothing with no
+                // session loaded. The settings themselves are the part that does -- sound, combat
+                // speed, the lot, and our own MODS page hanging off it -- so this goes straight to
+                // the preferences screen. It runs its own loop and returns here, leaving the menu
+                // standing, which is why nothing else is torn down around it.
+                //
+                // ⚠️ BUT THE MENU HAS TO BE HIDDEN, and that was the whole of "options nic
+                // neukazují". main_window is created WINDOW_MOVE_ON_TOP (mainmenu.cc), so it is
+                // moved above anything opened after it -- the preferences window came up
+                // UNDERNEATH it, running its input loop invisibly while the screen did not change.
+                // The loop's next pass calls main_menu_show() again, which is exactly what CREDITS
+                // already relies on.
+                //
+                // ⚠️ AND HIDDEN WITHOUT THE FADE, which was the SECOND half of "nothing shows".
+                // main_menu_hide(true) fades the palette to BLACK and leaves it there (mainmenu.cc)
+                // -- CREDITS gets away with it because it fades back in itself. Preferences does
+                // not: it drew its window perfectly into a black palette, so the screen stayed
+                // dark. `false` hides the window and leaves the palette alone.
+                main_menu_hide(false);
+                mouse_show(); // this is a pointer screen; the menu loop had just hidden the cursor
+                do_preferences();
+                mouse_hide();
+                break;
             case MAIN_MENU_CREDITS:
                 main_menu_hide(true);
                 credits("credits.txt", -1, false);
@@ -290,6 +333,12 @@ static bool main_init_system(int argc, char** argv)
     // is loaded. combat_rt provides the heartbeat snapshot (realtime state + health checks).
     trace_init();
     trace_set_snapshot_fn(combat_rt_trace_snapshot);
+
+    // Say, once per run, which language every .msg was read from and where the interface fonts
+    // came from. Both are latched before the recorder exists, and both have already produced a
+    // report -- Czech text under an English interface, English in a font the translation shipped --
+    // that could only be answered by reading files off disk afterwards.
+    trace_event(TRACE_FLOW, "lang", "messages=%s fonts=%s", message_language(), FMFontSource());
 
     // NOTE: Uninline.
     main_selfrun_init();
@@ -404,7 +453,9 @@ static void main_game_loop()
             rtDelta = 0.25f;
         }
 
+        Uint64 sectionStart = SDL_GetPerformanceCounter();
         int keyCode = get_input();
+        main_ms_input = main_ms_since(sectionStart);
 
         // Debug: F11 toggles a red ring at 15 hex tiles around the dude (the gunshot-
         // hearing distance, so you can see how far that reaches in-world).
@@ -422,7 +473,9 @@ static void main_game_loop()
             game_handle_input(keyCode, false);
         }
 
+        sectionStart = SDL_GetPerformanceCounter();
         combat_rt_update(rtDelta);
+        main_ms_rt = main_ms_since(sectionStart);
 
         // While the debug ring is up, force a full refresh when the dude changes tile
         // so the ring follows cleanly instead of ghosting (partial dirty-rect refreshes
@@ -441,11 +494,15 @@ static void main_game_loop()
         // Gamepad overlays that touch GNW windows (the LB skill wheel) run here, at a
         // safe frame-tick point outside the input/mouse hook, to avoid re-entrant
         // windowing during win_check_all_buttons.
+        sectionStart = SDL_GetPerformanceCounter();
         gamepad_ui_tick();
+        main_ms_ui = main_ms_since(sectionStart);
 
+        sectionStart = SDL_GetPerformanceCounter();
         scripts_check_state();
 
         map_check_state();
+        main_ms_state = main_ms_since(sectionStart);
 
         // Autosave on entering a new location. Done here -- a safe point with the map fully
         // settled, outside the map-load machinery (saving re-enters map saving, so doing it
@@ -529,14 +586,168 @@ static void main_game_loop()
             game_user_wants_to_quit = 2;
         }
 
+        sectionStart = SDL_GetPerformanceCounter();
         renderPresent();
+        main_ms_present = main_ms_since(sectionStart);
         sharedFpsLimiter.throttle();
+
+        main_frame_meter();
     }
 
     scr_disable();
 
     if (cursorWasHidden) {
         mouse_hide();
+    }
+}
+
+// FRAME-PACING METER (2026-10-08, "potřebuji aby to bylo plynulé"). What the eye calls choppy, as
+// numbers, measured at the one point every main-loop frame passes (just after its present):
+//
+//   [ANIM/hitch]  one frame that took far too long, with the path searches it ran -- a failed search
+//                 walks its whole node budget, and that stalls EVERY animation on screen at once.
+//   [ANIM/pace]   every 30 s: frame rate, average and worst frame, how many were late, whether the
+//                 display is pacing us (VSync), and what the smoothing did -- glides started and
+//                 abandoned, strides held between chase legs and stood after all, legs that waited
+//                 for their beat. Zero glides with Smooth movement on means it is not running.
+//
+// A frame over 250 ms is not a hitch but a pause -- a modal screen, a map load -- and is skipped.
+static void main_frame_meter()
+{
+    static Uint64 last = 0;
+    static Uint64 windowStart = 0;
+    static int frames = 0;
+    static double sumMs = 0.0;
+    static double worstMs = 0.0;
+    static int late = 0;
+    static int hitches = 0;
+    static AnimSmoothStats window;
+
+    // WHERE THE LATE FRAMES GO (2026-10-09). A 33 ms frame on a 60 Hz panel is a doubled frame -- a
+    // visible stutter -- but it is under the 50 ms hitch bar, so it was counted (`late=`) and never
+    // explained: the cathedral after the escape ran 15-25 % of them with not one hitch line
+    // (trace_2026-10-09_120546 s=872-934). Summed per section over the window's late frames and
+    // over ALL its frames, so the pace line can say which section grows when a frame runs late.
+    // other = the frame minus every timed section (game_handle_input and the loop's own glue).
+    static double lateSec[7];
+    static double allSec[7];
+
+    // Taken every frame even with the trace off, so the counters never run on unbounded.
+    AnimSmoothStats frame;
+    anim_smooth_take_stats(&frame);
+    int drawCount;
+    long long drawPixels;
+    double drawMs;
+    tile_take_refresh_stats(&drawCount, &drawPixels, &drawMs);
+    int drawFull = tile_take_full_refreshes();
+    char bkTimes[192];
+    bk_take_times(bkTimes, sizeof(bkTimes));
+    int artLoads;
+    double artMs;
+    cache_take_miss_stats(&artLoads, &artMs);
+    int sndLoads;
+    double sndMs;
+    gsound_take_load_stats(&sndLoads, &sndMs);
+
+    if (!trace_enabled()) {
+        return;
+    }
+
+    Uint64 now = SDL_GetPerformanceCounter();
+    double freq = (double)SDL_GetPerformanceFrequency();
+
+    if (last == 0) {
+        last = now;
+        windowStart = now;
+        memset(&window, 0, sizeof(window));
+        return;
+    }
+
+    double ms = (double)(now - last) * 1000.0 / freq;
+    last = now;
+
+    int interval;
+    int refresh;
+    bool paced;
+    svga_vsync_state(&interval, &refresh, &paced);
+    double period = paced && refresh > 0 ? interval * 1000.0 / refresh : 1000.0 / 60.0;
+
+    if (ms < 250.0) {
+        frames++;
+        sumMs += ms;
+        if (ms > worstMs) {
+            worstMs = ms;
+        }
+        double sec[7] = { main_ms_input, main_ms_rt, main_ms_ui, main_ms_state, main_ms_present, drawMs, 0.0 };
+        sec[6] = ms - (sec[0] + sec[1] + sec[2] + sec[3] + sec[4]);
+        for (int k = 0; k < 7; k++) {
+            allSec[k] += sec[k];
+        }
+        if (ms > period * 1.5) {
+            late++;
+            for (int k = 0; k < 7; k++) {
+                lateSec[k] += sec[k];
+            }
+        }
+        if (ms > 50.0 && ms > period * 3.0) {
+            hitches++;
+            // WHERE THE FRAME WENT: input = get_input incl. process_bk (animations, glides, script bk),
+            // rt = combat_rt_update, ui = gamepad_ui_tick, st = scripts + map state, pres = the present;
+            // draw = every world redraw inside them (count / ms / kilopixels); bk = the input
+            // section split by background process (pump = the OS event queue, anim = every
+            // animation step incl. starting attacks, sound, scripts = script timers, floaters =
+            // the text over heads, cursor/mouse, palette = colour cycling, other = unlabelled);
+            // full = how many of the draws repainted the whole display (camera moves);
+            // art / snd = what was read from disk in that frame (cache misses, sound opens).
+            trace_event(TRACE_ANIM, "hitch", "ms=%.1f in=%.1f rt=%.1f ui=%.1f st=%.1f pres=%.1f draw=%d/%.1fms/%lldk full=%d paths=%d pathMs=%.1f glides=%d bk=[%s] art=%d/%.1fms snd=%d/%.1fms",
+                ms, main_ms_input, main_ms_rt, main_ms_ui, main_ms_state, main_ms_present,
+                drawCount, drawMs, drawPixels / 1000, drawFull, frame.pathSearches, frame.pathMs, frame.liveGlides, bkTimes,
+                artLoads, artMs, sndLoads, sndMs);
+        }
+    }
+
+    window.pathSearches += frame.pathSearches;
+    window.pathMs += frame.pathMs;
+    if (frame.pathMaxMs > window.pathMaxMs) {
+        window.pathMaxMs = frame.pathMaxMs;
+    }
+    window.glides += frame.glides;
+    window.glideSnaps += frame.glideSnaps;
+    if (frame.liveGlides > window.liveGlides) {
+        window.liveGlides = frame.liveGlides;
+    }
+    window.strideHolds += frame.strideHolds;
+    window.strideStands += frame.strideStands;
+    window.cadenceHolds += frame.cadenceHolds;
+
+    if ((double)(now - windowStart) / freq >= 30.0) {
+        double seconds = (double)(now - windowStart) / freq;
+        trace_event(TRACE_ANIM, "pace",
+            "fps=%.1f avg=%.1f worst=%.1f late=%d hitch=%d vsync=%d@%dHz%s smooth=%d paths=%d pathMs=%.0f pathMax=%.1f glides=%d snaps=%d peak=%d strideHold=%d strideStand=%d beatWait=%d",
+            frames / seconds, frames > 0 ? sumMs / frames : 0.0, worstMs, late, hitches,
+            interval, refresh, interval > 0 ? (paced ? "" : " IGNORED") : "", anim_get_smooth_motion() ? 1 : 0,
+            window.pathSearches, window.pathMs, window.pathMaxMs, window.glides, window.glideSnaps,
+            window.liveGlides, window.strideHolds, window.strideStands, window.cadenceHolds);
+
+        // Average section times of a LATE frame against an average frame (ms; draw is inside the
+        // other sections, not on top of them). Only when there were late frames to explain.
+        if (late > 0 && frames > 0) {
+            trace_event(TRACE_ANIM, "pace-late",
+                "late=%d of %d | late avg: in=%.1f rt=%.1f ui=%.1f st=%.1f pres=%.1f draw=%.1f other=%.1f | all avg: in=%.1f rt=%.1f ui=%.1f st=%.1f pres=%.1f draw=%.1f other=%.1f",
+                late, frames,
+                lateSec[0] / late, lateSec[1] / late, lateSec[2] / late, lateSec[3] / late, lateSec[4] / late, lateSec[5] / late, lateSec[6] / late,
+                allSec[0] / frames, allSec[1] / frames, allSec[2] / frames, allSec[3] / frames, allSec[4] / frames, allSec[5] / frames, allSec[6] / frames);
+        }
+        memset(lateSec, 0, sizeof(lateSec));
+        memset(allSec, 0, sizeof(allSec));
+
+        windowStart = now;
+        frames = 0;
+        sumMs = 0.0;
+        worstMs = 0.0;
+        late = 0;
+        hitches = 0;
+        memset(&window, 0, sizeof(window));
     }
 }
 

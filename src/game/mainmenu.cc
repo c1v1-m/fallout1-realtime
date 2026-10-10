@@ -32,6 +32,7 @@ typedef enum MainMenuButton {
     MAIN_MENU_BUTTON_CONTINUE,
     MAIN_MENU_BUTTON_NEW_GAME,
     MAIN_MENU_BUTTON_LOAD_GAME,
+    MAIN_MENU_BUTTON_OPTIONS,
     MAIN_MENU_BUTTON_CREDITS,
     MAIN_MENU_BUTTON_EXIT,
     MAIN_MENU_BUTTON_COUNT,
@@ -75,6 +76,7 @@ static int button_values[MAIN_MENU_BUTTON_COUNT] = {
     KEY_LOWERCASE_O, // c is taken by CREDITS, so cOntinue
     KEY_LOWERCASE_N,
     KEY_LOWERCASE_L,
+    KEY_LOWERCASE_P, // o is cOntinue and c is CREDITS, so oPtions
     KEY_LOWERCASE_C,
     KEY_LOWERCASE_E,
 };
@@ -85,6 +87,7 @@ static int return_values[MAIN_MENU_BUTTON_COUNT] = {
     MAIN_MENU_CONTINUE,
     MAIN_MENU_NEW_GAME,
     MAIN_MENU_LOAD_GAME,
+    MAIN_MENU_OPTIONS,
     MAIN_MENU_CREDITS,
     MAIN_MENU_EXIT,
 };
@@ -355,10 +358,21 @@ int main_menu_loop()
     // keyboard/mouse keeps the vanilla (no-highlight) look. The world cursor is
     // hidden in-game, so this is how the pad drives the main menu without a cursor.
     SDL_GameController* pad = gamepad_ui_get_controller();
-    int selection = MAIN_MENU_BUTTON_NEW_GAME;
+
+    // ⚠️ THE HIGHLIGHT SURVIVES A SUB-SCREEN. This used to be a local reset to NEW GAME on every
+    // entry, and main_menu_loop is re-entered every time something it launched comes back -- so
+    // stepping out of OPTIONS put the highlight on NEW GAME, one press away from throwing the
+    // session away: "vyskočím z options, kliknu A, skočí mi to na new game". Coming back to the row
+    // you left is also simply what a menu does.
+    static int selection = MAIN_MENU_BUTTON_NEW_GAME;
+    if (selection < 0 || selection >= MAIN_MENU_BUTTON_COUNT) {
+        selection = MAIN_MENU_BUTTON_NEW_GAME;
+    }
+
     bool padPrevUp = false;
     bool padPrevDown = false;
     bool padPrevA = false;
+    bool padEdgesSeeded = false;
     // Cursor auto-hide (controller only): start hidden, reveal on movement. Also tell
     // the shared gamepad hook to stop left-stick-snapping the cursor to buttons while
     // in_main_menu -- otherwise it fights the highlight navigation (jumpy cursor).
@@ -411,6 +425,18 @@ int main_menu_loop()
             bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
                 || SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) > 16000;
             bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
+
+            // ⚠️ SEED THE EDGES FROM THE LIVE STATE, ONCE. padPrev* start false, so any button that
+            // is still physically DOWN when this loop starts rose-edges on its first frame -- and
+            // the A that just closed the preferences screen is exactly such a button. It confirmed
+            // whatever the highlight sat on, instantly: "A stistknutí je new game". Same fix, same
+            // reason, as the inventory A router's live-state baseline.
+            if (!padEdgesSeeded) {
+                padEdgesSeeded = true;
+                padPrevUp = upNow;
+                padPrevDown = downNow;
+                padPrevA = aNow;
+            }
 
             if (upNow && !padPrevUp) {
                 selection = (selection + MAIN_MENU_BUTTON_COUNT - 1) % MAIN_MENU_BUTTON_COUNT;
@@ -546,6 +572,12 @@ static void main_menu_play_sound(const char* fileName)
 #define MENU_PLATE_BOTTOM_Y 238
 #define MENU_PLATE_BOTTOM_H 14
 
+// How many rows the plate has to GROW BY: the art draws five, and every button past that needs one
+// cloned band. Derived rather than written down, so adding another entry to the menu enum is the
+// only edit adding another entry to the menu needs.
+#define MENU_PLATE_ART_ROWS 5
+#define MENU_PLATE_EXTRA_ROWS (MAIN_MENU_BUTTON_COUNT - MENU_PLATE_ART_ROWS)
+
 
 // ⚠️ THE LABEL IS NO LONGER `9 + index`. misc.msg ids 9..13 are INTRO / NEW GAME / LOAD GAME /
 // CREDITS / EXIT in exactly that order, so inserting CONTINUE at position 1 would have made every
@@ -555,8 +587,8 @@ static void main_menu_play_sound(const char* fileName)
 // MASTER.DAT: adding an id there would mean shipping a loose copy of the WHOLE file beside it,
 // which then fights every localisation and every patch. Same call, same reason, as the Pip-Boy
 // CONTROLS page.
-static const int menu_label_msg[MAIN_MENU_BUTTON_COUNT] = { 9, -1, 10, 11, 12, 13 };
-static const char* menu_label_literal[MAIN_MENU_BUTTON_COUNT] = { NULL, "CONTINUE", NULL, NULL, NULL, NULL };
+static const int menu_label_msg[MAIN_MENU_BUTTON_COUNT] = { 9, -1, 10, 11, -1, 12, 13 };
+static const char* menu_label_literal[MAIN_MENU_BUTTON_COUNT] = { NULL, "CONTINUE", NULL, NULL, "OPTIONS", NULL, NULL };
 
 // The text for one row, or NULL if the message is missing. The returned pointer is the message
 // list's own storage (the same thing getmsg hands out), so it outlives this call.
@@ -589,16 +621,20 @@ static void main_menu_extend_plate()
             w);
     }
 
-    // 2. Clone one interior band over it, which is the new sixth row.
-    for (int y = 0; y < MENU_PLATE_ROW_H; y++) {
-        memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + y) + MENU_PLATE_X0,
-            main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BAND_Y + y) + MENU_PLATE_X0,
-            w);
+    // 2. Clone that interior band once per extra row (CONTINUE, then OPTIONS).
+    for (int row = 0; row < MENU_PLATE_EXTRA_ROWS; row++) {
+        for (int y = 0; y < MENU_PLATE_ROW_H; y++) {
+            memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + row * MENU_PLATE_ROW_H + y) + MENU_PLATE_X0,
+                main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BAND_Y + y) + MENU_PLATE_X0,
+                w);
+        }
     }
 
-    // 3. Put the border back, now one row lower.
+    // 3. Put the border back, that many rows lower. ⚠️ The last row ends at
+    // 238 + 2*41 + 14 = 334, comfortably above the version string at y 460 -- but there is not
+    // room for many more, and nothing here would tell you when it ran out.
     for (int y = 0; y < MENU_PLATE_BOTTOM_H; y++) {
-        memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + MENU_PLATE_ROW_H + y) + MENU_PLATE_X0,
+        memcpy(main_window_buf + MAIN_MENU_WINDOW_WIDTH * (MENU_PLATE_BOTTOM_Y + MENU_PLATE_EXTRA_ROWS * MENU_PLATE_ROW_H + y) + MENU_PLATE_X0,
             &bottom[y * w],
             w);
     }

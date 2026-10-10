@@ -31,6 +31,15 @@ void handleWindowSizeChanged();
 void svga_toggle_fullscreen();
 void renderPresent();
 
+// MODS "VSync" (cfg vsync): hand each frame to the display on its refresh, at ~60 fps whatever the
+// panel's rate. Takes effect at the next present. svga_vsync_state: the swap interval in force
+// (0 = none), the refresh it was derived from, and whether the display is really pacing the game.
+void svga_set_vsync(bool on);
+bool svga_get_vsync();
+void svga_vsync_state(int* interval, int* refresh, bool* effective);
+// While a map loads: present without waiting for the display (map.cc brackets map_load_file).
+void svga_vsync_suspend(bool on);
+
 } // namespace fallout
 
 #endif /* FALLOUT_PLIB_GNW_SVGA_H_ */

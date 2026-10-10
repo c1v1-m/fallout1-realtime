@@ -823,6 +823,17 @@ static int first_visit_flag;
 // would put the cursor somewhere the player did not choose.
 static int wm_pad_town = -1;
 
+// CE: where the pointer was when WE last put it somewhere (window coords), -1 = not known yet.
+//
+// A acts on whatever the pointer is over -- but only once the player has MOVED it there. The D-pad
+// parks the pointer on the chosen town's tab, and on entry the pointer sits wherever the last screen
+// left it; neither of those is the player pointing at anything, and acting on them would turn "A =
+// enter the town I am standing in" into "A = travel to wherever the cursor happened to be". So every
+// park records its spot here, the first frame adopts the starting spot, and only a pointer that has
+// since moved away from it is read as a choice.
+static int wm_park_x = -1;
+static int wm_park_y = -1;
+
 // CE: entrance currently picked by the pad on the TOWN MAP (index into brnpos[], -1 = none yet).
 //
 // ⚠️ THIS SCREEN USED TO LEAK THE GAMEPLAY A-CLICK -- the third screen in this family, after the
@@ -1033,8 +1044,30 @@ int load_world_map(DB_FILE* stream)
 // than 9000 instructions.
 //
 // 0x4AA360
+// The world map reads the pad itself (the D-pad walks the town list, A confirms), so the gameplay
+// shortcut layer has to stand down for as long as this screen is up -- otherwise its D-pad holds
+// open the Pip-Boy over the top of the list you are trying to walk.
+//
+// ⚠️ SCOPED, because world_map() returns from six different places (save failure, quit, entering a
+// town, a random encounter...). A pair of set/clear calls would leak the flag out of whichever exit
+// nobody remembered, and a leaked self_nav means the pad stops working in the game world entirely.
+struct WmSelfNav {
+    WmSelfNav()
+    {
+        gamepad_ui_set_self_nav(true);
+        gamepad_ui_set_self_nav_cursor(true);
+    }
+    ~WmSelfNav()
+    {
+        gamepad_ui_set_self_nav_cursor(false);
+        gamepad_ui_set_self_nav(false);
+    }
+};
+
 int world_map(WorldMapContext ctx)
 {
+    WmSelfNav wmSelfNav;
+
     // TEMP DIAG: did we get in at all? STRIP with wm-armed.
     trace_event(TRACE_FLOW, "wm-enter", "state=%d town=%d", ctx.state, ctx.town);
     const char* title;
@@ -1123,6 +1156,7 @@ int world_map(WorldMapContext ctx)
 
     should_redraw = 1;
     wm_pad_town = -1; // fresh pick per visit to this screen
+    wm_park_x = -1; // and the pointer counts as untouched until it moves from where it starts
     // Which game we came in on. If a save is loaded while this loop is running, everything below
     // is drawing over a world that no longer exists -- see the bail-out beside the quit check.
     unsigned int wm_load_serial = LoadGameSerial();
@@ -1311,12 +1345,29 @@ int world_map(WorldMapContext ctx)
             //
             // Only VISITED towns are reachable (first_visit_flag), matching the tabs themselves --
             // an unvisited town has no tab to click and no name on the list.
+            //
+            // A pointed spot on the map with no visited town under it is handed to the vanilla
+            // left-click branch below instead (wmPadClick): travel to that point, or -- on the party
+            // marker -- enter where you stand. Same "don't duplicate the decision" rule.
+            bool wmPadClick = false;
             {
                 static bool wmPrevA = false;
                 static bool wmWasMoving = false;
                 static bool wmPrevUp = false;
                 static bool wmPrevDown = false;
                 static unsigned int wmLastStep = 0;
+
+                // Re-assert it every frame: a modal opened from here (a dialog box, the town map)
+                // may have set and then CLEARED the flag on its own way out, and we would be left
+                // sharing the D-pad with the gameplay layer again for the rest of the journey.
+                gamepad_ui_set_self_nav(true);
+                gamepad_ui_set_self_nav_cursor(true);
+
+                // The pointer's starting spot counts as a park: nobody has pointed at anything yet.
+                if (wm_park_x == -1) {
+                    wm_park_x = mouse_x;
+                    wm_park_y = mouse_y;
+                }
 
                 SDL_GameController* wmPad = gamepad_ui_get_controller();
                 bool wmANow = false;
@@ -1358,6 +1409,8 @@ int world_map(WorldMapContext ctx)
                         Rect wmWin;
                         if (win_get_rect(world_win, &wmWin) == 0) {
                             mouse_set_position(wmWin.ulx + 508 + 7, wmWin.uly + BttnYtab[wm_pad_town] + 7);
+                            wm_park_x = 508 + 7;
+                            wm_park_y = BttnYtab[wm_pad_town] + 7;
                         }
                     } else {
                         wm_pad_town = -1;
@@ -1371,6 +1424,11 @@ int world_map(WorldMapContext ctx)
                     wmDir = -1;
                 } else if ((wmDownNow && !wmPrevDown) || (wmDownNow && wmRepeat)) {
                     wmDir = 1;
+                } else {
+                    // ⚠️ NOT the left stick here. On this screen it STEERS THE PARTY across the map
+                    // -- the one place where it already has a job -- so walking the town list with it
+                    // would fight the travel it is in the middle of. Every other modal takes it.
+                    wmDir = 0;
                 }
 
                 if (wmDir != 0) {
@@ -1396,12 +1454,50 @@ int world_map(WorldMapContext ctx)
                         Rect wmWin;
                         if (win_get_rect(world_win, &wmWin) == 0) {
                             mouse_set_position(wmWin.ulx + 508 + 7, wmWin.uly + BttnYtab[wm_pad_town] + 7);
+                            wm_park_x = 508 + 7;
+                            wm_park_y = BttnYtab[wm_pad_town] + 7;
                         }
                     }
                 }
 
                 if (wmANow && !wmPrevA) {
-                    if (wm_pad_town != -1 && (first_visit_flag & (1 << wm_pad_town)) != 0) {
+                    // ⚠️ A ACTS ON WHAT THE POINTER IS OVER, ONCE THE PLAYER HAS PUT IT THERE
+                    // (2026-10-04: "měl jsem při cestování na worldu kurzor myši na The Hub a áčko
+                    // nereagovalo"). A used to read only the D-pad selection, so a pointer resting on
+                    // a town -- the most direct way there is of saying "that one" -- did nothing.
+                    // A pointer the D-pad parked, or one nobody has touched since this screen opened,
+                    // is not a choice (see wm_park_x) and leaves A on the selection exactly as before.
+                    bool wmPointed = abs(mouse_x - wm_park_x) + abs(mouse_y - wm_park_y) > 3;
+
+                    int wmPointedTown = -1;
+                    bool wmPointedMap = false;
+                    if (wmPointed) {
+                        for (int wmTab = 0; wmTab < TOWN_COUNT; wmTab++) {
+                            if (mouse_x >= 508 && mouse_x < 508 + 15
+                                && mouse_y >= BttnYtab[wmTab] && mouse_y < BttnYtab[wmTab] + 15) {
+                                wmPointedTown = wmTab;
+                                break;
+                            }
+                        }
+
+                        if (wmPointedTown == -1 && mouse_x > 22 && mouse_x < 472 && mouse_y > 21 && mouse_y < 463) {
+                            // A town owns its whole 50x50 cell (InCity), so anywhere over its circle
+                            // or its label counts -- no pixel-hunting with a stick.
+                            wmPointedTown = InCity(viewport_x + mouse_x - 22, viewport_y + mouse_y - 21);
+                            wmPointedMap = true;
+                        }
+                    }
+
+                    if (wmPointedTown != -1 && (first_visit_flag & (1 << wmPointedTown)) != 0) {
+                        // A visited town: exactly its tab -- travel to it, or enter it when it is the
+                        // one you are standing in. The selection follows, so the list agrees.
+                        wm_pad_town = wmPointedTown;
+                        input = 500 + wmPointedTown;
+                    } else if (wmPointedMap) {
+                        // Anywhere else on the map (open ground, a place never visited, the party
+                        // marker): whatever a left click there does in vanilla.
+                        wmPadClick = true;
+                    } else if (wm_pad_town != -1 && (first_visit_flag & (1 << wm_pad_town)) != 0) {
                         input = 500 + wm_pad_town;
                     } else {
                         // Nothing selectable (standing on an unvisited site): keep the original
@@ -1467,7 +1563,7 @@ int world_map(WorldMapContext ctx)
                 reselect = 0;
                 done = 1;
                 is_entering_townmap = 1;
-            } else if ((mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) != 0) {
+            } else if (wmPadClick || (mouse_get_buttons() & MOUSE_EVENT_LEFT_BUTTON_UP) != 0) {
                 if (mouse_x > 22 && mouse_x < 472 && mouse_y > 21 && mouse_y < 463) {
                     if (dropbtn && hover) {
                         is_entering_city = 0;
@@ -1763,9 +1859,27 @@ int world_map(WorldMapContext ctx)
             }
 
             if (is_moving) {
+                // CE: TRAVEL SPEED ON THE WORLD MAP TOO (2026-10-04, "víš jak máme rychleji hru,
+                // rychleji dude chodí... přidej to i při cestování na world mapě"). Same lever as on
+                // foot -- the MODS "Travel speed" row, cfg travel_speed, LOWER = FASTER.
+                //
+                // Vanilla runs this loop TWICE per 24 fps frame; at travel_speed 0.5 it now runs four
+                // times. Every pass is a whole vanilla pass -- its own game-time charge and queue
+                // check, its own dot on the travel line, its own mile and encounter roll -- so a
+                // journey costs exactly the same game time and meets exactly as many encounters per
+                // mile as before. Only the wall-clock wait shrinks. A fractional speed carries its
+                // remainder into the next frame, so 0.75 really is a third quicker.
+                //
+                // The RAW setting, not anim_travel_speed_in_effect(): that one exists to switch the
+                // speed-up off while a fight is on, and nobody fights on the world map.
+                static float wmPassCarry = 0.0f;
+                float wmPasses = 2.0f / anim_get_travel_speed() + wmPassCarry;
+                int wmPassesThisFrame = (int)wmPasses;
+                wmPassCarry = wmPasses - (float)wmPassesThisFrame;
+
                 v109 = 0;
                 dropbtn = 0;
-                while (v109 < 2) {
+                while (v109 < wmPassesThisFrame) {
                     if (!is_moving || is_entering_random_encounter || is_entering_city || done) {
                         break;
                     }
@@ -3728,6 +3842,10 @@ WorldMapContext town_map(WorldMapContext ctx)
     // above, and cleared right after the loop, so no failure exit can leave the flag stuck on and
     // silently kill the pad for the rest of the session.
     gamepad_ui_set_self_nav(true);
+    // The world map's free pointer does not carry in here: this screen walks its entrances with the
+    // pad, and a stick-driven pointer would only hover hotspots behind the selection's back. Put back
+    // on the way out, for the world map loop this was opened from.
+    bool tmPrevSelfNavCursor = gamepad_ui_set_self_nav_cursor(false);
 
     // Start on the first entrance, so the screen opens with something selected and the player can
     // press A immediately -- the same "the obvious choice is already picked" rule the world map's
@@ -3881,6 +3999,7 @@ WorldMapContext town_map(WorldMapContext ctx)
     // CE: hand the pad back before anything else -- see the note on tm_pad_sel. Leaving this set
     // would kill the shared right-stick cursor and A-as-click everywhere after this screen.
     gamepad_ui_set_self_nav(false);
+    gamepad_ui_set_self_nav_cursor(tmPrevSelfNavCursor);
     tm_pad_sel = -1;
 
     UnregTMAPsels(tmap_sels_count);

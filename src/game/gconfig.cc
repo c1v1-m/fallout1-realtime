@@ -96,7 +96,7 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, 0.6);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FALLOFF_TILES_KEY, 12);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY, 0.0);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY, 1.0);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY, 0.7);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_MOVING_NPC_KEY, 0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_SPEED_AP_MAX_KEY, 2.0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FLINCH_DT_FACTOR_KEY, 2.0);

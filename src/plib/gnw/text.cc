@@ -305,6 +305,39 @@ static bool text_font_exists(int font_num, FontMgrPtr* mgr)
     return false;
 }
 
+// A STAND-IN FOR A LETTER THE FONT DOES NOT HAVE. These .fon fonts carry 128 glyphs -- ASCII and
+// nothing else -- but a translation writes in CP1250, so its accented letters have no glyph here at
+// all. Rather than draw a hole, each one falls back to the plain letter underneath it:
+// "SMLOUVANI" instead of a word with pieces missing. Interface (.aaf) fonts carry all 256 and never
+// reach this. Indexed from 0x80; 0 means there is no sensible stand-in, so nothing is drawn.
+static const char gnw_ascii_fallback_table[128] = {
+    0, 0, 0, 0, 0, 0, 0, 0,  // 0x80
+    0, 0, 'S', 0, 'S', 'T', 'Z', 'Z',  // 0x88
+    0, 0, 0, 0, 0, 0, 0, 0,  // 0x90
+    0, 0, 's', 0, 's', 't', 'z', 'z',  // 0x98
+    ' ', 0, 0, 'L', 0, 'A', 0, 0,  // 0xA0
+    0, 0, 'S', 0, 0, 0, 0, 'Z',  // 0xA8
+    0, 0, 0, 'l', 0, 0, 0, 0,  // 0xB0
+    0, 'a', 's', 0, 'L', 0, 'l', 'z',  // 0xB8
+    'R', 'A', 'A', 'A', 'A', 'L', 'C', 'C',  // 0xC0
+    'C', 'E', 'E', 'E', 'E', 'I', 'I', 'D',  // 0xC8
+    'D', 'N', 'N', 'O', 'O', 'O', 'O', 0,  // 0xD0
+    'R', 'U', 'U', 'U', 'U', 'Y', 'T', 's',  // 0xD8
+    'r', 'a', 'a', 'a', 'a', 'l', 'c', 'c',  // 0xE0
+    'c', 'e', 'e', 'e', 'e', 'i', 'i', 'd',  // 0xE8
+    'd', 'n', 'n', 'o', 'o', 'o', 'o', 0,  // 0xF0
+    'r', 'u', 'u', 'u', 'u', 'y', 't', 0,  // 0xF8
+};
+
+static unsigned char gnw_ascii_fallback(unsigned char ch)
+{
+    if (ch < 0x80) {
+        return 0;
+    }
+
+    return (unsigned char)gnw_ascii_fallback_table[ch - 0x80];
+}
+
 // 0x4C1A70
 void GNW_text_to_buf(unsigned char* buf, const char* str, int swidth, int fullw, int color)
 {
@@ -320,9 +353,19 @@ void GNW_text_to_buf(unsigned char* buf, const char* str, int swidth, int fullw,
 
     unsigned char* ptr = buf;
     while (*str != '\0') {
-        char ch = *str++;
-        if (ch < curr_font->num) {
-            FontInfo* glyph = &(curr_font->info[ch & 0xFF]);
+        // UNSIGNED, AND THE BOUNDS TEST HAS TO MEAN SOMETHING. `char` is signed here, so every
+        // byte >= 0x80 -- which is every accented letter a translation uses -- came out NEGATIVE:
+        // the test passed for free and the `& 0xFF` then indexed past the end of the glyph table,
+        // giving a garbage offset that this loop happily wrote through. That is the Czech skill
+        // wheel crashing inside GNW_text_to_buf. English never reached it: ASCII is all positive.
+        // A character the font does not have is now simply skipped.
+        unsigned char ch = (unsigned char)*str++;
+        if (ch >= curr_font->num) {
+            ch = gnw_ascii_fallback(ch);
+        }
+
+        if (ch != 0 && ch < curr_font->num) {
+            FontInfo* glyph = &(curr_font->info[ch]);
 
             unsigned char* end;
             if ((color & FONT_MONO) != 0) {
@@ -386,8 +429,13 @@ static int GNW_text_width(const char* str)
     len = 0;
 
     for (i = 0; str[i] != '\0'; i++) {
-        if (str[i] < curr_font->num) {
-            fi = &(curr_font->info[str[i]]);
+        unsigned char ch = (unsigned char)str[i];
+        if (ch >= curr_font->num) {
+            ch = gnw_ascii_fallback(ch);
+        }
+
+        if (ch != 0 && ch < curr_font->num) {
+            fi = &(curr_font->info[ch]);
             len += curr_font->spacing + fi->width;
         }
     }
@@ -398,7 +446,20 @@ static int GNW_text_width(const char* str)
 // 0x4C1C64
 static int GNW_text_char_width(char c)
 {
-    return curr_font->info[c].width;
+    unsigned char ch = (unsigned char)c;
+
+    // Same reason as GNW_text_to_buf: an accented byte was a negative index into the table. The
+    // width has to be the width of what actually gets drawn, stand-in included, or the text is
+    // measured for one string and painted as another.
+    if (ch >= curr_font->num) {
+        ch = gnw_ascii_fallback(ch);
+    }
+
+    if (ch == 0 || ch >= curr_font->num) {
+        return 0;
+    }
+
+    return curr_font->info[ch].width;
 }
 
 // 0x4C1C78

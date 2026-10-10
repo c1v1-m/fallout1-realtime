@@ -141,6 +141,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/map.h"
     "src/game/message.cc"
     "src/game/message.h"
+    "src/game/mods_page.cc"
+    "src/game/mods_page.h"
     "src/game/moviefx.cc"
     "src/game/moviefx.h"
     "src/game/object_types.h"

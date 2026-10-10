@@ -37,6 +37,26 @@ static int wheel_win = -1;
 static RadialSegment wheel_segs[RADIAL_WHEEL_MAX];
 static int wheel_count = 0;
 static int wheel_highlight = -1;
+
+// ⚠️ THE AIM STICK MUST PASS THROUGH CENTRE BEFORE IT CAN SELECT ANYTHING.
+//
+// Three of the wheels (quick-use on B, weapon on Y, ammo on X) are aimed with the LEFT stick,
+// which is also the WALK stick -- and a player who presses a face button mid-fight is, almost by
+// definition, already holding a direction. The wheel then opened with the stick ALREADY deflected,
+// the very first radial_wheel_update highlighted whatever segment the running direction pointed at,
+// and the release picked it. Nobody ever aimed at it.
+//
+// That is the "reloading was weird, it loaded the wrong ammo" report, and the trace has it twice in
+// two seconds (trace_2026-09-07_233432, s=138.2 and s=139.3): X down while walking -> wheel up
+// 220 ms later -> release -> UNLOAD fired, dumping a full 30-round magazine back into the pack
+// (gun 30/30 -> 0/30, pack 126 -> 156 rounds). Both times the [INPUT/stick] event reappears ~20 ms
+// after the wheel closes, because combat_rt stops reading the stick while a wheel is up -- so the
+// deflection was held right through the wheel and never showed in the log.
+//
+// So a wheel opens DISARMED: deflection is ignored until the stick has come back inside the
+// deadzone once. Deliberately aiming costs nothing (the thumb returns to centre on the way to the
+// segment you want anyway); carrying a walk direction into the wheel now selects nothing.
+static bool wheel_aim_armed = false;
 static int wheel_w = 0;
 static int wheel_h = 0;
 // The ring is an ELLIPSE, not a circle. The panel's height is the scarce budget -- an internal
@@ -474,6 +494,7 @@ void radial_wheel_open(const RadialSegment* segments, int count, const char* tit
     memcpy(wheel_segs, segments, count * sizeof(RadialSegment));
     wheel_count = count;
     wheel_highlight = -1;
+    wheel_aim_armed = false; // a walk direction carried in from gameplay must not select
 
     if (title != NULL) {
         strncpy(wheel_title, title, sizeof(wheel_title) - 1);
@@ -636,6 +657,16 @@ void radial_wheel_update(float aimX, float aimY)
 
     int newHighlight = -1;
     float mag = sqrtf(aimX * aimX + aimY * aimY);
+
+    // Not armed yet: the stick was still deflected from before the wheel opened (see
+    // wheel_aim_armed). Nothing highlights until it passes through the centre once.
+    if (!wheel_aim_armed) {
+        if (mag >= RADIAL_WHEEL_DEADZONE) {
+            return;
+        }
+        wheel_aim_armed = true;
+    }
+
     if (mag >= RADIAL_WHEEL_DEADZONE) {
         // Angle measured from the top (12 o'clock), increasing clockwise. The stick's
         // y is down-positive, so negate it; atan2(x, -y) gives 0 at top, +pi/2 at right.
@@ -679,6 +710,7 @@ void radial_wheel_close()
     wheel_win = -1;
     wheel_count = 0;
     wheel_highlight = -1;
+    wheel_aim_armed = false;
     wheel_has_art = false;
 
     // Restore the engine's normal un-buffered mode if we turned buffering on for see-through.

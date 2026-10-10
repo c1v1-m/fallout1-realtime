@@ -7,6 +7,7 @@
 #include "game/anim.h"
 #include "game/game.h"
 #include "game/gconfig.h"
+#include "game/message.h"
 #include "game/object.h"
 #include "game/proto.h"
 #include "platform_compat.h"
@@ -88,6 +89,19 @@ int art_init()
     int cacheSize;
     if (!config_get_value(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_ART_CACHE_SIZE_KEY, &cacheSize)) {
         cacheSize = 8;
+    }
+
+    // ⚠️ 8 MB WAS A 1997 BUDGET AND THE MASTER'S HALL BLOWS THROUGH IT (2026-10-08). The Master is the
+    // biggest sprite in the game, and around him stand the horde, the robots, the eyebots and every
+    // body that falls; past 8 MB the cache evicts the art the very next object needs, so every frame
+    // reloads it from disk. trace_2026-10-08_215600 (Deck), the final fight and the escape after his
+    // death: 200-544 art loads PER FRAME (`art=` on the hitch line), 80-230 ms frames for four minutes
+    // straight -- the game at 5-10 fps, and the stairs out "would not work" in it. The heap is one
+    // block allocated up front (heap_init), so this costs exactly its size in RAM and nothing per
+    // frame; 128 MB is nothing on anything this runs on. A larger value in fallout.cfg still wins.
+    const int artCacheFloorMb = 128;
+    if (cacheSize < artCacheFloorMb) {
+        cacheSize = artCacheFloorMb;
     }
 
     if (!cache_init(&art_cache, art_data_size, art_data_load, art_data_free, cacheSize << 20)) {
@@ -648,6 +662,30 @@ char* art_get_name(int fid)
         break;
     }
 
+    // A TRANSLATION CAN REPAINT THE INTERFACE, and then the artwork IS language content: the Czech
+    // pack ships 36 of these FRMs with the words burnt into the pixels (the HP/AC labels, the
+    // "use on" button) -- dropped loose in the patch folder they answered for every language at
+    // once, and an English run came up with a Czech interface. So they live in the language folder
+    // like its .msg files and its fonts, and are looked for there first.
+    //
+    // INTERFACE ART ONLY. The probe costs one directory lookup per file; that is nothing across a
+    // few dozen interface frames and a bad trade across the thousands of critter and scenery ones,
+    // which no translation repaints.
+    if (type == OBJ_TYPE_INTERFACE) {
+        const char* language = message_language();
+        if (language != NULL && compat_stricmp(language, ENGLISH) != 0) {
+            char localized[COMPAT_MAX_PATH];
+            size_t base_len = strlen(cd_path_base);
+            snprintf(localized, sizeof(localized), "%stext\\%s\\%s",
+                cd_path_base, language, art_name + base_len);
+
+            dir_entry de;
+            if (db_dir_entry(localized, &de) != -1) {
+                strcpy(art_name, localized);
+            }
+        }
+    }
+
     return art_name;
 }
 
@@ -918,6 +956,48 @@ int art_alias_fid(int fid)
     return -1;
 }
 
+// THE TO-HIT CURSOR IS A CANVAS, NOT A PICTURE. ACTTOHIT.FRM (interface 284) is blanked and repainted
+// every time it is shown (gmouse_3d_build_to_hit_frame: the crosshair on the left, text to its right),
+// so its pixels never matter -- only its size does. The file is 50 px wide, which leaves 29 px of
+// text: "75%" and nothing more. Awareness now puts the target's hit points on a second line under the
+// percentage, up to "999/999" = 49 px in font 101, so the canvas is widened here, at load time,
+// instead of shipping a modified FRM nobody's install would have.
+//
+// The extra width goes on the RIGHT, and the direction shift grows by half of it, which keeps the
+// crosshair exactly where the original file draws it: sprites are centred on their position, so the
+// shift has to be width/2 - 10 -- the relation both vanilla files already obey (ACRSHAIR 21 px with
+// shift 0, ACTTOHIT 50 px with shift 15). Keep the added width EVEN or the crosshair moves a pixel.
+#define ART_TO_HIT_FRM_NUM 284
+#define ART_TO_HIT_CANVAS_WIDTH 76
+
+static bool art_is_to_hit_canvas(int fid)
+{
+    return FID_TYPE(fid) == OBJ_TYPE_INTERFACE && (fid & 0xFFF) == ART_TO_HIT_FRM_NUM;
+}
+
+// Widen a freshly loaded to-hit canvas in place. The cache allocated the block with the size
+// art_data_size reported, which already includes the extra pixels, so there is room for them.
+static void art_widen_to_hit_canvas(Art* art)
+{
+    ArtFrame* frame = frame_ptr(art, 0, 0);
+    if (frame == NULL || frame->width >= ART_TO_HIT_CANVAS_WIDTH) {
+        return;
+    }
+
+    int extraWidth = ART_TO_HIT_CANVAS_WIDTH - frame->width;
+    int extraSize = extraWidth * frame->height;
+
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        art->xOffsets[rotation] += extraWidth / 2;
+    }
+
+    frame->width = ART_TO_HIT_CANVAS_WIDTH;
+    frame->size += extraSize;
+    art->dataSize += extraSize;
+
+    memset((unsigned char*)frame + sizeof(*frame), 0, frame->size);
+}
+
 // 0x4191D8
 int art_data_size(int fid, int* sizePtr)
 {
@@ -938,6 +1018,19 @@ int art_data_size(int fid, int* sizePtr)
             Art art;
             if (art_readFrameData(&art, stream) == 0) {
                 *sizePtr = artGetDataSize(&art);
+
+                // Room for the widened to-hit canvas (see art_widen_to_hit_canvas). The stream sits
+                // on the first frame header, which starts with its width and height.
+                if (art_is_to_hit_canvas(fid)) {
+                    short width;
+                    short height;
+                    if (db_freadInt16(stream, &width) == 0
+                        && db_freadInt16(stream, &height) == 0
+                        && width < ART_TO_HIT_CANVAS_WIDTH) {
+                        *sizePtr += (ART_TO_HIT_CANVAS_WIDTH - width) * height;
+                    }
+                }
+
                 result = 0;
             }
             db_fclose(stream);
@@ -965,6 +1058,9 @@ int art_data_load(int fid, int* sizePtr, unsigned char* data)
     char* artFileName = art_get_name(fid);
     if (artFileName != NULL) {
         if (load_frame_into(artFileName, data) == 0) {
+            if (art_is_to_hit_canvas(fid)) {
+                art_widen_to_hit_canvas((Art*)data);
+            }
             *sizePtr = artGetDataSize((Art*)data);
             result = 0;
         }

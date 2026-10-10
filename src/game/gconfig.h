@@ -80,6 +80,25 @@ namespace fallout {
 // (bump and stand, the pre-assist behaviour). Hostiles and scenery/walls always block -- stopping
 // against them is deliberate (see rt_stick_segment_start). -> rt_npc_slide at combat_rt_init.
 #define GAME_CONFIG_NPC_SLIDE_KEY "npc_slide"
+// FREE MOVEMENT: the body is integrated from a velocity and obj->tile is re-anchored to whichever
+// cell it has moved into, instead of the body following a chain of whole tile steps. The engine
+// goes on reading obj->tile, which never stops being a real walkable tile, so nothing else in the
+// game learns the difference. 0 = the step mover. -> rt_free_move at combat_rt_init, MODS row
+// "Free movement". ⚠️ It does NOT add facings: the body travels at any angle, the sprite is still
+// one of six.
+#define GAME_CONFIG_FREE_MOVE_KEY "free_move"
+// Let RadAway cancel a radiation dose that is ALREADY QUEUED, instead of only lowering the counter
+// that decides how bad the NEXT one will be. 0 = vanilla. -> critter_radaway_cancels, MODS row
+// "RadAway clears dose".
+//
+// ⚠️ THIS IS A DESIGN CHANGE, NOT A BUG FIX, and it was checked against the sources before being
+// offered. In vanilla, being irradiated schedules an ATTACK 4-18 game hours out carrying the level
+// you had at that moment; RadAway sets the re-check flag only when rads GO UP (critter_adjust_rads),
+// so a negative adjustment never re-evaluates it and the queued dose lands whatever you drink. The
+// Fallout wiki and NMA describe exactly that ("taking RadAway once this happens does not prevent
+// the coming attack"), with the in-fiction reasoning that RadAway flushes particles but does not
+// undo tissue damage. Off by default for that reason.
+#define GAME_CONFIG_RADAWAY_CANCELS_KEY "radaway_cancels"
 // Right-stick free cursor: pixels per frame at FULL deflection, and the deadzone (0..0.8) below
 // which the stick does not move it. The response is squared, so small pushes are already gentle --
 // lower the speed when the last inch of aiming is the problem.
@@ -150,7 +169,8 @@ namespace fallout {
 // then applies only while standing). Same falloff distance, different endpoints: at contact
 // moving regen is regen_near_mult_moving (default 0 = none at all, so in a real fight you
 // either move or you attack -- vanilla's trade), while at range it is regen_far_mult_moving
-// (default 1.0, so crossing open ground toward a distant enemy is not punished).
+// (default 0.7 since 2026-10-08: walking away from a fight never refills fully, so even a distant
+// escape on foot slowly drains -- see RT_REGEN_FAR_MULT_MOVING in combat_rt.cc).
 #define GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY "regen_near_mult_moving"
 #define GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY "regen_far_mult_moving"
 // The NPC counterpart of the pair above. Same shape, gentler: the near end is what stops a critter
@@ -187,6 +207,11 @@ namespace fallout {
 // hits (only solid blows stagger them); 0 = disabled, every damaging hit flinches. Damage/knockdown/
 // death are never gated. Unarmored critters (DT 0) always flinch on any damage.
 #define GAME_CONFIG_FLINCH_DT_FACTOR_KEY "flinch_dt_factor"
+// Realtime combat: once a hit has got through the DT gate above, the CHANCE that it staggers is this
+// times the share of max HP it took (2.5: a sixth of the bar -> ~42%, a quarter or more -> always)
+// -> rt_flinch_chance_factor. 0 = no roll, every hit through armor staggers (the behaviour before
+// 2026-10-10). MODS "Hits stagger".
+#define GAME_CONFIG_FLINCH_CHANCE_FACTOR_KEY "flinch_chance_factor"
 
 // Realtime combat: how sharply SEQUENCE (= Perception x 2, Fallout's initiative) decides who lands
 // the blow first when you and your target swing at each other in the same frame -> the exponent in
@@ -215,6 +240,14 @@ namespace fallout {
 // -> 4 HP, no input the whole time). 0 = no cap. Keep it above knockdown_dwell, or the dwell never
 // gets to run; ~2x is the intent.
 #define GAME_CONFIG_KNOCKDOWN_MAX_GROUND_KEY "knockdown_max_ground"
+
+// How strongly AGILITY shortens the time a knocked-down critter spends on the ground.
+// 0 = no stat influence at all (every character lies there the same length).
+#define GAME_CONFIG_KNOCKDOWN_AGILITY_KEY "knockdown_agility_factor"
+
+// Follow-cam smoothing, as an exponential time constant (alpha = 1 - exp(-k*dt)).
+// 0 = no smoothing: the dude is welded to the exact screen centre, as before.
+#define GAME_CONFIG_CAM_SMOOTH_KEY "cam_smooth"
 // How near (hex tiles) an interactable must be before the contextual gamepad prompt offers it on
 // its own. The engine walks the dude the rest of the way when A fires, so this is only "close
 // enough that you clearly mean it". Lower = fewer things light up around you.
@@ -347,6 +380,22 @@ namespace fallout {
 #define GAME_CONFIG_CRT_SHADOW_LIFT_KEY "crt_shadow_lift"
 #define GAME_CONFIG_CRT_CORNER_KEY "crt_corner"
 
+// FRAME PACING (MODS "VSync", default 0 = the original: present at once, ~60 fps by sleeping).
+//   vsync    0/1  hand each frame to the display on its refresh. The swap interval keeps the game
+//                 at ~60 fps whatever the panel: round(refresh / 60) -- 4 at 240 Hz, 2 at 120/144,
+//                 1 at 60. svga.cc checks the driver honours it and falls back to the sleep if not.
+#define GAME_CONFIG_VSYNC_KEY "vsync"
+
+// MODS "Smooth movement" (default 0): walking, running and flying objects are DRAWN gliding between
+// the animation's own steps instead of jumping 10-20 times a second. Drawing only -- see anim.cc.
+#define GAME_CONFIG_SMOOTH_MOTION_KEY "smooth_motion"
+
+// MODS "Combat box sound" (default 1 = vanilla): the sounds of the end-turn box opening and closing
+// as a realtime fight starts and ends, and of its lights coming on.
+#define GAME_CONFIG_COMBAT_BOX_SOUND_KEY "combat_box_sound"
+#define GAME_CONFIG_CAM_LOCK_LEAN_KEY "cam_lock_lean"
+#define GAME_CONFIG_SCRIPT_FLOAT_KEY "script_float_lines"
+
 #define GAME_CONFIG_TEXT_BASE_DELAY_KEY "text_base_delay"
 #define GAME_CONFIG_TEXT_LINE_DELAY_KEY "text_line_delay"
 #define GAME_CONFIG_BRIGHTNESS_KEY "brightness"
@@ -386,6 +435,9 @@ namespace fallout {
 #define GAME_CONFIG_PLAYER_SPEEDUP_KEY "player_speedup"
 
 #define ENGLISH "english"
+// The engine builds every message path as text\<language>\<file> (message.cc), so a translation is
+// simply a second folder beside english. Nothing else in the engine needs to know the name.
+#define CZECH "czech"
 #define FRENCH "french"
 #define GERMAN "german"
 #define ITALIAN "italian"

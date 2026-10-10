@@ -1336,10 +1336,31 @@ static bool select_display_bio()
     int oldFont = text_curr();
     text_font(101);
 
+    // ⚠️ A TRANSLATION'S BIOS BELONG TO THE TRANSLATION (2026-10-06): "destripction postav je v
+    // češtině, hraju v eng". The Czech pack's premade\*.bio sat loose in the patch folder, where they
+    // answer to the bare path for EVERY language -- the same trap its fonts and interface art fell
+    // into. They now live in text\<language>\premade\, asked for first; the bare path is the
+    // fallback, which is master.dat's own English. Between the two, master.dat's OWN localisation
+    // layout -- it ships premade\french\*.bio and premade\spanish\*.bio, which nothing here ever read.
     char path[COMPAT_MAX_PATH];
-    snprintf(path, sizeof(path), "%s.bio", premade_characters[premade_index].fileName);
+    DB_FILE* stream = NULL;
+    const char* language = message_language();
+    if (language != NULL) {
+        snprintf(path, sizeof(path), "text\\%s\\%s.bio", language, premade_characters[premade_index].fileName);
+        stream = db_fopen(path, "rt");
+        if (stream == NULL) {
+            // fileName is "premade\\combat"; the vanilla layout puts the language between the two.
+            const char* base = strrchr(premade_characters[premade_index].fileName, '\\');
+            base = base != NULL ? base + 1 : premade_characters[premade_index].fileName;
+            snprintf(path, sizeof(path), "premade\\%s\\%s.bio", language, base);
+            stream = db_fopen(path, "rt");
+        }
+    }
+    if (stream == NULL) {
+        snprintf(path, sizeof(path), "%s.bio", premade_characters[premade_index].fileName);
+        stream = db_fopen(path, "rt");
+    }
 
-    DB_FILE* stream = db_fopen(path, "rt");
     if (stream != NULL) {
         int y = 40;
         int lineHeight = text_height();

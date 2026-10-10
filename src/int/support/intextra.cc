@@ -1557,7 +1557,17 @@ static void op_attack(Program* program)
         return;
     }
 
-    if (isInCombat()) {
+    if (isInCombat() && combat_rt_enabled()) {
+        // ⚠️ REALTIME: THE SCRIPT'S ORDER ALWAYS GETS THROUGH (2026-10-04). Vanilla's branch below
+        // only acts on a critter that is NOT already ENGAGING -- sound in turn-based, where
+        // combat_over() resets every participant's maneuver when a fight ends. combat_rt never runs
+        // combat_over, so ENGAGING is never cleared: a critter that was in ANY earlier fight (or was
+        // ever pointed at anyone by notify-attack or the witness spread) ignored its own script's
+        // attack(dude) for good whenever the warm combat bit was up -- standing there until somebody
+        // shot it. Part of "protivníci reagují až když na ně někdo začne střílet". The bit is saved
+        // with the critter, so it even survived reloads.
+        combat_rt_notify_attack(self, target);
+    } else if (isInCombat()) {
         CritterCombatData* combatData = &(self->data.critter.combat);
         if ((combatData->maneuver & CRITTER_MANEUVER_ENGAGING) == 0) {
             combatData->maneuver |= CRITTER_MANEUVER_ENGAGING;
@@ -3374,6 +3384,10 @@ static void op_critter_injure(Program* program)
     }
 
     flags &= DAM_CRIP;
+    // Who cripples or blinds by script, and whom: the dude went blind in trace_2026-10-08_215600
+    // with no attack anywhere near it, and nothing named the culprit.
+    trace_event(TRACE_COMBAT, "script-injure", "script=%s pid=%d id=%d flags=0x%x dude=%d",
+        program->name, critter->pid, critter->id, flags, critter == obj_dude ? 1 : 0);
     critter->data.critter.combat.results |= flags;
 
     if (critter == obj_dude) {
@@ -4086,7 +4100,19 @@ static void op_critter_set_flee_state(Program* program)
 static void op_terminate_combat(Program* program)
 {
     if (isInCombat()) {
-        game_user_wants_to_quit = 1;
+        // ⚠️ IN REALTIME THIS FLAG IS "QUIT THE GAME" (2026-10-04). Vanilla's turn-based combat loop
+        // reads game_user_wants_to_quit == 1 as "end this fight", ends it and zeroes the flag
+        // (combat.cc). Under combat_rt that loop never runs, so nobody consumed it: main_game_loop
+        // saw a quit request and dropped the player to the main menu, which looks exactly like
+        // dying ("když vystřílím všechny enemy… hra se vypne jako bych umřel"). The Regulators do it
+        // from their destroy_p_proc in the Boneyard; Caleb, the Junktown raiders, Marcelle, PEASVICT
+        // and PGUARD call it too. Same trap the map-exit guards fell into -- see
+        // combat_rt_end_for_map_exit.
+        if (combat_rt_enabled()) {
+            combat_rt_terminate_from_script();
+        } else {
+            game_user_wants_to_quit = 1;
+        }
     }
 }
 

@@ -23,6 +23,7 @@
 #include "game/item.h"
 #include "game/map.h"
 #include "game/object.h"
+#include "game/party.h"
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
@@ -117,6 +118,10 @@ typedef enum AnimationSequenceFlags {
     // Specifies that the animation sequence should not return to ANIM_STAND
     // when it's completed.
     ANIM_SEQ_NO_STAND = 0x80,
+
+    // CE: ANIMATION_REQUEST_DEFER_STAND -- one leg of a longer move. Its end holds the body in its
+    // stride for a beat (anim_defer_stand) instead of standing it at once.
+    ANIM_SEQ_DEFER_STAND = 0x100,
 } AnimationSequenceFlags;
 
 typedef enum AnimationSadFlags {
@@ -282,12 +287,24 @@ static void object_move(int index);
 static void object_straight_move(int index);
 static float walk_dir_slowdown(Object* object, int rotation);
 static float crippled_move_scale(Object* object);
+static float travel_speed_scale(Object* object);
+float anim_get_travel_speed();
 static float run_speed_scale(Object* object, int rotation);
-static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* frameY);
+static int walk_smooth_offset(Object* object, int rotation, int anim, int* frameX, int* frameY);
+static void walk_smooth_seed(Object* object, int x, int y);
 static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int flags);
 static void object_anim_compact();
 static int anim_turn_towards(Object* obj, int delta, int animationSequenceIndex);
 static int check_gravity(int tile, int elevation);
+static bool anim_smooth_begin(Object* obj, float* drawnX, float* drawnY);
+static void anim_smooth_end(Object* obj, float drawnX, float drawnY, unsigned int stepMs, Rect* dirty);
+static void anim_smooth_forget(Object* obj);
+static void anim_smooth_settle(Object* obj, const Rect* before);
+static bool anim_defer_stand(Object* obj);
+static void anim_deferred_stands(bool now);
+static void anim_note_move_step(Object* obj, int anim, unsigned int time, unsigned int stepMs);
+static bool anim_move_cadence_hold(Object* obj, int anim, unsigned int time);
+static int make_path_func_impl(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback);
 
 // 0x4FEA98
 static int curr_sad = 0;
@@ -307,8 +324,20 @@ static bool anim_in_bk = false;
 // 0x540014
 static AnimationSad sad[ANIMATION_SAD_LIST_CAPACITY];
 
-// 0x5566D4
-static PathNode dad[2000];
+// CE: make_path_func's working set (it replaced the vanilla dad[2000] / child[2000] lists -- see
+// the note on that function). Indexed by TILE, so a node's parent, entering rotation and cost are a
+// single load instead of a scan of the closed list.
+typedef struct PathHeapEntry {
+    int f; // cost so far + estimate to the goal, the vanilla scoring exactly
+    int seq; // insertion order: among equal scores the oldest node goes first
+    int tile;
+} PathHeapEntry;
+
+static PathHeapEntry path_heap[HEX_GRID_SIZE];
+static int path_parent[HEX_GRID_SIZE];
+static unsigned char path_rotation[HEX_GRID_SIZE];
+static int path_cost[HEX_GRID_SIZE];
+static unsigned char path_scratch[HEX_GRID_SIZE];
 
 // 0x560314
 static AnimationSequence anim_set[ANIMATION_SEQUENCE_LIST_CAPACITY];
@@ -331,9 +360,6 @@ static bool anim_set_ending[ANIMATION_SEQUENCE_LIST_CAPACITY];
 
 // 0x56A1E4
 static unsigned char seen[5000];
-
-// 0x54CA94
-static PathNode child[2000];
 
 // 0x56B56C
 static int curr_anim_counter;
@@ -449,6 +475,11 @@ void anim_init()
         attackStatHighBias = 2.0;
     }
     anim_attack_stat_high_bias = (float)attackStatHighBias;
+
+    // MODS "Smooth movement" -- default OFF, the original step-per-frame motion.
+    int smoothMotion = 0;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SMOOTH_MOTION_KEY, &smoothMotion);
+    anim_set_smooth_motion(smoothMotion != 0);
 }
 
 // 0x4134D0
@@ -507,6 +538,10 @@ int register_begin(int requestOptions)
 
     if ((requestOptions & ANIMATION_REQUEST_NO_STAND) != 0) {
         animationSequence->flags |= ANIM_SEQ_NO_STAND;
+    }
+
+    if ((requestOptions & ANIMATION_REQUEST_DEFER_STAND) != 0) {
+        animationSequence->flags |= ANIM_SEQ_DEFER_STAND;
     }
 
     curr_anim_set = v1;
@@ -813,6 +848,9 @@ void anim_notify_object_freed(Object* obj)
             break;
         }
     }
+
+    // ...and the smoothing tables (a glide, a held stride, the last step's cadence) hold it too.
+    anim_smooth_forget(obj);
 }
 
 // 0x413788
@@ -2238,7 +2276,20 @@ static int anim_set_end(int animationSequenceIndex)
                             if ((animationSequence->flags & ANIM_SEQ_NO_STAND) == 0
                                 && !critter_is_prone(owner)
                                 && !ownerBusyElsewhere) {
-                                dude_stand(owner, owner->rotation, -1);
+                                // ⚠️ ONE LEG OF A LONGER MOVE DOES NOT STAND. A chase is a string
+                                // of short legs, each its own sequence, and standing the body at
+                                // the end of every one flashed the STAND pose for a frame and
+                                // restarted the stride from frame 0 -- a hitch every four tiles on
+                                // every chaser. The next leg is registered within the frame; if it
+                                // never comes, anim_deferred_stands stands the body after all.
+                                int pose = FID_ANIM_TYPE(owner->fid);
+                                bool held = (animationSequence->flags & ANIM_SEQ_DEFER_STAND) != 0
+                                    && !anim_in_anim_stop
+                                    && (pose == ANIM_WALK || pose == ANIM_RUNNING)
+                                    && anim_defer_stand(owner);
+                                if (!held) {
+                                    dude_stand(owner, owner->rotation, -1);
+                                }
                             }
                         }
                     }
@@ -2317,7 +2368,117 @@ int make_path(Object* object, int from, int to, unsigned char* rotations, int a5
 }
 
 // 0x4159E8
+//
+// CE: THE SAME SEARCH WITH SIX TIMES THE REACH (2026-10-04).
+//
+// Vanilla kept its open and closed lists in two flat arrays of 2000 PathNodes, found the best open
+// node by scanning every slot, and walked the closed list linearly to rebuild the route -- and it
+// simply GAVE UP when either list filled. 2000 closed nodes is a disc of ~25 tiles around the
+// start: any route that has to swing out further than that to get round a wall does not exist as
+// far as Fallout is concerned. Measured on the real map (LAADYTUM, the trace's Adytum guard): from
+// 20914 to 18715 the shortest route is 54 steps around the compound wall, and the vanilla search
+// dies at 2000 closed nodes; it needs ~2900. That is "NPCs want to come after me but cannot get out
+// of the tent or the room" -- the way out exists, the search just never walks far enough to see it.
+//
+// ⚠️ SAME SCORING, SAME RULES. Step cost 50 (+10 for a turn out of combat), the screen-distance
+// estimate (idist), doors a biped can open, the destination exempt from the blocking test, a5's
+// "refuse a blocked destination" and the 800-step route cap: all exactly as before. What changed is
+// only the bookkeeping -- a binary heap instead of the slot scan, per-tile parent/rotation/cost
+// arrays instead of the closed-list walk -- which is also what pays for the bigger budget: one pop
+// is O(log n) where the scan was O(n), so 12000 nodes now cost about what 2000 used to.
+//
+// Among nodes of EQUAL score the oldest is expanded first. Vanilla's tie-break was "lowest free
+// slot", which shifted as slots were reused; routes can differ from vanilla in such ties, never in
+// length class.
+#define PATH_SEARCH_MAX_CLOSED 12000
+
+// The budget make_path_func searches with: PATH_SEARCH_MAX_CLOSED, except inside make_path_capped.
+static int path_closed_cap = PATH_SEARCH_MAX_CLOSED;
+
+// make_path with a smaller search budget -- VANILLA'S 2000 for a question vanilla asked with it,
+// such as "can I get to that tile a few steps away?" (the flee choice, combatai_flee_tile). A route
+// to a tile that close which needs more nodes than that is no route for a critter running for its
+// life, and asking with the full budget turns every walled-off candidate into a 12000-node failure.
+int make_path_capped(Object* object, int from, int to, unsigned char* rotations, int a5, int maxClosed)
+{
+    int saved = path_closed_cap;
+    path_closed_cap = maxClosed;
+    int steps = make_path_func(object, from, to, rotations, a5, obj_blocking_at);
+    path_closed_cap = saved;
+    return steps;
+}
+
+static void path_heap_push(int* size, int f, int seq, int tile)
+{
+    int i = (*size)++;
+    while (i > 0) {
+        int parent = (i - 1) / 2;
+        PathHeapEntry* p = &(path_heap[parent]);
+        if (p->f < f || (p->f == f && p->seq < seq)) {
+            break;
+        }
+        path_heap[i] = *p;
+        i = parent;
+    }
+    path_heap[i].f = f;
+    path_heap[i].seq = seq;
+    path_heap[i].tile = tile;
+}
+
+static PathHeapEntry path_heap_pop(int* size)
+{
+    PathHeapEntry top = path_heap[0];
+    PathHeapEntry last = path_heap[--(*size)];
+    int n = *size;
+    int i = 0;
+    while (true) {
+        int child = 2 * i + 1;
+        if (child >= n) {
+            break;
+        }
+        if (child + 1 < n) {
+            PathHeapEntry* l = &(path_heap[child]);
+            PathHeapEntry* r = &(path_heap[child + 1]);
+            if (r->f < l->f || (r->f == l->f && r->seq < l->seq)) {
+                child++;
+            }
+        }
+        PathHeapEntry* c = &(path_heap[child]);
+        if (last.f < c->f || (last.f == c->f && last.seq < c->seq)) {
+            break;
+        }
+        path_heap[i] = *c;
+        i = child;
+    }
+    if (n > 0) {
+        path_heap[i] = last;
+    }
+    return top;
+}
+
+// The search above, timed for the frame-pacing meter. A failed search walks its whole budget, and
+// several in one frame are the likeliest thing to make a frame late -- which is a hitch in every
+// animation on screen, not just the one that asked.
+static int anim_stat_path_searches = 0;
+static double anim_stat_path_ms = 0.0;
+static double anim_stat_path_max_ms = 0.0;
+
 int make_path_func(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
+{
+    Uint64 start = SDL_GetPerformanceCounter();
+    int steps = make_path_func_impl(object, from, to, rotations, a5, callback);
+    double ms = (double)(SDL_GetPerformanceCounter() - start) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+
+    anim_stat_path_searches++;
+    anim_stat_path_ms += ms;
+    if (ms > anim_stat_path_max_ms) {
+        anim_stat_path_max_ms = ms;
+    }
+
+    return steps;
+}
+
+static int make_path_func_impl(Object* object, int from, int to, unsigned char* rotations, int a5, PathBuilderCallback* callback)
 {
     if (a5) {
         if (callback(object, to, object->elevation) != NULL) {
@@ -2325,165 +2486,101 @@ int make_path_func(Object* object, int from, int to, unsigned char* rotations, i
         }
     }
 
+    // Vanilla indexed seen[] with whatever it was handed; an invalid tile would read and write
+    // outside it.
+    if (!hexGridTileIsValid(from) || !hexGridTileIsValid(to)) {
+        return 0;
+    }
+
     bool isNotInCombat = !isInCombat();
 
     memset(seen, 0, sizeof(seen));
-
     seen[from / 8] |= 1 << (from & 7);
-
-    child[0].tile = from;
-    child[0].from = -1;
-    child[0].rotation = 0;
-    child[0].field_C = EST(from, to);
-    child[0].field_10 = 0;
-
-    for (int index = 1; index < 2000; index += 1) {
-        child[index].tile = -1;
-    }
 
     int toScreenX;
     int toScreenY;
     tile_coord(to, &toScreenX, &toScreenY, object->elevation);
 
-    int closedPathNodeListLength = 0;
-    int openPathNodeListLength = 1;
-    PathNode temp;
+    path_parent[from] = -1;
+    path_rotation[from] = 0;
+    path_cost[from] = 0;
 
-    while (1) {
-        int v63 = -1;
+    int heapSize = 0;
+    int seq = 0;
+    path_heap_push(&heapSize, EST(from, to), seq++, from);
 
-        PathNode* prev = NULL;
-        int v12 = 0;
-        for (int index = 0; v12 < openPathNodeListLength; index += 1) {
-            PathNode* curr = &(child[index]);
-            if (curr->tile != -1) {
-                v12++;
-                if (v63 == -1 || (curr->field_C + curr->field_10) < (prev->field_C + prev->field_10)) {
-                    prev = curr;
-                    v63 = index;
-                }
-            }
-        }
+    int closed = 0;
+    bool found = false;
 
-        PathNode* curr = &(child[v63]);
+    while (heapSize > 0) {
+        PathHeapEntry curr = path_heap_pop(&heapSize);
 
-        memcpy(&temp, curr, sizeof(temp));
-
-        openPathNodeListLength -= 1;
-
-        curr->tile = -1;
-
-        if (temp.tile == to) {
-            if (openPathNodeListLength == 0) {
-                openPathNodeListLength = 1;
-            }
+        if (curr.tile == to) {
+            found = true;
             break;
         }
 
-        PathNode* curr1 = &(dad[closedPathNodeListLength]);
-        memcpy(curr1, &temp, sizeof(temp));
-
-        closedPathNodeListLength += 1;
-
-        if (closedPathNodeListLength == 2000) {
+        closed += 1;
+        if (closed >= path_closed_cap) {
             return 0;
         }
 
         for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
-            int tile = tile_num_in_direction(temp.tile, rotation, 1);
+            int tile = tile_num_in_direction(curr.tile, rotation, 1);
             int bit = 1 << (tile & 7);
             if ((seen[tile / 8] & bit) != 0) {
                 continue;
             }
 
             if (tile != to) {
-                Object* v24 = callback(object, tile, object->elevation);
-                if (v24 != NULL) {
-                    if (!anim_can_use_door(object, v24)) {
+                Object* blocker = callback(object, tile, object->elevation);
+                if (blocker != NULL) {
+                    if (!anim_can_use_door(object, blocker)) {
                         continue;
                     }
                 }
             }
 
-            int v25 = 0;
-            for (; v25 < 2000; v25++) {
-                if (child[v25].tile == -1) {
-                    break;
-                }
-            }
-
-            openPathNodeListLength += 1;
-
-            if (openPathNodeListLength == 2000) {
-                return 0;
-            }
-
             seen[tile / 8] |= bit;
 
-            PathNode* v27 = &(child[v25]);
-            v27->tile = tile;
-            v27->from = temp.tile;
-            v27->rotation = rotation;
+            int cost = path_cost[curr.tile] + 50;
+            if (isNotInCombat && path_rotation[curr.tile] != rotation) {
+                cost += 10;
+            }
+
+            path_parent[tile] = curr.tile;
+            path_rotation[tile] = (unsigned char)rotation;
+            path_cost[tile] = cost;
 
             int newX;
             int newY;
             tile_coord(tile, &newX, &newY, object->elevation);
 
-            v27->field_C = idist(newX, newY, toScreenX, toScreenY);
-            v27->field_10 = temp.field_10 + 50;
-
-            if (isNotInCombat && temp.rotation != rotation) {
-                v27->field_10 += 10;
-            }
-        }
-
-        if (openPathNodeListLength == 0) {
-            break;
+            path_heap_push(&heapSize, idist(newX, newY, toScreenX, toScreenY) + cost, seq++, tile);
         }
     }
 
-    if (openPathNodeListLength != 0) {
-        unsigned char* v39 = rotations;
-        int index = 0;
-        for (; index < 800; index++) {
-            if (temp.tile == from) {
-                break;
-            }
-
-            if (v39 != NULL) {
-                *v39 = temp.rotation & 0xFF;
-                v39 += 1;
-            }
-
-            int j = 0;
-            while (dad[j].tile != temp.from) {
-                j++;
-            }
-
-            PathNode* v36 = &(dad[j]);
-            memcpy(&temp, v36, sizeof(temp));
-        }
-
-        if (rotations != NULL) {
-            // Looks like array resevering, probably because A* finishes it's path from end to start,
-            // this probably reverses it start-to-end.
-            unsigned char* beginning = rotations;
-            unsigned char* ending = rotations + index - 1;
-            int middle = index / 2;
-            for (int index = 0; index < middle; index++) {
-                unsigned char rotation = *ending;
-                *ending = *beginning;
-                *beginning = rotation;
-
-                ending -= 1;
-                beginning += 1;
-            }
-        }
-
-        return index;
+    if (!found) {
+        return 0;
     }
 
-    return 0;
+    // Walk back from the goal into the scratch buffer (it comes out goal-first), then hand the
+    // caller the FIRST 800 steps in walking order. Vanilla copied only the 800 steps nearest the GOAL
+    // and reversed those, which on a longer route would have started the walker in the middle of
+    // nowhere; with the old budget no route ever got that long, with this one it can.
+    int length = 0;
+    for (int tile = to; tile != from; tile = path_parent[tile]) {
+        path_scratch[length++] = path_rotation[tile];
+    }
+
+    int steps = length < 800 ? length : 800;
+    if (rotations != NULL) {
+        for (int index = 0; index < steps; index++) {
+            rotations[index] = path_scratch[length - 1 - index];
+        }
+    }
+
+    return steps;
 }
 
 // 0x415D9C
@@ -2959,6 +3056,32 @@ static int anim_move_to_tile(Object* obj, int tile, int elev, int a4, int anim, 
     return 0;
 }
 
+// CE: WHAT THE LAST ROUTED MOVE ACTUALLY GOT.
+//
+// ⚠️ register_object_move_to_* / run_to_* only QUEUE a move, so the register_end that follows says
+// "queued", never "reachable" -- the routing happens here, as the move description starts, and a
+// 0-step make_path kills the move silently. combat_rt's chase read rc == 0 as "routed", so a
+// critter with no way out (trace_2026-10-04_153226: an Adytum guard, id=2105, ~60 failed make_path
+// calls a second for minutes) was never declared unreachable and never gave up: it stood there
+// "wanting to come", burning a full path search every frame ("npc chtějí jít za mnou, ale nemůžou
+// se dostat ze stanu nebo z místnosti").
+//
+// The first description of a sequence starts INSIDE register_end, so a caller can reset this,
+// register, and read the verdict straight after.
+static Object* anim_last_path_obj = NULL;
+static int anim_last_path_steps_value = -1;
+
+void anim_reset_last_path()
+{
+    anim_last_path_obj = NULL;
+    anim_last_path_steps_value = -1;
+}
+
+int anim_last_path_steps(Object* obj)
+{
+    return obj != NULL && obj == anim_last_path_obj ? anim_last_path_steps_value : -1;
+}
+
 // 0x416778
 static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, int animationSequenceIndex)
 {
@@ -2984,6 +3107,8 @@ static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, 
     sad_entry->anim = anim;
 
     sad_entry->field_1C = make_path(obj, obj->tile, tile, sad_entry->rotations, a5);
+    anim_last_path_obj = obj;
+    anim_last_path_steps_value = sad_entry->field_1C;
 
     // TEMP DIAG (walk-in-place hunt, 2026-08-10). combat_rt's [FLOW/walk-seg] measures the wrong
     // stage: register_object_move_to_tile only QUEUES the move, so its rc=0 says "queued", not
@@ -3126,7 +3251,22 @@ static void object_move(int index)
     Rect dirty;
     Rect temp;
 
+    // Smooth movement: where the body is DRAWN before this step moves it. The glide to the new
+    // position starts from there (anim_smooth_end, at the bottom).
+    float smoothX;
+    float smoothY;
+    bool smoothing = anim_smooth_begin(object, &smoothX, &smoothY);
+
     if (sad_entry->field_20 == -2000) {
+        // Where the body stands BEFORE obj_move_to_tile zeroes obj->x/y. A walk that starts after
+        // a stop mid-tile begins from here instead of from the tile centre.
+        int seedX = object->x;
+        int seedY = object->y;
+
+        // The gait the body is in right now -- a leg that follows a leg of the same gait carries
+        // on with its stride (rtWalkContinuous below).
+        int prevAnim = FID_ANIM_TYPE(object->fid);
+
         obj_move_to_tile(object, object->tile, object->elevation, &dirty);
 
         // Realtime NPC walk continuity: a chasing NPC steps ONE tile at a time (rt_step_toward),
@@ -3138,8 +3278,13 @@ static void object_move(int index)
         // frame; and all of a critter's walk facings share a frame count, so the preserved index
         // stays valid (clamped after the fid swap just in case). The dude already moves
         // continuously via anim_extend_move, and turn-based is untouched: both reset to 0 as before.
+        // ⚠️ RUNNING TOO, when the body is already running: a chase leg is usually a run, and its
+        // stride restarted at frame 0 at the start of every leg. Only from a run, though -- the run
+        // cycle has its own frame count, and a run that starts from a stand should start at its top.
         bool rtWalkContinuous = combat_rt_enabled() && object != obj_dude
-            && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && sad_entry->anim == ANIM_WALK;
+            && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+            && (sad_entry->anim == ANIM_WALK
+                || (sad_entry->anim == ANIM_RUNNING && prevAnim == ANIM_RUNNING));
 
         if (!rtWalkContinuous) {
             obj_set_frame(object, 0, &temp);
@@ -3164,6 +3309,11 @@ static void object_move(int index)
                     rect_min_bound(&dirty, &temp, &dirty);
                 }
             }
+        }
+
+        if (combat_rt_enabled() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+            && (sad_entry->anim == ANIM_WALK || sad_entry->anim == ANIM_RUNNING)) {
+            walk_smooth_seed(object, seedX, seedY);
         }
 
         sad_entry->field_20 = 0;
@@ -3199,8 +3349,13 @@ static void object_move(int index)
     // the radscorpion's NW facing front-loads its motion in big jumps and reads as "fast"
     // even though its per-tile time is normal -- so smoothing the within-tile motion fixes
     // that. Turn-based keeps the original art-driven motion.
-    if (combat_rt_enabled() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && sad_entry->anim == ANIM_WALK) {
-        walk_smooth_offset(object, rotation, &frameX, &frameY);
+    // ⚠️ RUNNING IS IN TOO. It never was: the gate said ANIM_WALK, so a run crossed a tile in 2.5
+    // art frames of raw hot-spot offsets. There is nothing walk-specific about a constant-velocity
+    // ramp.
+    int stepDone = -1;
+    if (combat_rt_enabled() && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+        && (sad_entry->anim == ANIM_WALK || sad_entry->anim == ANIM_RUNNING)) {
+        stepDone = walk_smooth_offset(object, rotation, sad_entry->anim, &frameX, &frameY);
     }
 
     obj_offset(object, frameX, frameY, &temp);
@@ -3261,15 +3416,38 @@ static void object_move(int index)
             retime = true;
         }
 
+        // Out-of-combat travel speed, folded in as one more factor for the same reason the limp is:
+        // it must NOT live inside compute_tpf, or it cancels out of walk_dir_slowdown's quotient and
+        // drags the dude's reference around with it.
+        //
+        // ⚠️ RE-TIMED UNCONDITIONALLY for the player's side, even when the factor is 1.0. tpf is
+        // STATE that outlives the step, so a factor that merely stops being applied leaves the last
+        // FAST value in the field for the rest of the sequence -- i.e. the dude would keep travel
+        // speed through the opening seconds of the fight that just started. Re-timing always is free
+        // and exact: the whole block derives from a fresh compute_tpf and assigns once, so running it
+        // with travel == 1.0 reproduces the registration value bit for bit.
+        float travel = travel_speed_scale(object);
+        if (travel != 1.0f || object == obj_dude || isPartyMember(object)) {
+            retime = true;
+        }
+
         if (retime) {
-            unsigned int tpf = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale * crip);
+            unsigned int tpf = (unsigned int)(compute_tpf(object, sad_entry->fid) * scale * crip * travel);
             sad_entry->ticksPerFrame = tpf > 0 ? tpf : 1;
         }
     }
 
     int y = off_tile[1][rotation];
     int x = off_tile[0][rotation];
-    if ((x > 0 && x <= object->x) || (x < 0 && x >= object->x) || (y > 0 && y <= object->y) || (y < 0 && y >= object->y)) {
+
+    // Has the step covered its tile? The ramp answers for itself when it ran, because a step may
+    // begin somewhere other than a tile centre and obj->x/y is then no longer a measure of progress
+    // on its own. For a step that starts at the centre its answer is identical to the test below.
+    bool crossed = stepDone >= 0
+        ? stepDone != 0
+        : ((x > 0 && x <= object->x) || (x < 0 && x >= object->x) || (y > 0 && y <= object->y) || (y < 0 && y >= object->y));
+
+    if (crossed) {
         x = object->x - x;
         y = object->y - y;
 
@@ -3346,6 +3524,13 @@ static void object_move(int index)
         }
     }
 
+    // The step's own clock, for the leg that follows this one (anim_move_cadence_hold).
+    anim_note_move_step(object, sad_entry->anim, sad_entry->animationTimestamp, sad_entry->ticksPerFrame);
+
+    if (smoothing) {
+        anim_smooth_end(object, smoothX, smoothY, sad_entry->ticksPerFrame, &dirty);
+    }
+
     tile_refresh_rect(&dirty, object->elevation);
     if (sad_entry->field_20 == -1000) {
         anim_set_continue(sad_entry->animationSequenceIndex, 1);
@@ -3360,6 +3545,12 @@ static void object_straight_move(int index)
 
     Rect dirtyRect;
     Rect temp;
+
+    // Smooth movement for the straight movers too: a projectile hops 32 px per frame of its art, a
+    // body knocked back 4 px. The dude's own knockback is left alone -- the camera is welded to him.
+    float smoothX;
+    float smoothY;
+    bool smoothing = anim_smooth_begin(object, &smoothX, &smoothY);
 
     if (sad_entry->field_20 == -2000) {
         obj_change_fid(object, sad_entry->fid, &dirtyRect);
@@ -3397,6 +3588,10 @@ static void object_straight_move(int index)
             if ((sad_entry->flags & ANIM_SAD_WAIT_FOR_COMPLETION) == 0 || object->frame == lastFrame) {
                 sad_entry->field_20 = -1000;
             }
+        }
+
+        if (smoothing) {
+            anim_smooth_end(object, smoothX, smoothY, sad_entry->ticksPerFrame, &dirtyRect);
         }
 
         tile_refresh_rect(&dirtyRect, sad_entry->obj->elevation);
@@ -3445,6 +3640,10 @@ static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int f
 // 0x417498
 void object_animate()
 {
+    // Bodies held in their stride by a leg that ended (anim_defer_stand) and that nothing followed.
+    // Before the early return: the table can be empty by then.
+    anim_deferred_stands(false);
+
     if (curr_sad == 0) {
         return;
     }
@@ -3461,6 +3660,16 @@ void object_animate()
 
         unsigned int time = get_time();
         if (elapsed_tocks(time, sad_entry->animationTimestamp) < sad_entry->ticksPerFrame) {
+            continue;
+        }
+
+        // A LEG THAT FOLLOWS A LEG KEEPS THE STRIDE'S BEAT. A new move sad is due at once (its
+        // timestamp is 0), so the first step of a chase leg landed a frame after the last step of
+        // the one before -- two steps in 16 ms, a lurch every four tiles. Wait out the step that
+        // is still running instead.
+        if (sad_entry->field_20 == -2000 && sad_entry->field_1C > 0
+            && (sad_entry->flags & ANIM_SAD_STRAIGHT) == 0
+            && anim_move_cadence_hold(object, sad_entry->anim, time)) {
             continue;
         }
 
@@ -3766,6 +3975,14 @@ void dude_fidget()
             break;
         }
 
+        // CE: with the reload animation on, the dude's STAND loop is his RELOAD and nothing else --
+        // left in the random idle pool it would play "reloading" at random and say nothing true
+        // (see anim_get_reload_anim). Everyone else keeps fidgeting.
+        if (object == obj_dude && anim_get_reload_anim()) {
+            object = obj_find_next_at();
+            continue;
+        }
+
         if ((object->flags & OBJECT_HIDDEN) == 0 && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && FID_ANIM_TYPE(object->fid) == ANIM_STAND && !critter_is_dead(object)) {
             Rect rect;
             obj_bound(object, &rect);
@@ -3827,13 +4044,36 @@ void dude_stand(Object* obj, int rotation, int fid)
 {
     Rect rect;
 
+    // Where the body is DRAWN before the pose changes, for anim_smooth_settle at the bottom.
+    Rect drawnBefore;
+    bool settle = anim_get_smooth_motion() && obj != NULL && obj->tile != -1 && obj->elevation == map_elevation;
+    if (settle) {
+        obj_bound(obj, &drawnBefore);
+    }
+
     obj_set_rotation(obj, rotation, &rect);
 
     int x = 0;
     int y = 0;
 
+    // ⚠️ FREE MOVEMENT: THE DUDE STANDS WHERE HE STOOD, NOT ON THE TILE CENTRE. Every animation of
+    // his ends here (a weapon or hand swap, a reload, an injection, a pickup), and re-centring threw
+    // him up to ~22 px across the floor at the end of each one. The take-out alignment below is the
+    // tile-centre convention and is skipped with it -- rt_fm_release stands him the same way.
+    int restX = 0;
+    int restY = 0;
+    bool rest = obj == obj_dude && combat_rt_dude_rest_offset(&restX, &restY);
+    if (rest) {
+        if (obj->x != restX || obj->y != restY) {
+            trace_event(TRACE_FLOW, "dude-rest", "anim=%d x=%d,%d -> %d,%d", FID_ANIM_TYPE(obj->fid),
+                obj->x, obj->y, restX, restY);
+        }
+        x = restX;
+        y = restY;
+    }
+
     int weaponAnimationCode = (obj->fid & 0xF000) >> 12;
-    if (weaponAnimationCode != 0) {
+    if (weaponAnimationCode != 0 && !rest) {
         if (fid == -1) {
             int takeOutFid = art_id(FID_TYPE(obj->fid), obj->fid & 0xFFF, ANIM_TAKE_OUT, weaponAnimationCode, obj->rotation + 1);
             CacheEntry* takeOutFrmHandle;
@@ -3889,6 +4129,10 @@ void dude_stand(Object* obj, int rotation, int fid)
     rect_min_bound(&rect, &temp, &rect);
 
     tile_refresh_rect(&rect, obj->elevation);
+
+    if (settle) {
+        anim_smooth_settle(obj, &drawnBefore);
+    }
 }
 
 // 0x417EAC
@@ -3975,6 +4219,10 @@ void anim_stop()
         anim_set_end(index);
     }
 
+    // Everything stops standing up -- including a body held in its stride by a leg that ended a
+    // moment ago (a save lands here mid-chase).
+    anim_deferred_stands(true);
+
     anim_in_anim_stop = false;
     curr_sad = 0;
 }
@@ -4033,6 +4281,89 @@ static float anim_weapon_swap_stat_factor = 0.0f;
 void anim_set_weapon_swap_stat_factor(float factor)
 {
     anim_weapon_swap_stat_factor = factor;
+}
+
+// RELOAD ANIMATION (2026-10-04, MODS "Reload animation", cfg [preferences] reload_anim, 0 = off =
+// the instant vanilla reload).
+//
+// Fallout has no reload animation -- but every weapon's STAND art is a 9..18-frame loop of the dude
+// handling that weapon (16 frames for the SMG, 15 for the shotgun), and the engine plays it as his
+// random idle fidget. That is the "he reloads his gun and I can't move" the player kept seeing. With
+// this on, that loop IS the reload: the reload button plays it once and the magazine fills at its
+// end (gamepad_ui.cc), and the random idle is switched off for the dude, so the animation only ever
+// means one thing.
+static int anim_reload_anim = -1;
+
+bool anim_get_reload_anim()
+{
+    if (anim_reload_anim < 0) {
+        int v = 0;
+        config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, "reload_anim", &v);
+        anim_reload_anim = v != 0 ? 1 : 0;
+    }
+    return anim_reload_anim != 0;
+}
+
+void anim_set_reload_anim(bool on)
+{
+    anim_reload_anim = on ? 1 : 0;
+}
+
+// The critter whose reload is being registered right now, NULL otherwise. Set around the
+// register_end that starts its STAND animation, so compute_tpf -- which runs right there,
+// synchronously, as the first description begins -- times THAT animation by the critter's Agility.
+// A plain "is it a STAND" test cannot tell a reload from a standing frame or somebody's idle.
+//
+// ⚠️ ANY CRITTER, not just the dude (2026-10-04, "budou všichni přebíjet?"): NPCs reload through the
+// same loop when the MODS row is on (combat_rt.cc rt_npc_start_reload_anim), so a slow reload is a
+// cost everyone pays, never one only the player does.
+static Object* anim_reload_timing_obj = NULL;
+
+void anim_set_reload_timing(Object* critter)
+{
+    anim_reload_timing_obj = critter;
+}
+
+// The critter whose DRUG INJECTION (ANIM_MAGIC_HANDS_MIDDLE) is being registered or measured right
+// now, NULL otherwise -- the same kind of bracket as anim_set_reload_timing. compute_tpf times that
+// animation by the average of Agility, Intelligence and Perception (2026-10-06); outside the bracket
+// the same animation (picking things up, using objects) keeps its plain timing.
+static Object* anim_injection_timing_obj = NULL;
+
+void anim_set_injection_timing(Object* critter)
+{
+    anim_injection_timing_obj = critter;
+}
+
+// THE RELOAD ITSELF, registered inside an open register_begin..register_end: the weapon's STAND
+// loop -- EXCEPT FOR PISTOLS (2026-10-06, "pistole 10mm má jen otírání hlavy jako reload?"). Every
+// pistol shares one animation set, and its STAND loop is the dude wiping his forehead, nothing to do
+// with the gun. So a pistol holsters and draws again instead -- the swap's own put-away + take-out,
+// the same two descriptions intface_change_fid_animate registers -- which reads as reaching to the
+// belt for a magazine. Agility times both through the swap curve in compute_tpf; dude_stand at the
+// end of the sequence rebuilds the pistol stand pose from the take-out art, exactly as after a swap.
+int register_object_reload(Object* critter)
+{
+    int weaponCode = (critter->fid & 0xF000) >> 12;
+    if (weaponCode == WEAPON_ANIMATION_PISTOL) {
+        const char* sfx = gsnd_build_character_sfx_name(critter, ANIM_PUT_AWAY, CHARACTER_SOUND_EFFECT_UNUSED);
+        register_object_play_sfx(critter, sfx, 0);
+        if (register_object_animate(critter, ANIM_PUT_AWAY, 0) == -1) {
+            return -1;
+        }
+        return register_object_take_out(critter, weaponCode, -1);
+    }
+
+    return register_object_animate(critter, ANIM_STAND, 0);
+}
+
+// Is this body still playing its reload? STAND for most weapons, PUT_AWAY then TAKE_OUT for a pistol
+// (register_object_reload). Anything else means the reload was replaced -- cut.
+bool anim_is_reload_pose(Object* critter)
+{
+    int anim = FID_ANIM_TYPE(critter->fid);
+    return anim_busy(critter) != 0
+        && (anim == ANIM_STAND || anim == ANIM_PUT_AWAY || anim == ANIM_TAKE_OUT);
 }
 
 // --- Realtime-combat per-direction NPC walk-speed normalization. ---
@@ -4200,6 +4531,83 @@ static void walk_log(const char* fmt, ...)
 //
 // Applies to the DUDE as well as NPCs, deliberately: he is the one who mostly does the crippling,
 // and a consequence he can never suffer is not a mechanic, it is a cheat code.
+// TRAVEL SPEED: how fast the player's side moves WHEN NOBODY IS FIGHTING.
+//
+// The complaint this answers is "walking bores me, I just hold run, and it is still meh" -- and the
+// numbers back it up. Movement had exactly one lever for the player and it only touched the RUN:
+// run_speed_scale normalises the art and then applies Agility (run_agility_factor 0.04, so AGI 10 =
+// 0.80). The WALK has none at all -- walk_dir_slowdown deliberately never rescales the dude, so his
+// walk is raw vanilla art times the global anim_speed, and Agility buys him nothing on foot. Crossing
+// an empty map is therefore exactly as slow as it was in 1997, which is what he actually noticed.
+//
+// ⚠️ ONLY OUT OF COMBAT, and that boundary is the whole design. Speed IS the kiting exploit: the
+// hostile runners are normalised against the dude's own run cadence (run_speed_scale's refCross
+// takes the SLOWER of dude/own), so making the dude faster does NOT drag them along -- he simply
+// outruns everything on the map, which is the hole the AP-drain on running was built to close.
+// Out of combat none of that exists: running is already free, nothing is chasing, and the only
+// thing the speed changes is how long the boring part lasts. So this is free to crank, and the
+// combat pacing that was play-tested into shape is untouched.
+//
+// Applies to the dude AND his party -- companions follow him, so leaving them behind would just
+// trade a slow walk for a string of teammates teleporting to catch up.
+//
+// ⚠️ DEFAULT IS 1.0 = OFF. His call: a normal player should get the game as it was authored, and
+// this is an accessibility/comfort knob you go and switch ON. So the shipped behaviour is vanilla
+// speed and the cfg (or the Preferences row) is what opts in.
+//
+// Lever: cfg [preferences] travel_speed (1.0 = off, 0.7 ~ 40% faster, floor 0.35).
+static float travel_speed_scale(Object* object)
+{
+    if (object == NULL || FID_TYPE(object->fid) != OBJ_TYPE_CRITTER) {
+        return 1.0f;
+    }
+
+    if (object != obj_dude && !isPartyMember(object)) {
+        return 1.0f;
+    }
+
+    // Any live fight, whoever it is between, puts everyone back on combat cadence. Deliberately the
+    // BROAD test (the warm combat bit) rather than "is something after ME": a bystander sprinting
+    // through someone else's firefight at travel speed would read as a bug, and being conservative
+    // here can only ever cost speed, never balance.
+    if (combat_rt_enabled() ? combat_rt_active() : (isInCombat() != 0)) {
+        return 1.0f;
+    }
+
+    return anim_get_travel_speed();
+}
+
+// The live value, -1 until the first read pulls it out of the cfg. Kept at file scope rather than
+// inside travel_speed_scale so the MODS screen can move it without a re-init.
+static float anim_travel_speed = -1.0f;
+
+// The travel-speed factor as it is ACTUALLY being applied to the dude right now -- combat test
+// and all. ⚠️ Callers outside this file must ask THIS, not anim_get_travel_speed: the raw setting
+// says what you chose, this says what the legs are doing, and the game clock has to follow the legs
+// (scr_process_all). Reading the setting instead would speed time up in the combat cases where the
+// movement itself is deliberately not sped up.
+float anim_travel_speed_in_effect()
+{
+    return travel_speed_scale(obj_dude);
+}
+
+float anim_get_travel_speed()
+{
+    if (anim_travel_speed < 0.0f) {
+        double v = 1.0;
+        config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, "travel_speed", &v);
+        anim_travel_speed = v < 0.35 ? 0.35f : (v > 1.0 ? 1.0f : (float)v);
+    }
+    return anim_travel_speed;
+}
+
+// MODS page: change the travel speed while the game runs. Same clamp as the loader, so the screen
+// cannot feed in a value the cfg path would have rejected.
+void anim_set_travel_speed(float scale)
+{
+    anim_travel_speed = scale < 0.35f ? 0.35f : (scale > 1.0f ? 1.0f : scale);
+}
+
 static float crippled_move_scale(Object* object)
 {
     if (object == NULL || FID_TYPE(object->fid) != OBJ_TYPE_CRITTER) {
@@ -4422,6 +4830,25 @@ struct WalkSmoothState {
     int rot;
     float fracX;
     float fracY;
+
+    // How far the ramp advances per frame. Stored rather than recomputed because a step may start
+    // from somewhere other than the tile centre (see the seed below), and then it is not delta / n.
+    float stepX;
+    float stepY;
+
+    // Where the body already stands when a walk STARTS, handed over by object_move before it
+    // re-centres the object. The first step then ramps FROM there instead of from the tile centre,
+    // which is what lets a walk begin after a stop that left the body between two tiles without
+    // teleporting it onto the tile first. Consumed by the next reset.
+    float seedX;
+    float seedY;
+    bool hasSeed;
+
+    // Set on the frame the ramp finished a tile, so the NEXT call restarts it. ⚠️ Inferring that
+    // from obj->x/y being back at zero (as this once did) stops working the moment a step can start
+    // anywhere other than a tile centre -- the ramp would run on into a second tile's worth of
+    // offset.
+    bool crossed;
 };
 #define WALK_SMOOTH_SLOTS 16
 static WalkSmoothState walk_smooth_state[WALK_SMOOTH_SLOTS];
@@ -4435,33 +4862,60 @@ static WalkSmoothState* walk_smooth_slot(Object* object)
     }
     for (int i = 0; i < WALK_SMOOTH_SLOTS; i++) {
         if (walk_smooth_state[i].obj == NULL) {
-            walk_smooth_state[i].obj = object;
-            walk_smooth_state[i].rot = -1;
-            return &walk_smooth_state[i];
+            WalkSmoothState* s = &walk_smooth_state[i];
+            memset(s, 0, sizeof(*s));
+            s->obj = object;
+            s->rot = -1;
+            return s;
         }
     }
     static int ev = 0; // all slots busy: evict via a rotating cursor
     WalkSmoothState* s = &walk_smooth_state[ev];
     ev = (ev + 1) % WALK_SMOOTH_SLOTS;
+    memset(s, 0, sizeof(*s)); // ⚠️ a reused slot must not inherit the last object's ramp
     s->obj = object;
     s->rot = -1;
     return s;
 }
 
-// Overrides this frame's (frameX, frameY) walk delta with a constant-velocity step so the
-// object marches linearly to the tile boundary. The ramp spans n = the art's own
-// frames-per-tile for this facing, so the per-tile duration (walk speed) is unchanged --
-// only the within-tile motion is evened, killing the lurch. No-op if the art can't be
-// measured, so motion never breaks.
-static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* frameY)
+// Tell the smoother where the body already is, before object_move re-centres it on its tile.
+// ⚠️ obj_move_to_tile zeroes obj->x/y, so without this a walk that begins after a stop mid-tile
+// would start by teleporting the body onto the tile centre.
+static void walk_smooth_seed(Object* object, int x, int y)
 {
-    if (rotation < 0 || rotation >= ROTATION_COUNT) {
+    if (x == 0 && y == 0) {
         return;
     }
 
-    float fpt = walk_frames_per_tile(object, rotation, ANIM_WALK);
+    WalkSmoothState* s = walk_smooth_slot(object);
+    s->seedX = (float)x;
+    s->seedY = (float)y;
+    s->hasSeed = true;
+}
+
+// CONSTANT-VELOCITY RAMP. Overrides this frame's (frameX, frameY) walk delta so obj->x/y marches
+// linearly to the tile boundary, instead of following the art's uneven per-frame hot offsets --
+// those lurch on some facings (the radscorpion's NW art front-loads its motion in big jumps) and
+// read as "fast" even when the per-tile time is normal. The ramp spans the art's own
+// frames-per-tile, so the walk speed per tile is unchanged; only the motion WITHIN a tile is
+// evened. Applied to every critter in realtime; turn-based keeps the art-driven motion.
+//
+// Returns 1 if this step has now covered its whole tile, 0 if not, -1 if the ramp did not run (bad
+// rotation, unmeasurable art) and the caller must fall back to its own test.
+//
+// ⚠️ IT OWNS THE TILE-CROSSING TEST. object_move's own test asks whether obj->x/y has reached the
+// tile delta -- which stops being the same question once a step can BEGIN somewhere other than the
+// tile centre (the seed above). For a step that starts at the centre the answer is identical,
+// because obj->x was never anything but this ramp, rounded.
+static int walk_smooth_offset(Object* object, int rotation, int anim, int* frameX, int* frameY)
+{
+    if (rotation < 0 || rotation >= ROTATION_COUNT) {
+        return -1;
+    }
+
+    float fpt = walk_frames_per_tile(object, rotation, anim);
     if (fpt < 1.0f) {
-        return;
+        return -1;
     }
 
     int n = (int)(fpt + 0.5f);
@@ -4473,17 +4927,51 @@ static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* f
     int oy = off_tile[1][rotation];
 
     WalkSmoothState* s = walk_smooth_slot(object);
-    if (rotation != s->rot || (object->x == 0 && object->y == 0)) {
+
+    if (s->crossed || rotation != s->rot || (object->x == 0 && object->y == 0)) {
+        // Where this step's ramp begins. Normally the tile centre; after a stop that left the body
+        // between tiles, wherever it was left -- so the step covers the real remaining ground and
+        // still lands exactly on the next tile.
+        float startX = 0.0f;
+        float startY = 0.0f;
+        if (s->hasSeed) {
+            startX = s->seedX;
+            startY = s->seedY;
+            s->hasSeed = false;
+
+            // ⚠️ A seed already at or past the target would finish the step on its first frame (the
+            // ramp would run backwards and the done test would fire at once). Nothing sensible can
+            // be interpolated from there, so fall back to the tile centre and accept the one snap.
+            if ((ox > 0 && startX >= (float)ox) || (ox < 0 && startX <= (float)ox)) {
+                startX = 0.0f;
+                startY = 0.0f;
+            }
+            if (oy != 0 && ((oy > 0 && startY >= (float)oy) || (oy < 0 && startY <= (float)oy))) {
+                startX = 0.0f;
+                startY = 0.0f;
+            }
+        }
+
+        s->crossed = false;
         s->rot = rotation;
-        s->fracX = 0.0f;
-        s->fracY = 0.0f;
+        s->fracX = startX;
+        s->fracY = startY;
+        s->stepX = ((float)ox - startX) / n;
+        s->stepY = ((float)oy - startY) / n;
     }
 
-    s->fracX += (float)ox / n;
-    s->fracY += (float)oy / n;
+    s->fracX += s->stepX;
+    s->fracY += s->stepY;
 
     *frameX = (int)lroundf(s->fracX) - object->x;
     *frameY = (int)lroundf(s->fracY) - object->y;
+
+    bool done = (ox > 0 ? s->fracX >= (float)ox : s->fracX <= (float)ox)
+        || (oy != 0 && (oy > 0 ? s->fracY >= (float)oy : s->fracY <= (float)oy));
+
+    s->crossed = done;
+
+    return done ? 1 : 0;
 }
 
 // Extends an in-flight normal (non-straight) move animation for `obj` by
@@ -4496,6 +4984,93 @@ static void walk_smooth_offset(Object* object, int rotation, int* frameX, int* f
 //   -2  obj's sad is already finished (field_20 == -1000)
 //   -3  obj's sad is a straight move (knockback etc.), not a walk/run
 //   -4  rotations[] capacity would overflow
+// How many steps of obj's live walk have NOT started yet. The step in progress is excluded --
+// the critter is physically between two tiles and that one can no longer be changed.
+//
+// WHY THIS EXISTS: steering used to mean cutting the walk and registering a new one, and
+// obj_connect_to_tile zeroes obj->x/y, so every such cut SNAPPED the critter back to the centre of
+// the tile he was crossing -- up to 32 px of progress thrown away, the walk cycle reset to frame 0,
+// and make_path run again. That is the "it is not seamless, it is jerky when I change direction"
+// report. With per-step rotations the queued step can simply be rewritten instead.
+int anim_move_pending_steps(Object* obj)
+{
+    for (int i = 0; i < curr_sad; i++) {
+        AnimationSad* sad_entry = &(sad[i]);
+        if (sad_entry->obj != obj) {
+            continue;
+        }
+
+        if ((sad_entry->flags & ANIM_SAD_STRAIGHT) != 0) {
+            return 0;
+        }
+
+        // -2000 (not started) and -1000 (finished) are both "nothing to steer".
+        if (sad_entry->field_20 < 0) {
+            return 0;
+        }
+
+        int pending = sad_entry->field_1C - (sad_entry->field_20 + 1);
+        return pending > 0 ? pending : 0;
+    }
+
+    return 0;
+}
+
+// Replace the not-yet-started steps of obj's live walk with `rots`, in place. `count` must equal
+// anim_move_pending_steps(obj). The destination tile is recomputed (object_move re-paths to it when
+// something blocks the way), and `newDest` receives it. Returns 0 on success.
+//
+// ⚠️ IT NEVER TOUCHES THE STEP IN PROGRESS OR THE FRAME. That is the whole point: the walk cycle
+// keeps running, obj->x/y keeps its sub-tile progress, and the new heading takes effect at the next
+// tile boundary -- which is the soonest a hex walk could honour it anyway.
+int anim_move_repoint(Object* obj, const int* rots, int count, int* newDest)
+{
+    if (rots == NULL || count <= 0) {
+        return -6;
+    }
+
+    for (int i = 0; i < curr_sad; i++) {
+        AnimationSad* sad_entry = &(sad[i]);
+        if (sad_entry->obj != obj) {
+            continue;
+        }
+
+        if ((sad_entry->flags & ANIM_SAD_STRAIGHT) != 0) {
+            return -3;
+        }
+
+        if (sad_entry->field_20 < 0) {
+            return -2;
+        }
+
+        int start = sad_entry->field_20 + 1;
+        if (sad_entry->field_1C - start != count) {
+            return -5;
+        }
+
+        // Rebuild the destination FORWARD from where the object actually is, rather than rewinding
+        // field_24. ⚠️ field_24 is not always the end of the rotations array -- anim_move truncates
+        // field_1C to the action-point budget without touching it -- so rewinding would quietly
+        // drift. obj->tile is the tile the step in progress LEAVES (object_move advances the tile
+        // and the index together), so this is exact whatever field_24 held.
+        int dest = tile_num_in_direction(obj->tile, sad_entry->rotations[sad_entry->field_20], 1);
+
+        for (int j = 0; j < count; j++) {
+            sad_entry->rotations[start + j] = (unsigned char)rots[j];
+            dest = tile_num_in_direction(dest, rots[j], 1);
+        }
+
+        sad_entry->field_24 = dest;
+        if (newDest != NULL) {
+            *newDest = dest;
+        }
+
+        return 0;
+    }
+
+    return -1;
+}
+
 int anim_extend_move(Object* obj, int rotation, int count)
 {
     for (int i = 0; i < curr_sad; i++) {
@@ -4525,6 +5100,46 @@ int anim_extend_move(Object* obj, int rotation, int count)
     }
 
     return -1;
+}
+
+// How fast this critter's WALK or RUNNING art moves it, as the step-based mover plays it:
+// tiles per second, and animation frames per second. ⚠️ THE FREE MOVER HAS TO MATCH THIS EXACTLY.
+// Two movement modes that pace differently would make every number tuned against one of them wrong
+// under the other -- chase distances, the AP drain per second, how far you get between two shots.
+//
+// Measured on the EAST facing, which is the one whose tile is a whole 32 px; the art's other
+// facings differ slightly and picking one reference is what keeps a continuous heading from
+// changing speed as it sweeps. The two multipliers that live at object_move's call site rather than
+// inside compute_tpf (travel speed and the crippled-leg limp) are applied here for the same reason
+// they are applied there: they are tile-TIME factors, so they divide the speed.
+void anim_move_speed(Object* object, int anim, float* tilesPerSec, float* framesPerSec)
+{
+    *tilesPerSec = 0.0f;
+    *framesPerSec = 0.0f;
+
+    if (object == NULL) {
+        return;
+    }
+
+    float fpt = walk_frames_per_tile(object, ROTATION_E, anim);
+    if (fpt < 1.0f) {
+        return;
+    }
+
+    int fid = art_id(FID_TYPE(object->fid), object->fid & 0xFFF, anim,
+        (object->fid & 0xF000) >> 12, object->rotation + 1);
+    float tpf = (float)compute_tpf(object, fid);
+    if (tpf < 1.0f) {
+        tpf = 1.0f;
+    }
+
+    tpf *= travel_speed_scale(object) * crippled_move_scale(object);
+    if (tpf < 1.0f) {
+        tpf = 1.0f;
+    }
+
+    *framesPerSec = 1000.0f / tpf;
+    *tilesPerSec = 1000.0f / (fpt * tpf);
 }
 
 unsigned int compute_tpf(Object* object, int fid)
@@ -4658,22 +5273,617 @@ unsigned int compute_tpf(Object* object, int fid)
     // would be hidden combat power. That is exactly the mistake made on 2026-08-10, when the
     // animation bias was copied onto the attack cooldown and the player felt it as "attacks at
     // Strength 10 are maybe too fast".
+    //
+    // ⚠️ THE RELOAD IS THE SAME KIND OF WORK AND GETS THE SAME CURVE (2026-10-04, "rychlost se odvíjí
+    // podle stats"). It holds the dude for its whole length exactly like a swap does -- you cannot
+    // fire through it -- so it is throughput too, and it takes this symmetric factor rather than the
+    // attack animations' biased one. Only a reload's own STAND (anim_reload_timing_obj), never an
+    // ordinary standing frame or anyone's idle.
+    //
+    // ⚠️ THREE KINDS OF HAND WORK NOW, THREE STATS (2026-10-06, his calls), all on this one symmetric
+    // curve -- anyone who does the work is timed by their own stats, the dude and NPCs alike:
+    //   - a WEAPON SWAP: Agility, as before;
+    //   - a RELOAD: the average of Agility and Perception ("můžeme kdyžtak spojit PE a AGI") -- hands
+    //     and eyes. Its STAND loop starts inside the bracketed register_end; a PISTOL's reload is a
+    //     put-away + take-out (register_object_reload) whose take-out starts later, outside the
+    //     bracket, so the reloading registry identifies that half;
+    //   - a DRUG INJECTION (ANIM_MAGIC_HANDS_MIDDLE inside anim_set_injection_timing): the average of
+    //     Agility, Intelligence and Perception -- "nesmíš být dement a vědět jak to píchnout... abys
+    //     věděl kam to píchnout". Its length is also the dude's one-injection-at-a-time lock.
     if (anim_weapon_swap_stat_factor > 0.0f && combat_rt_enabled()
-        && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
-        && (animType == ANIM_TAKE_OUT || animType == ANIM_PUT_AWAY)) {
-        float mult = 1.0f - (stat_level(object, STAT_AGILITY) - 5) * anim_weapon_swap_stat_factor;
-        if (mult < ANIM_ATTACK_SPEED_MIN) {
-            mult = ANIM_ATTACK_SPEED_MIN;
-        } else if (mult > ANIM_ATTACK_SPEED_MAX) {
-            mult = ANIM_ATTACK_SPEED_MAX;
+        && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
+        bool swapType = animType == ANIM_TAKE_OUT || animType == ANIM_PUT_AWAY;
+        bool reloading = (animType == ANIM_STAND || swapType)
+            && (object == anim_reload_timing_obj || (swapType && combat_rt_is_reloading(object)));
+
+        float stat = -1.0f;
+        if (reloading) {
+            stat = (stat_level(object, STAT_AGILITY) + stat_level(object, STAT_PERCEPTION)) / 2.0f;
+        } else if (swapType) {
+            stat = (float)stat_level(object, STAT_AGILITY);
+        } else if (animType == ANIM_MAGIC_HANDS_MIDDLE && object == anim_injection_timing_obj) {
+            stat = (stat_level(object, STAT_AGILITY) + stat_level(object, STAT_INTELLIGENCE)
+                       + stat_level(object, STAT_PERCEPTION))
+                / 3.0f;
         }
-        tpf = (unsigned int)(tpf * mult);
-        if (tpf < 1) {
-            tpf = 1;
+
+        if (stat >= 0.0f) {
+            float mult = 1.0f - (stat - 5.0f) * anim_weapon_swap_stat_factor;
+            if (mult < ANIM_ATTACK_SPEED_MIN) {
+                mult = ANIM_ATTACK_SPEED_MIN;
+            } else if (mult > ANIM_ATTACK_SPEED_MAX) {
+                mult = ANIM_ATTACK_SPEED_MAX;
+            }
+            tpf = (unsigned int)(tpf * mult);
+            if (tpf < 1) {
+                tpf = 1;
+            }
         }
     }
 
     return tpf;
+}
+
+// =================================================================================================
+// SMOOTH MOVEMENT, HELD STRIDES AND THE STRIDE'S BEAT (2026-10-08: "potřebuji aby všechny animace
+// nevypadaly přerušovaně ... aby to bylo plynulé, polish prostě")
+// =================================================================================================
+//
+// Three things made every moving body look broken up, and none of them is the art:
+//
+// 1. A MOVE ONLY MOVES WHEN ITS FRAME CHANGES. object_move and object_straight_move step the body
+//    once per animation frame -- 10 to 20 times a second -- and it stands still in between. On a
+//    853x480 picture stretched x3 to 1440p at 240 Hz a walking NPC jumps ~24 screen pixels at a
+//    time, while the dude (free movement) and the camera glide every frame, so next to them
+//    everything else stutters. The fix is DRAWING ONLY: the logical position (tile, obj->x/y) still
+//    jumps exactly as before and every rule that reads it is untouched, but the sprite is drawn
+//    gliding from where it was DRAWN to where it now IS, over the step's own frame time -- so the
+//    drawn spot trails the real one by at most a step. MODS "Smooth movement", cfg smooth_motion.
+//
+// 2. EVERY CHASE LEG ENDED STANDING. anim_set_end stands a critter whose sequence finishes, and a
+//    chase is a string of short legs (rt_step_toward: up to four tiles each): STAND for a frame,
+//    then the next leg's stride from frame 0 -- a hitch every four tiles on every chaser. A leg
+//    registered with ANIMATION_REQUEST_DEFER_STAND is held in its stride instead (anim_defer_stand)
+//    and only stood if no new leg turns up within ANIM_DEFER_STAND_MS.
+//
+// 3. EVERY LEG STARTED A FRAME AFTER THE LAST ONE ENDED. A new move sad is due the moment it
+//    exists, so the first step of a leg landed ~16 ms after the last step of the leg before: two
+//    steps at once, a lurch. anim_move_cadence_hold makes it wait for the beat it would have had.
+//
+// Measure, don't guess: the main loop's frame-pacing meter reports all of it (anim_smooth_take_stats).
+
+#define ANIM_SMOOTH_SLOTS 64
+
+// Further than this between where a body is drawn and where it really is, and it is not a step: a
+// teleport, a script moving it, a door path recompute. Snap rather than glide across the room.
+#define ANIM_SMOOTH_MAX_PX 48.0f
+
+typedef struct AnimSmooth {
+    Object* obj;
+    int elevation;
+
+    // WORLD pixels (anim_smooth_world) the body was DRAWN at when its latest step landed, the
+    // moment that step started, and how long the glide from there to the live position takes.
+    float fromX;
+    float fromY;
+    unsigned int t0;
+    float dur;
+
+    // Drawn = logical + (dx, dy), as of the last redraw. Every draw, bound and hit test reads THIS
+    // value -- never a fresh one -- so the screen and the dirty rects can never disagree about
+    // where the body is, which is what keeps the glide from leaving smears behind it.
+    int dx;
+    int dy;
+} AnimSmooth;
+
+static AnimSmooth anim_smooth[ANIM_SMOOTH_SLOTS];
+static int anim_smooth_count = 0;
+static bool anim_smooth_on = false;
+
+// Rects still showing a body that left the world while it was drawn off its logical spot. The
+// eraser redraws the LOGICAL spot only; the next tick redraws these.
+#define ANIM_SMOOTH_OWED_SLOTS 16
+static Rect anim_smooth_owed[ANIM_SMOOTH_OWED_SLOTS];
+static int anim_smooth_owed_elevation[ANIM_SMOOTH_OWED_SLOTS];
+static int anim_smooth_owed_count = 0;
+
+// HELD STRIDES (anim_defer_stand). Longer than one frame of the slowest walk art, shorter than the
+// eye reads as "it stopped mid-step".
+#define ANIM_DEFER_STAND_SLOTS 32
+#define ANIM_DEFER_STAND_MS 120
+
+typedef struct AnimDeferredStand {
+    Object* obj;
+    unsigned int since;
+} AnimDeferredStand;
+
+static AnimDeferredStand anim_deferred[ANIM_DEFER_STAND_SLOTS];
+static int anim_deferred_count = 0;
+
+// THE STRIDE'S BEAT (anim_move_cadence_hold): when each NPC's last move step landed, in which gait,
+// and how long that step lasts.
+#define ANIM_LAST_STEP_SLOTS 64
+
+typedef struct AnimLastStep {
+    Object* obj;
+    int anim;
+    unsigned int time;
+    unsigned int stepMs;
+    bool counted;
+} AnimLastStep;
+
+static AnimLastStep anim_last_step[ANIM_LAST_STEP_SLOTS];
+static int anim_last_step_count = 0;
+static int anim_last_step_cursor = 0;
+
+static int anim_stat_glides = 0;
+static int anim_stat_glide_snaps = 0;
+static int anim_stat_stride_holds = 0;
+static int anim_stat_stride_stands = 0;
+static int anim_stat_cadence_holds = 0;
+
+bool anim_get_smooth_motion()
+{
+    return anim_smooth_on;
+}
+
+// Off takes effect at the next tick, which lands every glide in flight on its real spot.
+void anim_set_smooth_motion(bool on)
+{
+    anim_smooth_on = on;
+}
+
+// Where obj is, in pixels that do not move with the camera: its tile's screen spot minus tile 0's,
+// both taken now, so the scroll cancels out. (tile_set_center keeps the camera's column even, and
+// that is what makes tile_coord's differences exact wherever the camera is.)
+static bool anim_smooth_world(Object* obj, float* x, float* y)
+{
+    if (obj->tile == -1) {
+        return false;
+    }
+
+    int sx;
+    int sy;
+    int ox;
+    int oy;
+    if (tile_coord(obj->tile, &sx, &sy, obj->elevation) != 0 || tile_coord(0, &ox, &oy, obj->elevation) != 0) {
+        return false;
+    }
+
+    *x = (float)(sx - ox + obj->x);
+    *y = (float)(sy - oy + obj->y);
+    return true;
+}
+
+static int anim_smooth_index(Object* obj)
+{
+    for (int i = 0; i < anim_smooth_count; i++) {
+        if (anim_smooth[i].obj == obj) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void anim_smooth_remove(int index)
+{
+    anim_smooth[index] = anim_smooth[--anim_smooth_count];
+}
+
+bool anim_smooth_offset(Object* obj, int* dx, int* dy)
+{
+    if (anim_smooth_count != 0) {
+        int i = anim_smooth_index(obj);
+        if (i != -1 && (anim_smooth[i].dx != 0 || anim_smooth[i].dy != 0)) {
+            *dx = anim_smooth[i].dx;
+            *dy = anim_smooth[i].dy;
+            return true;
+        }
+    }
+
+    *dx = 0;
+    *dy = 0;
+    return false;
+}
+
+// Before a move step: where the body is drawn right now. ⚠️ NEVER THE DUDE -- the camera follows his
+// LOGICAL spot (and free movement already glides him), so drawing him anywhere else would knock him
+// off the centre of his own view.
+static bool anim_smooth_begin(Object* obj, float* drawnX, float* drawnY)
+{
+    if (!anim_smooth_on || obj == NULL || obj == obj_dude) {
+        return false;
+    }
+
+    if (!anim_smooth_world(obj, drawnX, drawnY)) {
+        return false;
+    }
+
+    int i = anim_smooth_index(obj);
+    if (i != -1) {
+        *drawnX += (float)anim_smooth[i].dx;
+        *drawnY += (float)anim_smooth[i].dy;
+    }
+
+    return true;
+}
+
+// After the step, before object_move redraws `dirty`: start the glide from where the body was drawn
+// to where it now is. The body therefore does not move on screen at the instant of the step at all
+// -- it starts gliding. `dirty` already covers the old drawn spot (the step bounded the body before
+// it moved it); the new one is added here.
+static void anim_smooth_end(Object* obj, float drawnX, float drawnY, unsigned int stepMs, Rect* dirty)
+{
+    int i = anim_smooth_index(obj);
+
+    float wx = 0.0f;
+    float wy = 0.0f;
+    bool placed = anim_smooth_world(obj, &wx, &wy);
+
+    float ox = placed ? drawnX - wx : 0.0f;
+    float oy = placed ? drawnY - wy : 0.0f;
+    bool tooFar = fabsf(ox) > ANIM_SMOOTH_MAX_PX || fabsf(oy) > ANIM_SMOOTH_MAX_PX;
+
+    if (!placed || tooFar || (ox == 0.0f && oy == 0.0f)) {
+        if (i != -1) {
+            if (tooFar) {
+                anim_stat_glide_snaps++;
+            }
+            anim_smooth_remove(i);
+            if (placed) {
+                Rect r;
+                obj_bound(obj, &r);
+                rect_min_bound(dirty, &r, dirty);
+            }
+        }
+        return;
+    }
+
+    if (i == -1) {
+        if (anim_smooth_count >= ANIM_SMOOTH_SLOTS) {
+            return; // no slot: this one steps the way it always did
+        }
+        i = anim_smooth_count++;
+        anim_smooth[i].obj = obj;
+        anim_stat_glides++;
+    }
+
+    AnimSmooth* s = &(anim_smooth[i]);
+    s->elevation = obj->elevation;
+    s->fromX = drawnX;
+    s->fromY = drawnY;
+    s->t0 = get_time();
+
+    // A hair LONGER than the step itself, so the glide is still under way when the next step lands
+    // and the motion never pauses on a step boundary. The lag that builds settles at a few percent
+    // of a step, and the speed on screen is exactly the step's.
+    s->dur = (float)stepMs * 1.08f + 4.0f;
+    s->dx = (int)lroundf(ox);
+    s->dy = (int)lroundf(oy);
+
+    Rect r;
+    obj_bound(obj, &r);
+    rect_min_bound(dirty, &r, dirty);
+}
+
+// ⚠️ A POSE CHANGE THAT MOVES THE FEET, EASED (2026-10-08). Every animation ends in dude_stand, which
+// puts the body back on its standing spot in one frame -- and a shot does not end where it began:
+// POINT -> FIRE -> UNPOINT drift the body by their frame offsets, so lowering the gun hopped the dude
+// 7-12 px sideways (trace_2026-10-08_215600: 30 of them in 13 minutes, `dude-rest anim=44`). He
+// asked for it gone ("udělej to"). This measures the jump where the eye sees it -- the FEET, the
+// bottom centre of the drawn sprite, before and after the stand -- so whatever the art's own anchors
+// already cancel is left alone, and glides only what is left, over ANIM_SETTLE_MS. Drawing only, like
+// every glide here: the logical spot is the stand spot at once. The camera already eases on its own
+// over the same tenth of a second (rt_cam_advance_lag), so the two settle together.
+#define ANIM_SETTLE_MS 110.0f
+#define ANIM_SETTLE_MIN_PX 3.0f
+
+static void anim_smooth_settle(Object* obj, const Rect* before)
+{
+    if (!anim_smooth_on || obj == NULL || obj->tile == -1 || obj->elevation != map_elevation) {
+        return;
+    }
+
+    int i = anim_smooth_index(obj);
+    int curDx = i != -1 ? anim_smooth[i].dx : 0;
+    int curDy = i != -1 ? anim_smooth[i].dy : 0;
+
+    // obj_bound includes any glide already in flight; take it out to get the LOGICAL feet.
+    Rect after;
+    obj_bound(obj, &after);
+    float ox = (float)((before->ulx + before->lrx) / 2 - ((after.ulx + after.lrx) / 2 - curDx));
+    float oy = (float)(before->lry - (after.lry - curDy));
+
+    if (fabsf(ox) + fabsf(oy) < ANIM_SETTLE_MIN_PX) {
+        return; // the art lines up (or nearly): nothing to ease, and a glide in flight carries on
+    }
+    if (fabsf(ox) > ANIM_SMOOTH_MAX_PX || fabsf(oy) > ANIM_SMOOTH_MAX_PX) {
+        return; // not a pose: a teleport or a map move -- the stand snaps as it always did
+    }
+
+    float wx;
+    float wy;
+    if (!anim_smooth_world(obj, &wx, &wy)) {
+        return;
+    }
+
+    if (i == -1) {
+        if (anim_smooth_count >= ANIM_SMOOTH_SLOTS) {
+            return;
+        }
+        i = anim_smooth_count++;
+        anim_smooth[i].obj = obj;
+        anim_stat_glides++;
+    }
+
+    AnimSmooth* sm = &(anim_smooth[i]);
+    sm->elevation = obj->elevation;
+    sm->fromX = wx + ox;
+    sm->fromY = wy + oy;
+    sm->t0 = get_time();
+    sm->dur = ANIM_SETTLE_MS;
+    sm->dx = (int)lroundf(ox);
+    sm->dy = (int)lroundf(oy);
+
+    Rect r;
+    obj_bound(obj, &r);
+    tile_refresh_rect(&r, obj->elevation);
+}
+
+void anim_smooth_tick()
+{
+    for (int i = 0; i < anim_smooth_owed_count; i++) {
+        if (anim_smooth_owed_elevation[i] == map_elevation) {
+            tile_refresh_rect(&(anim_smooth_owed[i]), map_elevation);
+        }
+    }
+    anim_smooth_owed_count = 0;
+
+    if (anim_smooth_count == 0) {
+        return;
+    }
+
+    unsigned int now = get_time();
+
+    for (int i = 0; i < anim_smooth_count;) {
+        AnimSmooth* s = &(anim_smooth[i]);
+        Object* obj = s->obj;
+
+        // Left the map's drawing altogether (picked up, hidden, gone up the stairs): whoever did
+        // that redrew where it was. Just forget it.
+        if (obj->tile == -1 || obj->elevation != s->elevation || (obj->flags & OBJECT_HIDDEN) != 0) {
+            anim_smooth_remove(i);
+            continue;
+        }
+
+        // Switched off (or finished) lands it on its real spot: offset 0, redrawn below.
+        int ndx = 0;
+        int ndy = 0;
+        bool done = !anim_smooth_on;
+
+        float wx;
+        float wy;
+        if (!done && anim_smooth_world(obj, &wx, &wy)) {
+            unsigned int elapsed = elapsed_tocks(now, s->t0);
+            float p = (float)elapsed >= s->dur ? 1.0f : (float)elapsed / s->dur;
+            if (p >= 1.0f) {
+                done = true;
+            } else {
+                float ox = (s->fromX - wx) * (1.0f - p);
+                float oy = (s->fromY - wy) * (1.0f - p);
+                if (fabsf(ox) > ANIM_SMOOTH_MAX_PX || fabsf(oy) > ANIM_SMOOTH_MAX_PX) {
+                    // Something other than a step moved it a long way mid-glide.
+                    done = true;
+                    anim_stat_glide_snaps++;
+                } else {
+                    ndx = (int)lroundf(ox);
+                    ndy = (int)lroundf(oy);
+                }
+            }
+        } else {
+            done = true;
+        }
+
+        if (ndx != s->dx || ndy != s->dy) {
+            Rect before;
+            Rect after;
+            obj_bound(obj, &before);
+            s->dx = ndx;
+            s->dy = ndy;
+            obj_bound(obj, &after);
+            rect_min_bound(&before, &after, &before);
+            if (obj->elevation == map_elevation) {
+                tile_refresh_rect(&before, obj->elevation);
+            }
+        }
+
+        if (done) {
+            anim_smooth_remove(i);
+            continue;
+        }
+
+        i++;
+    }
+}
+
+// A leg of a longer move ended (anim_set_end, ANIM_SEQ_DEFER_STAND): leave the body in its stride
+// for now. False when the table is full -- the caller then stands it the old way.
+static bool anim_defer_stand(Object* obj)
+{
+    for (int i = 0; i < anim_deferred_count; i++) {
+        if (anim_deferred[i].obj == obj) {
+            anim_deferred[i].since = get_time();
+            return true;
+        }
+    }
+
+    if (anim_deferred_count >= ANIM_DEFER_STAND_SLOTS) {
+        return false;
+    }
+
+    anim_deferred[anim_deferred_count].obj = obj;
+    anim_deferred[anim_deferred_count].since = get_time();
+    anim_deferred_count++;
+    anim_stat_stride_holds++;
+    return true;
+}
+
+// Every frame (object_animate): a held body that something has taken over since (the next leg, an
+// attack, a flinch) is that animation's business now; one that nothing claimed within
+// ANIM_DEFER_STAND_MS is stood after all, exactly as anim_set_end would have. `now` stands every
+// held body at once (anim_stop: a save or a map change must not leave anyone mid-stride).
+static void anim_deferred_stands(bool now)
+{
+    if (anim_deferred_count == 0) {
+        return;
+    }
+
+    unsigned int time = get_time();
+
+    for (int i = 0; i < anim_deferred_count;) {
+        Object* obj = anim_deferred[i].obj;
+        bool drop = false;
+
+        if (!now && anim_busy(obj) != 0) {
+            drop = true;
+        } else if (now || elapsed_tocks(time, anim_deferred[i].since) >= ANIM_DEFER_STAND_MS) {
+            int pose = FID_ANIM_TYPE(obj->fid);
+            if ((pose == ANIM_WALK || pose == ANIM_RUNNING) && obj->tile != -1
+                && !critter_is_prone(obj) && !critter_is_dead(obj)) {
+                dude_stand(obj, obj->rotation, -1);
+                anim_stat_stride_stands++;
+            }
+            drop = true;
+        }
+
+        if (drop) {
+            anim_deferred[i] = anim_deferred[--anim_deferred_count];
+            continue;
+        }
+
+        i++;
+    }
+}
+
+static AnimLastStep* anim_last_step_find(Object* obj)
+{
+    for (int i = 0; i < anim_last_step_count; i++) {
+        if (anim_last_step[i].obj == obj) {
+            return &(anim_last_step[i]);
+        }
+    }
+    return NULL;
+}
+
+// Every move step of an NPC: when it landed, in which gait, and how long it lasts.
+static void anim_note_move_step(Object* obj, int anim, unsigned int time, unsigned int stepMs)
+{
+    if (!combat_rt_enabled() || obj == NULL || obj == obj_dude || FID_TYPE(obj->fid) != OBJ_TYPE_CRITTER) {
+        return;
+    }
+
+    AnimLastStep* r = anim_last_step_find(obj);
+    if (r == NULL) {
+        if (anim_last_step_count < ANIM_LAST_STEP_SLOTS) {
+            r = &(anim_last_step[anim_last_step_count++]);
+        } else {
+            // Full: recycle round-robin. Losing one critter's beat costs one lurch, nothing more.
+            r = &(anim_last_step[anim_last_step_cursor]);
+            anim_last_step_cursor = (anim_last_step_cursor + 1) % ANIM_LAST_STEP_SLOTS;
+        }
+        r->obj = obj;
+    }
+
+    r->anim = anim;
+    r->time = time;
+    r->stepMs = stepMs;
+    r->counted = false;
+}
+
+// A new leg in the same gait waits until the step the last leg ended on has had its time.
+static bool anim_move_cadence_hold(Object* obj, int anim, unsigned int time)
+{
+    if (!combat_rt_enabled() || obj == NULL || obj == obj_dude) {
+        return false;
+    }
+
+    AnimLastStep* r = anim_last_step_find(obj);
+    if (r == NULL || r->anim != anim) {
+        return false;
+    }
+
+    unsigned int since = elapsed_tocks(time, r->time);
+    if (since >= r->stepMs || since > 600) {
+        return false;
+    }
+
+    if (!r->counted) {
+        r->counted = true;
+        anim_stat_cadence_holds++;
+    }
+    return true;
+}
+
+// The object is about to be freed (anim_notify_object_freed): out of every table. If it was drawn
+// off its logical spot, that spot is owed a redraw once it is gone (see anim_smooth_owed).
+static void anim_smooth_forget(Object* obj)
+{
+    int i = anim_smooth_index(obj);
+    if (i != -1) {
+        if ((anim_smooth[i].dx != 0 || anim_smooth[i].dy != 0)
+            && anim_smooth_owed_count < ANIM_SMOOTH_OWED_SLOTS && obj->tile != -1) {
+            obj_bound(obj, &(anim_smooth_owed[anim_smooth_owed_count]));
+            anim_smooth_owed_elevation[anim_smooth_owed_count] = obj->elevation;
+            anim_smooth_owed_count++;
+        }
+        anim_smooth_remove(i);
+    }
+
+    for (int j = 0; j < anim_deferred_count;) {
+        if (anim_deferred[j].obj == obj) {
+            anim_deferred[j] = anim_deferred[--anim_deferred_count];
+            continue;
+        }
+        j++;
+    }
+
+    for (int j = 0; j < anim_last_step_count; j++) {
+        if (anim_last_step[j].obj == obj) {
+            anim_last_step[j] = anim_last_step[--anim_last_step_count];
+            break;
+        }
+    }
+}
+
+void anim_smooth_reset()
+{
+    anim_smooth_count = 0;
+    anim_smooth_owed_count = 0;
+    anim_deferred_count = 0;
+    anim_last_step_count = 0;
+    anim_last_step_cursor = 0;
+}
+
+void anim_smooth_take_stats(AnimSmoothStats* out)
+{
+    out->pathSearches = anim_stat_path_searches;
+    out->pathMs = anim_stat_path_ms;
+    out->pathMaxMs = anim_stat_path_max_ms;
+    out->glides = anim_stat_glides;
+    out->glideSnaps = anim_stat_glide_snaps;
+    out->liveGlides = anim_smooth_count;
+    out->strideHolds = anim_stat_stride_holds;
+    out->strideStands = anim_stat_stride_stands;
+    out->cadenceHolds = anim_stat_cadence_holds;
+
+    anim_stat_path_searches = 0;
+    anim_stat_path_ms = 0.0;
+    anim_stat_path_max_ms = 0.0;
+    anim_stat_glides = 0;
+    anim_stat_glide_snaps = 0;
+    anim_stat_stride_holds = 0;
+    anim_stat_stride_stands = 0;
+    anim_stat_cadence_holds = 0;
 }
 
 } // namespace fallout

@@ -93,6 +93,10 @@ void gmouse_3d_enable_modes();
 void gmouse_3d_disable_modes();
 int gmouse_3d_modes_are_enabled();
 void gmouse_3d_set_mode(int a1);
+// Arm the use-on crosshair for an item that is NOT in the hand (the pad's quick-use page): the next
+// click uses the first item of this PID in the dude's pack. Cleared by that click or by leaving the
+// crosshair mode. Call AFTER setting GAME_MOUSE_MODE_USE_CROSSHAIR.
+void gmouse_set_use_on_item(int pid);
 int gmouse_3d_get_mode();
 // Forces the crosshair to-hit indicator (reticle + accuracy %) for a specific
 // target this frame, regardless of cursor stillness. Used by the controller
@@ -119,7 +123,8 @@ int gmouse_3d_pick_frame_hot(int* a1, int* a2);
 int gmouse_3d_build_menu_frame(int x, int y, const int* menuItems, int menuItemsCount, int width, int height);
 int gmouse_3d_menu_frame_hot(int* x, int* y);
 int gmouse_3d_highlight_menu_frame(int menuItemIndex);
-int gmouse_3d_build_to_hit_frame(const char* string, int color);
+// `line2` is an optional second line drawn under the first (the Awareness hit points).
+int gmouse_3d_build_to_hit_frame(const char* string, int color, const char* line2 = nullptr, int color2 = 0);
 int gmouse_3d_build_hex_frame(const char* string, int color);
 void gmouse_3d_synch_item_highlight();
 void gmouse_remove_item_outline(Object* object);

@@ -1,5 +1,6 @@
 #include "game/interact_prompt.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "game/actions.h"
@@ -207,18 +208,50 @@ static int ip_classify(Object* obj)
     }
 
     switch (FID_TYPE(obj->fid)) {
-    case OBJ_TYPE_ITEM:
-        if (item_get_type(obj) == ITEM_TYPE_CONTAINER) {
+    case OBJ_TYPE_ITEM: {
+        // ⚠️ RESOLVE THE PROTO OURSELVES. `item_get_type()` is vanilla and calls proto_ptr WITHOUT
+        // checking it (item.cc:585): on failure proto_ptr leaves the pointer NULL and the very next
+        // line reads `proto->item.type` -- NULL + 0x20. That is the crash he hit one tenth of a
+        // second after Continue loaded JUNKKILL.sav (trace_2026-09-16_214225, ACCESS_VIOLATION
+        // read 0x20 in item_get_type <- ip_classify).
+        //
+        // ⚠️ AND IT IS NOT A LOAD-TIMING FLUKE -- an object can simply HAVE NO PROTO. Scripts (and
+        // map_load_file itself) create objects with `obj_new(&obj, fid, -1)`, and pid -1 is the
+        // first thing proto_ptr refuses. The mouse never had to care, because vanilla picks targets
+        // out of what is rendered and reaches items through paths that check first; our prompt
+        // enumerates the map with obj_find_first_at and hands whatever it finds straight to a
+        // helper that assumes a proto. Same shape as the scenery branch below, which already does
+        // this correctly -- this branch was simply written trusting a function that cannot be.
+        //
+        // No proto = nothing we can say about the thing = not interactable.
+        Proto* itemProto = NULL;
+        if (proto_ptr(obj->pid, &itemProto) == -1 || itemProto == NULL) {
+            // DIAGNOSTIC, once per distinct pid: the guard above stops the crash either way, but
+            // the two causes want different follow-ups. A pid that shows up here EVERY session is a
+            // protoless object that simply exists on that map (nothing more to do). One that
+            // appears only in the seconds after a load would mean proto_ptr is failing TRANSIENTLY
+            // while the proto lists rebuild -- and that would be hiding a real bug, because the
+            // same item would be silently un-interactable for those frames. Say which it is.
+            static int reportedPid = -1;
+            if (obj->pid != reportedPid) {
+                reportedPid = obj->pid;
+                trace_event(TRACE_WARN, "ip-no-proto", "pid=%d fid=%08x tile=%d",
+                    obj->pid, obj->fid, obj->tile);
+            }
+            return IP_NONE;
+        }
+        if (itemProto->item.type == ITEM_TYPE_CONTAINER) {
             // A LOCKED chest offers the pick instead of a loot window that would just refuse.
             return obj_is_locked(obj) ? IP_LOCKPICK : IP_LOOT_CONTAINER;
         }
         return IP_GET;
+    }
     case OBJ_TYPE_SCENERY: {
         if (!proto_action_can_use(obj->pid)) {
             return IP_NONE;
         }
         // A LOCKED door: A picks it rather than rattling the handle. Reaching the lockpick any
-        // other way on a controller is L3 -> wheel -> Lockpick -> aim the cursor -> A, which is
+        // other way on a controller is LB -> wheel -> Lockpick -> aim the cursor -> A, which is
         // why pressing A at the door (the obvious move) appeared to do nothing. Once it's open
         // (or was never locked) this falls through to the normal use.
         //
@@ -572,6 +605,155 @@ int interact_prompt_candidate_count()
     return ip_collect(cand, IP_CANDIDATES_MAX);
 }
 
+// --- WHERE A SKILL CURSOR STARTS ----------------------------------------------------------------
+//
+// His request: *"při výběru first aid dej kurzor na hráče, při odemkání na locknutý container a to
+// samé u dalších skillů"*. An armed skill cursor used to appear wherever the pointer was abandoned,
+// which in free play is nowhere near anything -- the pointer is hidden and has not moved for
+// minutes -- so every use of the wheel began by hunting for the crosshair and dragging it back.
+//
+// This answers "what would he obviously be pointing at", per skill, out of the same scan the prompt
+// itself uses -- which matters, because that scan is where the traps live: HIDDEN objects are
+// staged map content that must never be offered, and an object can have NO PROTO at all. Both are
+// handled inside ip_classify, so this goes through it rather than around it.
+//
+// Nothing suitable nearby returns NULL and the caller simply leaves the cursor where it is: a
+// crosshair parked on something absurd is worse than one that did not move.
+Object* interact_prompt_skill_target(int skill)
+{
+    if (obj_dude == NULL) {
+        return NULL;
+    }
+
+    // Two passes: what the skill is FOR, then what it will settle for. Traps is the reason -- a
+    // trapped chest is not necessarily a LOCKED one, so "locked things" is the right first guess
+    // and "containers and doors" the right second one.
+    for (int pass = 0; pass < 2; pass++) {
+        Object* best = NULL;
+        int bestDist = 0;
+
+        for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+            if (obj == obj_dude) {
+                continue;
+            }
+
+            int kind = ip_classify(obj); // HIDDEN / proto-less / non-interactable all fall out here
+            bool critter = FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER && !critter_is_dead(obj);
+            if (kind == IP_NONE && !critter) {
+                continue;
+            }
+
+            bool want = false;
+            switch (skill) {
+            case SKILL_LOCKPICK:
+                want = kind == IP_LOCKPICK
+                    || (pass == 1 && (kind == IP_LOOT_CONTAINER || kind == IP_USE));
+                break;
+            case SKILL_TRAPS:
+                want = kind == IP_LOCKPICK
+                    || (pass == 1 && (kind == IP_LOOT_CONTAINER || kind == IP_USE));
+                break;
+            case SKILL_STEAL:
+                // Only a living critter can be stolen from, and only someone ELSE.
+                want = critter;
+                break;
+            case SKILL_SCIENCE:
+                // Terminals and the like first; a robot or a critter is the fallback.
+                want = kind == IP_USE || (pass == 1 && critter);
+                break;
+            case SKILL_REPAIR:
+                want = kind == IP_USE || (pass == 1 && kind == IP_LOOT_CONTAINER);
+                break;
+            case SKILL_FIRST_AID:
+            case SKILL_DOCTOR:
+                // The caller parks these on the DUDE himself -- this is only reached if it asks for
+                // a patient other than him.
+                want = critter;
+                break;
+            default:
+                return NULL;
+            }
+
+            if (!want) {
+                continue;
+            }
+
+            if (!ip_on_screen(obj)) {
+                continue; // off-screen: the cursor cannot be put there at all
+            }
+
+            int dist = obj_dist(obj_dude, obj);
+            if (dist > ip_pick_range_tiles) {
+                continue;
+            }
+
+            if (best == NULL || dist < bestDist) {
+                best = obj;
+                bestDist = dist;
+            }
+        }
+
+        if (best != NULL) {
+            return best;
+        }
+    }
+
+    return NULL;
+}
+
+// --- WHAT A USE-ON OR SKILL CURSOR CAN BE PUT ON (2026-10-08) ----------------------------------
+//
+// *"Nemohl jsem nasměrovat provaz správně, furt to aimoval něco jiného, musíme to nějak pojistit."*
+// The crosshair the rope arms was a free pointer, and the click resolves to whatever is drawn
+// topmost at that pixel (object_under_mouse) -- a wall, a rat, a crate in front of the hole -- so
+// aiming a stick at a flat hole in the floor was a matter of luck. The pad now steps the crosshair
+// between the objects a use-on can mean and the click goes to the one it sits on
+// (gamepad_ui_targeting_pick). These are them: the dude himself (first aid, a doctor's bag),
+// every critter, and any item, scenery or wall that is interactable or carries a SCRIPT -- a script
+// is what answers "use rope on me"; an unscripted rock would only say nothing happens. HIDDEN staged
+// content is never one (see ip_classify).
+bool interact_prompt_is_use_target(Object* obj)
+{
+    if (obj == NULL || (obj->flags & OBJECT_HIDDEN) != 0) {
+        return false;
+    }
+    if (obj == obj_dude) {
+        return true;
+    }
+    switch (FID_TYPE(obj->fid)) {
+    case OBJ_TYPE_CRITTER:
+        return true;
+    case OBJ_TYPE_ITEM:
+    case OBJ_TYPE_SCENERY:
+    case OBJ_TYPE_WALL:
+        return obj->sid != -1 || ip_classify(obj) != IP_NONE;
+    default:
+        return false;
+    }
+}
+
+// Every use target on screen within the picker's reach, the dude included.
+int interact_prompt_use_targets(Object** out, int max)
+{
+    int n = 0;
+    if (obj_dude == NULL) {
+        return 0;
+    }
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL && n < max; obj = obj_find_next_at()) {
+        if (!interact_prompt_is_use_target(obj)) {
+            continue;
+        }
+        if (obj != obj_dude && obj_dist(obj_dude, obj) > ip_pick_range_tiles) {
+            continue;
+        }
+        if (!ip_on_screen(obj)) {
+            continue;
+        }
+        out[n++] = obj;
+    }
+    return n;
+}
+
 // Screen-centre of an object, for direction comparisons.
 static void ip_screen_pos(Object* obj, int* x, int* y)
 {
@@ -678,18 +860,15 @@ static void ip_clear_outline()
 
 static void ip_set_outline(Object* obj)
 {
-    if (ip_outlined == obj) {
-        return;
-    }
-    ip_clear_outline();
-    ip_outline_saved = obj->outline;
-    ip_outlined = obj;
-    obj_outline_object(obj, OUTLINE_TYPE_ITEM, NULL);
-    Rect r;
-    if (obj_turn_on_outline(obj, &r) == 0) {
-        tile_refresh_rect(&r, obj->elevation);
-    } else {
-        tile_refresh_display();
+    // ⚠️ THE PROMPT NO LONGER OUTLINES ANYTHING (2026-10-04): "highlighty žluté u výtahů dej pryč i
+    // u pipbye když čekám, celkově je nechci". The floating action icon is the prompt; the yellow
+    // outline sat on every elevator panel and stayed lit over the Pip-Boy while he waited. Outlines on
+    // CRITTERS now mean one thing only -- friend / neutral / foe while aiming (combat_rt) -- and a
+    // yellow item outline here would read as "neutral". ip_clear_outline still undoes whatever an
+    // older state left behind, so nothing can stay stuck lit.
+    (void)obj;
+    if (ip_outlined != NULL) {
+        ip_clear_outline();
     }
 }
 
@@ -700,6 +879,25 @@ static void ip_hide_overlay()
         ip_win = -1;
     }
     ip_win_x = ip_win_y = -32000;
+}
+
+// ⚠️ THE HAND OUTLIVES THE WORLD IT POINTS AT -- THIRD TIME (2026-10-08). Its window is
+// WINDOW_MOVE_ON_TOP, so every screen opened over the world shows it straight through, and the only
+// thing that ever takes it down is interact_prompt_tick, which runs from the MAIN loop and not from
+// a screen's own input loop. The Pip-Boy (gpui_open_dpad_screen) and the elevator panel each got an
+// explicit interact_prompt_reset; then the called-shot window showed it too: *"když jsem vybíral
+// střelbu končetin, tak ruka na loot byla skrz to vidět"*. The explicit resets stay (they are
+// instant); this is the net under the next screen nobody has thought of yet. It is a BACKGROUND
+// process, so it runs inside every screen's input loop too: once the main loop has not ticked the
+// prompt for a quarter of a second -- i.e. some screen owns the frame -- it hides the hand. The
+// tick puts it back the moment the world runs again (it recreates a missing window).
+static unsigned int ip_last_tick_ms = 0;
+
+static void ip_overlay_guard()
+{
+    if (ip_win != -1 && get_time() - ip_last_tick_ms > 250) {
+        ip_hide_overlay();
+    }
 }
 
 // Which action-menu icon floats for a given interaction kind. Same art the vanilla action menu
@@ -825,6 +1023,13 @@ static void ip_show_overlay(Object* obj, int kind)
 
 void interact_prompt_tick()
 {
+    ip_last_tick_ms = get_time();
+    static bool guardInstalled = false;
+    if (!guardInstalled) {
+        add_bk_process(ip_overlay_guard, "prompt-guard");
+        guardInstalled = true;
+    }
+
     ip_load_config();
 
     // 1) Perform a queued interaction FIRST, from this safe main-loop context (never from the
@@ -975,16 +1180,57 @@ void interact_prompt_tick()
         return;
     }
 
-    // Rebuild the D-pad cycle for whatever is highlighted now. The SELECTION only resets when the
-    // target changes -- rebuilding every tick keeps the list honest (a door that just got unlocked
-    // drops its pick entry) without snapping the icon back to the default under the player's thumb.
+    // Rebuild the D-pad cycle for whatever is highlighted now. Rebuilding every tick keeps the list
+    // honest (a door that just got unlocked drops its pick entry) without snapping the icon back to
+    // the default under the player's thumb.
+    //
+    // ⚠️ THE SELECTION FOLLOWS THE ACTION, NOT THE SLOT (2026-10-04, "když odemknu dveře nebo stash,
+    // tak ať je tam hned ruka, ať prostě zmáčknu jen A"). It used to be kept by INDEX, so when a lock
+    // opened and the list shrank from [pick, use, look] to [use, look], whatever sat in slot 1 before
+    // -- the hand -- was now the eye. Two rules instead:
+    //   * the object's MAIN action changed (the pick became the hand: the lock just opened) -> back
+    //     to that new default, so the very next A opens it;
+    //   * otherwise keep the same ACTION selected, wherever it now sits in the list.
+    static int lastDefault = IP_NONE;
+    int prevChosen = (ip_actions_count > 0 && ip_action_index < ip_actions_count)
+        ? ip_actions[ip_action_index]
+        : IP_NONE;
     ip_actions_count = ip_build_actions(best, ip_actions);
-    if (targetChanged) {
+    int newDefault = ip_actions_count > 0 ? ip_actions[0] : IP_NONE;
+    if (targetChanged || newDefault != lastDefault) {
         ip_action_index = 0;
-    } else if (ip_action_index >= ip_actions_count) {
-        ip_action_index = ip_actions_count > 0 ? ip_actions_count - 1 : 0;
+    } else {
+        int found = 0;
+        for (int i = 0; i < ip_actions_count; i++) {
+            if (ip_actions[i] == prevChosen) {
+                found = i;
+                break;
+            }
+        }
+        ip_action_index = found;
     }
+    lastDefault = newDefault;
     kind = ip_chosen_kind();
+
+    // ⚠️ SAY WHICH ACTION IS ON SCREEN, on every change. Without it the log cannot answer the one
+    // question that matters about this prompt -- "what did it offer me?" -- and his report that a
+    // just-picked lock still showed the pick instead of the hand was undecidable from a trace that
+    // recorded the lockpick going out and nothing about what came back. The list is rebuilt every
+    // tick and the index survives a rebuild, so a door that loses its IP_LOCKPICK entry should show
+    // this flip to IP_USE (1) by itself; if it ever does not, this line is the proof.
+    {
+        static Object* lastObj = NULL;
+        static int lastKind = -1;
+        static int lastCount = -1;
+        if (best != lastObj || kind != lastKind || ip_actions_count != lastCount) {
+            lastObj = best;
+            lastKind = kind;
+            lastCount = ip_actions_count;
+            trace_event(TRACE_FLOW, "ip-show", "pid=%d kind=%d idx=%d of=%d locked=%d",
+                best->pid, kind, ip_action_index, ip_actions_count,
+                FID_TYPE(best->fid) == OBJ_TYPE_SCENERY && obj_is_locked(best) ? 1 : 0);
+        }
+    }
 
     // In combat (a hostile in weapon range), only advertise the prompt for an interactable you're
     // standing RIGHT AT (a door/corpse adjacent to the dude). A merely-nearby one (a neutral patron
@@ -1061,6 +1307,32 @@ bool interact_prompt_target_adjacent()
 {
     return ip_target != NULL && obj_dude != NULL
         && obj_dist(obj_dude, ip_target) <= IP_INTERACT_ADJACENT_TILES;
+}
+
+// A SINGLE object is about to be freed (obj_erase_object): a scripted destroy, a corpse cleanup,
+// or the OLD DUDE that obj_load_dude erases on its way in. The prompt caches raw Object* in
+// ip_target / ip_pending and dereferences them (ip_classify, the overlay, the queued action), so a
+// pointer that survives the free is a crash waiting for the next frame. Same hook and the same
+// reasoning as combat_rt_notify_critter_removed and anim_notify_object_freed next to it.
+//
+// Only forgets the object being freed -- everything else the prompt knows is still valid, and a
+// full reset here would drop a target the player is standing at for no reason.
+void interact_prompt_notify_object_freed(Object* obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+    if (ip_target == obj) {
+        ip_clear_outline();
+        ip_hide_overlay();
+        ip_target = NULL;
+        ip_actions_count = 0;
+        ip_action_index = 0;
+    }
+    if (ip_pending == obj) {
+        ip_pending = NULL;
+        ip_pending_kind = IP_NONE;
+    }
 }
 
 void interact_prompt_reset()

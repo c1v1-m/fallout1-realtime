@@ -1,6 +1,8 @@
 #include "game/gamepad_ui.h"
 
+#include <ctype.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -33,6 +35,7 @@
 #include "game/tile.h"
 #include "game/object.h"
 #include "game/options.h"
+#include "game/perk.h"
 #include "game/pipboy.h"
 #include "game/radial_wheel.h"
 #include "game/select.h"
@@ -43,6 +46,7 @@
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
+#include "plib/db/db.h" // the hand-painted aim masks come out of data\aimmask.dat
 #include "plib/gnw/memory.h"
 #include "plib/gnw/mouse.h"
 #include "plib/gnw/rect.h"
@@ -74,8 +78,14 @@ static float gpui_stick_deadzone = GPUI_STICK_DEADZONE;
 // The gap between the two levels IS the debounce; they must never be equal. The press level is also
 // lower than the click's 50% -- half a trigger pull is a lot to ask for "start aiming", and that
 // number was inherited from the click rather than chosen for this.
-#define GPUI_AIM_TRIGGER_PRESS 12000   // ~37% pull to engage
-#define GPUI_AIM_TRIGGER_RELEASE 6000  // ~18% pull to let go
+//
+// ⚠️ LOWERED AGAIN 2026-09-08 (12000/6000 -> 8000/4000): "stisknutí LT bylo obtížné". 37 % of the
+// travel is fine for a HOLD, where the finger is going all the way down anyway, but this gesture's
+// common case is a TAP -- and a tap has to cross the level, stop, and come back inside 220 ms. At
+// 37 % that is a long way to move a finger twice. The Schmitt gap keeps its 2:1 ratio, so nothing
+// about the dither immunity changes; only the distance your finger has to travel does.
+#define GPUI_AIM_TRIGGER_PRESS 8000   // ~24% pull to engage
+#define GPUI_AIM_TRIGGER_RELEASE 4000 // ~12% pull to let go
 
 // How long the axis must STAY low before the latch drops.
 //
@@ -151,15 +161,25 @@ static bool gpui_trigger_held(SDL_GameController* pad, SDL_GameControllerAxis ax
 // thing you are watching.
 #define GPUI_AIM_SETTLE_MS 130
 
-// Stick deflection needed to aim at all, as a fraction of full throw. Higher than the old 0.18
-// rest test: a thumb resting on the stick sits well above 0.18 on a worn pad, which meant the
-// picker was steering off noise the whole time the wheel was up.
-#define GPUI_AIM_STICK_MIN 0.35f
+// Stick deflection needed to aim at all, as a fraction of full throw. Below it the stick counts as
+// centered, which selects the TORSO (see gpui_aimbody_pick). Higher than the old 0.18: a thumb
+// resting on the stick sits well above 0.18 on a worn pad, which meant the picker steered on noise.
+//
+// ⚠️ THIS IS THE ONLY PLACE MAGNITUDE IS READ. Past it, the part is chosen by ANGLE alone -- see
+// gpui_aim_ring_slot. Every earlier layout mixed the two and that is what kept breaking.
+#define GPUI_AIM_STICK_MIN 0.22f
+
+#define GPUI_PI 3.14159265358979323846f
 
 // Quick-use wheel B tap-vs-hold split: hold B past this to bring up the drug wheel; a
 // shorter press stays the weapon's firing-mode cycle. Same window as the aimed-shot split
 // so both holds feel identical in the hand.
 #define GPUI_QUICK_HOLD_MS GPUI_AIM_TAP_MS
+
+// Hold threshold for BACK and START (inventory / pause menu on the tap, exit-run / quick
+// save on the hold). Deliberately longer than the wheels: these are pressed deliberately
+// rather than drummed, and 220 ms would turn a firm press into the hold action.
+#define GPUI_MENU_HOLD_MS 450
 
 // D-pad tap-vs-hold split: a HOLD past this opens the standalone screen for that direction
 // (Pip-Boy / character sheet / automap) or ends combat; a shorter TAP steps the action the
@@ -257,6 +277,8 @@ static bool gpui_a_interact_deferred = false;
 // True while the ACTIVE HAND holds an item the engine can "use on" something (proto_action_can_use_on).
 static bool gpui_useon_item_in_hand();
 static bool gpui_targeting_cursor_armed();
+// Puts the pointer a few tiles in front of the dude (the use-on crosshair's starting spot).
+static void gpui_useon_park_cursor();
 
 // A screen is running its OWN controller-driven navigation and reads the pad
 // directly in its own loop -- the main menu (highlight + A) and the load/save slot
@@ -264,7 +286,21 @@ static bool gpui_targeting_cursor_armed();
 // must NOT also left-stick-snap the cursor or map A/Y to a click -- both would fight
 // that nav (the snap yanks the cursor onto buttons/scroll arrows). The right stick
 // can still move the cursor and RT still clicks, for optional mouse-style use.
+// BACK HELD = RUN TO THE NEAREST MAP EXIT (was LB+RB before the 2026-09-16 layout dropped the
+// modifier button). Set from the mouse hook (gpui_button_shortcuts), performed on
+// the safe tick (gamepad_ui_tick) for the same reason the heal is: it registers an animation.
+static bool gpui_exit_nav_pending = false;
+
 static bool gpui_self_nav = false;
+
+// A self-nav screen that STILL WANTS THE FREE POINTER on the right stick -- the world map.
+//
+// self_nav takes the stick away from the cursor because on a MENU a creeping pointer hovers buttons
+// (the hover blip the title menu misread as its own move sound). The world map is not a menu: its
+// pointer is how you say WHERE -- a town, a spot on the map -- and A then acts on what it is over
+// ("měl jsem kurzor myši na The Hub a áčko nereagovalo"). So it keeps the stick, and only while no
+// modal sits on top of it (a dialog box or the pause menu opened from there is a menu again).
+static bool gpui_self_nav_cursor = false;
 
 // Suppresses ONLY the left-stick item snap (gpui_menu_snap), leaving A/Y clicks and
 // RT alone. The barter/trade window sets this while it drives its own LB/RB cursor
@@ -297,10 +333,13 @@ bool gamepad_ui_set_suppress_a_click(bool suppress)
 }
 
 // Aim-picker cancel handshake. Declared up here rather than beside gpui_aim_body_on because the
-// B-button shortcut handler further down the file has to see the swallow flag: the press that
-// cancels an aim must not ALSO cycle the weapon's firing mode.
-static bool gpui_aim_canceled = false;  // B cancelled this aim; eat the LB release still to come
-static bool gpui_aim_swallow_b = false; // that same B press is spent
+// B-button shortcut handler further down the file has to see it: the press that cancels an aim
+// must not ALSO switch the weapon's firing mode.
+//
+// ⚠️ ITS TWIN IS GONE. There used to be a second flag (gpui_aim_canceled) whose only job was to eat
+// the trigger RELEASE that followed a cancel, because a release used to mean "fire". In this layout
+// a release just closes the picker, so there is nothing left to eat.
+static bool gpui_aim_swallow_b = false; // that B press is spent
 
 // Opens the first connected controller if we don't have one yet.
 static void gpui_acquire()
@@ -355,6 +394,13 @@ void gamepad_ui_set_self_nav(bool active)
     gpui_self_nav = active;
 }
 
+bool gamepad_ui_set_self_nav_cursor(bool active)
+{
+    bool previous = gpui_self_nav_cursor;
+    gpui_self_nav_cursor = active;
+    return previous;
+}
+
 
 // Set while a PRE-GAME modal screen with no live session is up -- currently the death scene.
 // Sibling of in_main_menu, and it exists for the identical reason: those screens run their own
@@ -405,6 +451,56 @@ int gamepad_ui_action_popup_dpad()
     if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0) {
         dir = -1;
     } else if (SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0) {
+        dir = 1;
+    }
+
+    if (dir == 0) {
+        lastDir = 0;
+        return 0;
+    }
+
+    Uint32 now = SDL_GetTicks();
+    bool changed = dir != lastDir;
+    if (!changed && now - lastStepTime < GPUI_SNAP_REPEAT_MS) {
+        return 0;
+    }
+
+    lastDir = dir;
+    lastStepTime = now;
+    return dir;
+}
+
+// LEFT STICK AS A LIST STEPPER for modal screens: -1 up, +1 down, 0 nothing. Edge plus repeat, the
+// same cadence the D-pad snap uses, so a screen can offer both without writing the timing twice --
+// and so they FEEL the same, which is the part a player notices.
+//
+// ⚠️ A FIRM PUSH, not the walking deadzone. This is a menu: a stick resting slightly off centre must
+// not walk the selection, and there is no analogue speed to recover here the way there is in the
+// world. Half deflection is the threshold.
+//
+// ⚠️ The statics are shared across screens on purpose -- only one modal is ever up -- and they
+// self-clear the moment the stick returns to centre, so nothing carries from one screen to the next.
+#define GPUI_MENU_STICK_THRESHOLD 16000
+
+int gamepad_ui_menu_stick_step()
+{
+    static int lastDir = 0;
+    static Uint32 lastStepTime = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        lastDir = 0;
+        return 0;
+    }
+
+    SDL_GameControllerUpdate();
+
+    int y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+
+    int dir = 0;
+    if (y < -GPUI_MENU_STICK_THRESHOLD) {
+        dir = -1;
+    } else if (y > GPUI_MENU_STICK_THRESHOLD) {
         dir = 1;
     }
 
@@ -659,10 +755,12 @@ static void gpui_inventory_a(SDL_GameController* pad, int* buttons)
             // Released before the hold threshold -> a tap (quick action).
             int type = inven_current_window_type();
             if (type == INVENTORY_WINDOW_TYPE_NORMAL || type == INVENTORY_WINDOW_TYPE_USE_ITEM_ON) {
-                if (inven_normal_cursor_over_list()) {
-                    // Over the item list: defer the quick equip/use to
-                    // handle_inventory's loop -- the use/equip pipeline is not
-                    // safe to run inside the input hook (see gpui_quick_normal).
+                if (inven_normal_cursor_over_list()
+                    || (type == INVENTORY_WINDOW_TYPE_NORMAL && inven_normal_cursor_over_armor())) {
+                    // Over the item list (or, in the normal inventory, the armor slot -- A there
+                    // takes the armor off): defer the quick action to handle_inventory's loop --
+                    // the use/equip pipeline is not safe to run inside the input hook (see
+                    // gpui_quick_normal).
                     gpui_quick_normal = true;
                     phase = 0;
                 } else {
@@ -835,12 +933,14 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             // have ATTACKED instead of applying the armed skill.
             bool targetingArmed = gpui_targeting_cursor_armed();
 
-            gpui_a_interacting = targetingArmed
-                || gamepad_ui_menu_active()
-                || dialog_active()
-                || (!combat_rt_has_lock()
-                    && (!gpui_hostile_in_range_cached
-                        || interact_prompt_target_adjacent()));
+            // ⚠️ A ALWAYS INTERACTS NOW. The whole arbitration this used to run -- "is a hostile in
+            // weapon range, is there a lock, is the thing I am standing at adjacent enough to beat
+            // a fight" -- existed because A meant BOTH interact and attack, and every one of its
+            // branches was a guess about which one you meant. The 2026-09-16 layout moved the
+            // attack to RT, so there is nothing left to arbitrate: A opens the door beside the
+            // raider, and RT shoots him. The variable stays because the click-suppression and loot
+            // paths below read it.
+            gpui_a_interacting = true;
 
             // In the world (not a menu, not a conversation), if A is interacting, route it to a
             // world interaction and suppress this press's walk-click. Do WHAT THE PROMPT HIGHLIGHTS
@@ -971,11 +1071,41 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             bool worldClickAtHiddenCursor = gmouse_move_cursor_is_hidden()
                 && !gamepad_ui_menu_active()
                 && !dialog_active();
+
+            // ⚠️ A NEVER FIRES THE GUN. "RT bude jen utok" has an unspoken other half -- nothing
+            // ELSE is -- and the combat crosshair broke it silently: in GAME_MOUSE_MODE_CROSSHAIR a
+            // left click on a critter goes straight to combat_attack_this (gmouse.cc:1007), and
+            // while a lock is held combat_rt GLUES the cursor onto the target. So every A meant as
+            // "use that" was a click on an enemy, i.e. a shot -- his report, and he had seen it
+            // "even during normal aiming", which is exactly when the mode is up.
+            //
+            // Scoped to the attack crosshair alone. USE_CROSSHAIR (the rope, a lockpick, dynamite
+            // aimed from the hand) is a DIFFERENT mode and still needs A to confirm on the target.
+            // Interactions are unaffected either way: A reaches doors, corpses and people through
+            // interact_prompt's queued request, never through this synthetic click.
+            bool worldAttackClick = gmouse_3d_get_mode() == GAME_MOUSE_MODE_CROSSHAIR
+                && !gamepad_ui_menu_active()
+                && !dialog_active()
+                && !inven_any_open();
+
+            if (worldAttackClick) {
+                static unsigned int lastAttackClickVeto = 0;
+                if (get_time() - lastAttackClickVeto > 500) {
+                    lastAttackClickVeto = get_time();
+                    trace_event(TRACE_INPUT, "a-attack-vetoed", "lock=%d",
+                        combat_rt_has_lock() ? 1 : 0);
+                }
+            }
             // Edges above are updated either way -- only the CLICK is dropped. Skipping the
             // whole router instead is what leaked a stale click into the world once (see the
             // note at the top of this function).
-            if (!worldClickAtHiddenCursor && !gpui_suppress_a_click) {
+            if (!worldClickAtHiddenCursor && !worldAttackClick && !gpui_suppress_a_click) {
                 *buttons |= MOUSE_STATE_LEFT_BUTTON_DOWN;
+            } else if (aEdge && gpui_targeting_cursor_armed()) {
+                // The confirming A of an armed rope / lockpick / skill went nowhere -- say why.
+                trace_event(TRACE_INPUT, "a-confirm-dropped", "hidden=%d attack=%d suppress=%d mode=%d",
+                    worldClickAtHiddenCursor ? 1 : 0, worldAttackClick ? 1 : 0, gpui_suppress_a_click ? 1 : 0,
+                    gmouse_3d_get_mode());
             }
         }
     }
@@ -996,16 +1126,20 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     // Inventory A router (no-op / self-resetting when no inventory is open).
     gpui_inventory_a(pad, buttons);
 
-    // NOT while a radial wheel owns the screen: RB pages the weapon wheel there, and letting the
-    // same press ALSO fire the engine's right-click would silently flip the world cursor's mode
-    // behind the wheel -- you would put the gun away and find yourself in the wrong cursor.
-    // NOT while a radial wheel owns the screen: RB pages the weapon wheel there, and letting the
-    // same press ALSO fire the engine's right-click would silently flip the world cursor's mode
-    // behind the wheel -- you would put the gun away and find yourself in the wrong cursor.
-    if (rbEdge && !radial_wheel_is_open()) {
+    // RB IN THE WORLD BELONGS TO AIMING NOW (tap = fire the last aimed shot again, hold = the ammo
+    // wheel), so it no longer fires the engine's right-click there. That right-click only ever
+    // cycled the world cursor between move and look/use -- a mode the interact prompt and A have
+    // made redundant, and one that silently changed what the next press would do.
+    //
+    // ⚠️ IT IS KEPT ON THE SCREENS, where a right-click is a real action on a real widget and
+    // nothing else wants RB. Same reason it is still refused while a radial wheel is up: there RB
+    // PAGES the wheel, and letting the press also right-click would flip the world cursor behind
+    // the overlay -- you would put the gun away and find yourself in the wrong cursor.
+    //
+    // LB+RB (run to the nearest map exit) died with the modifier button; it is a BACK hold now.
+    if (rbEdge && !radial_wheel_is_open()
+        && (gamepad_ui_menu_active() || inven_any_open() || dialog_active())) {
         *buttons |= MOUSE_STATE_RIGHT_BUTTON_DOWN;
-        // RB toggles which cursor is active -- reveal it briefly (like a right-stick
-        // nudge) so the player sees the cursor they just switched to; it auto-hides again.
         gpui_cursor_show_time = get_time();
     }
 
@@ -1101,26 +1235,145 @@ static void gpui_open_dpad_screen(int which)
 // mouse_info(); the engine's modal windows register WINDOW_MODAL before their
 // loop starts, so the already-open checks are true for every nested frame and
 // prevent recursion.
-// Set by the quick-use wheel (gpui_quick_wheel) when a B HOLD opened it, so the tap handler
-// below knows that press was a hold and must not also cycle the weapon's firing mode.
-// Declared here because the tap handler is compiled before the wheel that sets it.
-static bool gpui_quick_consumed_b = false;
 
-// LB + B = DEDICATED HEAL. Set on the B PRESS edge while LB is held; drained by
-// gamepad_ui_tick, which is the only place it is safe to actually use an item (the press is
-// read inside the mouse hook, and gpui_quick_use registers an animation). Same deferral the
-// wheels use -- see gpui_use_best_heal.
+// Each wheel hangs off a tap-vs-hold button, so that button's TAP action has to wait for the
+// RELEASE and only fire if the press never became a hold. One "this press is already spent" flag
+// per button, set by whatever claimed it -- the wheel, or any gesture that used the same press.
+//
+// ⚠️ THE 2026-09-16 LAYOUT MOVED EVERY ONE OF THESE, so the names say the BUTTON, never the wheel
+// that used to sit on it: B is cancel-only now, the drug wheel moved to Y, the weapon wheel to X,
+// the ammo wheel to RB, and the skill wheel off L3 onto LB.
+static bool gpui_consumed_b = false;  // B:  tap cancels, hold opens the DRUG wheel
+static bool gpui_consumed_y = false;  // Y:  tap swaps hands, hold opens the WEAPON wheel, LT+Y spends it
+static bool gpui_consumed_x = false;  // X:  tap switches firing mode, hold RUNS (no wheel any more)
+static bool gpui_consumed_lb = false; // LB: tap reloads, hold opens the aim picker
+static bool gpui_consumed_rb = false; // RB: a press already spent (paging a wheel, a screen closing)
+
+// Y = DEDICATED HEAL (it was LB+B until the 2026-09-16 layout -- he moved it himself, having
+// decided on 2026-08-31 to keep the combo; the modifier button is simply gone now). Set on the Y
+// release when that press was a tap, and drained by gamepad_ui_tick, which is the only place it is
+// safe to actually use an item: the press is read inside the mouse hook, and gpui_quick_use
+// registers an animation. Same deferral the wheels use -- see gpui_use_best_heal.
 static bool gpui_heal_pending = false;
 
-// The same arrangement for Y: a HOLD opens the weapon wheel (gpui_weapon_wheel), so the hand-swap
-// has to wait for the release. Set by ANYTHING that has already spent this Y press -- the wheel, or
-// an LB+Y quick save -- so the release doesn't also swap hands. (Testing "is LT still down?" at
-// release time is not enough: letting go of LT first would leak the swap through.)
-static bool gpui_weapon_consumed_y = false;
+// LB-tap reload with MODS "Reload animation" on: requested from the hook, started on the safe tick
+// (it registers an animation), and dropped if the dude stays busy past GPUI_RELOAD_WAIT_MS.
+static bool gpui_reload_pending = false;
+static unsigned int gpui_reload_pending_since = 0;
+#define GPUI_RELOAD_WAIT_MS 1000
 
-// Same again for X: a HOLD opens the ammo wheel, so the plain reload has to wait for the release
-// and only fire if the press was a tap.
-static bool gpui_ammo_consumed_x = false;
+// The 2 AP of the reload in progress have been taken (at its START, see gpui_reload_anim_start) and
+// not yet earned by a finished reload. Cleared by the end callback; if the loop ends any other way,
+// the tick hands them back.
+static bool gpui_reload_charged = false;
+
+// NOTE: RB fired aimed shots until 2026-10-09 (a tap, then a held repeat). It is the HEAL now, set
+// through gpui_heal_pending above; the aimed shot is the weapon slot's AIMED mode, fired by RT.
+
+// RUN IS A HELD BUTTON AGAIN (X), not the toggle this layout briefly had: "lepší je držet běh".
+// Read live from the pad rather than latched anywhere, because there is no gesture to arbitrate --
+// X's only other job is a TAP (firing mode), and that is settled on the release edge in
+// gpui_button_shortcuts by the same 220 ms rule the wheels use.
+bool gamepad_ui_run_on()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        return false;
+    }
+    return SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
+}
+
+bool gamepad_ui_attack_held()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        return false;
+    }
+
+    // Its own latch, independent of the one gpui_aim_wheel keeps for the same axis: two
+    // readers of one trigger each need their own hysteresis state, and sharing it would
+    // make whichever ran second see an already-consumed edge.
+    static bool latch = false;
+    static unsigned int lowAt = GPUI_TRIGGER_NOT_LOW;
+    return gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, &latch, &lowAt);
+}
+
+// True while LT is pulled, for a caller OUTSIDE the world layer -- the barter window's split-stack
+// gesture (LT + A).
+//
+// ⚠️ THIS EXISTS BECAUSE THE BARTER SCREEN WAS READING THE RAW AXIS. `SDL_GameControllerGetAxis(..)
+// > 8000` looks harmless and is not: a physically HELD trigger intermittently reports a hard 0 --
+// measured in trace_2026-08-30_234101, 14 of 33 release transitions read exactly 0 -- so roughly
+// four times in ten the split was asked for and the code saw the trigger as released, and moved the
+// WHOLE STACK instead of opening the quantity picker. That is his report: "Dal jsem pri tradu add
+// one alt plus A ... a jen jeden se nepresune, ale celej stack."
+//
+// Its own latch pair, kept here rather than in inventry, so the barter gesture cannot steal or be
+// stolen by the aim trigger's state -- the same rule every other gesture in this file follows.
+// ⚠️ A MODIFIER IS NOT AN EDGE, AND THE SCHMITT LATCH IS THE WRONG TOOL FOR ONE. gpui_trigger_held
+// is built to never MISS a pull: once latched it needs the axis to stay low for a continuous 60 ms,
+// and ANY single high sample in that window resets the timer. That is right for "did he pull the
+// trigger", and wrong here -- this axis is known to report garbage (a held trigger intermittently
+// reads a hard 0, measured 14 of 33 samples, which is the same noise in the other direction). One
+// spurious high after a genuine LT+A is enough to keep the latch armed, and from then on every
+// plain A moves the WHOLE STACK: "furt to předává celej stack áčkem", reported three times.
+//
+// So the split modifier is filtered by AGREEMENT instead of by edges. Each read moves a small
+// counter: a pull adds 2, a release takes 1, and the modifier is on at 3 of 6. A lone spurious high
+// from rest reaches 2 and never arms it; a lone dropout while held costs 1 of 6 and never drops it;
+// a real release walks it to 0 in six frames (~100 ms). Deliberately NOT applied to the aim/attack
+// triggers -- those are edges on their own latches, they have their own history of breaking, and
+// nothing about them is reported wrong.
+#define GPUI_SPLIT_LEVEL_MAX 6
+#define GPUI_SPLIT_LEVEL_ON 3
+
+static int gpui_split_level = 0;
+
+bool gamepad_ui_split_trigger_held()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        gpui_split_level = 0;
+        return false;
+    }
+
+    int v = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT);
+    if (v > GPUI_AIM_TRIGGER_PRESS) {
+        gpui_split_level += 2;
+        if (gpui_split_level > GPUI_SPLIT_LEVEL_MAX) {
+            gpui_split_level = GPUI_SPLIT_LEVEL_MAX;
+        }
+    } else if (v < GPUI_AIM_TRIGGER_RELEASE) {
+        gpui_split_level -= 1;
+        if (gpui_split_level < 0) {
+            gpui_split_level = 0;
+        }
+    }
+
+    return gpui_split_level >= GPUI_SPLIT_LEVEL_ON;
+}
+
+// Raw axis + filter state, for the barter diagnostic -- so a report of "A moved the whole stack"
+// can be answered with what the trigger actually read rather than with a theory about it.
+void gamepad_ui_split_trigger_debug(int* raw, int* level)
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    *raw = pad != NULL ? SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) : -1;
+    *level = gpui_split_level;
+}
+
+bool gamepad_ui_aim_trigger_held()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        return false;
+    }
+
+    // Own latch, like the attack trigger above: one reader, one piece of hysteresis state.
+    static bool latch = false;
+    static unsigned int lowAt = GPUI_TRIGGER_NOT_LOW;
+    return gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, &latch, &lowAt);
+}
 
 // Defined with the skill wheel further down; B is the cancel for a sticky skill cursor.
 static bool gpui_skill_cursor_armed();
@@ -1151,6 +1404,8 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     static bool prevUp = false;
     static bool prevDown = false;
     static bool prevLeft = false;
+    static bool prevRb = false;
+    static bool prevLb = false;
 
     bool startNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START) != 0;
     bool backNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0;
@@ -1161,6 +1416,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     bool downNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
     bool leftNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
     bool rightNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+    bool rbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
 
     bool startPressed = startNow && !prevStart;
     bool backPressed = backNow && !prevBack;
@@ -1194,6 +1450,34 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     bool upPressed = upNow && !prevUp;
     bool downPressed = downNow && !prevDown;
     bool leftPressed = leftNow && !prevLeft;
+
+    // LB is the reload on its release (and the LB+B heal alias)
+    // and RB heals on its press, so both are read and stamped HERE with the rest.
+    // ⚠️ Every one of these reads belongs at the top, before the first early return: an edge that
+    // is only computed on some paths reports a press that already happened as brand new.
+    bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    bool lbReleased = !lbNow && prevLb; // LB is the reload, on its release -- no hold to time
+    prevLb = lbNow;
+    bool rbPressed = rbNow && !prevRb;
+    bool rbReleased = !rbNow && prevRb;
+    // NOTE: no hold timer for RB -- it is a single action on its press (the heal), nothing to split.
+
+    // BACK is a tap-vs-hold now too: a TAP opens the inventory (as it always did) and a HOLD runs
+    // to the nearest map exit, which was LB+RB before the modifier button disappeared.
+    bool backReleased = !backNow && prevBack;
+    bool startReleased = !startNow && prevStart;
+    static unsigned int startDownTime = 0;
+    static bool startHoldSpent = false;
+    if (startPressed) {
+        startDownTime = get_time();
+        startHoldSpent = false;
+    }
+    static unsigned int backDownTime = 0;
+    static bool backHoldSpent = false;
+    if (backPressed) {
+        backDownTime = get_time();
+        backHoldSpent = false;
+    }
     prevStart = startNow;
     prevBack = backNow;
     prevX = xNow;
@@ -1202,6 +1486,16 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     prevUp = upNow;
     prevDown = downNow;
     prevLeft = leftNow;
+    prevRb = rbNow;
+
+    // A FRESH PRESS STARTS CLEAN. Y acts on its RELEASE and LT+Y spends it, so a flag left standing
+    // by a release this function never saw (it came during a dialogue or a menu, where it returns
+    // early) would otherwise eat the next hand swap -- and now also the next weapon-wheel hold, which
+    // checks it. Cleared here, BEFORE the screen-epoch block below, which re-spends a button still
+    // held when a screen closes.
+    if (yPressed) {
+        gpui_consumed_y = false;
+    }
 
     // ⚠️ A SCREEN JUST RAN ITS OWN INPUT LOOP (inventory, pause menu, Pip-Boy, a confirmation
     // box, load/save). Same counter and the same reasoning as gpui_action_buttons: these statics
@@ -1222,13 +1516,25 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     if (shortcutEpoch != lastShortcutEpoch) {
         lastShortcutEpoch = shortcutEpoch;
         if (bNow) {
-            gpui_quick_consumed_b = true;
+            gpui_consumed_b = true;
         }
         if (xNow) {
-            gpui_ammo_consumed_x = true;
+            gpui_consumed_x = true;
+        }
+        if (lbNow) {
+            gpui_consumed_lb = true;
+        }
+        if (rbNow) {
+            gpui_consumed_rb = true;
+        }
+        if (backNow) {
+            backHoldSpent = true;
+        }
+        if (startNow) {
+            startHoldSpent = true;
         }
         if (yNow) {
-            gpui_weapon_consumed_y = true;
+            gpui_consumed_y = true;
         }
         return;
     }
@@ -1282,6 +1588,14 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         bool sameDirection = (gpui_dpad_screen_open == GPUI_DPAD_PIPBOY && upPressed)
             || (gpui_dpad_screen_open == GPUI_DPAD_AUTOMAP && leftPressed);
         if (bPressed || backPressed || sameDirection) {
+            // ⚠️ SPEND THE PRESS THAT CLOSES, or its RELEASE reopens the screen. BACK and
+            // START open on the release edge now (they grew a hold -- exit-run and quick
+            // save), so a close on the press edge bounced straight back: ESC shut the
+            // window and the release of that same press walked into the tap handler.
+            // "po opětovném stisku se zase otevře a otevře".
+            if (backPressed) {
+                backHoldSpent = true;
+            }
             GNW_add_input_buffer(KEY_ESCAPE);
         }
         return;
@@ -1290,6 +1604,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // Inventory open: BACK toggles it shut; X/B equip the item under the cursor.
     if (inven_is_open()) {
         if (backPressed) {
+            backHoldSpent = true;
             GNW_add_input_buffer(KEY_ESCAPE);
         } else if (xPressed) {
             inven_equip_under_cursor(HAND_LEFT);
@@ -1319,6 +1634,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // Options/pause menu open: START toggles it shut.
     if (options_is_open()) {
         if (startPressed) {
+            startHoldSpent = true;
             GNW_add_input_buffer(KEY_ESCAPE);
         }
         return;
@@ -1329,19 +1645,45 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // stays "enabled" through a talking-head, but map bk processes are disabled, so a
     // weapon swap (intface_toggle_items -> intface_change_fid_animate) would block
     // forever waiting on a put-away/take-out animation that can never advance = hang.
-    if (gamepad_ui_menu_active() || dialog_active() || !intface_is_enabled()) {
+    // ⚠️ AND NOT WHILE A SCREEN DRIVES ITS OWN PAD (gpui_self_nav). This layer is GAMEPLAY: D-pad
+    // holds open the Pip-Boy / character sheet / automap, LB+RB runs for the exit, and so on. On a
+    // screen that reads the pad itself those are not shortcuts, they are that screen's own keys --
+    // on the WORLD MAP, holding D-pad up to walk down the town list opened the Pip-Boy instead
+    // ("když při travellingu držím Dpadem nahoru a dolu tak se zapíná pipboy"), and the buttons it
+    // did not recognise buzzed at him. Same leak as the main menu once had, one screen further on.
+    if (gamepad_ui_menu_active() || dialog_active() || !intface_is_enabled() || gpui_self_nav) {
         return;
     }
 
-    // BACK/START open inventory/options directly on press. (They used to be deferred to
-    // release so a BACK+START quick-save combo could pre-empt them, but that combo collided
-    // with Steam Big Picture / Xbox Game Bar grabbing BACK -- quick save now lives on LB+Y.)
-    if (backPressed) {
+    // BACK and START ARE TAP-vs-HOLD NOW, because the LB modifier they shared their combos with is
+    // gone: BACK tap = inventory, BACK hold = run to the nearest map exit (was LB+RB), START tap =
+    // pause menu, START hold = QUICK SAVE (was LB+Y).
+    //
+    // ⚠️ QUICK SAVE HAD TO GO SOMEWHERE, and BACK+START is not it: that combo was abandoned once
+    // because Steam Big Picture and the Xbox Game Bar grab BACK, and nothing about that changed.
+    // A START hold is a single button this layer sees whole.
+    //
+    // ⚠️ A LONGER THRESHOLD THAN THE WHEELS (450 ms, not 220). These two are pressed deliberately
+    // rather than drummed, and a 220 ms bar turns an ordinary firm press on the inventory button
+    // into a sprint for the exit. The hold fires the INSTANT it elapses instead of waiting for the
+    // release, so the action is felt while the thumb is still down and a long press cannot be
+    // mistaken for a stuck button.
+    if (backNow && !backHoldSpent && get_time() - backDownTime >= GPUI_MENU_HOLD_MS) {
+        backHoldSpent = true;
+        gsound_play_sfx_file("ib1p1xx1");
+        gpui_exit_nav_pending = true;
+    }
+    if (startNow && !startHoldSpent && get_time() - startDownTime >= GPUI_MENU_HOLD_MS) {
+        startHoldSpent = true;
+        gsound_play_sfx_file("ib1p1xx1");
+        QuickSaveGame();
+    }
+    if (backReleased && !backHoldSpent) {
         gsound_play_sfx_file("ib1p1xx1");
         handle_inventory();
         return;
     }
-    if (startPressed) {
+    if (startReleased && !startHoldSpent) {
         gsound_play_sfx_file("ib1p1xx1");
         do_options();
         return;
@@ -1427,136 +1769,211 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         }
     }
 
-    // Quick save = hold RB + press Y (emulator-style). The modifier suppresses Y's normal weapon
-    // swap for that press.
+    // The 2026-09-16 LAYOUT -- AND THE MODIFIER BUTTON IS GONE. LB+B (heal), LB+Y (quick save)
+    // and LB+RB (run to the exit) all died with it, because LB is a wheel button now and a button
+    // that opens a radial when held cannot also be a modifier. Every action that lived on a combo
+    // got its own tap instead, which is what he asked for -- one gesture, one meaning:
     //
-    // ⚠️ IT SHARES A BUTTON WITH RUN, AND THAT IS A DELIBERATE ACCEPTED COST. The modifier used to
-    // live on LT precisely because LT was "otherwise unused in gameplay"; after the LB/LT swap the
-    // modifier follows RUN, which is the most-HELD button on the pad. So Y pressed while running
-    // quick-saves instead of swapping weapons, and B while running heals instead of cycling firing
-    // mode. That is the trade the layout makes -- there is no unused shoulder left to move it to.
-    // Still named ltNow because every guard that reads it means "the combo key is down".
-    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
-
-    // DIAG (LB+B / LB+Y "nefunguje", 2026-08-29). One line per B or Y PRESS with the modifier state
-    // at that instant, which is the single fact that separates the two possible answers and that no
-    // amount of reading the source can settle: either the modifier was genuinely not down when the
-    // button went in (a gesture question), or it WAS down and the combo still did not fire (a code
-    // question). The button trace alone cannot say -- it timestamps LB and B independently, and an
-    // overlap of a few frames is not reliably visible when the coalescer merges runs.
+    //   X  tap = RUN on/off   hold = weapon wheel        (run was LB-held, weapons were Y)
+    //   Y  tap = heal         hold = drug wheel          (heal was LB+B, drugs were B)
+    //   B  tap = cancel       hold = firing mode         (fire mode was the B tap)
+    //   LB tap = reload       hold = skill wheel         (reload was X, skills were L3)
+    //   RB tap = last aimed shot again   hold = ammo wheel   (ammo was X)
     //
-    // ⚠️ STRIP THIS once the answer is known. Press edges only, so it costs two lines per gesture.
-    if (bPressed || yPressed) {
-        trace_event(TRACE_INPUT, "combo", "btn=%s mod=%d", bPressed ? "B" : "Y", ltNow ? 1 : 0);
-    }
+    // Quick save is unaffected: BACK+START already did it. Running to the nearest exit moved to a
+    // BACK hold (see the inventory branch above).
 
-    // Quick save stays on the PRESS edge -- the modifier already makes the gesture unambiguous
-    // (the weapon wheel refuses to open while it is held), so there is nothing to disambiguate and
-    // no reason to make a save wait for the release. Mark the press spent so the release below
-    // doesn't also swap hands.
-    if (yPressed && ltNow) {
-        gsound_play_sfx_file("ib1p1xx1");
-        gpui_weapon_consumed_y = true;
-        QuickSaveGame();
-    }
-
-    // LB + B = HEAL NOW. Same shape and the same reasoning as the quick save above: the LB
-    // modifier makes the gesture unambiguous -- gpui_quick_wheel now refuses to open while LT is
-    // held, the same guard the weapon wheel already had -- so this sits on the PRESS edge
-    // and marks the press spent so the release below neither cycles the firing mode nor cancels
-    // a bound action. Wanted as a dedicated button because reaching for the wheel mid-fight is
-    // exactly when you cannot afford to.
+    // ⚠️ X IS RUN AND ONLY RUN. The firing mode was on its TAP for exactly one session, and the
+    // 220 ms split I called an honest small cost turned out to be nothing of the kind: every short
+    // dash -- a step through a doorway, a dodge sideways -- came back under the threshold and
+    // silently switched the weapon. With a SPEAR that is not a cosmetic flip, it is thrust becoming
+    // THROW: "při běhu občas překliknu režim střelby a místo útoku oštěpem ho hodím", i.e. the
+    // weapon leaves your hands because you moved too briefly.
     //
-    // ⚠️ DEFERRED, not done here. This runs inside the mouse hook; gpui_quick_use registers an
-    // animation and destroys an object, which belongs in the per-frame safe tick with the wheels.
-    if (bPressed && ltNow) {
-        gpui_quick_consumed_b = true;
-        gpui_heal_pending = true;
-    }
+    // A button you hold constantly must not carry an action on its release. The firing mode went
+    // to LB+X after that, then LB+Y, then RT+Y for ten minutes, and since 2026-10-10 it is LT+Y (below).
 
-    // X is TAP-vs-HOLD like B and Y: a hold opens the ammo wheel (gpui_ammo_wheel), so the plain
-    // reload waits for the release and only fires if this was a tap. Release edge, so deliberately
-    // outside the press chain above.
+    // ⚠️ LT + Y = FIRING MODE (2026-10-10). The fifth home in two days: RB+Y (would have pushed the
+    // heal onto RB's release), LB+Y (*"lb je reload, ne? tak LB a Y"*), RT+Y for ten minutes -- he had
+    // written RT and meant LT: *"já myslel LT ne RT"* -- and now LT+Y. With LB declared reload and
+    // nothing else, the mode goes on the AIM trigger: hold LT, tap Y, and the shots are aimed /
+    // single / burst. Cycles the
+    // active weapon the way the keyboard N does: single -> AIMED -> burst
+    // (intface_item_action_available). A weapon with nothing to switch to buzzes.
+    //
+    // The Y is SPENT: no hand swap on its release, no weapon wheel on its hold (gpui_consumed_y,
+    // checked in gpui_weapon_wheel). LT is read through the same Schmitt helper the lock reads
+    // (gamepad_ui_aim_trigger_held), so "held" here means exactly what "aiming" means there.
+    if (yPressed && gamepad_ui_aim_trigger_held() && !radial_wheel_is_open()) {
+        gpui_consumed_y = true;
+        bool can = intface_item_can_toggle_state();
+        if (can) {
+            gsound_play_sfx_file("ib1p1xx1");
+            intface_toggle_item_state();
+        } else {
+            gsound_play_sfx_file("iisxxxx1");
+        }
+        trace_event(TRACE_INPUT, "fire-mode", "src=lt+y ok=%d", can ? 1 : 0);
+    }
     if (xReleased) {
-        if (gpui_ammo_consumed_x) {
-            // This press opened (and released out of) the ammo wheel.
-            gpui_ammo_consumed_x = false;
-        } else if (get_time() - xDownTime < GPUI_QUICK_HOLD_MS) {
-            // Reload the active-hand weapon from inventory ammo. In realtime combat this
-            // costs AP (vanilla reload = 2) from combat_rt's pool -- you can't reload on an
-            // empty pool; out of combat the pool is full so it's effectively free. Charge
-            // only when a reload actually happened (had ammo / wasn't already full).
-            if (combat_rt_player_ap() >= 2) {
-                if (intface_reload_weapon() == 0) {
-                    combat_rt_spend_ap(2);
+        // Nothing to do on a plain release any more -- just clear the spent flag so the next press
+        // starts clean.
+        gpui_consumed_x = false;
+    }
+
+    // ⚠️ LB: TAP RELOADS, HOLD AIMS. Reload has now been on X, on LB, on LT and back on LB inside
+    // one session -- this is where he put it, and LB earns it: the reload and the body-part picker
+    // are the two things you reach for with the same finger in the same fight.
+    //
+    // LT is not involved at all any more: it is the aim/lock (combat_rt), the same job R3 does.
+    if (lbReleased) {
+        if (gpui_consumed_lb) {
+            // This press was spent: an LB+B heal, a weapon-wheel page, or a
+            // screen that closed on it.
+            gpui_consumed_lb = false;
+        } else {
+            // ⚠️ ANY RELEASE RELOADS, HOWEVER LONG THE PRESS (2026-10-09). The 220 ms tap limit was
+            // there to tell the reload from the hold (the called-shot window, then for a moment a
+            // lock); "LB bude jen reload" took the hold away, and a limit with nothing on the other
+            // side of it would only turn a slow press into a dead button.
+            // Reload the active-hand weapon from inventory ammo. In realtime combat this costs AP
+            // (vanilla reload = 2) from combat_rt's pool -- you cannot reload on an empty pool; out
+            // of combat the pool is full so it is effectively free. Charge only when a reload
+            // actually happened (had ammo, was not already full).
+            //
+            // ⚠️ THIS USED TO FAIL SILENTLY IN THREE DIFFERENT WAYS and leave no trace of any of
+            // them: not enough AP, nothing to reload with, or already full. You pressed LB, nothing
+            // happened, and there was no way to tell which -- not on screen, not in the log ("Jak
+            // je reload?"). The whole point of the empty-gun lesson is that a refusal has to be
+            // audible; and the log has to be able to answer the question afterwards, which it
+            // could not: a whole session showed ZERO player reloads because none were recorded.
+            //
+            // The sound is the vanilla refusal buzz, the same one every other refused gamepad
+            // action uses. No console line -- the buzz already says it (see the console rule).
+            if (combat_rt_player_ap() < 2) {
+                gsound_play_sfx_file("iisxxxx1");
+                trace_event(TRACE_INPUT, "reload-refused", "why=ap ap=%d", combat_rt_player_ap());
+            } else if (anim_get_reload_anim()) {
+                // MODS "Reload animation": the weapon's handling loop plays first and the magazine
+                // fills at its END (gpui_reload_anim_start). Asked here, done on the safe tick --
+                // it registers an animation, which the hook must never do. Refused NOW if there is
+                // nothing to load, so the buzz still answers the press it belongs to.
+                //
+                // A press while the reload is already running is NOT a new reload: it used to be
+                // read as "the body is only fidgeting", cut the loop and start it over -- so an
+                // impatient second tap made the reload take longer, and looked like it.
+                if (combat_rt_is_reloading(obj_dude)) {
+                    // already on it
+                } else if (intface_can_reload_weapon()) {
+                    gpui_reload_pending = true;
+                    gpui_reload_pending_since = get_time();
+                } else {
+                    gsound_play_sfx_file("iisxxxx1");
+                    trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
                 }
+            } else if (intface_reload_weapon() == 0) {
+                combat_rt_spend_ap(2);
+                trace_event(TRACE_ACTION, "reload", "ap=%d", combat_rt_player_ap());
+            } else {
+                // intface_reload_weapon says no: no weapon in hand, it takes no ammo, there is
+                // none in the pack, or the magazine is already full. It does not tell us which,
+                // so neither do we -- but the player hears that nothing happened.
+                gsound_play_sfx_file("iisxxxx1");
+                trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
             }
         }
     }
 
-    // B is TAP-vs-HOLD: a hold brings up the quick-use wheel (gpui_quick_wheel), so the
-    // firing-mode cycle has to wait for the release and only fire if this was a tap. Every
-    // other pad button was already taken; firing mode is the least time-critical of them,
-    // which is why it is the one that got split.
+    // ⚠️ RB = THE HEAL (2026-10-09). LB+B never sat right in his hands, and a heal is
+    // the one action that must work first time while you are being shot: *"jako quick heal to stojí
+    // za hovno, to musí být quick heal ne tam půl hodiny štelovat jestli to neposeru"*. RB came free
+    // because the aimed shot it used to repeat is the weapon slot's AIMED mode again (his idea, the
+    // original's own UI with its price on it), fired by RT.
     //
-    // Deliberately NOT part of the y/x else-if chain above: those are press edges and this
-    // is a release edge, so they can legitimately land on the same frame. Chaining them
-    // would let a simultaneous X/Y press swallow the release and strand
-    // gpui_quick_consumed_b set, which would then eat the NEXT B tap.
-    if (bReleased) {
+    // ON THE PRESS: RB carries nothing else, so there is nothing to wait for (for ten minutes it was
+    // the first half of RB+Y and healed on the release; the firing mode moved off RB so the heal could
+    // stay instant). NOT while a radial wheel is up -- there RB turns its page -- and DEFERRED to
+    // the safe tick like every other item use (gpui_use_best_heal). LB+B still heals too; it costs
+    // nothing to leave.
+    if (rbPressed && !radial_wheel_is_open() && !inven_any_open()) {
+        gpui_heal_pending = true;
+        trace_event(TRACE_INPUT, "heal-press", "src=rb");
+    }
+    if (rbReleased) {
+        gpui_consumed_rb = false;
+    }
+
+    // B: TAP CANCELS, HOLD OPENS THE DRUG WHEEL. The firing mode that briefly lived on this hold
+    // moved to X's tap when the wheels were shuffled -- B is "back out of this" everywhere on the
+    // pad, and the drugs are back where they were originally built.
+    //
+    // Deliberately NOT part of a press-edge chain: this is a release edge, so it can legitimately
+    // land on the same frame as one, and chaining them would strand the consumed flag set and eat
+    // the NEXT B tap.
+    if (bReleased && get_time() - bDownTime < GPUI_QUICK_HOLD_MS) {
         if (gpui_aim_swallow_b) {
-            // This press already did its job: it cancelled the aim picker. Letting it fall
-            // through would silently change the weapon's firing mode as well.
+            // This press already did its job: it cancelled the aim picker.
             gpui_aim_swallow_b = false;
-        } else if (gpui_quick_consumed_b) {
-            // The press opened (and released out of) the quick-use wheel.
-            gpui_quick_consumed_b = false;
+        } else if (gpui_consumed_b) {
+            // The press opened (and released out of) the drug wheel.
+            gpui_consumed_b = false;
         } else if (gpui_skill_cursor_armed()) {
-            // PUT THE SKILL AWAY. A skill armed from the wheel now survives being used, so it
-            // needs an explicit way out or you would be stuck aiming a lockpick at the world. B is
-            // the natural one -- it is already "back out of this" everywhere else on the pad -- and
-            // the firing-mode cycle it normally does is meaningless while a skill cursor is up.
+            // PUT THE SKILL AWAY. A skill armed from the wheel survives being used, so it needs an
+            // explicit way out or you would be stuck aiming a lockpick at the world.
             gsound_play_sfx_file("ib1p1xx1");
             gpui_cancel_skill_cursor();
         } else if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
-            // Same idea for the use-item-on cursor that holding A arms: B is the way out, and the
-            // firing-mode cycle is meaningless while it is up.
+            // Same idea for the use-item-on cursor that holding A arms.
             gsound_play_sfx_file("ib1p1xx1");
             gmouse_set_cursor(MOUSE_CURSOR_NONE);
             gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
         } else if (combat_rt_cancel_player_action()) {
             // STOP. A on something across the room registers a walk-there-then-act sequence, and
-            // until now nothing could call it off -- "I clicked A and the character walked far, I
-            // wanted to cancel and couldn't". B is already "back out of this" everywhere else on
-            // the pad, so it is the one that gets it. Only swallows the firing-mode cycle when
-            // there really was something to stop, so a B tap while standing still still cycles.
+            // until this existed nothing could call it off -- "I clicked A and the character walked
+            // far, I wanted to cancel and couldn't".
             gsound_play_sfx_file("ib1p1xx1");
-        } else if (get_time() - bDownTime < GPUI_QUICK_HOLD_MS) {
-            // Cycle the active weapon's firing mode, mirroring the keyboard 'N'. B's inventory
-            // role (equip right hand) is handled in the inven_is_open() branch above, so this is
-            // gameplay-only. In realtime the cycle is only single/burst -- the aiming and reload
-            // entries are skipped as inert (see intface_item_action_available), so a single-mode
-            // weapon has nothing to switch to and says so instead of beeping a confirmation at a
-            // cycle that changes nothing.
-            if (intface_item_can_toggle_state()) {
-                gsound_play_sfx_file("ib1p1xx1");
-                intface_toggle_item_state();
-            } else {
-                gsound_play_sfx_file("iisxxxx1");
-            }
+        }
+    } else if (bReleased) {
+        // A HOLD that the wheel did not claim (it was blocked, or nothing was aimed at): swallow
+        // the flags it would otherwise leave standing, and cancel nothing -- a hold is not a tap.
+        gpui_aim_swallow_b = false;
+        gpui_consumed_b = false;
+    }
+
+    // Y: TAP SWAPS THE ACTIVE HAND, hold opens the weapon wheel. The swap came back on his word --
+    // it is the one thing the wheel cannot do as fast, because swapping is a single flick between
+    // two guns you have already chosen, not a choice among everything you carry.
+    if (yReleased) {
+        if (gpui_consumed_y) {
+            // Already spent -- this press opened the weapon wheel.
+            gpui_consumed_y = false;
+        } else if (get_time() - yDownTime < GPUI_QUICK_HOLD_MS) {
+            intface_toggle_items(true);
         }
     }
 
-    // Y, same shape as B: the hand swap is a TAP, because a HOLD belongs to the weapon wheel.
-    // Also a release edge, so deliberately outside the y/x press chain above.
-    if (yReleased) {
-        if (gpui_weapon_consumed_y) {
-            // Already spent -- this press opened the weapon wheel, or saved the game.
-            gpui_weapon_consumed_y = false;
-        } else if (get_time() - yDownTime < GPUI_QUICK_HOLD_MS) {
-            // Swap the active weapon hand (left <-> right).
-            intface_toggle_items(true);
-        }
+    // ⚠️ LB + B = HEAL, a combo again, and the ONE place in this layout where a modifier survived.
+    // LB's own two jobs are a tap (reload, on the release) and a hold (the called-shot window, once
+    // it has been down GPUI_QUICK_HOLD_MS).
+    //
+    // ⚠️ THE HOLD AND THE HEAL COLLIDED AGAIN, AND B IS WHY. In the on-body picker era B did nothing
+    // inside the picker, so a held LB could carry both. Since 2026-09-24 the hold opens the VANILLA
+    // called-shot window, where B CANCELS -- so holding LB as the heal modifier and mashing B opened
+    // the window 220 ms in and the next B shut it instead of healing (trace_2026-10-05_001014: LB
+    // down 36.36, heal 36.48, window 36.63, cancelled; again at 39.61). "Oprav i to okno mířené
+    // střely při LB+B." So a heal now SPENDS the LB press (gpui_consumed_lb): this hold opens no
+    // window and its release reloads nothing. A hold that has not carried a B by the 220 ms mark is
+    // still the called shot -- the gesture cannot know a B is coming.
+    //
+    // Sits on the PRESS edge: the modifier already makes the gesture unambiguous (the drug wheel
+    // refuses to open while LB is held), so there is nothing to disambiguate and no reason to make
+    // a heal wait for a release. Marks the press spent so the release neither cancels anything nor
+    // opens the wheel. DEFERRED to the safe tick like every other item use.
+    if (bPressed && lbNow) {
+        gpui_consumed_b = true;
+        gpui_consumed_lb = true;
+        gpui_heal_pending = true;
+        trace_event(TRACE_INPUT, "heal-press", "src=lb+b");
     }
 }
 
@@ -1971,6 +2388,267 @@ static void gpui_cancel_skill_cursor()
     }
 }
 
+// Move the pointer to (sx, sy) and REDRAW it there.
+//
+// ⚠️ mouse_set_position ALONE ONLY MOVES THE COORDINATES (mouse.cc:744) -- it neither erases the old
+// cursor sprite nor blits the new one, so a bare call leaves a ghost behind. This is the same dance
+// barter_warp_cursor does: refresh what was under the old rect, then show at the new spot. Clamped
+// into the world window, because a cursor parked under the interface bar or off screen is exactly
+// the "where did it go" this whole idea exists to end.
+static void gpui_park_cursor_at(int sx, int sy)
+{
+    Rect world;
+    if (display_win != -1 && win_get_rect(display_win, &world) == 0) {
+        if (sx < world.ulx) {
+            sx = world.ulx;
+        } else if (sx > world.lrx) {
+            sx = world.lrx;
+        }
+        if (sy < world.uly) {
+            sy = world.uly;
+        } else if (sy > world.lry) {
+            sy = world.lry;
+        }
+    }
+
+    int curX;
+    int curY;
+    mouse_get_position(&curX, &curY);
+    if (sx == curX && sy == curY) {
+        return;
+    }
+
+    Rect oldRect;
+    mouse_get_rect(&oldRect);
+    mouse_set_position(sx, sy);
+    win_refresh_all(&oldRect);
+    mouse_show();
+
+    // The pointer is hidden by default with a pad connected; having just moved it ON PURPOSE is
+    // exactly the moment it has to be visible (and a click at a hidden cursor is dropped anyway).
+    gpui_cursor_show_time = get_time();
+}
+
+// --- THE RIGHT STICK STEPS AN ARMED CURSOR BETWEEN OBJECTS (2026-10-08) ------------------------
+//
+// *"Nemohl jsem nasměrovat provaz správně, furt to aimoval něco jiného, musíme to nějak pojistit."*
+// With the rope (or a skill) armed, the stick drove a free pointer and the click went to whatever
+// was drawn topmost under it (object_under_mouse) -- trace_2026-10-08_213405 s=247-261: nine A
+// presses, nine uses, none on what he meant. Now a push picks the use target lying that way from the
+// current one (interact_prompt_use_targets: the dude, critters, scripted / interactable things) and
+// GLUES the crosshair onto it, and the click goes to THAT object, not to the pixel
+// (gamepad_ui_targeting_pick, read by gmouse). Scored like the enemy lock -- the anchor is what was
+// picked when the push began, distance plus angle off the push -- so one flick is one step. Where
+// nothing lies that way the stick still moves the pointer freely, and a pointer that has left the
+// glued spot drops the pick, so the old aiming is never taken away -- only made exact.
+#define GPUI_TPICK_MAX 48
+#define GPUI_TPICK_CONE_COS 0.4f // ~66 degrees either side of the push
+#define GPUI_TPICK_DEG_PER_TILE 30.0f
+#define GPUI_TPICK_SWITCH_MARGIN 0.75f
+
+static Object* gpui_tpick = NULL; // compare-only until re-found in a live scan (objects get freed)
+static int gpui_tpick_x = -32000; // where the crosshair was glued for it
+static int gpui_tpick_y = -32000;
+static bool gpui_tpick_pushing = false;
+static Object* gpui_tpick_anchor = NULL;
+static int gpui_tpick_anchor_x = 0;
+static int gpui_tpick_anchor_y = 0;
+
+static void gpui_tpick_centre(Object* obj, int* x, int* y)
+{
+    Rect b;
+    obj_bound(obj, &b);
+    *x = (b.ulx + b.lrx) / 2;
+    *y = (b.uly + b.lry) / 2;
+}
+
+// The current pick, if it is still a live use target on screen; NULL otherwise.
+static Object* gpui_tpick_live()
+{
+    if (gpui_tpick == NULL) {
+        return NULL;
+    }
+    Object* list[GPUI_TPICK_MAX];
+    int n = interact_prompt_use_targets(list, GPUI_TPICK_MAX);
+    for (int i = 0; i < n; i++) {
+        if (list[i] == gpui_tpick) {
+            return gpui_tpick;
+        }
+    }
+    gpui_tpick = NULL;
+    return NULL;
+}
+
+static void gpui_tpick_set(Object* obj)
+{
+    int x;
+    int y;
+    gpui_tpick_centre(obj, &x, &y);
+    gpui_park_cursor_at(x, y);
+    gpui_tpick = obj;
+    // Where the pointer really ended up (gpui_park_cursor_at clamps into the world window).
+    mouse_get_position(&gpui_tpick_x, &gpui_tpick_y);
+}
+
+static void gpui_tpick_reset()
+{
+    gpui_tpick = NULL;
+    gpui_tpick_pushing = false;
+    gpui_tpick_anchor = NULL;
+}
+
+// Read by gmouse when an armed cursor is clicked: the object to use it on, or NULL to let the pixel
+// decide as it always did. Only while the pointer is still exactly where it was glued -- a real
+// mouse or the free stick moving it hands the choice straight back to the pixel.
+Object* gamepad_ui_targeting_pick()
+{
+    if (!gpui_targeting_cursor_armed()) {
+        return NULL;
+    }
+    int mx;
+    int my;
+    mouse_get_position(&mx, &my);
+    if (mx != gpui_tpick_x || my != gpui_tpick_y) {
+        return NULL;
+    }
+    return gpui_tpick_live();
+}
+
+// One frame of the right stick while a cursor is armed. True = the stick is taken (glued or just
+// stepped), false = let it move the pointer freely.
+static bool gpui_tpick_stick(float x, float y, float mag)
+{
+    if (mag <= gpui_stick_deadzone) {
+        gpui_tpick_pushing = false;
+        gpui_tpick_anchor = NULL;
+
+        // Follow a target that walks: keep the crosshair on it while the stick rests.
+        Object* live = gpui_tpick_live();
+        if (live != NULL && gamepad_ui_targeting_pick() == live) {
+            int cx;
+            int cy;
+            gpui_tpick_centre(live, &cx, &cy);
+            int mx;
+            int my;
+            mouse_get_position(&mx, &my);
+            if (abs(cx - mx) > 2 || abs(cy - my) > 2) {
+                gpui_tpick_set(live);
+            }
+        }
+        return false;
+    }
+
+    Object* list[GPUI_TPICK_MAX];
+    int n = interact_prompt_use_targets(list, GPUI_TPICK_MAX);
+    if (n == 0) {
+        return false;
+    }
+
+    // The anchor holds for the whole push: what was picked when it began, else the pointer itself.
+    if (!gpui_tpick_pushing) {
+        gpui_tpick_pushing = true;
+        Object* live = gamepad_ui_targeting_pick();
+        gpui_tpick_anchor = live;
+        if (live != NULL) {
+            gpui_tpick_centre(live, &gpui_tpick_anchor_x, &gpui_tpick_anchor_y);
+        } else {
+            mouse_get_position(&gpui_tpick_anchor_x, &gpui_tpick_anchor_y);
+        }
+    }
+
+    bool glued = gamepad_ui_targeting_pick() != NULL;
+    if (mag < GPUI_IP_PICK_THRESHOLD) {
+        return glued; // a gentle push neither steps nor creeps a glued crosshair off its target
+    }
+
+    float sx = x / mag;
+    float sy = y / mag;
+    Object* best = NULL;
+    float bestScore = 0.0f;
+    float currentScore = 0.0f;
+    bool haveCurrent = false;
+
+    for (int i = 0; i < n; i++) {
+        Object* c = list[i];
+        if (c == gpui_tpick_anchor) {
+            continue; // pushing away from it means someone else
+        }
+        int cx;
+        int cy;
+        gpui_tpick_centre(c, &cx, &cy);
+        float ex = (float)(cx - gpui_tpick_anchor_x);
+        float ey = (float)(cy - gpui_tpick_anchor_y);
+        float elen = sqrtf(ex * ex + ey * ey);
+        if (elen < 1.0f) {
+            continue;
+        }
+        float dot = (ex * sx + ey * sy) / elen;
+        if (dot < GPUI_TPICK_CONE_COS) {
+            continue;
+        }
+        float clamped = dot > 1.0f ? 1.0f : dot;
+        float offDeg = acosf(clamped) * (180.0f / 3.14159265f);
+        // Screen pixels over 32 is roughly tiles -- the anchor may be a bare pointer with no tile.
+        float score = elen / 32.0f + offDeg / GPUI_TPICK_DEG_PER_TILE; // lower is better
+
+        if (c == gpui_tpick && glued) {
+            currentScore = score;
+            haveCurrent = true;
+        }
+        if (best == NULL || score < bestScore) {
+            best = c;
+            bestScore = score;
+        }
+    }
+
+    if (best == NULL) {
+        // Nothing that way: the pointer moves freely, which also unglues it -- the target he wants
+        // may simply not be on the list, and the stick must still be able to reach it.
+        return false;
+    }
+
+    if (best != gpui_tpick || !glued) {
+        if (haveCurrent && currentScore - bestScore < GPUI_TPICK_SWITCH_MARGIN) {
+            return true;
+        }
+        gpui_tpick_set(best);
+        gsound_play_sfx_file("ib1p1xx1");
+        trace_event(TRACE_INPUT, "tpick", "pid=%d id=%d name=%s tile=%d dist=%d",
+            best->pid, best->id, object_name(best), best->tile, obj_dist(obj_dude, best));
+    }
+    return true;
+}
+
+// --- WHERE AN ARMED SKILL CURSOR STARTS ---------------------------------------------------------
+//
+// His request: first aid arms on the DUDE, the lockpick arms on the locked chest, and so on for the
+// rest. The skill cursor used to appear whereever the pointer was left, which out in the world is
+// nowhere -- it is hidden and has not moved for minutes -- so every use of the wheel started with a
+// hunt for the crosshair.
+//
+// First aid and Doctor are answered here, because the answer is not on the map: it is the dude, and
+// healing yourself is what you reach for the wheel for. Everything else asks interact_prompt, which
+// owns the map scan and all of its traps (hidden staging, proto-less objects).
+static void gpui_skill_park_cursor(int skill)
+{
+    if (obj_dude == NULL) {
+        return;
+    }
+
+    Object* target = (skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR)
+        ? obj_dude
+        : interact_prompt_skill_target(skill);
+
+    // Nothing sensible in reach: leave the cursor exactly where it is. A crosshair yanked onto
+    // something absurd is worse than one that did not move.
+    if (target == NULL) {
+        return;
+    }
+
+    // Parked AND picked: A applies it to exactly this object, not to whatever pixel is topmost there.
+    gpui_tpick_set(target);
+}
+
 static void gpui_use_skill(int skill)
 {
     if (skill == SKILL_SNEAK) {
@@ -1999,22 +2677,22 @@ static void gpui_use_skill(int skill)
         // STICKY from here: gmouse will not revert to MOVE after applying it, so the skill can be
         // used again (another lock, the next trap, a second patient) without re-opening the wheel.
         gpui_skill_sticky = true;
+        // ...and put the crosshair on whatever this skill is obviously for.
+        gpui_skill_park_cursor(skill);
     }
 }
 
-// --- LB aimed-shot wheel (a second radial_wheel instance). ---
+// --- The eight hit locations, and who owns the shared wheel overlay. ---
 //
-// In combat, hold LB to bring up a wheel of the eight body parts; aim a segment with the
-// RIGHT stick; release LB to fire an aimed shot at the lock-on target (or nearest hostile
-// in range). Each segment shows the to-hit % for that part. Combat-only and weapon-gated
-// via combat_rt_can_aim(). Reuses the same skilldex button art as the skill wheel.
+// The order below is CLOCKWISE FROM THE TOP and is load-bearing twice over: the wheels lay their
+// segments out in it, and gpui_aim_ring_slot maps stick directions onto it, so a given push means
+// the same body part wherever it is read.
 
-// The radial_wheel is a single shared overlay, so only one of the two wheels may own it
-// at a time. This tracks which driver opened the current overlay so the other ignores it.
+// The radial_wheel is a single shared overlay, so only one wheel may own it at a time. This tracks
+// which driver opened the current overlay so the others ignore it.
 enum {
     GPUI_WHEEL_NONE = 0,
     GPUI_WHEEL_SKILL,
-    GPUI_WHEEL_AIM,
     GPUI_WHEEL_QUICK,
     GPUI_WHEEL_WEAPON,
     GPUI_WHEEL_AMMO,
@@ -2040,107 +2718,36 @@ static const struct {
     { "Torso", HIT_LOCATION_TORSO },
 };
 
-// The target's body picture, scaled to sit in the wheel hub. Reuses the engine's
-// called-shot critter art (ANIM_CALLED_SHOT_PIC, the same figure the turn-based aimed-shot
-// screen shows). Built per open from the current target and freed on close. Scaled down so
-// the body-part labels around it have room.
-#define GPUI_AIM_FIG_MAX_W 120
-#define GPUI_AIM_FIG_MAX_H 150
-static unsigned char* gpui_aim_fig = NULL; // malloc'd scaled copy (transparent, index 0 = clear)
-static int gpui_aim_fig_w = 0;
-static int gpui_aim_fig_h = 0;
-
-static void gpui_release_aim_figure()
-{
-    if (gpui_aim_fig != NULL) {
-        mem_free(gpui_aim_fig);
-        gpui_aim_fig = NULL;
-    }
-    gpui_aim_fig_w = 0;
-    gpui_aim_fig_h = 0;
-}
-
-static void gpui_load_aim_figure(Object* target)
-{
-    gpui_release_aim_figure();
-    if (target == NULL) {
-        return;
-    }
-
-    CacheEntry* key;
-    int w;
-    int h;
-    int fid = art_id(OBJ_TYPE_CRITTER, target->fid & 0xFFF, ANIM_CALLED_SHOT_PIC, 0, 0);
-    unsigned char* src = art_lock(fid, &key, &w, &h);
-    if (src == NULL) {
-        return; // this critter has no called-shot picture -- hub just stays empty
-    }
-
-    // Fit within the hub box, preserving aspect, never upscaling.
-    float scale = 1.0f;
-    if (w > GPUI_AIM_FIG_MAX_W) {
-        scale = (float)GPUI_AIM_FIG_MAX_W / w;
-    }
-    if ((float)h * scale > GPUI_AIM_FIG_MAX_H) {
-        scale = (float)GPUI_AIM_FIG_MAX_H / h;
-    }
-    int sw = (int)(w * scale);
-    int sh = (int)(h * scale);
-    if (sw < 1) {
-        sw = 1;
-    }
-    if (sh < 1) {
-        sh = 1;
-    }
-
-    gpui_aim_fig = (unsigned char*)mem_malloc(sw * sh);
-    if (gpui_aim_fig != NULL) {
-        memset(gpui_aim_fig, 0, sw * sh); // transparent background for the trans scale
-        trans_cscale(src, w, h, w, gpui_aim_fig, sw, sh, sw);
-        gpui_aim_fig_w = sw;
-        gpui_aim_fig_h = sh;
-    }
-
-    art_ptr_unlock(key);
-}
-
-static void gpui_open_aim_wheel()
-{
-    gpui_load_skill_art(); // same button/digit art as the skill wheel
-
-    Object* target = combat_rt_aim_target();
-    gpui_load_aim_figure(target);
-
-    // Anchor a SMALL opaque panel flush to the LEFT edge, vertically centered: passing x=0
-    // makes win_move clamp the (off-screen-left) panel against the left margin. This keeps it
-    // off the enemy you're aiming at -- the enemy stays green-outlined out on the battlefield,
-    // clearly visible -- instead of a big black block sitting on top of it.
-    int atX = 0;
-    int atY = screenGetHeight() / 2;
-
-    RadialSegment segs[8];
-    memset(segs, 0, sizeof(segs)); // see gpui_open_skill_wheel: optional fields must be zeroed
-    for (int i = 0; i < 8; i++) {
-        segs[i].label = gpui_aim_order[i].label;
-        segs[i].id = gpui_aim_order[i].location;
-        segs[i].enabled = true;
-        segs[i].value = combat_rt_aim_chance(gpui_aim_order[i].location); // to-hit %
-    }
-
-    // Plain compact text look (no skilldex buttons / hub figure): each label shows its
-    // to-hit % inline, so the panel stays small and readable at the screen edge.
-    radial_wheel_open(segs, 8, "AIM", NULL, atX, atY, false);
-}
+// ⛔ THERE IS NO AIM WHEEL, AND THAT IS A DECISION. Picking the body part in a radial panel was
+// built on 2026-09-02 and rejected on sight -- the part is chosen ON THE TARGET'S BODY (the marks
+// further down this file), because that is the feature. What was actually broken was the stick
+// mapping, not the display; see gpui_aim_ring_slot. Do not bring the panel back.
 
 // Drive the wheel from the per-frame safe tick (gamepad_ui_tick). Open on the L3 press
 // edge, aim while held, execute + close on release.
 static void gpui_skill_wheel(SDL_GameController* pad)
 {
+    // ⚠️ BACK ON L3, WHERE IT LIVED FOR MONTHS. It spent about an hour on an LB hold in this
+    // layout, until LB was claimed by the body-part picker; L3 was left free by that same move, so
+    // the skills go home rather than squatting on a third button. No tap/hold split here: nothing
+    // else wants the stick click, so the wheel opens on the PRESS edge, aims while held, and
+    // executes on release -- the snappiest of the four, and the one that needs to be.
+    //
+    // It aims with the RIGHT stick: the left thumb is on the left stick, so the right one is free.
+    //
+    // ⚠️ IT STAYS OPEN (2026-10-10): *"stisk R3 menu zůstane, stisk L3 menu nezůstane, změň to na R3"*.
+    // The wheel used to close and pick on the RELEASE of L3, so it had to be held -- a stick click
+    // held down while the other thumb aims. Now it behaves like the R3 called-shot window: a press
+    // opens it and it stays; the right stick aims, A or another L3 press takes the highlighted
+    // skill, B closes it without one.
     static bool prevL3 = false;
+    static bool prevB = false;
     bool l3Now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) != 0;
     bool l3Edge = l3Now && !prevL3;
-    bool l3Released = !l3Now && prevL3;
     prevL3 = l3Now;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool bEdge = bNow && !prevB;
+    prevB = bNow;
 
     // Ignore the shared overlay while the aim wheel owns it.
     if (radial_wheel_is_open() && gpui_wheel_owner != GPUI_WHEEL_SKILL) {
@@ -2156,7 +2763,12 @@ static void gpui_skill_wheel(SDL_GameController* pad)
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (l3Released || gpui_wheel_a_edge) {
+        } else if (bEdge) {
+            // Closed without a pick.
+            radial_wheel_close();
+            gpui_wheel_owner = GPUI_WHEEL_NONE;
+            gpui_icons_release();
+        } else if (l3Edge || gpui_wheel_a_edge) {
             int skill = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -2180,7 +2792,7 @@ static void gpui_skill_wheel(SDL_GameController* pad)
     }
 }
 
-// --- B-hold quick-use wheel (a third radial_wheel instance). ---
+// --- Y-hold quick-use wheel (a radial_wheel instance). ---
 //
 // Hold B to bring up a wheel of the healing/combat drugs; aim a segment with the LEFT
 // stick (B is a face button -- the right thumb is busy holding the wheel open and cannot
@@ -2409,15 +3021,15 @@ static void gpui_weapon_detail(Object* weapon, char* out, size_t size)
     snprintf(out + len, size - len, "  %s: %d", proto_name(ammoPid), rounds);
 }
 
-static void gpui_open_quick_wheel()
+// Distinct drug PIDs the dude is carrying loose, in priority-then-inventory order, with the combined
+// count of each. Returns how many (at most GPUI_QUICK_MAX). Shared by the B-hold drug wheel and the
+// drug page at the end of the Y-hold weapon wheel, so both always show the same list in the same seats.
+//
+// PIDs, not Object*: unlike a weapon, a drug is consumed the moment you use it, so a pointer
+// would dangle. "Use the next one of these I'm carrying" is the right identity here and it
+// survives consuming, looting, trading and reloading a save.
+static int gpui_collect_drugs(int* pids, int* counts)
 {
-    // Distinct drug PIDs the dude is carrying loose, in priority-then-inventory order.
-    //
-    // PIDs, not Object*: unlike a weapon, a drug is consumed the moment you use it, so a pointer
-    // would dangle. "Use the next one of these I'm carrying" is the right identity here and it
-    // survives consuming, looting, trading and reloading a save.
-    int pids[GPUI_QUICK_MAX];
-    int counts[GPUI_QUICK_MAX];
     int count = 0;
 
     Inventory* inventory = &(obj_dude->data.inventory);
@@ -2462,6 +3074,36 @@ static void gpui_open_quick_wheel()
         count++;
     }
 
+    return count;
+}
+
+// Fill drug segments [0, count) of `segs` -- name, count badge, effect line, prose, icon. The detail
+// lines live in gpui_detail_buf, indexed by SEGMENT, so the caller's segment numbers must be the
+// buffer slots too (both wheels start their drugs at segment 0).
+static void gpui_fill_drug_segments(RadialSegment* segs, const int* pids, const int* counts, int count, int idBase)
+{
+    for (int i = 0; i < count; i++) {
+        // idBase < 0 encodes the index (weapon ring, see GPUI_WHEEL_DRUG_ID_BASE); otherwise the
+        // segment id IS the pid, as the B-hold wheel has always had it.
+        segs[i].id = idBase < 0 ? idBase - i : pids[i];
+        segs[i].label = proto_name(pids[i]);
+        segs[i].value = counts[i];
+        segs[i].enabled = true; // everything on the ring is something you have
+        gpui_drug_detail(pids[i], gpui_detail_buf[i], sizeof(gpui_detail_buf[i]));
+        segs[i].detail = gpui_detail_buf[i][0] != '\0' ? gpui_detail_buf[i] : NULL;
+        // Fallout's own prose, straight from the proto message file -- no copy, the proto text
+        // outlives the wheel.
+        segs[i].description = proto_description(pids[i]);
+        gpui_icon_from_pid(segs, i, pids[i]);
+    }
+}
+
+static void gpui_open_quick_wheel()
+{
+    int pids[GPUI_QUICK_MAX];
+    int counts[GPUI_QUICK_MAX];
+    int count = gpui_collect_drugs(pids, counts);
+
     if (count == 0) {
         // Carrying nothing usable -- refuse audibly rather than flashing an empty ring (the
         // empty-gun lesson: never fail silently). Same as the weapon wheel with no weapons.
@@ -2474,19 +3116,7 @@ static void gpui_open_quick_wheel()
 
     RadialSegment segs[GPUI_QUICK_MAX];
     memset(segs, 0, sizeof(segs));
-
-    for (int i = 0; i < count; i++) {
-        segs[i].id = pids[i];
-        segs[i].label = proto_name(pids[i]);
-        segs[i].value = counts[i];
-        segs[i].enabled = true; // everything on the ring is something you have
-        gpui_drug_detail(pids[i], gpui_detail_buf[i], sizeof(gpui_detail_buf[i]));
-        segs[i].detail = gpui_detail_buf[i][0] != '\0' ? gpui_detail_buf[i] : NULL;
-        // Fallout's own prose, straight from the proto message file -- no copy, the proto text
-        // outlives the wheel.
-        segs[i].description = proto_description(pids[i]);
-        gpui_icon_from_pid(segs, i, pids[i]);
-    }
+    gpui_fill_drug_segments(segs, pids, counts, count, 0);
 
     RadialWheelArt art;
     radial_wheel_open(segs, count, "QUICK USE",
@@ -2495,6 +3125,39 @@ static void gpui_open_quick_wheel()
     if (!radial_wheel_is_open()) {
         gpui_icons_release();
     }
+}
+
+// ⚠️ ONE INJECTION AT A TIME IN A FIGHT (2026-10-05, his pick of four: "Jedno píchnutí naráz").
+// The 2 AP alone never limited healing. Next to an enemy at AGI 10 the pool hands them back in
+// ~0.7 s, and every press RESTARTED the injection animation (1.38 s in power armour) instead of
+// waiting for it: trace_2026-10-05_001014 went 21 -> 84 HP in three seconds of LB+B mashing, six
+// stimpaks, while the bar showed "only yellow" -- the second green bulb lit for 0.07-0.17 s before
+// the next press took it. "Nemám AP mám jen žluté a i tak se můžu healovat do nekonečna."
+//
+// So a drug now holds the next one off for as long as its own injection animation lasts. TIMED, not
+// "while the animation plays": the animation is cancellable (a single step cuts it) and is not played
+// at all while he is down, and either would have reopened the spam -- tap a direction, heal again;
+// get knocked over, heal five times on the floor. Out of a fight there is no lock, just as there is
+// no AP cost: nothing is racing you there.
+static unsigned int gpui_injection_since = 0;
+static unsigned int gpui_injection_ms = 0;
+
+// How long the dude's injection animation runs right now: frames x the same ticks-per-frame the
+// scheduler will use (compute_tpf -- the global animation speed lever applies to it), so the lock
+// and what you see end together. The fid is built the way anim_animate builds it.
+static unsigned int gpui_injection_duration()
+{
+    int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_MAGIC_HANDS_MIDDLE,
+        (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+
+    unsigned int ms = 1000;
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art != NULL) {
+        ms = (unsigned int)art_frame_max_frame(art) * compute_tpf(obj_dude, fid);
+        art_ptr_unlock(handle);
+    }
+    return ms;
 }
 
 // Use one of `pid` on the dude. This is deliberately the same sequence combatai.cc:370 runs
@@ -2513,6 +3176,14 @@ static void gpui_quick_use(int pid)
     // pool sits at maximum, so this never bites outside a fight.
     if (combat_rt_player_ap() < 2) {
         gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=ap ap=%d", pid, combat_rt_player_ap());
+        return;
+    }
+
+    if (combat_rt_active() && elapsed_time(gpui_injection_since) < gpui_injection_ms) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=injecting left=%ums ap=%d",
+            pid, gpui_injection_ms - elapsed_time(gpui_injection_since), combat_rt_player_ap());
         return;
     }
 
@@ -2534,11 +3205,23 @@ static void gpui_quick_use(int pid)
         return;
     }
 
+    int hpBefore = critter_get_hits(obj_dude);
+    int apBefore = combat_rt_player_ap();
+
     if (item_d_take_drug(obj_dude, item) == -1) {
         // Refused (robotic body, dead) -- put it back rather than eating the item.
         item_add_force(obj_dude, item, 1);
         return;
     }
+
+    // Taken: the next one waits out this injection (see gpui_injection_since). Armed whether or not
+    // the animation below can be registered -- the prone case is exactly the one it must cover.
+    //
+    // The bracket makes compute_tpf time the injection by (AGI + INT + PE) / 3 (2026-10-06) -- for the
+    // lock measured here and for the animation registered below alike, so the two end together.
+    anim_set_injection_timing(obj_dude);
+    gpui_injection_since = get_time();
+    gpui_injection_ms = gpui_injection_duration();
 
     // The "using something" animation. This DOES tie up obj_dude until it finishes, which is
     // intended. NOTE: combatai follows a failed register_end() with combat_turn_run(); that
@@ -2562,6 +3245,7 @@ static void gpui_quick_use(int pid)
         register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
         register_end();
     }
+    anim_set_injection_timing(NULL);
 
     obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
     obj_destroy(item);
@@ -2571,6 +3255,10 @@ static void gpui_quick_use(int pid)
     // Vanilla charges 2 AP for taking a drug. Unconditional now: affordability was settled at
     // the top of this function, before the item was spent.
     combat_rt_spend_ap(2);
+
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d lock=%ums fight=%d",
+        pid, hpBefore, critter_get_hits(obj_dude), apBefore, combat_rt_player_ap(),
+        gpui_injection_ms, combat_rt_active() ? 1 : 0);
 }
 
 // What the dedicated heal button (LB+B) reaches for, best first. Fallout 1 has no other
@@ -2607,6 +3295,101 @@ static Object* gpui_next_heal(int* count)
     return NULL;
 }
 
+// --- LB+RB: run to the nearest map exit ---
+//
+// "Just take me to the next area." Crossing a cleared map on foot is the part of Fallout that is
+// pure travel time, and on a pad it is worse than on a mouse: a mouse player clicks the far edge of
+// the screen once and the engine paths him there, while the stick player has to steer every tile of
+// it himself. This is the pad's version of that click, aimed at the one destination that is always
+// what you meant -- the way out.
+//
+// ⚠️ BOTH SHOULDERS, because it is the only two-button gesture left that costs nothing. LB is the
+// modifier already (run, LB+Y quick save, LB+B heal) and its face-button combos are all spoken for;
+// worse, LB is HELD CONSTANTLY by anyone who runs everywhere, so hanging this on LB+X would have
+// eaten reload-while-running -- the exact collision the quick-save comment calls the layout's
+// accepted cost, and one more of them is one too many. RB's own job in the world is toggling the
+// cursor mode, a tap worth nothing mid-run, so the combo simply swallows it.
+//
+// OUT OF COMBAT ONLY, and that is not timidity: auto-pathing a player through a firefight would walk
+// him into rifle fire he is not steering away from. (Leaving a map mid-fight works by stepping onto
+// the grid yourself -- immediate since 2026-10-06, see combat_rt_arm_map_exit.)
+//
+// Exit grids are the MISC objects with pids 0x5000010..0x5000017 -- the same range obj_move_to_tile
+// tests to fire map_leave_map, and the same one obj_dude_on_exit_grid reads, so "what counts as an
+// exit" has exactly one definition in the build.
+static void gpui_run_to_exit()
+{
+    if (obj_dude == NULL || !intface_is_enabled()) {
+        return;
+    }
+
+    if (combat_rt_enabled() ? combat_rt_active() : (isInCombat() != 0)) {
+        gsound_play_sfx_file("iisxxxx1");
+        display_print("Not while you're being shot at.");
+        return;
+    }
+
+    Object** objects;
+    int count = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_MISC, &objects);
+
+    Object* best = NULL;
+    int bestDist = INT_MAX;
+    for (int i = 0; i < count; i++) {
+        Object* obj = objects[i];
+        if (obj == NULL || obj->pid < 0x5000010 || obj->pid > 0x5000017) {
+            continue;
+        }
+        // Straight tile distance, not path length. make_path on every candidate would be the
+        // honest answer and is far too expensive for a button press; the nearest grid as the crow
+        // flies is the right one on essentially every map, and if the path turns out to be longer
+        // the engine still walks it correctly -- only the CHOICE would be second-best.
+        int d = tile_dist(obj_dude->tile, obj->tile);
+        if (d < bestDist) {
+            bestDist = d;
+            best = obj;
+        }
+    }
+
+    if (count > 0) {
+        obj_delete_list(objects);
+    }
+
+    if (best == NULL) {
+        gsound_play_sfx_file("iisxxxx1");
+        display_print("No way out of here.");
+        return;
+    }
+
+    if (bestDist <= 1) {
+        gsound_play_sfx_file("iisxxxx1");
+        display_print("You're standing on it.");
+        return;
+    }
+
+    // Same shape as dude_run (anim.cc): clear whatever the stick had registered, then one run
+    // sequence to the destination. actionPoints -1 = unlimited, which is what out-of-combat
+    // movement always passes. Sneaking drops for the same reason vanilla drops it on a run.
+    register_clear(obj_dude);
+
+    if (!perk_level(PERK_SILENT_RUNNING)) {
+        pc_flag_off(PC_FLAG_SNEAKING);
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_object_run_to_tile(obj_dude, best->tile, obj_dude->elevation, -1, 0);
+    int rc = register_end();
+
+    trace_event(TRACE_ACTION, "exit-nav", "tile=%d dist=%d rc=%d", best->tile, bestDist, rc);
+
+    if (rc == -1) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
+    gsound_play_sfx_file("ib1p1xx1");
+    display_print("Heading for the exit.");
+}
+
 // Uses the best healing item carried. Drained once per press from gamepad_ui_tick.
 static void gpui_use_best_heal()
 {
@@ -2619,22 +3402,142 @@ static void gpui_use_best_heal()
     gpui_quick_use(item->pid);
 }
 
+// --- THE RELOAD ANIMATION (MODS "Reload animation", cfg reload_anim) ---
+//
+// His design, in two messages: *"tlačítko na přebíjení provede animaci při přebíjení... čím větší
+// agi... tak přebije rychleji"* and *"chci aby se zahrála animace... a rychlost se odvíjí podle
+// stats"*. The animation is the weapon's own STAND loop -- the thing he had been seeing as a random
+// idle and reading as a reload (see anim_get_reload_anim) -- played ONCE, timed by Agility through the
+// same symmetric curve the weapon swap uses (compute_tpf), with the magazine filling at its END.
+//
+// ⚠️ LOAD AT THE END, NOT AT THE PRESS. Loading first would make the animation decoration and the
+// reload exactly as instant as vanilla, which is the opposite of "higher Agility reloads faster".
+// And it is the order he asked for with the doors the same evening: "nech udělat animaci a pak se
+// odemkne".
+//
+// ⚠️ EVERYTHING THAT TAKES THE BODY CANCELS IT, AND A CANCEL COSTS NOTHING. Moving (the movers cut a
+// busy STAND exactly as they cut the idle fidget -- "when I move I want to move, not wait for an
+// animation"), firing the rounds still in the gun (action_attack clears the dude), B, a hit. A cut
+// sequence never reaches the callback, so nothing is loaded and no AP is spent -- the AP is charged
+// at the end, with the load.
+
+// The END of the reload's loop: this is where the magazine actually fills.
+static int gpui_reload_anim_done(void* a1, void* a2)
+{
+    (void)a1;
+    Object* weapon = (Object*)a2;
+
+    // The points were taken at the start; finishing is what earns them, so this reload keeps them
+    // whatever happens below (a refusal below gives them back explicitly).
+    gpui_reload_charged = false;
+    combat_rt_reload_end(obj_dude);
+
+    // Re-checked, not trusted: a reload finishing into a gun no longer in the active hand would be
+    // the one silent wrong outcome this path can have.
+    if (weapon == NULL || intface_reload_target() != weapon) {
+        combat_rt_refund_ap(2);
+        trace_event(TRACE_INPUT, "reload-refused", "why=hand-changed");
+        return 0;
+    }
+
+    if (intface_reload_weapon() == 0) {
+        trace_event(TRACE_ACTION, "reload", "ap=%d anim=1", combat_rt_player_ap());
+    } else {
+        combat_rt_refund_ap(2);
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do-at-end");
+    }
+
+    return 0;
+}
+
+// Start the reload's loop. Returns true when the request is finished with (started, or refused for
+// good), false to try again on the next tick because the dude is still busy with something real.
+static bool gpui_reload_anim_start()
+{
+    // Already reloading (a press queued just before the loop began): nothing more to start.
+    if (combat_rt_is_reloading(obj_dude)) {
+        return true;
+    }
+
+    Object* weapon = intface_reload_target();
+    if (weapon == NULL || !intface_can_reload_weapon()) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "reload-refused", "why=nothing-to-do");
+        return true;
+    }
+
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "reload-refused", "why=ap ap=%d", combat_rt_player_ap());
+        return true;
+    }
+
+    // Wait out what owns the body: a knockdown, the stick (starting under a held stick would only be
+    // cut again on the next frame), or a real animation -- a swing, a walk, an action. His idle
+    // fidget is not real work; the reload replaces it, with the same pending-only cut the movers use.
+    if (critter_is_prone(obj_dude) || combat_rt_stick_walking()) {
+        return false;
+    }
+
+    if (anim_busy(obj_dude) != 0) {
+        if (FID_ANIM_TYPE(obj_dude->fid) != ANIM_STAND || anim_clear_pending(obj_dude) != 0) {
+            return false;
+        }
+    }
+
+    // obj_dude->fid already carries the active weapon's code, so ANIM_STAND resolves to THAT weapon's
+    // handling loop -- or, for a pistol, register_object_reload holsters and draws it instead (its
+    // loop is a forehead wipe). The call waits for the animation (-1 = after everything before it).
+    //
+    // ⚠️ register_begin's refusal MUST be honoured: it refuses when ANOTHER transaction is still
+    // open, and registering anyway would append the reload to somebody else's sequence.
+    if (register_begin(ANIMATION_REQUEST_RESERVED) != 0) {
+        return false;
+    }
+    register_object_reload(obj_dude);
+    register_object_call(obj_dude, weapon, gpui_reload_anim_done, -1);
+
+    // compute_tpf runs INSIDE register_end, as the first description starts -- that is the one moment
+    // the Agility timing has to be visible to it.
+    anim_set_reload_timing(obj_dude);
+    int rc = register_end();
+    anim_set_reload_timing(NULL);
+
+    if (rc != 0) {
+        return false; // the registry would not take him this tick -- try again
+    }
+
+    // ⚠️ THE 2 AP GO AT THE START (2026-10-04, said twice and the second time in capitals: "ZMÁČKNU
+    // RELOAD A UŽ MI TO BERE 2 BODY, JASNÝ?"). Charging at the end looked like the pool refilling
+    // through the reload and then dropping, and read as the price arriving from nowhere. Taken now,
+    // and handed back by the tick if the loop never finishes (a knockdown, the player walking or
+    // firing out of it) -- a reload that did not happen still costs nothing.
+    combat_rt_spend_ap(2);
+    gpui_reload_charged = true;
+    combat_rt_reload_begin(obj_dude);
+
+    trace_event(TRACE_ACTION, "reload-anim", "pid=%d agi=%d ap=%d",
+        weapon->pid, stat_level(obj_dude, STAT_AGILITY), combat_rt_player_ap());
+    return true;
+}
+
 // Drive from the per-frame safe tick (gamepad_ui_tick). Open once B has been held past the
 // tap window, aim while held, execute + close on release.
 static void gpui_quick_wheel(SDL_GameController* pad)
 {
-    static bool prevB = false;
-    static unsigned int bDownTime = 0;
-    static bool bHandled = false; // this hold already tried to open; don't retry every frame
+    static bool prevQb = false;
+    static unsigned int qbDownTime = 0;
+    static bool qbHandled = false; // this hold already tried to open; don't retry every frame
 
-    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
-    bool bEdge = bNow && !prevB;
-    bool bReleased = !bNow && prevB;
-    prevB = bNow;
+    bool qbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool qbEdge = qbNow && !prevQb;
+    bool qbReleased = !qbNow && prevQb;
+    prevQb = qbNow;
 
-    if (bEdge) {
-        bDownTime = get_time();
-        bHandled = false;
+    if (qbEdge) {
+        qbDownTime = get_time();
+        qbHandled = false;
     }
 
     // Ignore the shared overlay while one of the other wheels owns it.
@@ -2642,27 +3545,23 @@ static void gpui_quick_wheel(SDL_GameController* pad)
         return;
     }
 
-    // Don't bring up (or keep up) the wheel over a modal menu / inventory / a disabled
-    // interface bar -- and not while the aimed-shot picker is up, where B means cancel.
-    // ⚠️ LB BLOCKS THIS WHEEL, exactly as it blocks the weapon wheel: LB+B is the dedicated heal,
-    // so while LT is held B is not ours at all. Without it the same hold both healed (on the
-    // press) and opened this wheel 220 ms later.
-    // ⚠️ THE MODIFIER GATES *OPENING* ONLY -- IT MUST NOT CLOSE A WHEEL THAT IS ALREADY UP.
-    // RB is the modifier now, and RB is also how you PAGE an open wheel. Folding it into `blocked`
-    // (which closes the overlay) would have meant that reaching for the next page shut the wheel
-    // instead of turning it. The two roles never actually collide: while the wheel is up the page
-    // step owns RB, and while it is down RB is free to be half of a shortcut.
-    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    // Don't bring up (or keep up) the wheel over a modal menu / inventory / a disabled interface
+    // bar -- and not while the aimed-shot picker is up.
+    //
+    // ⚠️ AND NOT WHILE LB IS HELD: LB+B IS THE HEAL AGAIN. Without this guard the same press would
+    // heal immediately AND open this wheel 220 ms later, which is exactly how the combo behaved the
+    // first time it existed. The guard is on OPENING only -- it must never close a wheel already up.
+    bool lbHeld = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()
         || gpui_aim_picker_active();
-    bool blockedOpen = blocked || ltNow;
+    bool blockedOpen = blocked || lbHeld;
 
     if (radial_wheel_is_open()) {
         if (blocked) {
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (bReleased || gpui_wheel_a_edge) {
+        } else if (qbReleased || gpui_wheel_a_edge) {
             int pid = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
@@ -2671,7 +3570,8 @@ static void gpui_quick_wheel(SDL_GameController* pad)
                 gpui_quick_use(pid);
             }
         } else {
-            // LEFT stick, unlike the other two wheels, which aim with the right. B is a FACE
+            // LEFT stick, like the other two FACE-button wheels (X ammo, Y weapons); only the L3
+            // skill wheel aims with the right, because the left thumb holds that one open. B is a FACE
             // button: the right thumb is already holding the wheel open and physically cannot
             // reach the right stick at the same time, so the aim moves to the other hand.
             // Walking is not a conflict -- rt_gamepad_input bails out entirely while any
@@ -2684,14 +3584,14 @@ static void gpui_quick_wheel(SDL_GameController* pad)
         return;
     }
 
-    if (bNow && !bHandled && !blockedOpen && get_time() - bDownTime >= GPUI_QUICK_HOLD_MS) {
-        bHandled = true;
+    if (qbNow && !qbHandled && !blockedOpen && get_time() - qbDownTime >= GPUI_QUICK_HOLD_MS) {
+        qbHandled = true;
         gpui_open_quick_wheel();
         if (radial_wheel_is_open()) {
             gpui_wheel_owner = GPUI_WHEEL_QUICK;
             // Tell the tap handler this B press was a hold, so releasing it does not also
-            // cycle the weapon's firing mode.
-            gpui_quick_consumed_b = true;
+            // run the cancel chain.
+            gpui_consumed_b = true;
         }
     }
 }
@@ -2714,7 +3614,6 @@ static void gpui_quick_wheel(SDL_GameController* pad)
 // twenty is unaimable and destroys the one thing a radial menu is good for -- fixed positions you
 // stop having to read. Eight stays learnable; the page number is the only thing you track.
 #define GPUI_WEAPON_PER_PAGE 8
-#define GPUI_WEAPON_GUNS_PER_PAGE (GPUI_WEAPON_PER_PAGE - 1)
 
 // Hard ceiling on weapons the wheel will page through, i.e. 8 pages' worth. Anything past this is
 // unreachable from the wheel and has to come out of the inventory screen.
@@ -2743,6 +3642,155 @@ static int gpui_weapon_count = 0;
 // on the page your first seven weapons live on.
 static int gpui_weapon_page = 0;
 static int gpui_weapon_pages = 1;
+
+// AMMO IS THE LAST PAGE OF THIS WHEEL (2026-09-17). It used to be its own wheel on RB-hold, and RB
+// had to give that up so it could become a HELD fire button like RT -- his call: "RB se musi
+// klikat a RT se muze drzet". Folding it in here costs no new button and reuses the paging the
+// weapon wheel already had, so the shoulders keep meaning "turn to the next thing in this ring".
+
+// The ring's "dump the magazine back into the pack" entry. Not a slot index, so it cannot collide
+// with one -- and NOT -1, which radial_wheel_highlight_id() already returns for "nothing aimed at".
+// ⚠️ NOT -2 EITHER any more: bare hands and Unload are on the SAME page now, and they were both
+// -2 while they could never meet.
+#define GPUI_AMMO_UNLOAD_ID (-3)
+
+// Ammunition segments on the weapon ring: id = BASE - <index into gpui_ammo_slot>. Far below every
+// other id the ring uses, so a weapon slot index, bare hands and Unload can never be mistaken for
+// a box of ammo.
+#define GPUI_WHEEL_AMMO_ID_BASE (-100)
+
+#define GPUI_AMMO_MAX 8
+
+// THE DRUGS ARE THE LAST PAGE OF THIS RING (2026-10-04, "může držení Y quick menu pak pomocí RB nebo
+// LB dostat až k itemům? ať je to fakt ez pz"). The B-hold drug wheel stays, but one hold of Y now
+// reaches everything you would grab mid-fight: guns forward with RB, and the drugs ONE LB press back
+// from the first page, because the paging wraps. Segment ids = BASE - <index into
+// gpui_wheel_drug_pid>, far below the ammo range, and tested BEFORE it (every drug id is also
+// <= GPUI_WHEEL_AMMO_ID_BASE).
+//
+// ⚠️ AND THE USABLE ITEMS AFTER THE DRUGS (2026-10-04, "já chci používat i normální itemy jako
+// stealthboy, lockpicking v quick menu ffs"). Every MISC item the engine itself lets you Use
+// (proto_action_can_use: Stealth Boy, flare, Geiger counter, motion sensor, explosives -- arming them)
+// or Use On (proto_action_can_use_on: lockpicks, first aid kit, doctor's bag, rope) joins the list,
+// one entry per kind, eight to a page, as many pages as it takes. A Use item works straight away, the
+// way the inventory's Use does it; a Use On item arms the use-on crosshair FOR THAT ITEM
+// (gmouse_set_use_on_item), so you aim a lockpick at a door without the gun leaving your hand.
+#define GPUI_WHEEL_DRUG_ID_BASE (-1000)
+#define GPUI_QUICK_ENTRY_MAX 32
+static int gpui_wheel_drug_pid[GPUI_QUICK_ENTRY_MAX];
+static int gpui_wheel_drug_qty[GPUI_QUICK_ENTRY_MAX];
+static int gpui_wheel_drug_count = 0;
+
+// Usable MISC items in the pack (see above), merged by kind, appended after `count` entries already in
+// pids/counts. Returns the new total.
+static int gpui_collect_usable_items(int* pids, int* counts, int count, int max)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        Object* item = inventory->items[i].item;
+        if (item == NULL || item_get_type(item) != ITEM_TYPE_MISC) {
+            continue;
+        }
+        if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
+            continue;
+        }
+
+        int at = -1;
+        for (int j = 0; j < count; j++) {
+            if (pids[j] == item->pid) {
+                at = j;
+                break;
+            }
+        }
+        if (at != -1) {
+            counts[at] += inventory->items[i].quantity;
+        } else if (count < max) {
+            pids[count] = item->pid;
+            counts[count] = inventory->items[i].quantity;
+            count++;
+        }
+    }
+    return count;
+}
+
+// USE an item on yourself, exactly the inventory's Use (inventry.cc, GAME_MOUSE_ACTION_MENU_ITEM_USE):
+// take one out of the stack, protinst_use_item it, destroy it if that consumed it, otherwise put it
+// back. 2 AP in a fight, refused when the pool cannot pay -- the same price the drugs have.
+static void gpui_quick_use_item(int pid)
+{
+    if (combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
+    Object* item = NULL;
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        if (inventory->items[i].item != NULL && inventory->items[i].item->pid == pid) {
+            item = inventory->items[i].item;
+            break;
+        }
+    }
+    if (item == NULL) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+
+    if (item_remove_mult(obj_dude, item, 1) != 0) {
+        return;
+    }
+
+    int rc = protinst_use_item(obj_dude, item);
+    if (rc == 1) {
+        obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
+        obj_destroy(item);
+    } else {
+        item_add_force(obj_dude, item, 1);
+    }
+
+    if (rc != -1) {
+        combat_rt_spend_ap(2);
+    }
+    trace_event(TRACE_ACTION, "quick-use-item", "pid=%d rc=%d ap=%d", pid, rc, combat_rt_player_ap());
+    intface_update_items(true);
+}
+
+// USE ON: arm the engine's use-on crosshair for THIS item (not the hand item) and put the crosshair in
+// front of the dude, exactly like holding A with the item in hand does (gpui_useon_arm). The A that
+// confirms it lands in gmouse.cc, which reads the item back by PID and charges the AP there.
+static void gpui_quick_use_on_item(int pid)
+{
+    gmouse_set_cursor(MOUSE_CURSOR_USE_CROSSHAIR);
+    gmouse_3d_set_mode(GAME_MOUSE_MODE_USE_CROSSHAIR);
+    if (gmouse_3d_get_mode() != GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+    gmouse_set_use_on_item(pid);
+    gpui_useon_park_cursor();
+    gpui_cursor_show_time = get_time();
+    gsound_play_sfx_file("ib1p1xx1");
+    trace_event(TRACE_ACTION, "quick-use-on", "pid=%d", pid);
+}
+
+// The ammo objects the open wheel is showing -- one per distinct proto, pointing at the first stack
+// of that type. Object*, because item_w_reload needs the actual object.
+static Object* gpui_ammo_slot[GPUI_AMMO_MAX];
+static int gpui_ammo_count = 0;
+
+// TOTAL rounds of each slot's proto across the whole pack -- every box, times every stack. The
+// slot Object above is only the one the reload will draw from; it is not what the player is
+// carrying, and showing its magazine as the count was the "wtf, that is not how much I have" bug.
+static int gpui_ammo_rounds[GPUI_AMMO_MAX];
+
+// The weapon the wheel was opened for, so a hand swap mid-hold cannot reload the wrong gun.
+static Object* gpui_ammo_weapon = NULL;
+
+// Defined below -- the weapon ring carries the ammunition entries and the two actions that go
+// with them.
+static bool gpui_ammo_collect(Object** weaponOut, bool* canUnloadOut);
+static void gpui_ammo_unload();
+static void gpui_ammo_load(int index);
 
 // Collect every loose weapon, then show one page of it. Object pointers, NOT pids: two rifles of the
 // same proto are different guns with different loads, and the wheel must equip the exact one aimed
@@ -2795,31 +3843,152 @@ static void gpui_open_weapon_wheel()
         }
     }
 
-    if (gpui_weapon_count == 0) {
+    // Drugs first (at most GPUI_QUICK_MAX, the B wheel's own list), then every usable item.
+    {
+        int drugPids[GPUI_QUICK_MAX];
+        int drugCounts[GPUI_QUICK_MAX];
+        int drugs = gpui_collect_drugs(drugPids, drugCounts);
+        for (int i = 0; i < drugs; i++) {
+            gpui_wheel_drug_pid[i] = drugPids[i];
+            gpui_wheel_drug_qty[i] = drugCounts[i];
+        }
+        gpui_wheel_drug_count = gpui_collect_usable_items(gpui_wheel_drug_pid, gpui_wheel_drug_qty,
+            drugs, GPUI_QUICK_ENTRY_MAX);
+    }
+
+    if (gpui_weapon_count == 0 && gpui_wheel_drug_count == 0) {
         // Nothing to choose from -- refuse audibly rather than flashing an empty ring (the empty-gun
         // lesson: never fail silently). Checked before the bare-hands entry is added: a ring whose
-        // only option is "put away the nothing you are holding" is not a choice.
+        // only option is "put away the nothing you are holding" is not a choice. A carried drug IS
+        // one, now that the drugs have a page here.
         gsound_play_sfx_file("iisxxxx1");
         return;
     }
 
-    gpui_weapon_pages = (gpui_weapon_count + GPUI_WEAPON_GUNS_PER_PAGE - 1) / GPUI_WEAPON_GUNS_PER_PAGE;
+    // ⚠️ THE FRONT OF THE RING IS FIXED, AND THAT IS THE POINT. His call: "bude to Y a prvni
+    // ikonky vzdycky budou unarmed, unload, a type of ammos". Ammunition used to be a PAGE of its
+    // own at the far end -- hold Y, page past every gun you own, then choose -- which is a lot of
+    // gestures for something you do with a fight going on. It sits at the front now, and the guns
+    // queue up behind it.
+    Object* ammoWeapon = NULL;
+    bool canUnload = false;
+    gpui_ammo_collect(&ammoWeapon, &canUnload);
+
+    // Bare hands and Unload are ALWAYS the first two, whether they apply or not: a radial is only
+    // worth something while a given choice sits in the same place every time, so Unload greys out
+    // instead of vanishing and shuffling everything behind it one seat along.
+    int ammoShown = gpui_ammo_count;
+    if (ammoShown > GPUI_WEAPON_PER_PAGE - 3) {
+        // Leave at least one weapon seat on the first page. No FO1 weapon takes anywhere near this
+        // many kinds of round; the clamp is here so the arithmetic below cannot go negative.
+        ammoShown = GPUI_WEAPON_PER_PAGE - 3;
+    }
+
+    int head = 2 + ammoShown;
+    int gunsOnFirstPage = GPUI_WEAPON_PER_PAGE - head;
+
+    // Page 0 carries that head plus whatever guns still fit; every page after it is guns alone.
+    int rest = gpui_weapon_count - gunsOnFirstPage;
+    int gunPages = 1;
+    if (rest > 0) {
+        gunPages += (rest + GPUI_WEAPON_PER_PAGE - 1) / GPUI_WEAPON_PER_PAGE;
+    }
+
+    // ...and the drugs and usable items after all of them, eight to a page.
+    int quickPages = (gpui_wheel_drug_count + GPUI_WEAPON_PER_PAGE - 1) / GPUI_WEAPON_PER_PAGE;
+    gpui_weapon_pages = gunPages + quickPages;
+
+    int totalPages = gpui_weapon_pages;
+
     if (gpui_weapon_page < 0) {
-        gpui_weapon_page = gpui_weapon_pages - 1; // wrap backwards off page 0
-    } else if (gpui_weapon_page >= gpui_weapon_pages) {
+        gpui_weapon_page = totalPages - 1; // wrap backwards off page 0
+    } else if (gpui_weapon_page >= totalPages) {
         gpui_weapon_page = 0; // wrap forwards off the last page
     }
 
-    int first = gpui_weapon_page * GPUI_WEAPON_GUNS_PER_PAGE;
+    if (gpui_weapon_page >= gunPages) {
+        int firstEntry = (gpui_weapon_page - gunPages) * GPUI_WEAPON_PER_PAGE;
+        int entries = gpui_wheel_drug_count - firstEntry;
+        if (entries > GPUI_WEAPON_PER_PAGE) {
+            entries = GPUI_WEAPON_PER_PAGE;
+        }
+
+        RadialSegment quickSegs[GPUI_WEAPON_PER_PAGE];
+        memset(quickSegs, 0, sizeof(quickSegs));
+        // Same filler for drugs and items: name, count, effect line (empty for a non-drug), prose,
+        // icon. Ids keep the ABSOLUTE entry index, so the selection needs no page arithmetic.
+        gpui_fill_drug_segments(quickSegs, gpui_wheel_drug_pid + firstEntry, gpui_wheel_drug_qty + firstEntry,
+            entries, GPUI_WHEEL_DRUG_ID_BASE - firstEntry);
+
+        char quickTitle[32];
+        snprintf(quickTitle, sizeof(quickTitle), "QUICK USE %d/%d", gpui_weapon_page + 1, totalPages);
+
+        RadialWheelArt quickArt;
+        radial_wheel_open(quickSegs, entries, quickTitle,
+            gpui_wheel_art_for_icons(&quickArt, gpui_icons_held), -1, -1, false);
+        radial_wheel_set_side_hints("LB", "RB");
+
+        if (!radial_wheel_is_open()) {
+            gpui_icons_release();
+        }
+        return;
+    }
+
+    bool firstPage = gpui_weapon_page == 0;
+    int first = firstPage ? 0 : gunsOnFirstPage + (gpui_weapon_page - 1) * GPUI_WEAPON_PER_PAGE;
+    int room = firstPage ? gunsOnFirstPage : GPUI_WEAPON_PER_PAGE;
+
     int shown = gpui_weapon_count - first;
-    if (shown > GPUI_WEAPON_GUNS_PER_PAGE) {
-        shown = GPUI_WEAPON_GUNS_PER_PAGE;
+    if (shown > room) {
+        shown = room;
+    }
+    if (shown < 0) {
+        shown = 0;
     }
 
     RadialSegment segs[GPUI_WEAPON_PER_PAGE];
     memset(segs, 0, sizeof(segs));
 
     int n = 0;
+
+    if (firstPage) {
+        // 1. BARE HANDS. Going unarmed had no route on the pad at all before this (Y swaps hands;
+        // the wheel could only ever put something INTO one), and it matters more than it sounds:
+        // unarmed and melee skills, sneaking past people who react to a drawn gun, talking to
+        // someone without a rifle pointed at them.
+        // ⚠️ NOT id -1: radial_wheel_highlight_id() returns -1 for "nothing aimed at", so an id of
+        // -1 could not be told apart from letting go while aiming at nothing.
+        segs[n].id = GPUI_WEAPON_UNARMED_ID;
+        segs[n].enabled = true;
+        segs[n].label = skill_name(SKILL_UNARMED);
+        segs[n].value = -1;
+        gpui_icon_from_interface(segs, n, GPUI_UNARMED_ART_NUM);
+        n++;
+
+        // 2. UNLOAD, in its seat whether or not there is anything in the gun to dump.
+        segs[n].id = GPUI_AMMO_UNLOAD_ID;
+        segs[n].enabled = canUnload;
+        segs[n].label = "Unload";
+        segs[n].value = canUnload ? item_w_curr_ammo(ammoWeapon) : -1;
+        gpui_icon_unload_glyph(segs, n);
+        n++;
+
+        // 3. ...and then every kind of round the gun in hand takes. The badge is the whole pack's
+        // count of that type, not the box this slot happens to point at.
+        for (int i = 0; i < ammoShown; i++) {
+            Object* ammo = gpui_ammo_slot[i];
+            segs[n].id = GPUI_WHEEL_AMMO_ID_BASE - i;
+            segs[n].enabled = true;
+            segs[n].label = object_name(ammo);
+            segs[n].value = gpui_ammo_rounds[i];
+            gpui_ammo_detail(ammo, gpui_detail_buf[n], sizeof(gpui_detail_buf[n]));
+            segs[n].detail = gpui_detail_buf[n][0] != 0 ? gpui_detail_buf[n] : NULL;
+            segs[n].description = object_description(ammo);
+            gpui_icon_from_pid(segs, n, ammo->pid);
+            n++;
+        }
+    }
+
     for (int i = 0; i < shown; i++) {
         Object* item = gpui_weapon_slot[first + i];
 
@@ -2829,38 +3998,24 @@ static void gpui_open_weapon_wheel()
 
         segs[n].label = object_name(item);
 
-        // Rounds in the magazine, for weapons that take ammo at all. A melee weapon has no
-        // count worth showing, so it gets no badge instead of a meaningless 0.
+        // Rounds in the magazine, for weapons that take ammo at all. A melee weapon has no count
+        // worth showing, so it gets no badge instead of a meaningless 0.
         segs[n].value = item_w_max_ammo(item) > 0 ? item_w_curr_ammo(item) : -1;
 
         gpui_weapon_detail(item, gpui_detail_buf[n], sizeof(gpui_detail_buf[n]));
-        segs[n].detail = gpui_detail_buf[n][0] != '\0' ? gpui_detail_buf[n] : NULL;
+        segs[n].detail = gpui_detail_buf[n][0] != 0 ? gpui_detail_buf[n] : NULL;
         segs[n].description = object_description(item);
 
         gpui_icon_from_pid(segs, n, item->pid);
         n++;
     }
 
-    // Bare hands, LAST on EVERY page -- id -1 rather than a slot index, since it is not one of the
-    // collected weapons. Going unarmed had no route on the pad at all (Y swaps hands; the wheel
-    // could only ever put something INTO one), and it matters more than it sounds: unarmed/melee
-    // skills, sneaking past people who react to a drawn gun, talking to someone without a rifle
-    // pointed at them.
-    // ⚠️ NOT -1: radial_wheel_highlight_id() already returns -1 for "nothing aimed at", so a
-    // bare-hands id of -1 would be indistinguishable from an unaimed release.
-    segs[n].id = GPUI_WEAPON_UNARMED_ID;
-    segs[n].enabled = true;
-    segs[n].label = skill_name(SKILL_UNARMED);
-    segs[n].value = -1;
-    gpui_icon_from_interface(segs, n, GPUI_UNARMED_ART_NUM);
-    n++;
-
     // The page number goes back in the title (shown in the hub while nothing is aimed at), and the
     // BUTTONS go to the panel's outer corners, where they stay readable while you choose -- one
     // column of hub text was too much to read at a glance.
     char title[32];
-    if (gpui_weapon_pages > 1) {
-        snprintf(title, sizeof(title), "WEAPONS %d/%d", gpui_weapon_page + 1, gpui_weapon_pages);
+    if (totalPages > 1) {
+        snprintf(title, sizeof(title), "WEAPONS %d/%d", gpui_weapon_page + 1, totalPages);
     } else {
         snprintf(title, sizeof(title), "WEAPONS");
     }
@@ -2869,9 +4024,9 @@ static void gpui_open_weapon_wheel()
     radial_wheel_open(segs, n, title,
         gpui_wheel_art_for_icons(&art, gpui_icons_held), -1, -1, false);
 
-    // LB on the far left, RB on the far right -- the way they sit on the pad. Only with something
-    // to page to.
-    if (gpui_weapon_pages > 1) {
+    // LB pages back, RB forward (both wrap). LB spent a while unable to page -- see gpui_weapon_wheel
+    // -- and the hint said "RB" alone for exactly that long.
+    if (totalPages > 1) {
         radial_wheel_set_side_hints("LB", "RB");
     }
 
@@ -2928,30 +4083,36 @@ static void gpui_weapon_equip(int index)
 // Drive from the per-frame safe tick (gamepad_ui_tick), exactly like the quick-use wheel.
 static void gpui_weapon_wheel(SDL_GameController* pad)
 {
-    static bool prevY = false;
-    static unsigned int yDownTime = 0;
-    static bool yHandled = false; // this hold already tried to open; don't retry every frame
+    static bool prevWy = false;
+    static unsigned int wyDownTime = 0;
+    static bool wyHandled = false; // this hold already tried to open; don't retry every frame
 
     static bool prevRB = false;
+    static bool prevLB = false;
 
-    bool yNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
-    bool yEdge = yNow && !prevY;
-    bool yReleased = !yNow && prevY;
-    prevY = yNow;
+    bool wyNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
+    bool wyEdge = wyNow && !prevWy;
+    bool wyReleased = !wyNow && prevWy;
+    prevWy = wyNow;
 
-    // Page step for the open wheel, edge-triggered so one press is exactly one page.
-    // ⚠️ RB ONLY -- LB USED TO PAGE BACKWARDS AND CANNOT ANY MORE. Since the 2026-08-29 swap LB
-    // is RUN, and every wheel is BLOCKED while it is held (it is the quick-save / heal modifier --
-    // see `blocked` below), so an LB press meant to page would have CLOSED the wheel instead.
-    // Nothing is lost: gpui_weapon_rebuild wraps the page index in BOTH directions, so RB alone
-    // still reaches every page, it just takes more presses to get to the last one.
+    // Page step for the open wheel, edge-triggered so one press is exactly one page: RB forward, LB
+    // BACK. gpui_open_weapon_wheel wraps the page index at both ends.
+    //
+    // ⚠️ LB PAGES BACK AGAIN (2026-10-04, "quickmenu nejde LB zpátky jen RB"). It was taken away on
+    // 2026-08-29, when LB was the run/modifier shoulder that blocked -- and so CLOSED -- every wheel.
+    // Since the 2026-09-16 layout LB is reload (tap) / limb picker (hold), and neither belongs inside
+    // an open wheel, so the button is free here. The press is marked spent (gpui_consumed_lb) so that
+    // letting go of it does not also reload, and so a hold that outlives the wheel cannot open the
+    // limb picker behind it.
     bool rbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
-    int pageStep = (rbNow && !prevRB) ? 1 : 0;
+    bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    int pageStep = (rbNow && !prevRB) ? 1 : ((lbNow && !prevLB) ? -1 : 0);
     prevRB = rbNow;
+    prevLB = lbNow;
 
-    if (yEdge) {
-        yDownTime = get_time();
-        yHandled = false;
+    if (wyEdge) {
+        wyDownTime = get_time();
+        wyHandled = false;
         gpui_weapon_page = 0; // a fresh summon always starts on the first page
     }
 
@@ -2967,30 +4128,65 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
     // (which closes the overlay) would have meant that reaching for the next page shut the wheel
     // instead of turning it. The two roles never actually collide: while the wheel is up the page
     // step owns RB, and while it is down RB is free to be half of a shortcut.
-    bool ltNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()
         || gpui_aim_picker_active();
-    bool blockedOpen = blocked || ltNow;
+    // A Y that LT+Y spent on the firing mode (gpui_button_shortcuts) is not a wheel hold.
+    bool blockedOpen = blocked || gpui_consumed_y;
 
     if (radial_wheel_is_open()) {
         if (blocked) {
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-        } else if (yReleased || gpui_wheel_a_edge) {
+            if (rbNow) {
+                gpui_consumed_rb = true;
+            }
+        } else if (wyReleased || gpui_wheel_a_edge) {
             int index = radial_wheel_highlight_id();
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
-            if (index != -1) {
+            // ⚠️ RB MAY STILL BE DOWN -- you page with it. Spend this press so letting go of Y is
+            // not read as anything else. (It was the held aimed-shot button until 2026-10-09; it is
+            // the heal now, which acts on a fresh PRESS only, but the rule stands: take the state
+            // over when a screen closes, do not read it as a new press.)
+            if (rbNow) {
+                gpui_consumed_rb = true;
+            }
+            // Backing out with nothing aimed at is just backing out -- a ring you opened to LOOK
+            // at what you are carrying must never fall out into an action. The id says which kind
+            // of segment it was: Unload and the ammunition sit far below any weapon slot index.
+            if (index == GPUI_AMMO_UNLOAD_ID) {
+                gpui_ammo_unload();
+            } else if (index <= GPUI_WHEEL_DRUG_ID_BASE) {
+                // A quick-use entry -- BEFORE the ammo test, which every one of these ids also passes.
+                // Drug -> take it; Use item -> use it now; Use On item -> arm the crosshair for it.
+                int d = GPUI_WHEEL_DRUG_ID_BASE - index;
+                if (d >= 0 && d < gpui_wheel_drug_count) {
+                    int pid = gpui_wheel_drug_pid[d];
+                    Proto* proto = NULL;
+                    bool isDrug = proto_ptr(pid, &proto) != -1 && proto != NULL
+                        && proto->item.type == ITEM_TYPE_DRUG;
+                    if (isDrug) {
+                        gpui_quick_use(pid);
+                    } else if (proto_action_can_use(pid)) {
+                        gpui_quick_use_item(pid);
+                    } else {
+                        gpui_quick_use_on_item(pid);
+                    }
+                }
+            } else if (index <= GPUI_WHEEL_AMMO_ID_BASE) {
+                gpui_ammo_load(GPUI_WHEEL_AMMO_ID_BASE - index);
+            } else if (index != -1) {
                 gpui_weapon_equip(index);
             }
         } else if (pageStep != 0) {
-            // RB = next page, LB = previous, wrapping at both ends (gpui_open_weapon_wheel clamps).
-            // The shoulders are free while Y is held -- LT is suppressed entirely (it means quick
-            // save with Y) and the aimed-shot picker cannot be up at the same time as this wheel.
+            // RB = next page, LB = previous, wrapping at both ends (gpui_open_weapon_wheel wraps).
             // Reopening rebuilds the ring for the new page; the icon slots are released and
             // re-locked by the open itself, so no leak.
+            if (pageStep < 0) {
+                gpui_consumed_lb = true; // a page turn, not a reload and not the start of a picker hold
+            }
             gpui_weapon_page += pageStep;
             radial_wheel_close();
             gpui_icons_release();
@@ -3011,56 +4207,51 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
         return;
     }
 
-    if (yNow && !yHandled && !blockedOpen && get_time() - yDownTime >= GPUI_QUICK_HOLD_MS) {
-        yHandled = true;
+    if (wyNow && !wyHandled && !blockedOpen && get_time() - wyDownTime >= GPUI_QUICK_HOLD_MS) {
+        wyHandled = true;
         gpui_open_weapon_wheel();
         if (radial_wheel_is_open()) {
             gpui_wheel_owner = GPUI_WHEEL_WEAPON;
             // Tell the tap handler this Y press was a hold, so releasing it does not also
-            // swap the active hand.
-            gpui_weapon_consumed_y = true;
+            // use a stimpack.
+            gpui_consumed_y = true;
         }
     }
 }
 
-// --- X-hold ammo wheel ---
+// --- the ammunition actions, which now live at the front of the WEAPON ring (Y-hold) ---
 //
-// X already means "reload"; a HOLD naturally means "reload with WHICH". Fallout 1 has no ammo-type
-// switch of its own -- vanilla's only way to choose is to drag a specific box onto the weapon in the
-// inventory, and `item_w_try_reload` (what a tap of X runs) just grabs the first compatible box it
-// finds. So on a pad there was no way to answer "how do I pick AP over JHP?" at all.
+// Fallout 1 has no ammo-type switch of its own: vanilla's only way to choose is to drag a specific
+// box onto the weapon in the inventory, and `item_w_try_reload` (what a tap of LB runs) just grabs
+// the first compatible box it finds. So on a pad there was no way to answer "how do I pick AP over
+// JHP?" at all.
 //
-// Same tap-vs-hold shape as B and Y, and aimed with the LEFT stick for the same reason: a face
-// button ties up the right thumb, so the aim has to move to the other hand.
+// This started as its own wheel on X-hold, became the weapon wheel's last PAGE when RB had to give
+// up a button, and is now the first thing in that wheel -- three homes, each time because the ring
+// it was in needed the button more than it needed the page. The two actions never changed.
 
-#define GPUI_AMMO_MAX 8
 
-// Segment id of the UNLOAD entry. Not an index into gpui_ammo_slot, so it must be outside 0..count
-// -- and NOT -1, which radial_wheel_highlight_id() already uses for "not pointing at anything".
-// Same convention as the weapon wheel's "no weapon" slot.
-#define GPUI_AMMO_UNLOAD_ID (-2)
 
-// The ammo objects the open wheel is showing -- one per distinct proto, pointing at the first stack
-// of that type. Object*, because item_w_reload needs the actual object.
-static Object* gpui_ammo_slot[GPUI_AMMO_MAX];
-static int gpui_ammo_count = 0;
-
-// TOTAL rounds of each slot's proto across the whole pack -- every box, times every stack. The
-// slot Object above is only the one the reload will draw from; it is not what the player is
-// carrying, and showing its magazine as the count was the "wtf, that is not how much I have" bug.
-static int gpui_ammo_rounds[GPUI_AMMO_MAX];
-
-// The weapon the wheel was opened for, so a hand swap mid-hold cannot reload the wrong gun.
-static Object* gpui_ammo_weapon = NULL;
-
-static void gpui_open_ammo_wheel()
+// Gather what the gun in hand can be fed, and whether it has anything in it to dump. Fills the
+// three statics below and says nothing out loud: this is one part of a ring that is opening
+// anyway, so "no ammunition here" is an absence of segments, not a refusal.
+static bool gpui_ammo_collect(Object** weaponOut, bool* canUnloadOut)
 {
+    gpui_ammo_count = 0;
+    gpui_ammo_weapon = NULL;
+
+    if (weaponOut != NULL) {
+        *weaponOut = NULL;
+    }
+    if (canUnloadOut != NULL) {
+        *canUnloadOut = false;
+    }
+
     Object* weapon = NULL;
     if (intface_get_current_item(&weapon) != 0 || weapon == NULL
         || item_get_type(weapon) != ITEM_TYPE_WEAPON || item_w_max_ammo(weapon) <= 0) {
         // Bare hands, a melee weapon, or anything that does not take ammo.
-        gsound_play_sfx_file("iisxxxx1");
-        return;
+        return false;
     }
 
     gpui_ammo_count = 0;
@@ -3106,58 +4297,19 @@ static void gpui_open_ammo_wheel()
         }
     }
 
-    // UNLOAD is offered whenever the gun actually has rounds in it. Deliberately checked SEPARATELY
-    // from the box list: dumping the magazine is exactly what you want when you are carrying no
-    // compatible ammo at all (wrong caliber picked up, or you want the rounds back before dropping
-    // the gun), so refusing the whole wheel on an empty box list would hide the one entry that
-    // still applies. Vanilla can only do this by right-clicking the weapon in the inventory.
-    bool canUnload = item_w_can_unload(weapon) != 0;
-
-    if (gpui_ammo_count == 0 && !canUnload) {
-        gsound_play_sfx_file("iisxxxx1"); // nothing this gun can take, and nothing in it either
-        return;
+    // UNLOAD is offered whenever the gun actually has rounds in it. Deliberately reported
+    // SEPARATELY from the box list: dumping the magazine is exactly what you want when you are
+    // carrying no compatible ammunition at all -- wrong caliber picked up, or you want the rounds
+    // back before dropping the gun -- so it must not depend on that list having anything in it.
+    // Vanilla can only do this by right-clicking the weapon in the inventory.
+    if (weaponOut != NULL) {
+        *weaponOut = weapon;
+    }
+    if (canUnloadOut != NULL) {
+        *canUnloadOut = item_w_can_unload(weapon) != 0;
     }
 
-    gpui_icons_release();
-    gpui_load_skill_art(); // BIGNUM digit strip for the box counts
-
-    RadialSegment segs[GPUI_AMMO_MAX + 1];
-    memset(segs, 0, sizeof(segs));
-
-    for (int i = 0; i < gpui_ammo_count; i++) {
-        Object* ammo = gpui_ammo_slot[i];
-        segs[i].id = i;
-        segs[i].label = object_name(ammo);
-        segs[i].enabled = true;
-        segs[i].value = gpui_ammo_rounds[i]; // every round of this type in the pack
-
-        // Same two extras the weapon and drug wheels carry: the stat line under the name, and
-        // Fallout's own prose for the item. Without them the ammo wheel was the only one that
-        // named a thing without ever saying what it does.
-        gpui_ammo_detail(ammo, gpui_detail_buf[i], sizeof(gpui_detail_buf[i]));
-        segs[i].detail = gpui_detail_buf[i][0] != '\0' ? gpui_detail_buf[i] : NULL;
-        segs[i].description = object_description(ammo);
-
-        gpui_icon_from_pid(segs, i, ammo->pid);
-    }
-
-    int segCount = gpui_ammo_count;
-    if (canUnload) {
-        int slot = segCount++;
-        segs[slot].id = GPUI_AMMO_UNLOAD_ID;
-        segs[slot].label = "Unload";
-        segs[slot].enabled = true;
-        segs[slot].value = item_w_curr_ammo(weapon); // rounds currently IN the gun
-        gpui_icon_unload_glyph(segs, slot);
-    }
-
-    RadialWheelArt art;
-    radial_wheel_open(segs, segCount, "AMMO",
-        gpui_wheel_art_for_icons(&art, gpui_icons_held), -1, -1, false);
-
-    if (!radial_wheel_is_open()) {
-        gpui_icons_release();
-    }
+    return true;
 }
 
 // Dump the magazine back into the pack. Mirrors the inventory's own UNLOAD action (inventry.cc):
@@ -3204,6 +4356,15 @@ static void gpui_ammo_unload()
     // 2026-08-29). Checked before anything is moved, so a refusal leaves the gun untouched.
     combat_rt_spend_ap(2);
     intface_update_items(true);
+
+    // ⚠️ SAY THAT IT HAPPENED. Every refusal in here has always buzzed, but the case that WORKED
+    // made no sound at all ("chybi zvuk pri unload") -- so the only outcome without feedback was
+    // the successful one. Vanilla's inventory unload is silent too, which is why it was never
+    // noticed there. It is the weapon's own READY sound, the same one a tap of LB plays through
+    // intface_reload_weapon: rounds moving into the gun or out of it is the same handling.
+    const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_READY, weapon,
+        HIT_MODE_RIGHT_WEAPON_PRIMARY, NULL);
+    gsound_play_sfx_file(sfx);
 }
 
 // Load the chosen box. Deliberately the same sequence item_w_try_reload runs (reload, destroy the
@@ -3293,77 +4454,34 @@ static void gpui_ammo_load(int index)
     // Vanilla charges 2 AP for a reload; mirror the tap-X path, refusal included.
     combat_rt_spend_ap(2);
     intface_update_items(true);
+
+    // ⚠️ SAY THAT IT HAPPENED. Every refusal in here has always buzzed, but the case that WORKED
+    // made no sound at all ("chybi zvuk pri unload") -- so the only outcome without feedback was
+    // the successful one. Vanilla's inventory unload is silent too, which is why it was never
+    // noticed there. It is the weapon's own READY sound, the same one a tap of LB plays through
+    // intface_reload_weapon: rounds moving into the gun or out of it is the same handling.
+    const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_READY, weapon,
+        HIT_MODE_RIGHT_WEAPON_PRIMARY, NULL);
+    gsound_play_sfx_file(sfx);
 }
 
-// Driven from the per-frame safe tick, exactly like the quick-use and weapon wheels.
-static void gpui_ammo_wheel(SDL_GameController* pad)
-{
-    static bool prevX = false;
-    static unsigned int xDownTime = 0;
-    static bool xHandled = false;
+// NOTE: gpui_ammo_wheel() used to sit here -- the RB tap/hold handler that opened the ammo ring.
+// It is gone, and with it RB's tap/hold split. The ammo ring lives on as the last PAGE of the
+// weapon wheel; RB was a held aimed-shot button, and since 2026-10-09 it is the heal.
 
-    bool xNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
-    bool xEdge = xNow && !prevX;
-    bool xReleased = !xNow && prevX;
-    prevX = xNow;
-
-    if (xEdge) {
-        xDownTime = get_time();
-        xHandled = false;
-    }
-
-    if (radial_wheel_is_open() && gpui_wheel_owner != GPUI_WHEEL_AMMO) {
-        return;
-    }
-
-    bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()
-        || gpui_aim_picker_active();
-
-    if (radial_wheel_is_open()) {
-        if (blocked) {
-            radial_wheel_close();
-            gpui_wheel_owner = GPUI_WHEEL_NONE;
-            gpui_icons_release();
-        } else if (xReleased || gpui_wheel_a_edge) {
-            int index = radial_wheel_highlight_id();
-            radial_wheel_close();
-            gpui_wheel_owner = GPUI_WHEEL_NONE;
-            gpui_icons_release();
-            if (index == GPUI_AMMO_UNLOAD_ID) {
-                gpui_ammo_unload();
-            } else if (index != -1) {
-                gpui_ammo_load(index);
-            }
-        } else {
-            // LEFT stick, exactly like the B and Y wheels. X is a FACE button: the right thumb is
-            // holding the wheel open and cannot work the right stick at the same time. Which corner
-            // of the diamond X sits in is irrelevant -- one thumb serves the whole diamond.
-            float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) / GPUI_AXIS_MAX;
-            float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) / GPUI_AXIS_MAX;
-            radial_wheel_update(x, y);
-        }
-        return;
-    }
-
-    if (xNow && !xHandled && !blocked && get_time() - xDownTime >= GPUI_QUICK_HOLD_MS) {
-        xHandled = true;
-        gpui_open_ammo_wheel();
-        if (radial_wheel_is_open()) {
-            gpui_wheel_owner = GPUI_WHEEL_AMMO;
-            // Tell the tap handler this X press was a hold, so releasing it does not also reload.
-            gpui_ammo_consumed_x = true;
-        }
-    }
-}
-
-// --- On-body aimed-shot picker (green body-part markers on the locked enemy) ---
+// --- On-body aimed-shot picker (green body-part markers on the target) ---
 //
-// Holding LB brings up the aimed-shot picker. Instead of an abstract radial wheel, GREEN markers are
+// ⚠️ THE 2026-09-16 LAYOUT SPLIT AIMING ACROSS TWO BUTTONS, and that is what finally killed the
+// tap-vs-hold problem here. LT now does ONE thing: hold it and the picker is up. GREEN markers are
 // drawn directly on the target's on-screen sprite, one per called-shot body part, the selected one
-// WHITE. The RIGHT stick moves the selection over the body; releasing LB fires an aimed shot at it
-// and remembers it, so a quick TAP of LB repeats that part instantly (the fast path). Part positions
-// are APPROXIMATE fractions of the critter's bounding box -- the world sprite has no real per-part
-// coordinates -- good enough to read as "aim here", rougher on non-humanoids.
+// WHITE; the RIGHT stick moves the selection over the body; RT fires at it, as many times as you
+// like while LT is down; releasing LT just puts the picker away, and B cancels out of it.
+// REPEATING the last part is RB, on its own button, so nothing here has to tell a tap from a hold
+// any more -- no 220 ms window, and no way for a quick press to be promoted into a hold. Since
+// 2026-09-17 RB is HELD rather than clicked, the same as RT.
+//
+// Part positions are APPROXIMATE fractions of the critter's silhouette -- the world sprite has no
+// real per-part coordinates -- good enough to read as "aim here", rougher on non-humanoids.
 
 // NO OVERLAY WINDOW. Three attempts at a see-through GNW window all rendered a black rectangle
 // over the enemy: WINDOW_TRANSPARENT is honoured only while GNW double-buffers (gnw.cc:869/887),
@@ -3373,7 +4491,14 @@ static void gpui_ammo_wheel(SDL_GameController* pad)
 // on, so there is nothing to make transparent: pixels we don't touch are simply the game. The
 // previous frame's marks are wiped by asking the engine to repaint that patch of world
 // (tile_refresh_rect), which is exactly how the engine erases its own transient drawing.
-static int gpui_aim_last_part = HIT_LOCATION_HEAD; // part a quick tap / release fires at
+static int gpui_aim_last_part = HIT_LOCATION_HEAD; // part the slot's AIMED mode fires at
+
+// The part bound in the LB called-shot window. combat_rt reads it for every attack made while the
+// weapon slot is on its AIMED mode (rt_player_called_loc).
+int gamepad_ui_aim_part()
+{
+    return gpui_aim_last_part;
+}
 static bool gpui_aim_body_on = false;              // on-body picker currently up
 
 // True from the instant the aim trigger goes down until it comes up -- i.e. the whole GESTURE,
@@ -3413,6 +4538,16 @@ bool gamepad_ui_aim_body_active()
     return gpui_aim_body_on;
 }
 
+// True for the WHOLE aim gesture -- from the instant LB goes down, not just once the markers
+// are drawn 220 ms later. Only the ATTACK reads this: a pull of RT inside that opening window
+// would otherwise fire an ordinary unaimed shot at whatever the auto-target picked, which is
+// never what someone holding the aim button meant. Movement deliberately does NOT read it --
+// gating the feet on the gesture would freeze the dude for 220 ms on every LB tap (reload).
+bool gamepad_ui_aim_gesture_active()
+{
+    return gpui_aim_gesture || gpui_aim_body_on;
+}
+
 // Mark size per part, as a percentage of the common base radius.
 //
 // These were roughly halved after a play-test screenshot: at the previous sizes the arm, torso and
@@ -3444,12 +4579,14 @@ static void gpui_aimbody_frac(int location, float* fx, float* fy)
     switch (location) {
     case HIT_LOCATION_EYES:      *fx = 0.50f; *fy = 0.09f; break;
     case HIT_LOCATION_HEAD:      *fx = 0.50f; *fy = 0.18f; break;
-    case HIT_LOCATION_RIGHT_ARM: *fx = 0.22f; *fy = 0.40f; break;
-    case HIT_LOCATION_LEFT_ARM:  *fx = 0.78f; *fy = 0.40f; break;
-    case HIT_LOCATION_TORSO:     *fx = 0.50f; *fy = 0.40f; break;
-    case HIT_LOCATION_GROIN:     *fx = 0.50f; *fy = 0.62f; break;
-    case HIT_LOCATION_RIGHT_LEG: *fx = 0.40f; *fy = 0.86f; break;
-    case HIT_LOCATION_LEFT_LEG:  *fx = 0.60f; *fy = 0.86f; break;
+    // Centres of the bands the masks are cut from (head 0-17, torso to 45, groin to 57, legs below),
+    // so the plain ring lands where the outline would have been when a part cannot be masked.
+    case HIT_LOCATION_RIGHT_ARM: *fx = 0.15f; *fy = 0.36f; break;
+    case HIT_LOCATION_LEFT_ARM:  *fx = 0.85f; *fy = 0.36f; break;
+    case HIT_LOCATION_TORSO:     *fx = 0.50f; *fy = 0.31f; break;
+    case HIT_LOCATION_GROIN:     *fx = 0.50f; *fy = 0.51f; break;
+    case HIT_LOCATION_RIGHT_LEG: *fx = 0.35f; *fy = 0.78f; break;
+    case HIT_LOCATION_LEFT_LEG:  *fx = 0.65f; *fy = 0.78f; break;
     default:                     *fx = 0.50f; *fy = 0.50f; break;
     }
 }
@@ -3469,6 +4606,7 @@ static void gpui_aimbody_frac(int location, float* fx, float* fy)
 // Arms then land on the shoulders' real span rather than on frame padding, and it self-corrects
 // for facing, pose, crouch and non-humanoid shapes.
 #define GPUI_AIMBODY_MAX_H 256
+#define GPUI_AIMBODY_MAX_W 256
 #define GPUI_AIMBODY_MAX_RUNS 8 // opaque segments per row we bother recording
 
 typedef struct GpuiSilhouette {
@@ -3563,205 +4701,216 @@ static bool gpui_aimbody_scan(const unsigned char* fd, int fw, int fh, GpuiSilho
 typedef struct GpuiBodyRegions {
     bool headValid;
     int headTop;
-    int headBottom; // last row of the head, i.e. the row above the shoulders
-    bool legsValid;
-    int legsTop; // first row at which the legs are separated
-    int legSplit[GPUI_AIMBODY_MAX_H]; // x of the gap centre per row, from legsTop down
-    // The TRUNK: everything between the neck and the crotch, which is then split vertically into
-    // torso / groin and horizontally into torso / arms. Needs the head (the neck line is its top
-    // edge), so trunkValid implies headValid.
-    bool trunkValid;
-    int trunkTop;
-    int trunkBottom;
-    int groinTop;  // first row counted as groin rather than torso
-    int armBottom; // last row an arm reaches (hands hang to about hip height)
+    int headBottom; // last row of the head, i.e. where the neck runs into the chest
+    // The head is a COLUMN, not a band across the row: these are its left and right edges. See
+    // gpui_find_head -- a band takes the shoulders with it, which is what "nemá označenou celou
+    // hlavu" was looking at.
+    int headLo;
+    int headHi;
+    // ⚠️ THE LEGS AND THE TRUNK USED TO LIVE HERE TOO -- crotch row, per-row leg split, groin band,
+    // arm reach -- and every one of them was a horizontal stripe. They were deleted on 2026-09-02
+    // when the parts started coming out of gpui_aimbody_partition, which decides pixel by pixel
+    // instead of row by row. The head stays because it is the one region worth measuring up front:
+    // it gates whether the critter is an upright biped at all, and it gives the flood its best seed.
 } GpuiBodyRegions;
 
-// Find the neck: the row in the upper part of the body where the silhouette's width jumps most
-// sharply. Sets headValid=false when nothing convincing is there (a shape with no distinct head).
+// Find the neck line: the head is the band from the crown down to the row where the silhouette
+// widens into shoulders. Sets headValid=false only for shapes that have no head ABOVE anything --
+// a dog, a brahmin, a radscorpion, the Master -- which then keep the plain ring.
+//
+// ⚠️ THIS USED TO BE A SINGLE-ROW WIDTH JUMP AND THAT IS WHY THE MUTANT HAD NO HEAD.
+// The old rule was "the sharpest row-to-row widening in the top 40%, and it must be at least
+// 1.4x". Measured over every critter frame in CRITTER.DAT (1370 stand frames: 58 critters x their
+// weapon poses x 6 facings) that rule found a head in 68% of frames -- and in a third of THOSE the
+// band it returned was not head-shaped at all (it ran from a raised spear tip, or covered half the
+// body). Two things break it, and both are properties of the art rather than of any one critter:
+//
+//   NO SINGLE ROW CARRIES THE JUMP. On a 60-90 px sprite the neck widens over three or four rows,
+//   ~1.2x each. MAMTNTLA (super mutant, minigun) facing NE goes 11,13,16,20,23,25,27 px down its
+//   first seven rows: a completely ordinary head-into-shoulders, with a best single-row ratio of
+//   1.25 -- refused. Same for every robed figure (HAROBEAA peaks at 1.17), which is why the whole
+//   robe/peasant family scored 0/6. It was never mutant-specific; the mutant is just what he
+//   happened to aim at.
+//
+//   THE TOP OF THE FRAME IS NOT ALWAYS THE HEAD. A raised spear or a rifle barrel puts a 1-2 px
+//   spike above the crown, and the jump then lands where the SHAFT meets the head -- so the
+//   "head" outline was drawn around the weapon.
+//
+// So: skip a thin spike to find the real crown, then walk down for the first row that is 1.5x the
+// crown's width, searched inside a band of 10%..24% of the body height -- the anatomical range a
+// head occupies on every one of these sprites. Below 10% is the jaw, past 24% is the chest. If no
+// such row exists (a gradual robe) the head simply ends at 18%, which is what the art shows.
+// Clamping the ANSWER instead of thresholding the evidence is the whole change: 91% of frames now
+// get a head, and every band it returns is inside the plausible range by construction.
 static void gpui_find_head(const GpuiSilhouette* sil, GpuiBodyRegions* reg)
 {
     reg->headValid = false;
 
     int bodyH = sil->bottom - sil->top + 1;
     if (bodyH < 8) {
-        return; // too few pixels for the jump to mean anything
+        return; // too few pixels to divide into anything
     }
 
-    // Only look in the top 40%: below that a width jump is a belt, a coat, or the legs parting.
-    int limit = sil->top + bodyH * 40 / 100;
-    if (limit > sil->bottom) {
-        limit = sil->bottom;
-    }
-
-    int bestRow = -1;
-    float bestRatio = 1.0f;
-    for (int y = sil->top + 2; y <= limit; y++) {
-        if (sil->rowMax[y] < sil->rowMin[y] || sil->rowMax[y - 1] < sil->rowMin[y - 1]) {
+    // Width profile: the widest row, and the MEDIAN row width (a counting histogram -- widths are
+    // small integers, so no sort is needed). The median is what makes the upright test below
+    // survive a held weapon.
+    int maxW = 0;
+    int rowsWithPixels = 0;
+    int hist[GPUI_AIMBODY_MAX_W + 1];
+    memset(hist, 0, sizeof(hist));
+    for (int y = sil->top; y <= sil->bottom; y++) {
+        if (sil->rowMax[y] < sil->rowMin[y]) {
             continue;
         }
-        int wPrev = sil->rowMax[y - 1] - sil->rowMin[y - 1] + 1;
-        int wHere = sil->rowMax[y] - sil->rowMin[y] + 1;
-        if (wPrev <= 0) {
-            continue;
+        int w = sil->rowMax[y] - sil->rowMin[y] + 1;
+        if (w > maxW) {
+            maxW = w;
         }
-        float ratio = (float)wHere / (float)wPrev;
-        if (ratio > bestRatio) {
-            bestRatio = ratio;
-            bestRow = y;
-        }
+        int bucket = w > GPUI_AIMBODY_MAX_W ? GPUI_AIMBODY_MAX_W : w;
+        hist[bucket]++;
+        rowsWithPixels++;
     }
-
-    // 1.4x is the shoulders. A head is roughly a third of the shoulder width, so the real jump is
-    // far larger than this; the threshold only has to exclude ordinary taper.
-    if (bestRow < 0 || bestRatio < 1.4f) {
+    if (maxW <= 0 || rowsWithPixels <= 0) {
         return;
     }
 
-    reg->headTop = sil->top;
-    reg->headBottom = bestRow - 1;
+    int medW = 0;
+    for (int w = 0, seen = 0; w <= GPUI_AIMBODY_MAX_W; w++) {
+        seen += hist[w];
+        if (seen > rowsWithPixels / 2) {
+            medW = w;
+            break;
+        }
+    }
+    if (medW <= 0) {
+        medW = maxW;
+    }
+
+    // "A head sits above shoulders" only means something on an UPRIGHT silhouette. A dog, a rat, a
+    // brahmin, a radscorpion, the Master are wider than they are tall (or nearly), their head is
+    // out at the front rather than on top, and no band of rows is it. They keep the plain ring --
+    // an honest refusal, which is what the fallback is for.
+    //
+    // ⚠️ THE SECOND TEST IS THERE FOR THE MINIGUN. Measured against the frame's WIDEST row alone, a
+    // super mutant holding a minigun (62x84) or a laser rifle across its chest is not "tall and
+    // narrow" any more and lost its head at three of six facings -- which is half of why he saw the
+    // mutant without one. A weapon widens a handful of rows; the MEDIAN row is still the body's own
+    // girth, so h >= 1.9 x median recovers exactly those poses. Over all 1370 stand frames the pair
+    // finds a head on 99.4% of humanoid frames (up from 97.0%) and wrongly claims one on 35% of
+    // non-humanoid frames (up from 26%) -- the extra ones being Mr Handy, a radscorpion facing away
+    // and a deathclaw, where the band lands on the top of a shape that has no head anyway.
+    if (bodyH * 100 < maxW * 140 && bodyH * 10 < medW * 19) {
+        return;
+    }
+
+    // The crown: skip a thin spike at the very top (spear held upright, rifle barrel, antenna).
+    // Only a spike -- if the "thin" run goes on for a quarter of the body it is the shape itself.
+    int thin = maxW * 15 / 100;
+    if (thin < 2) {
+        thin = 2;
+    }
+    int crown = sil->top;
+    while (crown < sil->bottom) {
+        int w = sil->rowMax[crown] >= sil->rowMin[crown] ? sil->rowMax[crown] - sil->rowMin[crown] + 1 : 0;
+        if (w >= thin) {
+            break;
+        }
+        crown++;
+    }
+    if (crown - sil->top > bodyH * 25 / 100) {
+        crown = sil->top;
+    }
+
+    int crownH = sil->bottom - crown + 1;
+    if (crownH < 8) {
+        return;
+    }
+
+    // Head CENTRE: the middle of the widest run in the crown's first three rows. Everything below
+    // is measured against this column, so a head drawn off to one side (every three-quarter facing)
+    // is followed instead of averaged away.
+    int cx = -1;
+    int widestRun = -1;
+    for (int y = crown; y <= crown + 2 && y <= sil->bottom; y++) {
+        for (int i = 0; i < sil->runCount[y]; i++) {
+            int w = sil->runHi[y][i] - sil->runLo[y][i] + 1;
+            if (w > widestRun) {
+                widestRun = w;
+                cx = (sil->runLo[y][i] + sil->runHi[y][i]) / 2;
+            }
+        }
+    }
+    if (cx < 0) {
+        return;
+    }
+
+    // ⚠️ HEIGHT IS A PROPORTION, NOT A DETECTED LINE, and that is deliberate. Every attempt to find
+    // the chin from the silhouette lands at the SHOULDER line instead -- on this art the head and
+    // the shoulders are one continuous blob, and the row where the silhouette widens is where the
+    // shoulder appears BESIDE the head, not where the head ends. Stopping there marks the top third
+    // of the head and calls it done: "supermutant nemá označenou celou hlavu". Measured on the art,
+    // a figure here is very close to six heads tall across the whole cast (mutant 84 px / head 14,
+    // human 64/11, ghoul 61/10, robe 66/11), so 17% of the body IS the head.
+    int depth = bodyH * 17 / 100;
+    if (depth < 3) {
+        depth = 3;
+    }
+    int bottom = crown + depth - 1;
+    if (bottom > sil->bottom) {
+        bottom = sil->bottom;
+    }
+
+    // Width comes from the sprite -- how wide the run under the head gets before the shoulders merge
+    // into it -- but clamped to the proportions the art actually uses (head width 12..22% of body
+    // height, measured across the cast). The clamp is what saves the two failure modes of measuring
+    // alone: a facing where the shoulders merge on the second row (which would give a 4 px head) and
+    // a hood or helmet that keeps widening (which would give a 25 px one).
+    int minW = bodyH * 12 / 100;
+    if (minW < 3) {
+        minW = 3;
+    }
+    int maxHeadW = bodyH * 22 / 100;
+    if (maxHeadW < minW) {
+        maxHeadW = minW;
+    }
+
+    int headW = 0;
+    int prev = 0;
+    for (int y = crown; y <= bottom; y++) {
+        int w = 0;
+        for (int i = 0; i < sil->runCount[y]; i++) {
+            if (cx >= sil->runLo[y][i] && cx <= sil->runHi[y][i]) {
+                w = sil->runHi[y][i] - sil->runLo[y][i] + 1;
+            }
+        }
+        if (w == 0) {
+            break; // the column left the sprite
+        }
+        if (w > maxHeadW) {
+            break; // wider than a head can be: this row is head + shoulder in one run
+        }
+        if (prev >= minW && w * 100 > prev * 160) {
+            break; // and this is that merge happening in one step
+        }
+        if (w > headW) {
+            headW = w;
+        }
+        prev = w;
+    }
+    if (headW < minW) {
+        headW = minW;
+    }
+    if (headW > maxHeadW) {
+        headW = maxHeadW;
+    }
+
+    reg->headTop = crown;
+    reg->headBottom = bottom;
+    reg->headLo = cx - headW / 2;
+    reg->headHi = reg->headLo + headW - 1;
     reg->headValid = reg->headBottom >= reg->headTop;
 }
 
-// Walk up from the feet for as long as the row is split in two: that gap is between the legs.
-static void gpui_find_legs(const GpuiSilhouette* sil, GpuiBodyRegions* reg)
-{
-    reg->legsValid = false;
-
-    int bodyH = sil->bottom - sil->top + 1;
-    if (bodyH < 8) {
-        return;
-    }
-
-    // The split may not reach the very bottom (feet can touch), so allow a few solid rows at the
-    // bottom before giving up on finding it at all.
-    int firstSplit = -1;
-    int floorLimit = sil->bottom - bodyH * 55 / 100; // legs never start above mid-body
-    for (int y = sil->bottom; y >= sil->top && y >= floorLimit; y--) {
-        if (sil->runCount[y] >= 2) {
-            firstSplit = y;
-            break;
-        }
-    }
-    if (firstSplit < 0) {
-        return;
-    }
-
-    // Extend upward while the row stays split; that top row is the crotch.
-    int topRow = firstSplit;
-    for (int y = firstSplit - 1; y >= sil->top && y >= floorLimit; y--) {
-        if (sil->runCount[y] < 2) {
-            break;
-        }
-        topRow = y;
-    }
-
-    // Record the gap centre per row. Below the split (feet merged) the last known centre carries
-    // down, which is what keeps the two feet assigned to the leg they belong to.
-    int lastCentre = -1;
-    for (int y = topRow; y <= sil->bottom; y++) {
-        if (sil->runCount[y] >= 2) {
-            // Widest gap in the row: with a weapon or a tail there can be more than two runs.
-            int bestGap = -1;
-            int centre = -1;
-            for (int i = 1; i < sil->runCount[y]; i++) {
-                int gap = sil->runLo[y][i] - sil->runHi[y][i - 1];
-                if (gap > bestGap) {
-                    bestGap = gap;
-                    centre = (sil->runHi[y][i - 1] + sil->runLo[y][i]) / 2;
-                }
-            }
-            lastCentre = centre;
-        }
-        reg->legSplit[y] = lastCentre;
-    }
-
-    reg->legsTop = topRow;
-    reg->legsValid = lastCentre >= 0;
-}
-
-// The trunk is what is left once the head and the legs are accounted for. Its top edge is the neck
-// line (so a head is required); its bottom edge is the crotch when the legs were found, otherwise
-// the bottom of the sprite.
-static void gpui_find_trunk(const GpuiSilhouette* sil, GpuiBodyRegions* reg)
-{
-    reg->trunkValid = false;
-
-    if (!reg->headValid) {
-        return; // without a neck line there is nothing to measure the trunk from
-    }
-
-    reg->trunkTop = reg->headBottom + 1;
-    reg->trunkBottom = reg->legsValid ? reg->legsTop - 1 : sil->bottom;
-
-    int trunkH = reg->trunkBottom - reg->trunkTop + 1;
-    if (trunkH < 4) {
-        return; // too short to divide into torso / groin without the two colliding
-    }
-
-    // The groin is the bottom quarter of the trunk -- the band that sits directly above where the
-    // legs part -- and the arms reach down to roughly hip height.
-    reg->groinTop = reg->trunkBottom - trunkH * 25 / 100;
-    if (reg->groinTop <= reg->trunkTop) {
-        reg->groinTop = reg->trunkTop + 1;
-    }
-    reg->armBottom = reg->trunkTop + trunkH * 70 / 100;
-    if (reg->armBottom > reg->trunkBottom) {
-        reg->armBottom = reg->trunkBottom;
-    }
-    reg->trunkValid = true;
-}
-
-// Splits ONE trunk row into torso and (optional) arm zones. This is where the arm problem is
-// actually confronted, and it has two genuinely different cases:
-//
-//   ARM CLEAR OF THE BODY -- the row has several runs. The WIDEST run is the torso (a torso is
-//   always broader than an arm), so whatever lies to its left and right is arm, and a weapon held
-//   out in that hand comes along with it, which is correct: it is in the hand.
-//
-//   ARM AGAINST THE BODY -- one solid run, and the boundary the eye "sees" is not in the image at
-//   all; the pixels are one continuous block. No amount of scanning recovers it. So the row is
-//   divided proportionally: the outer 30% each side is arm, the middle is torso. That is an
-//   ESTIMATE and is the one part of this whole system that cannot be made exact. It still hugs the
-//   silhouette vertically, so it tracks the pose; only the left/right cut is assumed.
-//
-// Returns false for a row too narrow to divide at all (the caller then treats it as pure torso).
-static bool gpui_trunk_row_split(const GpuiSilhouette* sil, int y, int* torsoLo, int* torsoHi)
-{
-    if (sil->rowMax[y] < sil->rowMin[y]) {
-        return false;
-    }
-
-    if (sil->runCount[y] >= 2) {
-        int bestW = -1;
-        for (int i = 0; i < sil->runCount[y]; i++) {
-            int w = sil->runHi[y][i] - sil->runLo[y][i] + 1;
-            if (w > bestW) {
-                bestW = w;
-                *torsoLo = sil->runLo[y][i];
-                *torsoHi = sil->runHi[y][i];
-            }
-        }
-        return true;
-    }
-
-    int lo = sil->rowMin[y];
-    int hi = sil->rowMax[y];
-    int w = hi - lo + 1;
-    if (w < 6) {
-        *torsoLo = lo;
-        *torsoHi = hi;
-        return true; // nothing to carve an arm out of
-    }
-
-    int armW = w * 30 / 100;
-    if (armW < 2) {
-        armW = 2;
-    }
-    *torsoLo = lo + armW;
-    *torsoHi = hi - armW;
-    return true;
-}
 
 // Are we looking at the critter's BACK? Decides whether its own left limb is drawn on our left or
 // our right -- without this the left/right marks are simply mirrored for half of the six facings,
@@ -3771,9 +4920,14 @@ static bool gpui_trunk_row_split(const GpuiSilhouette* sil, int y, int* torsoLo,
 // (we see the back, its left is on our left). E and W are the side views: the art is a three-
 // quarter pose that reads as front-facing, so they are grouped with the front. That last part is
 // the one judgement call here and it is a single line to flip if the screenshot says otherwise.
+static bool gpui_rotation_is_back(int rotation)
+{
+    return rotation == ROTATION_NE || rotation == ROTATION_NW;
+}
+
 static bool gpui_viewing_back(Object* obj)
 {
-    return obj->rotation == ROTATION_NE || obj->rotation == ROTATION_NW;
+    return gpui_rotation_is_back(obj->rotation);
 }
 
 // Maps a HIT_LOCATION_*_ARM/LEG onto a screen side. Returns true for "the critter's own left limb
@@ -3784,123 +4938,810 @@ static bool gpui_part_on_screen_left(Object* obj, int location)
     return gpui_viewing_back(obj) ? ownLeft : !ownLeft;
 }
 
-// --- Part mask + outline. ---
+// --- WHICH PART OWNS WHICH PIXEL: a flood through the body, not a stack of bands. ---
+//
+// ⚠️ THIS REPLACED THE BAND SEGMENTATION ON 2026-09-02, AND THE REASON IS WORTH KEEPING. Bands ask
+// "which horizontal stripe is this row in", so the answer can only ever be a rectangle: the arm was
+// a fixed share of each row, the torso a box, a leg half a row. Rendered over the real art (the
+// offline part-map harness in [[aim-body-segmentation]]) they read as slabs pasted on a character,
+// and no amount of tuning the stripe edges fixes that, because the shape of the answer is wrong.
+//
+// This asks a different question: WHICH PART CAN REACH THIS PIXEL FIRST, WALKING THROUGH THE BODY.
+// Eight seeds are placed on the anatomy (head, two hands, two thighs, torso, groin), then a single
+// breadth-first flood runs from all of them at once through opaque pixels only. Every pixel goes to
+// whichever seed reaches it first, so a region flows down a limb and stops where the limb does: an
+// arm held out keeps its whole arm INCLUDING the hand, a leg mid-stride keeps its whole leg
+// including the boot, and the boundary between two parts lands where the body actually narrows --
+// the shoulder, the hip -- because that is where the two floods meet.
+//
+// It is also cheaper than what it replaced: one pass over ~4000 opaque pixels, no per-row run
+// analysis, no latch. And it cannot produce a degenerate part: every part that gets a seed gets a
+// connected region, and a part whose seed could not be placed simply has none.
 
-#define GPUI_AIMBODY_MAX_W 256
+// Owner per pixel: a HIT_LOCATION_*, or one of these two.
+#define GPUI_OWNER_NONE (-1)
+#define GPUI_OWNER_SHADOW (-2)
+
+static signed char gpui_aim_owner[GPUI_AIMBODY_MAX_H * GPUI_AIMBODY_MAX_W];
+static int gpui_aim_owner_w = 0;
+static int gpui_aim_owner_h = 0;
+static bool gpui_aim_owner_valid = false;
+
+// BFS frontier. Two buffers rather than a ring, so the flood stays breadth-first (equal distance
+// grows in step) without any modular arithmetic.
+static int gpui_aim_bfs_a[GPUI_AIMBODY_MAX_H * GPUI_AIMBODY_MAX_W];
+static int gpui_aim_bfs_b[GPUI_AIMBODY_MAX_H * GPUI_AIMBODY_MAX_W];
+
+// Perceived brightness of a palette index, 0..255. cmap is 6-bit per channel, hence the <<2.
+static int gpui_pal_luminance(unsigned char index)
+{
+    int r = cmap[index * 3] << 2;
+    int g = cmap[index * 3 + 1] << 2;
+    int b = cmap[index * 3 + 2] << 2;
+    return (r * 30 + g * 59 + b * 11) / 100;
+}
+
+// ⚠️ THE GROUND SHADOW IS PART OF THE SPRITE AND IT IS NOT THE CRITTER. Fallout bakes it into the
+// FRM and the engine anchors the frame's BOTTOM ROW to the tile -- so there is no geometry to
+// subtract it with. Left alone, the leg flood runs straight out across the ground and the leg
+// outline flares into an ellipse on the floor.
+//
+// It has one property nothing on the body has: it is uniformly very dark, and it is one connected
+// mass reaching the bottom of the frame. So: start from the dark pixels on the bottom rows and
+// spread through dark pixels only. What that mass reaches is shadow; what it cannot reach is not.
+//
+// ⚠️ IT IS NOT "THE BOTTOM FIFTH", WHICH IS WHAT THIS TRIED FIRST AND WHY A LEG STILL ATE GROUND.
+// The shadow is drawn BEHIND the feet and reaches much higher than the feet do: on the super mutant
+// (MAMTNTAA rot 2, 81 rows) it runs from row 55 -- 68 % of the way up -- while the boots are rows
+// 72..80, in FRONT of it and brighter. A fixed bottom-fifth cut therefore walled off the part of the
+// shadow that was level with the boots and left the ten rows above it to the legs.
+//
+// The luminance cut stays at 30, which is what separates shadow from footwear: boots sit at 40+ even
+// on the darkest critters, and raising it to 40 visibly ate them. Checked by rendering, not reasoning.
+#define GPUI_SHADOW_LUM 30
+// Only looked for below this fraction of the body -- a safety rail, so a critter dressed head to
+// toe in black cannot have its chest declared "ground". The shadow reaches higher than one would
+// think (68 % of the sprite on the super mutant), so this cannot be the bottom fifth.
+#define GPUI_SHADOW_CEILING_PCT 55
+
+// ⚠️ COLUMN BY COLUMN, FROM THE BOTTOM UP, STOPPING AT THE FIRST LIT PIXEL. Two other rules were
+// tried against the art first and both are worse:
+//
+//   * FOLLOW THE DARKNESS (flood through connected dark pixels from the bottom). The mutant wears
+//     dark trousers over dark boots and the shadow touches them, so the flood climbed his legs and
+//     declared them ground -- one leg disappeared from the picker entirely.
+//   * KEEP EACH ROW'S LIT CORE (dark pixels outside the outermost bright ones are shadow). The
+//     ground BETWEEN the two feet is inside that span, so the leg regions kept growing horizontal
+//     spikes across the floor.
+//
+// Walking up a column stops where the critter starts, which is exactly the question being asked. A
+// column through a boot hits the boot and stops, so the boot and everything above it is kept, dark
+// shading included; a column that only ever passes through ground -- beside the feet, or between
+// them -- is ground all the way up. And because the cut is a run from the bottom of each column, it
+// can never punch a hole in the middle of a limb, which any per-pixel test can: a hole would be
+// traced as an extra outline loop and read as noise.
+#define GPUI_SHADOW_BRIGHT_LUM 45
+
+static void gpui_aimbody_wall_off_shadow(const unsigned char* fd, int fw, int fh,
+    const GpuiSilhouette* sil)
+{
+    int bodyH = sil->bottom - sil->top + 1;
+    int ceiling = sil->top + bodyH * GPUI_SHADOW_CEILING_PCT / 100;
+
+    for (int x = 0; x < fw; x++) {
+        for (int y = fh - 1; y >= ceiling; y--) {
+            unsigned char index = fd[(size_t)y * fw + x];
+            if (index == 0) {
+                continue; // a gap in this column is not the end of the ground
+            }
+            if (gpui_pal_luminance(index) >= GPUI_SHADOW_BRIGHT_LUM) {
+                break; // the critter, standing on it
+            }
+            gpui_aim_owner[(size_t)y * fw + x] = GPUI_OWNER_SHADOW;
+        }
+    }
+}
+
+// Nearest opaque pixel to (x, y), searched in growing squares. A seed must land ON the body: the
+// anatomy says "about here", and this is what turns that into a pixel that exists.
+static int gpui_aimbody_seed_at(const unsigned char* fd, int fw, int fh, int x, int y)
+{
+    int limit = fw > fh ? fw : fh;
+    for (int r = 0; r <= limit; r++) {
+        for (int dy = -r; dy <= r; dy++) {
+            for (int dx = -r; dx <= r; dx++) {
+                int adx = dx < 0 ? -dx : dx;
+                int ady = dy < 0 ? -dy : dy;
+                if ((adx > ady ? adx : ady) != r) {
+                    continue; // only the ring at radius r
+                }
+                int px = x + dx;
+                int py = y + dy;
+                if (px < 0 || px >= fw || py < 0 || py >= fh) {
+                    continue;
+                }
+                int p = py * fw + px;
+                if (fd[p] != 0 && gpui_aim_owner[p] == GPUI_OWNER_NONE) {
+                    return p;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+// Row inside the body at `pct` of its height.
+static int gpui_aimbody_row_at(const GpuiSilhouette* sil, int pct)
+{
+    int bodyH = sil->bottom - sil->top + 1;
+    int y = sil->top + bodyH * pct / 100;
+    if (y < sil->top) {
+        y = sil->top;
+    }
+    if (y > sil->bottom) {
+        y = sil->bottom;
+    }
+    return y;
+}
+
+static int gpui_aimbody_row_mid(const GpuiSilhouette* sil, int y)
+{
+    if (sil->rowMax[y] < sil->rowMin[y]) {
+        return 0;
+    }
+    return (sil->rowMin[y] + sil->rowMax[y]) / 2;
+}
+
+// Places the seeds. Everything anatomical this feature knows lives here and nowhere else.
+//
+// A part may have MORE THAN ONE seed -- `seeds` holds the first of each, `extra` a second. That is
+// not a detail: an arm seeded only at the hand has to flood back up the limb, so the torso (whose
+// seed sits closer to the shoulder) wins the upper arm on the way, and the mark ends up on a forearm
+// while the torso outline bulges over a shoulder -- "trup zabírá hruď a pravou ruku". Seeding the
+// SHOULDER as well roots each arm where it attaches, and the two floods then meet along the armpit,
+// which is where an arm actually stops.
+static void gpui_aimbody_seeds(const unsigned char* fd, int fw, int fh,
+    const GpuiSilhouette* sil, const GpuiBodyRegions* reg, Object* target, int* seeds, int* extra)
+{
+    for (int i = 0; i < 8; i++) {
+        seeds[i] = -1;
+        extra[i] = -1;
+    }
+
+    // HEAD: the detected head column, which is measured from the art (gpui_find_head) and is the one
+    // piece of the old segmentation worth keeping. Without it, the crown of the silhouette.
+    int headX;
+    int headY;
+    int eyesY;
+    if (reg->headValid) {
+        int headH = reg->headBottom - reg->headTop + 1;
+        headX = (reg->headLo + reg->headHi) / 2;
+        // ⚠️ THE TWO HEAD SEEDS SIT AT OPPOSITE ENDS OF THE HEAD ON PURPOSE. Seeding the eyes at the
+        // very top row gave them a three-pixel scrape of hair on the crown, because the head's own
+        // seed was only a couple of rows below and won everything else immediately. Putting the eyes
+        // a third of the way down and the head at the jaw makes the two floods meet in the middle of
+        // the skull: eyes get the face, head gets the jaw and the neck.
+        eyesY = reg->headTop + headH / 3;
+        headY = reg->headBottom;
+    } else {
+        headX = gpui_aimbody_row_mid(sil, sil->top);
+        headY = gpui_aimbody_row_at(sil, 10);
+        eyesY = gpui_aimbody_row_at(sil, 4);
+    }
+    seeds[HIT_LOCATION_HEAD] = gpui_aimbody_seed_at(fd, fw, fh, headX, headY);
+    seeds[HIT_LOCATION_EYES] = gpui_aimbody_seed_at(fd, fw, fh, headX, eyesY);
+
+    // HANDS: the pixel that reaches furthest from the body on each side, anywhere an arm can be.
+    // That is a hand, or an elbow, or a shoulder pad -- whatever it is, it is on the arm and on
+    // nothing else, which is all a seed has to be.
+    int armTop = gpui_aimbody_row_at(sil, 20);
+    int armBot = gpui_aimbody_row_at(sil, 55);
+    int lx = -1;
+    int ly = -1;
+    int rx = -1;
+    int ry = -1;
+    for (int y = armTop; y <= armBot; y++) {
+        if (sil->rowMax[y] < sil->rowMin[y]) {
+            continue;
+        }
+        if (lx < 0 || sil->rowMin[y] < lx) {
+            lx = sil->rowMin[y];
+            ly = y;
+        }
+        if (rx < 0 || sil->rowMax[y] > rx) {
+            rx = sil->rowMax[y];
+            ry = y;
+        }
+    }
+    int leftArmLoc = gpui_part_on_screen_left(target, HIT_LOCATION_LEFT_ARM)
+        ? HIT_LOCATION_LEFT_ARM
+        : HIT_LOCATION_RIGHT_ARM;
+    int rightArmLoc = leftArmLoc == HIT_LOCATION_LEFT_ARM
+        ? HIT_LOCATION_RIGHT_ARM
+        : HIT_LOCATION_LEFT_ARM;
+    if (lx >= 0) {
+        seeds[leftArmLoc] = gpui_aimbody_seed_at(fd, fw, fh, lx, ly);
+    }
+    if (rx >= 0) {
+        seeds[rightArmLoc] = gpui_aimbody_seed_at(fd, fw, fh, rx, ry);
+    }
+
+    // The shoulders: the outer edge of the body a short way below the head, which is where an arm
+    // hangs from on every one of these sprites.
+    int shoulderY = reg->headValid
+        ? reg->headBottom + (sil->bottom - sil->top + 1) * 8 / 100
+        : gpui_aimbody_row_at(sil, 25);
+    if (shoulderY > sil->bottom) {
+        shoulderY = sil->bottom;
+    }
+    if (sil->rowMax[shoulderY] >= sil->rowMin[shoulderY]) {
+        extra[leftArmLoc] = gpui_aimbody_seed_at(fd, fw, fh, sil->rowMin[shoulderY], shoulderY);
+        extra[rightArmLoc] = gpui_aimbody_seed_at(fd, fw, fh, sil->rowMax[shoulderY], shoulderY);
+    }
+
+    // TORSO and GROIN on the centre line. The groin sits high -- at the belt, not between the
+    // thighs: seeded lower it wins the whole pelvis AND both thighs down to the knees, and the leg
+    // marks start at the shins. Rendered over the art that reads as "the groin is his trousers".
+    int torsoY = gpui_aimbody_row_at(sil, 32);
+    int groinY = gpui_aimbody_row_at(sil, 48);
+    seeds[HIT_LOCATION_TORSO] = gpui_aimbody_seed_at(fd, fw, fh, gpui_aimbody_row_mid(sil, torsoY), torsoY);
+    seeds[HIT_LOCATION_GROIN] = gpui_aimbody_seed_at(fd, fw, fh, gpui_aimbody_row_mid(sil, groinY), groinY);
+
+    // LEGS: mid-THIGH, one either side of the centre line -- not at the feet. Seeding a foot puts
+    // the seed at the far end of the leg, so the groin's flood wins everything down to the knee and
+    // the leg mark starts halfway down the shin. From the thigh each leg still floods all the way
+    // into its own boot, because through the body that is the only way down there.
+    int thighY = gpui_aimbody_row_at(sil, 66);
+    int thighMid = gpui_aimbody_row_mid(sil, thighY);
+    int thighSpan = sil->rowMax[thighY] >= sil->rowMin[thighY]
+        ? sil->rowMax[thighY] - sil->rowMin[thighY] + 1
+        : 0;
+    int spread = thighSpan / 4;
+    if (spread < 1) {
+        spread = 1;
+    }
+    {
+        int loc = gpui_part_on_screen_left(target, HIT_LOCATION_LEFT_LEG)
+            ? HIT_LOCATION_LEFT_LEG
+            : HIT_LOCATION_RIGHT_LEG;
+        seeds[loc] = gpui_aimbody_seed_at(fd, fw, fh, thighMid - spread, thighY);
+    }
+    {
+        int loc = gpui_part_on_screen_left(target, HIT_LOCATION_LEFT_LEG)
+            ? HIT_LOCATION_RIGHT_LEG
+            : HIT_LOCATION_LEFT_LEG;
+        seeds[loc] = gpui_aimbody_seed_at(fd, fw, fh, thighMid + spread, thighY);
+    }
+}
+
+// --- HAND-PAINTED PART MASKS (data\aimmask.dat) ---
+//
+// The flood above infers where a critter's parts are from its silhouette alone, which is as good
+// as a guess about anatomy can be. Where it is not good enough, a mask painted BY HAND wins:
+// aimmask.dat holds a per-pixel part map for individual stand frames, built out of PNGs painted in
+// Aseprite by .claude/tools/f1script/aimmask.js -- that tool carries the painting rules and the
+// canvas layout, and is the only thing that writes this file.
+//
+// ⚠️ A MASK DOES NOT REPLACE THE FLOOD, IT SEEDS IT, and that is not a shortcut -- it is the only
+// shape of answer that survives the animation. Every frame of an idle loop is a DIFFERENT SIZE
+// (measured: a super mutant breathes between 44x81 and 55x92, a human between 18x60 and 25x60), so
+// a mask painted on one frame cannot be stamped onto the frame actually on screen. It is projected
+// onto the live silhouette and the flood then fills whatever the projection missed, so the marks
+// stay put across the loop instead of snapping between two segmentations several times a second --
+// the exact defect that made the previous, latched design unusable.
+//
+// No file, or no mask for this critter, is the normal case and costs nothing: the flood runs as it
+// always did.
+
+#define GPUI_AIMMASK_MAX 128
+#define GPUI_AIMMASK_NONE 0xff
+// Critter art is named <base><weapon><animation>, and every base in CRITTERS.LST is six characters
+// (hfjmps, mamtnt, hmlthr...). That prefix is the critter; the two letters after it are the pose.
+#define GPUI_AIMMASK_BASE_LEN 6
+
+typedef struct {
+    char name[16]; // FRM base name, uppercase, no extension
+    unsigned char rot;
+    unsigned short w;
+    unsigned short h;
+    // Bounds of the PAINTED pixels, which is what the projection maps -- not the frame, whose
+    // margins differ from the live frame's.
+    unsigned short boxLo;
+    unsigned short boxHi;
+    unsigned short boxTop;
+    unsigned short boxBottom;
+    unsigned char* data; // w*h, a HIT_LOCATION_* or GPUI_AIMMASK_NONE
+} GpuiAimMask;
+
+static GpuiAimMask gpui_aimmask[GPUI_AIMMASK_MAX];
+static int gpui_aimmask_count = 0;
+static bool gpui_aimmask_loaded = false;
+
+// The file is little-endian because the tool that writes it is; the DAT formats around it are big-
+// endian, so read the bytes rather than reusing db_freadInt and getting it silently backwards.
+static unsigned int gpui_aimmask_rd16(const unsigned char* p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8);
+}
+
+static unsigned int gpui_aimmask_rd32(const unsigned char* p)
+{
+    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+}
+
+static void gpui_aimmask_load()
+{
+    if (gpui_aimmask_loaded) {
+        return;
+    }
+    gpui_aimmask_loaded = true; // one attempt per run, hit or miss
+
+    DB_FILE* stream = db_fopen("aimmask.dat", "rb");
+    if (stream == NULL) {
+        return;
+    }
+
+    unsigned char head[16];
+    if (db_fread(head, 1, sizeof(head), stream) != sizeof(head)
+        || memcmp(head, "AIMM", 4) != 0
+        || gpui_aimmask_rd32(head + 4) != 1) {
+        db_fclose(stream);
+        return;
+    }
+
+    int count = (int)gpui_aimmask_rd32(head + 8);
+    unsigned int blobStart = gpui_aimmask_rd32(head + 12);
+    if (count > GPUI_AIMMASK_MAX) {
+        count = GPUI_AIMMASK_MAX;
+    }
+
+    for (int i = 0; i < count; i++) {
+        unsigned char rec[28];
+        if (db_fseek(stream, 16 + i * 28, SEEK_SET) != 0
+            || db_fread(rec, 1, sizeof(rec), stream) != sizeof(rec)) {
+            break;
+        }
+
+        int w = (int)gpui_aimmask_rd16(rec + 18);
+        int h = (int)gpui_aimmask_rd16(rec + 20);
+        int packedLen = (int)gpui_aimmask_rd16(rec + 22);
+        unsigned int blobOff = gpui_aimmask_rd32(rec + 24);
+        if (w <= 0 || h <= 0 || w > GPUI_AIMBODY_MAX_W || h > GPUI_AIMBODY_MAX_H || packedLen <= 0) {
+            continue;
+        }
+
+        unsigned char* packed = (unsigned char*)malloc((size_t)packedLen);
+        if (packed == NULL) {
+            break;
+        }
+        if (db_fseek(stream, (long)(blobStart + blobOff), SEEK_SET) != 0
+            || db_fread(packed, 1, (size_t)packedLen, stream) != (size_t)packedLen) {
+            free(packed);
+            break;
+        }
+
+        unsigned char* pixels = (unsigned char*)malloc((size_t)w * h);
+        if (pixels == NULL) {
+            free(packed);
+            break;
+        }
+
+        // [run][value] pairs, row-major. A short file is a broken file: drop the entry rather
+        // than leave half a body mapped.
+        size_t out = 0;
+        bool ok = true;
+        for (int p = 0; p + 1 < packedLen; p += 2) {
+            int run = packed[p];
+            unsigned char value = packed[p + 1];
+            if (out + run > (size_t)w * h) {
+                ok = false;
+                break;
+            }
+            memset(pixels + out, value, run);
+            out += run;
+        }
+        free(packed);
+        if (!ok || out != (size_t)w * h) {
+            free(pixels);
+            continue;
+        }
+
+        GpuiAimMask* m = &gpui_aimmask[gpui_aimmask_count];
+        memcpy(m->name, rec, 16);
+        m->name[15] = '\0';
+        m->rot = rec[16];
+        m->w = (unsigned short)w;
+        m->h = (unsigned short)h;
+        m->data = pixels;
+
+        int lo = w;
+        int hi = -1;
+        int top = h;
+        int bottom = -1;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if (pixels[y * w + x] == GPUI_AIMMASK_NONE) {
+                    continue;
+                }
+                if (x < lo) lo = x;
+                if (x > hi) hi = x;
+                if (y < top) top = y;
+                if (y > bottom) bottom = y;
+            }
+        }
+        if (hi < lo || bottom < top) {
+            free(pixels);
+            continue; // nothing painted
+        }
+        m->boxLo = (unsigned short)lo;
+        m->boxHi = (unsigned short)hi;
+        m->boxTop = (unsigned short)top;
+        m->boxBottom = (unsigned short)bottom;
+
+        gpui_aimmask_count++;
+    }
+
+    db_fclose(stream);
+    trace_event(TRACE_STATE, "aimmask", "loaded=%d", gpui_aimmask_count);
+}
+
+// The art's own file name is the key, so a mask follows the critter's appearance rather than a
+// prototype id: every raider in a leather jacket shares one painted mask.
+//
+// A critter FRM is named <base 6><weapon><animation>, and the match is tried twice: the whole name
+// first, then just the BASE. The base match is what makes hand-painting affordable -- one mask for
+// a critter covers it standing, walking, running and holding any weapon, instead of one per pose --
+// and it is only sound because the projection maps row by row and so re-fits itself to whatever
+// silhouette is on screen.
+//
+// ⚠️ THE LOOSE MATCH IS GATED ON AN UPRIGHT BODY (`upright`, i.e. the caller's headValid), and that
+// is not caution for its own sake: the same base also names the KNOCKDOWN and death frames, where
+// the critter is lying down. Row-by-row mapping would then confidently paint the head onto whatever
+// is at the top of a horizontal body. An exact match is trusted without the gate, because a mask
+// painted for that precise frame is a statement about that precise frame.
+static const GpuiAimMask* gpui_aimmask_find(Object* target, bool upright)
+{
+    if (target == NULL) {
+        return NULL;
+    }
+    gpui_aimmask_load();
+    if (gpui_aimmask_count == 0) {
+        return NULL;
+    }
+
+    char* path = art_get_name(target->fid);
+    if (path == NULL) {
+        return NULL;
+    }
+
+    const char* base = path;
+    for (const char* p = path; *p != '\0'; p++) {
+        if (*p == '\\' || *p == '/') {
+            base = p + 1;
+        }
+    }
+
+    char key[16];
+    int n = 0;
+    for (const char* p = base; *p != '\0' && *p != '.' && n < 15; p++) {
+        key[n++] = (char)toupper((unsigned char)*p);
+    }
+    key[n] = '\0';
+
+    for (int i = 0; i < gpui_aimmask_count; i++) {
+        const GpuiAimMask* m = &gpui_aimmask[i];
+        if (m->rot == target->rotation && strcmp(m->name, key) == 0) {
+            return m;
+        }
+    }
+
+    if (!upright || n < GPUI_AIMMASK_BASE_LEN) {
+        return NULL;
+    }
+
+    // Ranked, best first: this rotation; a rotation seen from the same side (the other front view,
+    // or the other back view); then anything painted for this critter. Rendered over all six
+    // directions before it was allowed: a front mask carries into the other front view and into the
+    // back views cleanly, and in the two PROFILE views it is a compromise -- it lays an arm along
+    // both edges of a body where only one arm is really visible -- but still beats the inferred
+    // seeds it replaces, which had no idea where anything was.
+    const GpuiAimMask* sameView = NULL;
+    const GpuiAimMask* anyView = NULL;
+    bool targetBack = gpui_rotation_is_back(target->rotation);
+    for (int i = 0; i < gpui_aimmask_count; i++) {
+        const GpuiAimMask* m = &gpui_aimmask[i];
+        if (strncmp(m->name, key, GPUI_AIMMASK_BASE_LEN) != 0) {
+            continue;
+        }
+        if (m->rot == target->rotation) {
+            return m;
+        }
+        if (sameView == NULL && gpui_rotation_is_back(m->rot) == targetBack) {
+            sameView = m;
+        }
+        if (anyView == NULL) {
+            anyView = m;
+        }
+    }
+    return sameView != NULL ? sameView : anyView;
+}
+
+// True when a mask painted for `maskRot` has to have its left and right limbs exchanged to be used
+// at `targetRot`: the sides are stored anatomically, and which anatomical side you SEE on the left
+// of the screen flips between a front view and a back one. Same rule as gpui_part_on_screen_left.
+static bool gpui_aimmask_swaps_sides(const GpuiAimMask* m, Object* target)
+{
+    return gpui_rotation_is_back(m->rot) != gpui_rotation_is_back(target->rotation);
+}
+
+// Lays a painted mask over the frame being drawn, and returns the pixels it claimed so they can be
+// the flood's starting front (anything it could not decide is left to the flood, as before).
+//
+// ⚠️ ROW BY ROW, MATCHING THE BODY'S WIDTH -- NOT A BOX SCALED ONTO A BOX, AND NOT SEEDS. Both of
+// those were built and rendered over the whole idle loop before this one survived:
+//
+//   * box onto box assumes the pose does not change. It does -- the arm comes out, the weight
+//     shifts -- and by the middle of the human female's loop one leg's colour covered both legs
+//     while the other leg had none.
+//   * eight seed points thrown to the flood keeps nothing of what was painted but its centres of
+//     mass, and the flood's own distances then decide everything: the head ran down the shoulder,
+//     the groin spread into a belt, the torso shrank to a blob.
+//
+// A ROW of the live body maps onto the matching row of the painted body and stretches to ITS width.
+// That keeps the order across a row -- arm, torso, arm -- while letting each part's share breathe
+// with the silhouette, which is exactly what changes between frames.
+static int gpui_aimmask_project(const GpuiAimMask* m, const unsigned char* fd, int fw, int fh,
+    const GpuiSilhouette* sil, bool swapSides, int* front)
+{
+    // Reused from a direction that sees the critter from the other side; see gpui_aimmask_swaps_sides.
+    signed char relabel[8];
+    for (int i = 0; i < 8; i++) {
+        relabel[i] = (signed char)i;
+    }
+    if (swapSides) {
+        relabel[HIT_LOCATION_LEFT_ARM] = HIT_LOCATION_RIGHT_ARM;
+        relabel[HIT_LOCATION_RIGHT_ARM] = HIT_LOCATION_LEFT_ARM;
+        relabel[HIT_LOCATION_LEFT_LEG] = HIT_LOCATION_RIGHT_LEG;
+        relabel[HIT_LOCATION_RIGHT_LEG] = HIT_LOCATION_LEFT_LEG;
+    }
+
+    // ⚠️ MEASURE THE BODY, NOT THE FRAME. The shadow is baked into the sprite, sticks out to one
+    // side and below the feet, and grows and shrinks with the pose, so a box drawn around it
+    // stretches the mapping differently on every frame. It has already been walled off by the
+    // caller, so the opaque pixels that still own nothing are exactly the critter.
+    int liveTop = fh;
+    int liveBottom = -1;
+    for (int y = sil->top; y <= sil->bottom; y++) {
+        for (int x = 0; x < fw; x++) {
+            size_t p = (size_t)y * fw + x;
+            if (fd[p] == 0 || gpui_aim_owner[p] == GPUI_OWNER_SHADOW) {
+                continue;
+            }
+            if (y < liveTop) liveTop = y;
+            if (y > liveBottom) liveBottom = y;
+        }
+    }
+    if (liveBottom < liveTop) {
+        return 0;
+    }
+
+    int liveH = liveBottom - liveTop + 1;
+    int maskH = m->boxBottom - m->boxTop + 1;
+
+    int count = 0;
+    for (int y = liveTop; y <= liveBottom; y++) {
+        int lo = -1;
+        int hi = -1;
+        for (int x = 0; x < fw; x++) {
+            size_t p = (size_t)y * fw + x;
+            if (fd[p] == 0 || gpui_aim_owner[p] == GPUI_OWNER_SHADOW) {
+                continue;
+            }
+            if (lo < 0) lo = x;
+            hi = x;
+        }
+        if (lo < 0) {
+            continue;
+        }
+
+        int my = maskH > 1
+            ? m->boxTop + ((y - liveTop) * (maskH - 1) + (liveH - 1) / 2) / (liveH - 1)
+            : m->boxTop;
+        if (my < 0 || my >= m->h) {
+            continue;
+        }
+
+        int mlo = -1;
+        int mhi = -1;
+        for (int mx = 0; mx < m->w; mx++) {
+            if (m->data[my * m->w + mx] >= 8) {
+                continue;
+            }
+            if (mlo < 0) mlo = mx;
+            mhi = mx;
+        }
+        if (mlo < 0) {
+            continue; // nothing painted on that row; the flood gets this one
+        }
+
+        for (int x = lo; x <= hi; x++) {
+            size_t p = (size_t)y * fw + x;
+            if (fd[p] == 0 || gpui_aim_owner[p] != GPUI_OWNER_NONE) {
+                continue;
+            }
+            int mx = hi > lo
+                ? mlo + ((x - lo) * (mhi - mlo) + (hi - lo) / 2) / (hi - lo)
+                : mlo;
+            unsigned char part = m->data[my * m->w + mx];
+            if (part >= 8) {
+                continue;
+            }
+            gpui_aim_owner[p] = relabel[part];
+            front[count++] = (int)p;
+        }
+    }
+    return count;
+}
+
+// Builds the owner map for this frame. False = this critter is not a shape we can divide up (no
+// head region: a dog, a scorpion, the Master), and the caller falls back to the plain rings.
+static bool gpui_aimbody_partition(const unsigned char* fd, int fw, int fh,
+    const GpuiSilhouette* sil, const GpuiBodyRegions* reg, Object* target)
+{
+    gpui_aim_owner_valid = false;
+
+    if (fd == NULL || fw <= 0 || fh <= 0 || fw > GPUI_AIMBODY_MAX_W || fh > GPUI_AIMBODY_MAX_H) {
+        return false;
+    }
+    // A painted mask states where the parts are, so it needs none of the inference below -- not the
+    // seeds, and not the upright-biped gate either: a dog can have a mask even though nothing in
+    // the silhouette code can find a head on one.
+    const GpuiAimMask* mask = gpui_aimmask_find(target, reg->headValid);
+
+    if (mask == NULL && !reg->headValid) {
+        // Same gate as before: an upright silhouette is what all of this assumes, and a critter
+        // that fails it deserves an honest ring rather than a confident carve-up.
+        return false;
+    }
+
+    memset(gpui_aim_owner, GPUI_OWNER_NONE, (size_t)fh * fw);
+    gpui_aimbody_wall_off_shadow(fd, fw, fh, sil);
+
+    int seeds[8];
+    int extra[8];
+    for (int i = 0; i < 8; i++) {
+        seeds[i] = -1;
+        extra[i] = -1;
+    }
+    if (mask == NULL) {
+        gpui_aimbody_seeds(fd, fw, fh, sil, reg, target, seeds, extra);
+    }
+
+    // ⚠️ THE HEAD IS THE ONE PART THAT NEEDS A LEASH. Everywhere else the floods meet at a real
+    // narrowing, but a hunched critter has no neck to speak of -- on the super mutant the skull sits
+    // straight on a shoulder mass twice its width, so the head's flood had nothing to stop it and ran
+    // down the back: "hlava stále zabírá záda". A head is a head-sized thing, so it is allowed to
+    // spread about a head and a half from its seed and no further; the pixels beyond that fall to
+    // whichever part reaches them next, which is the torso. Nothing else is capped -- an arm SHOULD
+    // be allowed to run as far as the arm goes.
+    int headH = reg->headBottom - reg->headTop + 1;
+    int headBudget = headH * 3 / 2;
+    if (headBudget < 4) {
+        headBudget = 4;
+    }
+    int budget[8];
+    for (int i = 0; i < 8; i++) {
+        budget[i] = 1 << 20;
+    }
+    if (reg->headValid) {
+        // Guarded because a mask lets a critter through that has no detected head at all (a dog),
+        // and then there is no head height to leash the flood with.
+        budget[HIT_LOCATION_HEAD] = headBudget;
+        budget[HIT_LOCATION_EYES] = headBudget;
+    }
+
+    int* cur = gpui_aim_bfs_a;
+    int* next = gpui_aim_bfs_b;
+    int curCount = 0;
+    if (mask != NULL) {
+        curCount = gpui_aimmask_project(mask, fd, fw, fh, sil,
+            gpui_aimmask_swaps_sides(mask, target), cur);
+    }
+    for (int i = 0; i < 8; i++) {
+        int p = seeds[i];
+        if (p >= 0 && gpui_aim_owner[p] == GPUI_OWNER_NONE) {
+            gpui_aim_owner[p] = (signed char)i;
+            cur[curCount++] = p;
+        }
+        p = extra[i];
+        if (p >= 0 && gpui_aim_owner[p] == GPUI_OWNER_NONE) {
+            gpui_aim_owner[p] = (signed char)i;
+            cur[curCount++] = p;
+        }
+    }
+    if (curCount == 0) {
+        return false;
+    }
+
+    int dist = 0;
+    while (curCount > 0) {
+        int nextCount = 0;
+        dist++;
+        for (int i = 0; i < curCount; i++) {
+            int p = cur[i];
+            int y = p / fw;
+            int x = p - y * fw;
+            signed char owner = gpui_aim_owner[p];
+            if (dist > budget[owner]) {
+                continue; // this part has spread as far as it is entitled to
+            }
+
+            int nb[4];
+            int n = 0;
+            if (x > 0) {
+                nb[n++] = p - 1;
+            }
+            if (x < fw - 1) {
+                nb[n++] = p + 1;
+            }
+            if (y > 0) {
+                nb[n++] = p - fw;
+            }
+            if (y < fh - 1) {
+                nb[n++] = p + fw;
+            }
+            for (int k = 0; k < n; k++) {
+                int q = nb[k];
+                if (fd[q] == 0 || gpui_aim_owner[q] != GPUI_OWNER_NONE) {
+                    continue;
+                }
+                gpui_aim_owner[q] = owner;
+                next[nextCount++] = q;
+            }
+        }
+        int* swap = cur;
+        cur = next;
+        next = swap;
+        curCount = nextCount;
+    }
+
+    gpui_aim_owner_w = fw;
+    gpui_aim_owner_h = fh;
+    gpui_aim_owner_valid = true;
+    return true;
+}
+
+// --- Part mask + outline. ---
 
 // One frame's worth of "this pixel belongs to the selected part". Static rather than stack: this
 // runs from the per-frame aim path (and, indirectly, from the mouse hook) where 64K of stack is
 // not worth spending.
 static unsigned char gpui_aim_mask[GPUI_AIMBODY_MAX_H * GPUI_AIMBODY_MAX_W];
 
-// Marks the opaque pixels belonging to `location`. False = this part cannot be resolved from this
-// frame (no detected region, or a part stage 1 does not segment yet), and the caller falls back to
-// the plain ring rather than drawing an outline around a guess.
+// Marks the opaque pixels belonging to `location` -- now just a read-out of the flood
+// (gpui_aimbody_partition), which already decided every pixel's owner. False = this critter could
+// not be divided up at all, or nothing reached this part, and the caller falls back to the plain
+// ring rather than drawing an outline around a guess.
 static bool gpui_aimbody_build_mask(const unsigned char* fd, int fw, int fh,
     const GpuiSilhouette* sil, const GpuiBodyRegions* reg, Object* target, int location)
 {
     if (fw > GPUI_AIMBODY_MAX_W || fh > GPUI_AIMBODY_MAX_H) {
         return false;
     }
-
-    bool legs = location == HIT_LOCATION_LEFT_LEG || location == HIT_LOCATION_RIGHT_LEG;
-    bool arms = location == HIT_LOCATION_LEFT_ARM || location == HIT_LOCATION_RIGHT_ARM;
-    bool trunk = arms || location == HIT_LOCATION_TORSO || location == HIT_LOCATION_GROIN;
-    if (location == HIT_LOCATION_HEAD) {
-        if (!reg->headValid) {
-            return false;
-        }
-    } else if (legs) {
-        if (!reg->legsValid) {
-            return false;
-        }
-    } else if (trunk) {
-        if (!reg->trunkValid) {
-            return false;
-        }
-    } else {
-        return false; // eyes have nothing to outline -- the caller draws a dot
+    if (!gpui_aim_owner_valid || gpui_aim_owner_w != fw || gpui_aim_owner_h != fh) {
+        return false;
     }
 
     memset(gpui_aim_mask, 0, (size_t)fh * fw);
 
-    if (trunk) {
-        int y0 = location == HIT_LOCATION_GROIN ? reg->groinTop : reg->trunkTop;
-        int y1 = location == HIT_LOCATION_GROIN ? reg->trunkBottom
-            : (arms ? reg->armBottom : reg->groinTop - 1);
-
-        bool wantLeft = arms && gpui_part_on_screen_left(target, location);
-        bool anyPixel = false;
-
-        for (int y = y0; y <= y1; y++) {
-            int tLo;
-            int tHi;
-            if (y < 0 || y >= fh || !gpui_trunk_row_split(sil, y, &tLo, &tHi)) {
-                continue;
-            }
-
-            // Torso and groin ARE the middle run; an arm is everything outside it on its side.
-            int lo;
-            int hi;
-            if (arms) {
-                lo = wantLeft ? sil->rowMin[y] : tHi + 1;
-                hi = wantLeft ? tLo - 1 : sil->rowMax[y];
-            } else {
-                lo = tLo;
-                hi = tHi;
-            }
-            if (lo > hi) {
-                continue; // that arm is not visible on this row (turned away, or fully overlapped)
-            }
-
-            const unsigned char* row = fd + (size_t)y * fw;
-            unsigned char* m = gpui_aim_mask + (size_t)y * fw;
-            for (int x = lo; x <= hi; x++) {
-                if (x >= 0 && x < fw && row[x] != 0) {
-                    m[x] = 1;
-                    anyPixel = true;
-                }
-            }
-        }
-
-        // An arm can end up with nothing at all (side-on pose, arm entirely behind the body).
-        // Report failure so the caller rings it rather than drawing an empty outline.
-        return anyPixel;
-    }
-
-    if (location == HIT_LOCATION_HEAD) {
-        for (int y = reg->headTop; y <= reg->headBottom; y++) {
-            const unsigned char* row = fd + (size_t)y * fw;
-            unsigned char* m = gpui_aim_mask + (size_t)y * fw;
-            for (int x = sil->rowMin[y]; x <= sil->rowMax[y]; x++) {
-                if (row[x] != 0) {
-                    m[x] = 1;
-                }
-            }
-        }
-        return true;
-    }
-
-    // A leg is everything opaque on its side of the gap, from the crotch down. Taking the side of
-    // the GAP rather than of the body's midline is what keeps a leg swung out mid-stride whole.
-    bool wantLeft = gpui_part_on_screen_left(target, location);
-    for (int y = reg->legsTop; y <= sil->bottom; y++) {
-        int split = reg->legSplit[y];
-        if (split < 0 || sil->rowMax[y] < sil->rowMin[y]) {
-            continue;
-        }
-        const unsigned char* row = fd + (size_t)y * fw;
-        unsigned char* m = gpui_aim_mask + (size_t)y * fw;
-        for (int x = sil->rowMin[y]; x <= sil->rowMax[y]; x++) {
-            if (row[x] == 0) {
-                continue;
-            }
-            if (wantLeft ? (x <= split) : (x > split)) {
-                m[x] = 1;
-            }
+    bool anyPixel = false;
+    for (int i = 0; i < fh * fw; i++) {
+        if (gpui_aim_owner[i] == (signed char)location) {
+            gpui_aim_mask[i] = 1;
+            anyPixel = true;
         }
     }
-    return true;
+    return anyPixel;
 }
 
 // The mask's boundary: a masked pixel with at least one unmasked (or off-frame) 4-neighbour. That
@@ -4076,93 +5917,133 @@ static void gpui_aimbody_draw(Object* target, int selLoc)
             gpui_aimbody_anchor(&sil, gpui_aim_order[i].location,
                 &gpui_aimbody_anchor_x[i], &gpui_aimbody_anchor_y[i]);
         }
-        // SEGMENT THE BODY. Head and legs are read out of the silhouette's real shape (see the
-        // long note at gpui_find_head); everything else still falls back to the fraction anchors
-        // above. Detection failing is a normal outcome -- a radscorpion has no neck line and no leg
-        // gap -- and it simply means this frame is drawn the old way.
+        // SEGMENT THE BODY. gpui_find_head still runs, for two things only: it is the upright-biped
+        // gate (a dog or a scorpion produces no head region, and such a critter keeps the honest
+        // plain rings), and its head column is the best seed the flood can be given. Everything
+        // else about the body now comes out of the flood itself.
         gpui_find_head(&sil, &reg);
-        gpui_find_legs(&sil, &reg);
-        gpui_find_trunk(&sil, &reg); // needs both of the above
+        bool partitioned = gpui_aimbody_partition(fd, fw, fh, &sil, &reg, target);
 
-        // Re-anchor the parts we DID detect, so the right stick picks against the same geometry the
-        // player can see. Without this the outline and the hit box drift apart.
-        if (reg.headValid) {
-            int hMid = (reg.headTop + reg.headBottom) / 2;
-            int hy = sil.rowMax[hMid] >= sil.rowMin[hMid] ? hMid : reg.headTop;
+        // ⚠️ RECOMPUTED EVERY FRAME, AND THAT IS NOW SAFE -- it was not before. The old band
+        // detection had to be latched per (target, fid, rotation) because it swung wildly between
+        // idle frames: measured on the same mutant, consecutive frames put the head column at 11 px,
+        // then 19 px, then 10 px, and the crotch row at 73, none, 88, none, 66. The flood does not
+        // do that: it is driven by the whole silhouette rather than by one row's widest run, so the
+        // same pose lands in the same place, and the frame-to-frame breathing moves a boundary by a
+        // pixel instead of teleporting it. Recomputing also keeps the mark exactly on the frame
+        // being drawn, which the re-projected latch could only approximate.
+        if (partitioned) {
+            // ANCHORS ARE THE REGIONS' OWN CENTRES OF MASS. The fraction table above placed them by
+            // proportion, which is a guess about where a part is; the centroid is where the part
+            // that will be outlined actually IS, so the ring (drawn when a part has no pixels) and
+            // the label can never sit somewhere the outline is not.
+            int sumX[8];
+            int sumY[8];
+            int count[8];
             for (int i = 0; i < 8; i++) {
-                int loc = gpui_aim_order[i].location;
-                if (loc != HIT_LOCATION_HEAD && loc != HIT_LOCATION_EYES) {
-                    continue;
-                }
-                // Eyes sit in the upper part of the detected head, the head at its centre.
-                int y = loc == HIT_LOCATION_EYES
-                    ? reg.headTop + (reg.headBottom - reg.headTop) * 40 / 100
-                    : hy;
-                if (sil.rowMax[y] < sil.rowMin[y]) {
-                    y = hy;
-                }
-                gpui_aimbody_anchor_y[i] = y;
-                gpui_aimbody_anchor_x[i] = (sil.rowMin[y] + sil.rowMax[y]) / 2;
+                sumX[i] = 0;
+                sumY[i] = 0;
+                count[i] = 0;
             }
-        }
-        if (reg.legsValid) {
-            int ly = (reg.legsTop + sil.bottom) / 2;
-            if (reg.legSplit[ly] < 0) {
-                ly = reg.legsTop;
+            for (int y = sil.top; y <= sil.bottom; y++) {
+                const signed char* own = gpui_aim_owner + (size_t)y * fw;
+                for (int x = 0; x < fw; x++) {
+                    signed char o = own[x];
+                    if (o < 0) {
+                        continue;
+                    }
+                    for (int i = 0; i < 8; i++) {
+                        if (gpui_aim_order[i].location == o) {
+                            sumX[i] += x;
+                            sumY[i] += y;
+                            count[i]++;
+                            break;
+                        }
+                    }
+                }
             }
             for (int i = 0; i < 8; i++) {
-                int loc = gpui_aim_order[i].location;
-                if (loc != HIT_LOCATION_LEFT_LEG && loc != HIT_LOCATION_RIGHT_LEG) {
-                    continue;
+                if (count[i] == 0) {
+                    continue; // nothing reached this part: keep the proportional anchor
                 }
-                int split = reg.legSplit[ly];
-                if (split < 0) {
-                    continue;
-                }
-                gpui_aimbody_anchor_y[i] = ly;
-                gpui_aimbody_anchor_x[i] = gpui_part_on_screen_left(target, loc)
-                    ? (sil.rowMin[ly] + split) / 2
-                    : (split + sil.rowMax[ly]) / 2;
-            }
-        }
+                int cx = sumX[i] / count[i];
+                int cy = sumY[i] / count[i];
 
-        if (reg.trunkValid) {
-            int torsoY = (reg.trunkTop + reg.groinTop) / 2;
-            int groinY = (reg.groinTop + reg.trunkBottom) / 2;
-            int armY = (reg.trunkTop + reg.armBottom) / 2;
-            for (int i = 0; i < 8; i++) {
-                int loc = gpui_aim_order[i].location;
-                int y;
-                if (loc == HIT_LOCATION_TORSO) {
-                    y = torsoY;
-                } else if (loc == HIT_LOCATION_GROIN) {
-                    y = groinY;
-                } else if (loc == HIT_LOCATION_LEFT_ARM || loc == HIT_LOCATION_RIGHT_ARM) {
-                    y = armY;
-                } else {
-                    continue;
-                }
-
-                int tLo;
-                int tHi;
-                if (y < 0 || y >= fh || !gpui_trunk_row_split(&sil, y, &tLo, &tHi)) {
-                    continue;
+                // A centroid can land in a hole -- between two legs, inside the crook of an arm.
+                // Pull it onto the nearest pixel the part actually owns, along its own row first.
+                if (cx >= 0 && cx < fw && cy >= sil.top && cy <= sil.bottom
+                    && gpui_aim_owner[(size_t)cy * fw + cx] != (signed char)gpui_aim_order[i].location) {
+                    int best = -1;
+                    int bestDist = 1 << 30;
+                    for (int y = sil.top; y <= sil.bottom; y++) {
+                        const signed char* own = gpui_aim_owner + (size_t)y * fw;
+                        for (int x = 0; x < fw; x++) {
+                            if (own[x] != (signed char)gpui_aim_order[i].location) {
+                                continue;
+                            }
+                            int dx = x - cx;
+                            int dy = y - cy;
+                            int d = dx * dx + dy * dy;
+                            if (d < bestDist) {
+                                bestDist = d;
+                                best = y * fw + x;
+                            }
+                        }
+                    }
+                    if (best >= 0) {
+                        cy = best / fw;
+                        cx = best - cy * fw;
+                    }
                 }
 
-                gpui_aimbody_anchor_y[i] = y;
-                if (loc == HIT_LOCATION_LEFT_ARM || loc == HIT_LOCATION_RIGHT_ARM) {
-                    // Middle of that arm's own zone, so the two arms never resolve to the same
-                    // point and the stick can actually tell them apart.
-                    gpui_aimbody_anchor_x[i] = gpui_part_on_screen_left(target, loc)
-                        ? (sil.rowMin[y] + tLo) / 2
-                        : (tHi + sil.rowMax[y]) / 2;
-                } else {
-                    gpui_aimbody_anchor_x[i] = (tLo + tHi) / 2;
-                }
+                gpui_aimbody_anchor_x[i] = cx;
+                gpui_aimbody_anchor_y[i] = cy;
             }
         }
 
         gpui_aimbody_anchors_valid = boxHi >= boxLo;
+
+        // TEMPORARY DIAGNOSTIC (remove once the marker placement is settled). The screenshots
+        // measure the head ring ~5 px ABOVE the crown and the leg outline ~14 px BELOW the feet on
+        // the same critter -- marks cannot be both, so the frame this scan runs on is not the frame
+        // on screen, or the rect it is mapped through is not the sprite's. This line prints both
+        // sides of that mapping so it can be compared against the sprite instead of guessed at.
+        // Coalesced by `sub`, so holding the picker costs one line per changing state, not per frame.
+        {
+            int selIdxForTrace = -1;
+            for (int i = 0; i < 8; i++) {
+                if (gpui_aim_order[i].location == selLoc) {
+                    selIdxForTrace = i;
+                    break;
+                }
+            }
+            static int lastFid = -1;
+            static int lastFrame = -1;
+            static int lastRot = -1;
+            static int lastSel = -1;
+            if (target->fid != lastFid || target->frame != lastFrame
+                || target->rotation != lastRot || selLoc != lastSel) {
+                lastFid = target->fid;
+                lastFrame = target->frame;
+                lastRot = target->rotation;
+                lastSel = selLoc;
+                trace_event(TRACE_ACTION, "aim-draw",
+                    "who=%s pid=%d tile=%d "
+                    "fid=%08x frame=%d rot=%d anim=%d frm=%dx%d bound=(%d,%d)-(%d,%d) %dx%d "
+                    "win=(%d,%d)-(%d,%d) sil=%d..%d box=%d..%d head=%d[%d..%d x %d..%d] "
+                    "split=%d sel=%d at=(%d,%d)",
+                    object_name(target), target->pid, target->tile,
+                    target->fid, target->frame, target->rotation, FID_ANIM_TYPE(target->fid),
+                    fw, fh,
+                    b.ulx, b.uly, b.lrx, b.lry, b.lrx - b.ulx + 1, b.lry - b.uly + 1,
+                    winRect.ulx, winRect.uly, winRect.lrx, winRect.lry,
+                    sil.top, sil.bottom, boxLo, boxHi,
+                    reg.headValid ? 1 : 0, reg.headTop, reg.headBottom, reg.headLo, reg.headHi,
+                    partitioned ? 1 : 0, selLoc,
+                    selIdxForTrace >= 0 ? gpui_aimbody_anchor_x[selIdxForTrace] : -1,
+                    selIdxForTrace >= 0 ? gpui_aimbody_anchor_y[selIdxForTrace] : -1);
+            }
+        }
 
         // ONLY THE SELECTED PART IS MARKED.
         //
@@ -4178,11 +6059,19 @@ static void gpui_aimbody_draw(Object* target, int selLoc)
                 break;
             }
         }
-
-        // PREFERRED: trace the part's own outline. Falls through to the ring when this frame's
-        // shape did not yield the part (see gpui_aimbody_build_mask).
+        // ⚠️ THE HEAD IS TRACED LIKE EVERY OTHER PART NOW, AND THAT IS ONLY TRUE SINCE THE FLOOD.
+        // It used to be drawn as an ellipse, for a good reason at the time: the head "region" was a
+        // box invented by a rule, so tracing its boundary drew straight lines across the chest -- a
+        // green rectangle pasted on the character, and the better the box was measured the more
+        // precisely wrong it looked. The flood's head is not a box: on the outside it follows the
+        // sprite's own edge, and underneath it stops where the head's flood met the torso's, which
+        // is the neck. There is nothing left to apologise for with a reticle.
         bool outlined = false;
-        if (selIndex >= 0 && gpui_aimbody_build_mask(fd, fw, fh, &sil, &reg, target, selLoc)) {
+
+        // PREFERRED for the limbs and trunk: trace the part's own outline, where the mask's
+        // boundary really does follow the sprite (a leg's edge, an arm clear of the body). Falls
+        // through to the ring when this frame's shape did not yield the part.
+        if (!outlined && selIndex >= 0 && gpui_aimbody_build_mask(fd, fw, fh, &sil, &reg, target, selLoc)) {
             for (int py = sil.top; py <= sil.bottom; py++) {
                 int wy = b.uly + py - winRect.uly;
                 if (wy < 0 || wy >= winH) {
@@ -4357,43 +6246,19 @@ static int gpui_limb_for_screen_side(Object* obj, bool screenLeft, bool arm)
     return ownLeft ? HIT_LOCATION_LEFT_LEG : HIT_LOCATION_RIGHT_LEG;
 }
 
-// Classify one frame pixel into a body part using the SAME regions the outlines are drawn from.
-// -1 when the pixel falls outside every detected region (the caller then falls back).
+// Which body part owns one frame pixel -- now a direct read of the flood, so it can never disagree
+// with the outline the player is looking at. -1 = this critter was not divided up, or the pixel is
+// background or ground shadow. Unused by the stick (which picks by direction), kept because it is
+// the natural way to ask the question and costs one lookup.
 static int gpui_aimbody_classify(Object* target, int px, int py)
 {
-    const GpuiSilhouette* sil = &gpui_aim_sil;
-    const GpuiBodyRegions* reg = &gpui_aim_reg;
-
-    if (reg->headValid && py <= reg->headBottom) {
-        int headH = reg->headBottom - reg->headTop + 1;
-        return py <= reg->headTop + headH / 2 ? HIT_LOCATION_EYES : HIT_LOCATION_HEAD;
+    if (!gpui_aim_owner_valid) {
+        return -1;
     }
-
-    if (reg->trunkValid && py <= reg->trunkBottom) {
-        if (py >= reg->groinTop) {
-            return HIT_LOCATION_GROIN;
-        }
-        int tLo;
-        int tHi;
-        if (gpui_trunk_row_split(sil, py, &tLo, &tHi) && py <= reg->armBottom) {
-            if (px < tLo) {
-                return gpui_limb_for_screen_side(target, true, true);
-            }
-            if (px > tHi) {
-                return gpui_limb_for_screen_side(target, false, true);
-            }
-        }
-        return HIT_LOCATION_TORSO;
+    if (px < 0 || px >= gpui_aim_owner_w || py < 0 || py >= gpui_aim_owner_h) {
+        return -1;
     }
-
-    if (reg->legsValid && py >= reg->legsTop && py <= sil->bottom) {
-        int split = reg->legSplit[py];
-        if (split >= 0) {
-            return gpui_limb_for_screen_side(target, px <= split, false);
-        }
-    }
-
-    return -1;
+    return gpui_aim_owner[(size_t)py * gpui_aim_owner_w + px];
 }
 
 // Right stick -> body part.
@@ -4413,51 +6278,107 @@ static int gpui_aimbody_classify(Object* target, int px, int py)
 // crown). Nearest-anchor survives only as the fallback for a critter whose body could not be
 // segmented -- and even then in NORMALISED space, so a tall narrow sprite no longer makes the
 // vertical parts disproportionately hard to reach.
-static int gpui_aimbody_pick(Object* target, float sx, float sy, int curLoc)
+// ⚠️ AND WHY IT IS NOT "POINT AT THE PIXEL" ANY MORE EITHER. Classifying the pixel under the stick
+// was self-consistent and measurably unusable, because the eight parts do not get eight comparable
+// shares of the stick's travel -- they get whatever share their pixels happen to occupy in the
+// sprite's bounding box. Replaying this function over a 49x49 grid of stick positions on the exact
+// frame his trace named (MAMTNTAA rot 1) and counting where each stick position landed:
+//
+//     eyes 112   head 99   left arm 236   TORSO 272   right arm 353   groin 324
+//     right leg 164   LEFT LEG 12   (of ~1800 reachable stick positions)
+//
+// and the torso's 272 sat in a thin ring around the dead zone, i.e. only at one precise stick
+// magnitude. His own trace agrees: 61 samples of the picker in use, and `sel=` never once took the
+// value 3 (torso) or 5 (left leg). "Nejde mi na něm zaměřit trup" was not a feel, it was arithmetic:
+// the arms are wide, the torso is the narrow middle, and one leg swallows the other's half of the
+// gap whenever the split sits off-centre.
+//
+// ⚠️ AND WHY "FIXED ANATOMICAL BANDS" WAS STILL WRONG (2026-09-02). The bands that replaced the
+// pixel test were rectangles in (sx, sy), not wedges, so two of the eight parts were unreachable at
+// the only stick position a thumb actually holds -- the rim:
+//
+//     torso: |sx| < 0.40 AND |sy| < 0.34  ->  impossible past magnitude 0.52
+//     groin: 0.34 <= sy < 0.56            ->  push straight down to the stop (sy ~ 1.0) and you
+//                                             always land in a LEG instead
+//
+// That is arithmetic, not taste, and it is the same defect as the pixel version wearing a different
+// shape: a rule whose answer depends on HOW FAR the stick is pushed, when a thumb only ever knows
+// centre or rim. The measurements that kept coming back lopsided (torso 13 % of the disc but only
+// in a thin ring; his trace with sel= never once reading 3 or 5) were all reading that.
+//
+// THE RULE NOW: past the dead zone, ONLY THE ANGLE COUNTS. Eight equal 45-degree wedges, clockwise
+// from straight up, in the same order the marks sit on the body and the same order the wheels use:
+//
+//        N  head          NE  eyes         E   arm on the screen-right
+//        SE leg (right)   S   groin        SW  leg (screen-left)
+//        W  arm (left)    NW  torso
+//
+// So every part owns exactly 1/8 of every circle at every magnitude -- provably equal, nothing to
+// measure, nothing to starve. Up is the head because that is where a head is; the arms and legs go
+// to the side they are DRAWN on (gpui_limb_for_screen_side flips them when you see the critter's
+// back), so "push toward the leg you can see" is right whichever way it faces. The eyes are inside
+// the head, so they take the spare upper diagonal next to it.
+//
+// ⚠️ AND THE CENTRE IS THE TORSO -- IT IS NOT "HOLD WHAT YOU HAD". The first version of this ring
+// latched the selection inside the dead zone, and that broke the one movement everybody makes:
+// "proč sjedu z hlavy na groin místo hlava trup groin?" Dragging the stick from up to down passes
+// through the CENTRE, where a latch means nothing changes, so the sweep read head -> groin and the
+// torso -- the part in the middle of the body -- was nowhere on the path. The centre of the stick IS
+// the middle of the body: releasing it selects the torso, and a vertical drag now walks head, torso,
+// groin in that order, which is what the body looks like. The torso keeps its up-left wedge too, so
+// it can also be picked without letting go.
+//
+// The on-body marks still show WHERE each part is; they no longer decide whether it can be picked.
+
+// The pure geometry, kept free of the target so it can be lifted verbatim into the offline harness
+// and measured over a grid of stick positions (see [[aim-body-segmentation]]). Returns the ring
+// slot 0..7 clockwise from up, or -1 when the stick is at rest.
+static int gpui_aim_ring_slot(float sx, float sy)
 {
     if (sx * sx + sy * sy < GPUI_AIM_STICK_MIN * GPUI_AIM_STICK_MIN) {
-        return curLoc; // stick at rest (or barely nudged): hold the selection
+        return -1;
     }
-    if (target == NULL || !gpui_aimbody_anchors_valid) {
+
+    // atan2(x, -y): 0 at straight up, growing clockwise, because the stick's y axis points DOWN.
+    float a = atan2f(sx, -sy);
+    if (a < 0.0f) {
+        a += 2.0f * GPUI_PI;
+    }
+
+    // Wedges are CENTRED on their direction, hence the half-wedge offset: straight up is the middle
+    // of slot 0, not its edge.
+    int slot = (int)((a + GPUI_PI / 8.0f) / (GPUI_PI / 4.0f)) % 8;
+    return slot < 0 ? 0 : slot;
+}
+
+static int gpui_aimbody_pick(Object* target, float sx, float sy, int curLoc)
+{
+    int slot = gpui_aim_ring_slot(sx, sy);
+    if (slot < 0) {
+        return HIT_LOCATION_TORSO; // stick at rest = the middle of the body
+    }
+    if (target == NULL) {
         return curLoc;
     }
 
-    float halfW = (gpui_aimbody_box.lrx - gpui_aimbody_box.ulx) * 0.5f;
-    float halfH = (gpui_aimbody_box.lry - gpui_aimbody_box.uly) * 0.5f;
-    float cx = (gpui_aimbody_box.ulx + gpui_aimbody_box.lrx) * 0.5f;
-    float cy = (gpui_aimbody_box.uly + gpui_aimbody_box.lry) * 0.5f;
-
-    float aimX = cx + sx * halfW * 1.05f;
-    float aimY = cy + sy * halfH * 1.05f;
-
-    // Clamp into the body box so full deflection lands ON the extreme part rather than past it.
-    if (aimX < gpui_aimbody_box.ulx) aimX = (float)gpui_aimbody_box.ulx;
-    if (aimX > gpui_aimbody_box.lrx) aimX = (float)gpui_aimbody_box.lrx;
-    if (aimY < gpui_aimbody_box.uly) aimY = (float)gpui_aimbody_box.uly;
-    if (aimY > gpui_aimbody_box.lry) aimY = (float)gpui_aimbody_box.lry;
-
-    int hit = gpui_aimbody_classify(target, (int)(aimX + 0.5f), (int)(aimY + 0.5f));
-    if (hit >= 0) {
-        return hit;
+    switch (slot) {
+    case 0:
+        return HIT_LOCATION_HEAD;
+    case 1:
+        return HIT_LOCATION_EYES;
+    case 2:
+        return gpui_limb_for_screen_side(target, false, true); // arm, screen-right
+    case 3:
+        return gpui_limb_for_screen_side(target, false, false); // leg, screen-right
+    case 4:
+        return HIT_LOCATION_GROIN;
+    case 5:
+        return gpui_limb_for_screen_side(target, true, false); // leg, screen-left
+    case 6:
+        return gpui_limb_for_screen_side(target, true, true); // arm, screen-left
+    default:
+        return HIT_LOCATION_TORSO;
     }
-
-    // Fallback: nearest anchor, measured in box-normalised units so the box's aspect ratio does
-    // not weight one axis against the other.
-    if (halfW < 1.0f) halfW = 1.0f;
-    if (halfH < 1.0f) halfH = 1.0f;
-
-    int best = curLoc;
-    float bestD = -1.0f;
-    for (int i = 0; i < 8; i++) {
-        float dx = (aimX - gpui_aimbody_anchor_x[i]) / halfW;
-        float dy = (aimY - gpui_aimbody_anchor_y[i]) / halfH;
-        float d = dx * dx + dy * dy;
-        if (bestD < 0.0f || d < bestD) {
-            bestD = d;
-            best = gpui_aim_order[i].location;
-        }
-    }
-    return best;
 }
 
 // Tears the picker down and puts the iso crosshair back. Every exit from the picker goes through
@@ -4479,8 +6400,8 @@ static void gpui_aim_picker_close()
 }
 
 // LT tap/hold aimed shot. TAP (< GPUI_AIM_TAP_MS) fires instantly at the last-used part; HOLD brings
-// up the on-body green markers (right stick selects), release fires the selected part -- or B
-// cancels, which is the only way out that does NOT spend the shot.
+// up the AIM wheel (right stick picks a part) with the chosen part marked on the target's body;
+// release fires it -- or B cancels, which is the only way out that does NOT spend the shot.
 // --- "USE THE THING IN MY HAND ON THAT" (hold A) ------------------------------------------------
 //
 // His design, and it turned out the engine already has the whole flow -- only the pad had no way in.
@@ -4515,11 +6436,48 @@ static bool gpui_useon_item_in_hand()
     return proto_action_can_use_on(item->pid);
 }
 
+// --- WHERE THE USE-ON CROSSHAIR APPEARS ---------------------------------------------------------
+//
+// ⚠️ IT USED TO ARM WHEREVER THE POINTER HAPPENED TO HAVE BEEN LEFT, and in free play the pointer is
+// hidden and has not moved for minutes -- so holding A on a flare armed a crosshair somewhere off in
+// the corner of the map, and the throw began with a hunt for it.
+//
+// His rule: it belongs in front of the dude's eyes. So it parks GPUI_USEON_PARK_TILES tiles along
+// the direction he is FACING (obj_dude->rotation -- the same facing the walk/free-movement mover
+// writes), at the centre of that tile, using the engine's own tile-centre convention of +16/+15
+// (gmouse.cc:2376). Facing west, the crosshair arms to the west of him, already over the ground he
+// was looking at.
+#define GPUI_USEON_PARK_TILES 3
+
+static void gpui_useon_park_cursor()
+{
+    if (obj_dude == NULL) {
+        return;
+    }
+
+    int sx;
+    int sy;
+    int dest = tile_num_in_direction(obj_dude->tile, obj_dude->rotation, GPUI_USEON_PARK_TILES);
+
+    // Facing off the edge of the map: his own feet are still "in front of him", and they are always
+    // a valid place to start aiming from.
+    if (dest < 0 || tile_coord(dest, &sx, &sy, obj_dude->elevation) != 0) {
+        if (tile_coord(obj_dude->tile, &sx, &sy, obj_dude->elevation) != 0) {
+            return;
+        }
+    }
+
+    gpui_park_cursor_at(sx + 16, sy + 15);
+}
+
 static void gpui_useon_arm(SDL_GameController* pad)
 {
     static bool prevA = false;
     static unsigned int aDownTime = 0;
     static bool aHandled = false; // this hold already armed; don't retry every frame
+    // This press turned the world click OFF -- whether it armed a cursor or not -- and owes turning it
+    // back on at the release. See the note at the release.
+    static bool aSuppressing = false;
 
     bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool aEdge = aNow && !prevA;
@@ -4535,9 +6493,18 @@ static void gpui_useon_arm(SDL_GameController* pad)
         // Let A click again. Held down, the press that armed the cursor must not ALSO reach the
         // world -- otherwise the same hold arms the mode and immediately spends it on whatever the
         // cursor happened to be over.
-        if (aHandled) {
+        //
+        // ⚠️ WHOEVER TURNED IT OFF TURNS IT BACK ON (2026-10-10). This used to clear it only when the
+        // hold had ARMED a cursor (aHandled) -- but a hold with nothing use-on-able in hand switches
+        // the click off too (below) and never sets aHandled, so one long A at a door left every later
+        // A click dead for the rest of the session. The A that should confirm a lockpick or a rope
+        // was swallowed and only RT, which clicks on its own path, still worked:
+        // trace_2026-10-10_115753 s=563.81 / 577.03, A twice at the door with the lockpick armed,
+        // nothing; RT, used. *"když klikám itemy jako provaz na šachtu, musím zmáčknout R2"*.
+        if (aHandled || aSuppressing) {
             gamepad_ui_set_suppress_a_click(false);
         }
+        aSuppressing = false;
 
         // The press never became a hold, so it was a TAP after all: run the interaction that
         // gpui_action_buttons held back. interact_prompt_request only QUEUES the action (it is
@@ -4574,10 +6541,25 @@ static void gpui_useon_arm(SDL_GameController* pad)
     }
 
     if (!gpui_useon_item_in_hand()) {
-        return; // hold A keeps its normal meaning
+        // ⚠️ A HOLD WITH NOTHING TO ARM MUST DO WHAT A TAP DOES, NOT SOMETHING ELSE.
+        //
+        // Without this the held press fell through to the raw world CLICK that gpui_action_buttons
+        // synthesises -- and a raw click lands on whatever the cursor is over, not on the object the
+        // interact prompt is offering. In the Glow elevator that is the difference between the floor
+        // panel and the door beside it: "když držím Ačko tak to ty dveře zavře, jinak patra". Three
+        // rounds of looking inside the elevator missed it, because the elevator was never the
+        // problem -- the press simply went somewhere else on its way.
+        //
+        // Suppressing only the CLICK is deliberate: the interaction the press deferred is still
+        // sitting in gpui_a_interact_deferred and fires on release, so a hold now performs exactly
+        // the same action a tap would. The suppression is cleared on that release (above).
+        gamepad_ui_set_suppress_a_click(true);
+        aSuppressing = true;
+        return;
     }
 
     aHandled = true;
+    aSuppressing = true;
     // The press turned out to be a hold, so the interaction gpui_action_buttons deferred is
     // cancelled outright -- arming REPLACES it, it does not follow it.
     gpui_a_interact_deferred = false;
@@ -4585,25 +6567,27 @@ static void gpui_useon_arm(SDL_GameController* pad)
     gsound_play_sfx_file("ib1p1xx1");
     intface_use_item();
 
+    // ...and put it in front of his eyes rather than wherever the pointer was abandoned. Only once
+    // the mode is really up: intface_use_item() is the authority on whether this item arms anything.
+    if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        gpui_useon_park_cursor();
+    }
+
     // Show the cursor you just armed. It is also what makes the confirming A land at all: a world
     // click at a HIDDEN cursor is dropped on purpose (gpui_action_buttons), so an armed crosshair
     // nobody can see would refuse every press.
     gpui_cursor_show_time = get_time();
 }
 
-// ⚠️ THE AIMED SHOT IS ON THE LEFT TRIGGER, NOT LB (swapped with RUN, 2026-08-29). The local names below
-// still read `lb*` on purpose: they are the tap/hold edge machinery, and renaming a dozen of them
-// buys nothing while making this diff unreadable against the history that explains the tap-vs-hold
-// split. Only the SOURCE of the press changed.
-//
-// LT is an ANALOG axis, not a button, so the read is a threshold rather than a boolean -- the one
-// real difference the swap introduced. Everything downstream (GPUI_AIM_TAP_MS, the B-cancel
-// handshake, gpui_aim_canceled) is untouched.
+// AIMING IS LB (hold = the called-shot window, which binds a part AND puts the weapon slot on its
+// AIMED mode) + RT (attack -- aimed while the slot shows the bullseye). RB is the heal since
+// 2026-10-09. ⚠️ RT IS ONLY EVER THE ATTACK BUTTON: while the picker is up that
+// attack simply lands on the part you chose, which is his rule -- "RT bude jen utok".
 static void gpui_aim_wheel(SDL_GameController* pad)
 {
     static bool prevLb = false;
-    static bool prevB = false;
-    static unsigned int lbDownTime = 0;
+
+    static bool prevRt = false;
 
     // Settle latch: which part the stick is currently ARGUING for, and since when. Statics rather
     // than fields because the picker is a singleton -- one target, one selection, at a time.
@@ -4611,24 +6595,35 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     static unsigned int aimPendSince = 0;
 
     // ⚠️ DEFAULTED FALSE HERE, BEFORE ANY EARLY RETURN, AND RE-ASSERTED LOWER DOWN.
-    // This function has seven early returns above the point where the flag used to be computed,
-    // so any of them left the previous frame's value standing. Stuck at true it claims the right
-    // stick permanently -- and because the guards that read it live in the MOUSE HOOK, which runs
-    // inside every modal loop, that killed the cursor everywhere: inventory, barter, dialogue.
+    // This function has early returns above the point where the flag used to be computed, so any
+    // of them left the previous frame's value standing. Stuck at true it claims the right stick
+    // permanently -- and because the guards that read it live in the MOUSE HOOK, which runs inside
+    // every modal loop, that killed the cursor everywhere: inventory, barter, dialogue.
     // "joystick ani dpad vubec nereaguje". A per-frame flag must never depend on which branch ran.
     gpui_aim_gesture = false;
-    static bool lbLatch = false;
-    static unsigned int lbLatchLowAt = GPUI_TRIGGER_NOT_LOW;
-    bool lbNow = gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT, &lbLatch, &lbLatchLowAt);
-    bool lbEdge = lbNow && !prevLb;
-    bool lbReleased = !lbNow && prevLb;
+
+    // ⚠️ THE PICKER IS ON LB NOW, NOT LT (his call, 2026-09-16). LB is a DIGITAL button, so there
+    // is no Schmitt trigger and no hard-zero debounce to worry about on this side any more -- a
+    // shoulder is either down or it is not, which is the whole reason the aiming gesture kept
+    // breaking while it lived on an analog axis. RT still needs the analog treatment.
+    static bool rtLatch = false;
+    static unsigned int rtLatchLowAt = GPUI_TRIGGER_NOT_LOW;
+    bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    bool rtNow = gpui_trigger_held(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, &rtLatch, &rtLatchLowAt);
+    bool rtEdge = rtNow && !prevRt;
     prevLb = lbNow;
+    prevRt = rtNow;
 
-    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
-    bool bPressed = bNow && !prevB;
-    prevB = bNow;
+    // R3 = THE CALLED-SHOT WINDOW (2026-10-09). Edge-detected here, above every early return, for
+    // the same reason the flag above is: a click read on only some paths is a click from the past.
+    static bool prevR3 = false;
+    bool r3Now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
+    bool r3Edge = r3Now && !prevR3;
+    prevR3 = r3Now;
 
-    // Don't run the aim picker while the skill wheel (L3) owns the shared radial overlay.
+
+    // Don't run the aim picker while a wheel (skills on LB, drugs on Y, weapons on X, ammo on RB) owns the
+    // shared radial overlay.
     if (radial_wheel_is_open()) {
         gpui_aim_picker_close();
         return;
@@ -4638,28 +6633,29 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     // inventory / disabled bar over the screen.
     bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_can_aim();
 
-    // Picker already up (LT held past the tap threshold): move the selection with the right stick and
-    // redraw the markers; on release fire the selected part. Blocked / target gone -> tear down.
+    // PICKER UP (LB is down): the right stick moves the mark and RT attacks the chosen part as
+    // often as the cooldown allows. LETTING GO OF LB is the way out -- it puts the markers away
+    // without firing, which is why looking at a target costs you nothing.
+    //
+    // ⚠️ B IS NOT A CANCEL HERE ANY MORE: LB+B IS THE HEAL. Two meanings for B on a held LB would
+    // be a coin toss in the exact moment you are bleeding, and the release already cancels, so B
+    // was the half of that pair with nothing to lose. A B pressed in here falls through to the
+    // heal in gpui_button_shortcuts and leaves the picker standing -- deliberately: patching
+    // yourself up should not cost you the aim you had lined up.
     if (gpui_aim_body_on) {
         // The picker owns the stick for as long as it is up; this branch returns before the
         // assignment further down, so it has to say so itself.
         gpui_aim_gesture = true;
         Object* target = combat_rt_aim_target();
-        if (blocked || target == NULL) {
+        if (blocked || target == NULL || !lbNow) {
+            // LB released (or the shot became impossible): put the markers away. NOT a shot.
             gpui_aim_picker_close();
-        } else if (bPressed) {
-            // CANCEL. Before this the picker had no exit but the shot: releasing LT always fired,
-            // so bringing the markers up to LOOK at a target -- or changing your mind about the
-            // part -- cost you an aimed attack. B is the cancel everywhere else in this UI.
-            // gpui_aim_swallow_b keeps the same press from also cycling the weapon's firing mode
-            // in gpui_button_shortcuts, and gpui_aim_canceled eats the LT release still to come.
-            gpui_aim_picker_close();
-            gpui_aim_canceled = true;
-            gpui_aim_swallow_b = true;
-        } else if (lbReleased || gpui_wheel_a_edge) {
-            gpui_aim_picker_close();
-            combat_rt_aimed_attack(gpui_aim_last_part);
         } else {
+            if (rtEdge) {
+                trace_event(TRACE_INPUT, "aim-fire", "part=%d", gpui_aim_last_part);
+                combat_rt_aimed_attack(gpui_aim_last_part);
+            }
+
             float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / GPUI_AXIS_MAX;
             float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / GPUI_AXIS_MAX;
 
@@ -4682,53 +6678,71 @@ static void gpui_aim_wheel(SDL_GameController* pad)
         return;
     }
 
-    // Picker not up yet -- TAP vs HOLD on LT:
-    //  - TAP (press+release under GPUI_AIM_TAP_MS): fire immediately at the last-used part.
-    //  - HOLD (past the threshold): bring up the on-body markers to pick a different part.
-    if (lbEdge) {
-        lbDownTime = get_time();
-        gpui_aim_canceled = false; // a fresh press starts a fresh aim
-
-        // ⚠️ SAY WHY, RATHER THAN DO NOTHING. `blocked` folds in combat_rt_can_aim(), and three of
-        // its reasons are vanilla rules that are invisible on the interface bar -- Fast Shot bans
-        // called shots for the whole game, burst and continuous modes cannot be aimed, and neither
-        // can flame/explosive/EMP. Refusing in silence is indistinguishable from a dead button, and
-        // that is exactly how it was read: the trigger was held for 900 ms and 650 ms, cleanly, and
-        // nothing happened, twice in a row.
-        //
-        // Once per PRESS, never per frame: this runs at frame rate while the trigger is down.
+    // ⚠️ R3 = THE CALLED-SHOT WINDOW (2026-10-09, *"R3 bude vybírání končetin"*). It opened on an LB
+    // hold until then, and R3 was a lock toggle. For about ten minutes the same evening LB held was
+    // the target lock instead -- *"neee LB bude jen reload, srát na zámek"*: LB is the reload and
+    // nothing else (its release, gpui_button_shortcuts), and the lock is LT's hold alone.
+    // R3: open the called-shot window on the click, or refuse audibly.
+    if (r3Edge) {
         if (blocked) {
+            // ⚠️ THE REFUSAL IS A SOUND, NOT A SENTENCE. It used to print the reason into the
+            // message window, because refusing in silence is indistinguishable from a dead button.
+            // That was right when the aim was an invisible gesture on a trigger; now a refused hold
+            // simply never draws the markers, which says the same thing without a line of text in
+            // the console every time a burst weapon is in your hands ("at to nevypisuje takové
+            // zbytečnosti do konzole"). The reason still goes to the TRACE, so "why did nothing
+            // happen" is still answerable afterwards -- and combat_rt_aim_refusal() stays, because
+            // it is the only place that separates Fast Shot from a burst from a flamer.
             const char* why = combat_rt_aim_refusal();
             gsound_play_sfx_file("iisxxxx1");
-            if (why != NULL && !gamepad_ui_menu_active() && !inven_any_open()) {
-                // display_print takes char*, so copy rather than cast the const away.
-                char msg[96];
-                snprintf(msg, sizeof(msg), "%s", why);
-                display_print(msg);
+            trace_event(TRACE_INPUT, "aim-refused", "why=%s", why != NULL ? why : "?");
+        } else {
+            // ⚠️ THE VANILLA CALLED-SHOT WINDOW, NOT OUR ON-BODY PICKER (2026-09-24). His call, said
+            // three times in a row so there could be no mistaking it: *"chci jako to je ve vanilla,
+            // změníme to úplně"*. So the pad opens the window the game has always had (on R3 since
+            // 2026-10-09, on an LB hold before) -- the critter's
+            // called-shot picture, eight named locations, the real to-hit chance beside each, Cancel
+            // -- with a controller taught to it (combat_called_shot_pick).
+            //
+            // ⚠️ CHOOSING BINDS, IT DOES NOT FIRE (his design, and it replaced "choosing fires" the
+            // same evening): *"držím tlačítko, najedu na tělo a po puštění je vpravo dole nabindován
+            // RB na střelbu končetin"*. So the whole thing is ONE gesture -- hold LB, run the
+            // selection onto the limb, let go -- and what you get is the part BOUND, printed in the
+            // weapon slot beside its bullseye (intface_update_aim_part, fed from gpui_aim_last_part on
+            // the tick). Until 2026-10-09 RB fired it; since then binding also puts the weapon slot
+            // on its AIMED mode and RT fires it, at the price the slot prints.
+            //
+            // Nothing in this window pulls a trigger any more, not even A: he had just reported
+            // "áčko spustí střelbu" and a picker that fires on confirm is the same complaint one
+            // screen further in. A and a second R3 click both mean the same thing here -- take this
+            // part -- and B cancels. (Letting go of LB confirmed while LB opened it; see combat.cc.)
+            //
+            // The on-body picker (gpui_aimbody_*, the hand-painted masks, the stick wedges) is left
+            // in the tree but is now unreachable -- ⚠️ DO NOT DELETE IT without asking him: those
+            // masks are his own work, painted in Aseprite over several rounds, and "change it
+            // completely" was about which UI opens, not about burning that.
+            Object* aimTarget = combat_rt_aim_target();
+            int part = aimTarget != NULL
+                ? combat_called_shot_pick(aimTarget, combat_rt_player_hit_mode(), gpui_aim_last_part)
+                : -1;
+            trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d", part,
+                aimTarget != NULL ? aimTarget->pid : -1);
+            if (part >= 0) {
+                gpui_aim_last_part = part;
+                // ...AND THE SLOT GOES TO ITS AIMED MODE (2026-10-09): binding a part means "aim
+                // there", so the next RT does, at the aimed price the slot now prints beside its
+                // bullseye. LT+Y steps back out of it. Still nothing is fired here.
+                bool aimed = intface_item_set_aiming();
+                trace_event(TRACE_INPUT, "aim-bind", "part=%d slot-aimed=%d", part, aimed ? 1 : 0);
+                gsound_play_sfx_file("ib1p1xx1");
             }
         }
     }
 
-    // The stick belongs to the aim for as long as the trigger is down and the aim is still live.
-    // Dropped the moment it is cancelled or refused, so a blocked trigger never holds the cursor
-    // hostage.
-    if (lbNow && !blocked && !gpui_aim_canceled) {
-        gpui_aim_gesture = true;
-    }
-    if (lbNow && !blocked && !gpui_aim_canceled && get_time() - lbDownTime >= GPUI_AIM_TAP_MS) {
-        gpui_aim_body_on = true;
-        aimPendPart = gpui_aim_last_part; // a fresh picker starts settled on what it shows
-        // The crosshair art is a big red reticle painted over the middle of the body -- exactly
-        // where the outline and label we are about to draw need to be readable.
-        gmouse_set_cursor_suppressed(true);
-        gpui_aimbody_draw(combat_rt_aim_target(), gpui_aim_last_part);
-    } else if (lbReleased && !blocked) {
-        // A cancelled aim must not fire on the release that follows it.
-        if (!gpui_aim_canceled) {
-            combat_rt_aimed_attack(gpui_aim_last_part);
-        }
-        gpui_aim_canceled = false;
-    }
+    // ⚠️ NO STICK CLAIM ON A HELD LB ANY MORE. The picker used to take gpui_aim_gesture for as long
+    // as LB was down, and that flag is what stops RT attacking (gamepad_ui_aim_gesture_active) --
+    // with LB just the reload, a held LB must not silence RT. The window is modal; it needs no
+    // claim from out here.
 }
 
 // mouse_info() hook: contributes right-stick cursor movement, the RT-as-left-
@@ -4738,9 +6752,27 @@ static void gpui_aim_wheel(SDL_GameController* pad)
 // the real mouse.
 static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
 {
+    // WHAT THE REAL MOUSE ALREADY SAID THIS FRAME, captured before any emitter below adds to it.
+    // Two things need to tell the player's own mouse apart from something we synthesised, and both
+    // of them are the STEAM DECK'S RIGHT TRACKPAD: in mouse mode Steam Input feeds it to the game
+    // as an ordinary OS-level mouse (motion, and a real left button under the pad click), so it
+    // arrives here in *dx/*dy/*buttons exactly like a desktop mouse -- while a controller is
+    // connected at the same time, which is the case neither of the two pieces below expected.
+    bool realMouseMoved = (*dx != 0 || *dy != 0);
+    bool realLeftDown = (*buttons & MOUSE_STATE_LEFT_BUTTON_DOWN) != 0;
+
     SDL_GameController* pad = gamepad_ui_get_controller();
     if (pad == NULL) {
         return;
+    }
+
+    // MOVING THE MOUSE SUMMONS THE POINTER, the same way a right-stick nudge does. With a pad
+    // connected the cursor is drawn only for GPUI_CURSOR_SHOW_MS after the stick moves it (see
+    // gpui_hide_cursor_predicate), and the stamp lived solely in the stick branch below -- so
+    // trackpad (or desktop mouse) motion was pushing an INVISIBLE cursor around the world.
+    // Draw-only, like the rest of that mechanism: it cannot touch controller input.
+    if (realMouseMoved) {
+        gpui_cursor_show_time = get_time();
     }
 
     SDL_GameControllerUpdate();
@@ -4775,6 +6807,16 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     //
     // Edge-triggered with a re-centre arm (same shape as rt_directional_lock): one push steps
     // exactly one object and a held stick does not spin through the room.
+    // An ARMED cursor (the rope, a skill) steps between the objects it can be used on, see
+    // gpui_tpick_stick; where nothing lies that way it falls through to the free pointer below.
+    bool tpickTook = false;
+    if (gpui_targeting_cursor_armed() && !lockedGameplay && !radial_wheel_is_open() && !gpui_self_nav
+        && !gamepad_ui_menu_active() && !dialog_active() && !inven_any_open()) {
+        tpickTook = gpui_tpick_stick(x, y, mag);
+    } else if (!gpui_targeting_cursor_armed()) {
+        gpui_tpick_reset();
+    }
+
     bool ipPickTook = false;
     if (!lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_aim_gesture && !gpui_self_nav
         && !gamepad_ui_menu_active() && !dialog_active() && !inven_any_open()
@@ -4830,12 +6872,41 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         && select_window_id == -1
         && intface_is_enabled();
 
-    if (mag > gpui_stick_deadzone && !inWorld && !ipPickTook && !lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_aim_gesture && !gpui_self_nav) {
+    // The world map's exception to self_nav (see gpui_self_nav_cursor). It also stands outside
+    // `inWorld`: the interface bar is merely hidden over there, so the world test can read true.
+    bool selfNavCursor = gpui_self_nav && gpui_self_nav_cursor && !gamepad_ui_menu_active();
+
+    // ⚠️ THE SPEED IS PIXELS PER CALL, AND THE WORLD MAP CALLS LESS OFTEN. cursor_speed was tuned on
+    // screens that run at the shared 60 fps; the world map busy-waits itself down to 24 fps for as
+    // long as the party is moving, so a per-call speed would cross the map at 40 % of the speed it
+    // has everywhere else -- and the report was exactly "pravá páčka ve world mapě chodí pomaleji".
+    // Scaled by the real time since the previous call, relative to a 60 fps frame. Floored at 1, so a
+    // screen that runs AT 60 is untouched to the pixel, and capped so a hitch cannot fling the
+    // pointer across the screen.
+    static unsigned int lastCursorCallMs = 0;
+    unsigned int cursorNowMs = get_time();
+    float cursorFrameScale = 1.0f;
+    if (lastCursorCallMs != 0) {
+        cursorFrameScale = (float)(cursorNowMs - lastCursorCallMs) / (1000.0f / 60.0f);
+        if (cursorFrameScale < 1.0f) {
+            cursorFrameScale = 1.0f;
+        } else if (cursorFrameScale > 4.0f) {
+            cursorFrameScale = 4.0f;
+        }
+    }
+    lastCursorCallMs = cursorNowMs;
+
+    if (mag > gpui_stick_deadzone && (selfNavCursor || (!inWorld && !gpui_self_nav)) && !ipPickTook && !tpickTook && !lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on && !gpui_aim_gesture) {
         float t = (mag - gpui_stick_deadzone) / (1.0f - gpui_stick_deadzone);
         if (t > 1.0f) {
             t = 1.0f;
         }
         float speed = t * t * gpui_cursor_max_speed;
+        if (selfNavCursor) {
+            // Only here: every other screen that drives the pointer runs at the shared 60 fps, and
+            // leaving them alone means none of them can change feel because of this.
+            speed *= cursorFrameScale;
+        }
         *dx += (int)(x / mag * speed);
         *dy += (int)(y / mag * speed);
 
@@ -4861,10 +6932,20 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         gpui_menu_snap(pad, dx, dy);
     }
 
-    // Right trigger -> left mouse button. Level-based: held = button down, so a
-    // press-release is exactly one click (no auto-repeat) and holding lets you
-    // drag.
-    if (SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > GPUI_TRIGGER_THRESHOLD) {
+    // Right trigger -> left mouse button ON THE SCREENS ONLY. RT is what presses the thing under
+    // the cursor in menus, the inventory, barter, dialogue, load/save and the character editor.
+    //
+    // ⚠️ AND NEVER IN THE WORLD, because out there RT IS THE ATTACK (combat_rt reads it directly).
+    // Letting the same pull also land a world click meant the engine acted on the cursor -- walk
+    // over there, or use whatever it sat on -- instead of, or on top of, the shot. That is "rt má
+    // střílet, ne?": the trigger was doing the old A-button's click job while the attack it was
+    // supposed to be was fighting it for the same frame.
+    //
+    // ⚠️ `inWorld` is FALSE while a use-on cursor is armed (gpui_targeting_cursor_armed), which is
+    // deliberate: the rope/lockpick crosshair is aimed with the pointer and confirmed with a click,
+    // so RT has to reach the world there. That is the one world case that still wants the click.
+    if (!inWorld && !gpui_aim_gesture && !gpui_aim_body_on
+        && SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > GPUI_TRIGGER_THRESHOLD) {
         *buttons |= MOUSE_STATE_LEFT_BUTTON_DOWN;
     }
 
@@ -4905,8 +6986,15 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     // -- RT is the deliberate click, and holding it must still work for the buttons the pad nav
     // does not step through (PRINT / DONE / OPTIONS).
     //
+    // ⚠️ AND A REAL MOUSE CLICK IS NOT OURS TO VETO. Only a left button that was synthesised
+    // INSIDE this hook is stripped; one that was already down on entry came from the player's own
+    // mouse -- on the Steam Deck, the right trackpad's click -- and these are still mouse-driven
+    // screens with buttons the pad nav does not step through. Stripping it blindly made the
+    // character editor and the New Game selection screen unclickable with a trackpad whenever a
+    // controller was plugged in, which on a Deck is always.
+    //
     // The trace fires once per veto with a backtrace, so the emitter finally names itself.
-    if (gpui_suppress_a_click && (*buttons & MOUSE_STATE_LEFT_BUTTON_DOWN) != 0) {
+    if (gpui_suppress_a_click && !realLeftDown && (*buttons & MOUSE_STATE_LEFT_BUTTON_DOWN) != 0) {
         // NOT conditioned on A being held. An emitter that sets the bit on the RELEASE frame, or
         // one frame late off a latch, would walk straight through such a test -- and after three
         // failed fixes I am not assuming anything about WHEN it is set. The deliberate click is the
@@ -4946,6 +7034,22 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
 // gpui_mouse_hook_impl clears the flag before gpui_button_shortcuts -- see the note there.
 static void gpui_mouse_hook(int* dx, int* dy, int* buttons)
 {
+    // ⚠️ AND THE OTHER HALF OF THAT WARNING: A MAP LOAD IS NOT A WORLD TO LOOK AT.
+    // The latch below only stops OUR recursion. It does nothing about a FIRST entry that
+    // lands inside the engine's own read -- which is what map_load_file's 8 KB mouse pump
+    // is, and it crashed the game travelling Shady Sands -> Raiders (trace 2026-09-16,
+    // ACCESS_VIOLATION read 0xffffffffffffffff). obj_remove_all had already freed the map
+    // and scr_load was mid-way through building the script lists, so the hook's interactable
+    // scan (ip_collect -> ip_classify -> scr_ptr) walked a script extent whose length and
+    // next pointer were still uninitialised malloc garbage. Nothing the pad does during a
+    // load is wanted anyway: there is no world to point at, and the loading cursor is the
+    // engine's own. Button edges resolve on the first frame after -- the same as the
+    // controller being unplugged for a moment -- so no press survives the load to leak a
+    // click into the map you just arrived on.
+    if (map_is_loading()) {
+        return;
+    }
+
     if (gpui_in_mouse_hook) {
         return;
     }
@@ -5003,7 +7107,6 @@ void gamepad_ui_tick()
         // Controller vanished mid-selection: drop the overlay so it can't linger.
         if (radial_wheel_is_open()) {
             radial_wheel_close();
-            gpui_release_aim_figure();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
         }
         // No controller -> restore the pointer (a mouse/keyboard player needs it).
@@ -5031,7 +7134,8 @@ void gamepad_ui_tick()
         prevA = aNow;
     }
 
-    // Keep the interface-bar heal slot in step with the pack. Polled rather than pushed: a
+    // Keep the heal slot (the side panel right of the bar, or the bar itself on a 640-wide screen)
+    // in step with the pack. Polled rather than pushed: a
     // stimpak can leave the inventory through looting, bartering, a script or a load, and this
     // is the one place that sees all of them. intface_update_heal_slot is a no-op unless the
     // item or the count actually changed.
@@ -5041,17 +7145,57 @@ void gamepad_ui_tick()
         intface_update_heal_slot(heal, healCount);
     }
 
-    // LB+B heal, drained before the wheels: it is a completed gesture, not an overlay, and
+    // ...and the aimed part for the weapon slot, which prints it beside the bullseye while the slot is
+    // AIMED: the remembered part is what RT fires at then.
+    // Also a no-op unless it changed, so polling costs a compare.
+    intface_update_aim_part(gpui_aim_last_part);
+
+    // The Y-tap heal, drained before the wheels: it is a completed gesture, not an overlay, and
     // doing it here keeps every item use on the same safe tick.
     if (gpui_heal_pending) {
         gpui_heal_pending = false;
         gpui_use_best_heal();
     }
 
+    // The LB-tap reload with its animation (MODS "Reload animation"). Waits for the body to come
+    // free -- a swing tail, a step -- but not forever: past GPUI_RELOAD_WAIT_MS the press is stale,
+    // and acting on it seconds later would read as the game reloading by itself. The drop is AUDIBLE,
+    // because a reload that silently never happened is exactly the "Jak je reload?" question again.
+    // A reload that took its points and then did not finish -- the loop was replaced by a knockdown,
+    // or the player walked or fired out of it -- gives them back. Checked BEFORE a new start below,
+    // so a loop registered this very tick is never judged before it has drawn a frame.
+    if (gpui_reload_charged && !combat_rt_is_reloading(obj_dude)) {
+        gpui_reload_charged = false;
+        combat_rt_refund_ap(2);
+        trace_event(TRACE_INPUT, "reload-cut", "refund=2 ap=%d anim=%d", combat_rt_player_ap(),
+            obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1);
+    }
+
+    if (gpui_reload_pending) {
+        if (gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled()) {
+            gpui_reload_pending = false;
+        } else if (gpui_reload_anim_start()) {
+            gpui_reload_pending = false;
+        } else if (elapsed_time(gpui_reload_pending_since) >= GPUI_RELOAD_WAIT_MS) {
+            gpui_reload_pending = false;
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "reload-refused", "why=busy anim=%d stick=%d",
+                obj_dude != NULL ? FID_ANIM_TYPE(obj_dude->fid) : -1, combat_rt_stick_walking() ? 1 : 0);
+        }
+    }
+
+    // RB NO LONGER REPEATS AN AIMED SHOT (2026-10-09). The aimed shot is the weapon slot's AIMED
+    // mode now and RT fires it (rt_player_called_loc in combat_rt); RB is the heal, read on its press
+    // edge in gpui_button_shortcuts and drained above with the other item uses.
+
+    if (gpui_exit_nav_pending) {
+        gpui_exit_nav_pending = false;
+        gpui_run_to_exit();
+    }
+
     gpui_skill_wheel(pad);
     gpui_quick_wheel(pad);
     gpui_weapon_wheel(pad);
-    gpui_ammo_wheel(pad);
     gpui_aim_wheel(pad);
     gpui_useon_arm(pad);
     gpui_wheel_a_edge = false; // consumed by whichever wheel was open
@@ -5158,7 +7302,6 @@ void gamepad_ui_init()
 
 void gamepad_ui_exit()
 {
-    gpui_release_aim_figure();
     gpui_free_skill_art();
     gpui_icons_release();
 

@@ -22,8 +22,10 @@ void process_bk();
 void GNW_add_input_buffer(int a1);
 void flush_input_buffer();
 void GNW_do_bk_process();
-void add_bk_process(BackgroundProcess* f);
+// label: the name the frame meter prints for it (a string literal); NULL pools it under "other".
+void add_bk_process(BackgroundProcess* f, const char* label = NULL);
 void remove_bk_process(BackgroundProcess* f);
+void bk_take_times(char* out, size_t size);
 void enable_bk();
 void disable_bk();
 void register_pause(int new_pause_key, PauseWinFunc* new_pause_win_func);

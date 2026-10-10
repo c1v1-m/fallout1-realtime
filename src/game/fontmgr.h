@@ -5,6 +5,9 @@ namespace fallout {
 
 int FMInit();
 void FMExit();
+
+// Which folder the interface fonts were loaded from ("master.dat" or "text\\<language>").
+const char* FMFontSource();
 void FMtext_font(int font);
 int FMtext_height();
 int FMtext_width(const char* string);

@@ -6,6 +6,9 @@
 namespace fallout {
 
 int do_options();
+
+// Just the preferences screen (no Save/Load/Exit around it), for the main menu's OPTIONS entry.
+int do_preferences();
 bool options_is_open();
 int PauseWindow(bool is_world_map);
 int init_options_menu();

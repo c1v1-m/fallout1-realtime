@@ -37,10 +37,39 @@ bool gamepad_ui_menu_active();
 // right stick on part-selection instead of lock-switching, like it does for the radial wheels.
 bool gamepad_ui_aim_body_active();
 
+// True for the whole aim gesture (LB down), not only while the markers are up. The attack
+// gate uses this so RT inside the opening window cannot fire an unaimed shot.
+bool gamepad_ui_aim_gesture_active();
+
 // True while the A button is acting as a world/UI interact (left click) for the
 // current press, rather than as an attack. combat_rt checks this so it does not
 // also fire an attack on the same press when a hostile drifts into range.
 bool gamepad_ui_a_interacting();
+
+// RUN IS A TOGGLE ON X (2026-09-16 layout), not a held button. X could not stay a hold:
+// holding X opens the weapon wheel, and one button cannot be both. combat_rt reads this
+// instead of the shoulder it used to read -- it is the only run input there is.
+bool gamepad_ui_run_on();
+
+// True while the ATTACK trigger (RT) is pulled. Exported so combat_rt does not have to
+// re-implement the Schmitt trigger + hard-zero debounce that every analog read in this
+// layer needs -- see gpui_trigger_held for why a bare threshold is not good enough.
+bool gamepad_ui_attack_held();
+
+// The body part bound in the LB called-shot window (a HIT_LOCATION_*). An attack made while the
+// weapon slot is on its AIMED mode goes there -- see rt_player_called_loc in combat_rt.
+int gamepad_ui_aim_part();
+
+// True while the AIM trigger (LT) is pulled. LT aims the same way R3 does -- see the lock
+// block in combat_rt -- and like every analog read in this layer it needs the Schmitt
+// trigger plus hard-zero debounce, which is why it is exported rather than re-read there.
+bool gamepad_ui_aim_trigger_held();
+
+// True while LT is pulled, for the barter window's split-stack gesture (LT + A). Exported for the
+// same reason as the two above: a bare threshold on the raw axis loses a held trigger to its
+// intermittent hard-zero readings, which is what silently turned "move one" into "move the lot".
+bool gamepad_ui_split_trigger_held();
+void gamepad_ui_split_trigger_debug(int* raw, int* level);
 
 // Set by the engine's hold-drag action popups (world action menu in gmouse.cc,
 // inventory action menu in inventry.cc) while their navigation loop runs. Those
@@ -53,6 +82,10 @@ void gamepad_ui_set_action_popup_active(bool active);
 // list. While set, the shared mouse hook suppresses left-stick cursor snapping and
 // A/Y-as-click so they don't fight that navigation; the right stick and RT still work.
 void gamepad_ui_set_self_nav(bool active);
+// Under self_nav, give the right stick back to the pointer (the world map, where the pointer is how
+// you say WHERE). Ignored while a modal sits on top. Returns the PREVIOUS state, so a screen opened
+// from inside (the town map) can switch it off and put it back.
+bool gamepad_ui_set_self_nav_cursor(bool active);
 // Drop the A -> left-click synthesis while a screen handles A itself. Narrower than self_nav:
 // the right stick keeps driving the cursor, and RT keeps clicking. Returns the PREVIOUS state, so
 // a screen opened from another one (the editor from character selection) can restore rather than
@@ -93,6 +126,7 @@ int gamepad_ui_action_popup_dpad();
 // movies hide the mouse, which disables the mouse_info hook, so the controller
 // can't reach the movie loop through the normal cursor pipeline.
 bool gamepad_ui_skip_pressed();
+int gamepad_ui_menu_stick_step();
 
 // Reads the left stick as a normalized vector (SDL axes / 32767, Y positive
 // down). Returns false and leaves x/y untouched when inside the deadzone. Used
@@ -104,6 +138,11 @@ bool gamepad_ui_get_left_stick(float* x, float* y);
 // Read by gmouse's skill-cursor dispatch, which otherwise reverts to MOVE after one use. B cancels
 // it (gpui_button_shortcuts), so a sticky cursor is never a state you are stuck in.
 bool gamepad_ui_skill_cursor_sticky();
+
+// The object the pad has the armed use-on / skill crosshair glued on, or NULL to let the pixel under
+// the pointer decide (gmouse reads it on the click). See gpui_tpick_stick.
+struct Object;
+Object* gamepad_ui_targeting_pick();
 
 } // namespace fallout
 

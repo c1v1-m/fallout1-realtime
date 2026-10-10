@@ -129,7 +129,7 @@ void cycle_init()
         monitors[index] >>= 2;
     }
 
-    add_bk_process(cycle_colors);
+    add_bk_process(cycle_colors, "palette");
 
     cycle_initialized = true;
     cycle_enabled = true;
@@ -149,7 +149,7 @@ void cycle_reset()
         last_cycle_medium = 0;
         last_cycle_fast = 0;
         last_cycle_very_fast = 0;
-        add_bk_process(cycle_colors);
+        add_bk_process(cycle_colors, "palette");
         cycle_enabled = true;
     }
 }
