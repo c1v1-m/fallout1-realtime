@@ -34,9 +34,8 @@ Download the latest zip from [Releases](../../releases) and unzip it.
 
 1. Switch to Desktop Mode and unzip the download.
 2. Open the `steamdeck` folder, right-click inside it, choose **Open Terminal Here** and type `bash install-steamdeck.sh`.
-3. Go back to Game Mode and press **Play** on Fallout.
-
-If the buttons act like a mouse, open Fallout's controller settings in Steam and pick the **Gamepad** layout.
+3. Go back to Game Mode. On Fallout's page open the controller settings, pick **Templates** and choose **Gamepad with Mouse Trackpad**. Steam's default layout for Fallout turns the buttons into keyboard keys, and the game then never sees a controller.
+4. Press **Play** on Fallout.
 
 ### GOG or a CD copy
 

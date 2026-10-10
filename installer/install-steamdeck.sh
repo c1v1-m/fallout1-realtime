@@ -163,9 +163,10 @@ if [ "$ACTION" = "install" ]; then
 
     echo
     if [ "$MODE" = "steam" ]; then
-        echo "Done. Press Play on Fallout in Steam -- Game Mode works -- to start Fallout 1 Realtime."
-        echo "If the buttons act like a mouse instead of a gamepad: open Fallout's controller settings"
-        echo "in Steam and pick the \"Gamepad\" layout."
+        echo "Done. One more step before you play, in Game Mode:"
+        echo "  Fallout's page > controller settings > Templates > \"Gamepad with Mouse Trackpad\"."
+        echo "Steam's default layout for Fallout turns the buttons into keyboard keys, and the game"
+        echo "then never sees a controller. After that, press Play on Fallout to start Fallout 1 Realtime."
     else
         echo "Done. This is not the Steam version: start fallout1-realtime.exe from that folder with Proton or Wine."
     fi
