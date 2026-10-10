@@ -35,7 +35,8 @@ namespace fallout {
 
 // How near (hex tiles) an interactable must be for the prompt to offer it. The engine walks the
 // dude the rest of the way when A fires, so this is just "close enough that you clearly mean it".
-#define IP_RANGE_TILES 4
+// 4 -> 2 at his request (cfg interact_range); synced into the default 2026-10-10.
+#define IP_RANGE_TILES 2
 
 // In combat, an interactable overrides the A-attack only when the dude is standing RIGHT at it
 // (<= this many tiles). Keeps doors/corpses openable mid-fight when you walk up to them, while a
@@ -95,11 +96,12 @@ static int ip_action_index = 0;
 static Object* ip_manual_target = NULL;
 static unsigned int ip_manual_since = 0;
 
-// How far the right-stick picker reaches, as opposed to IP_RANGE_TILES (4) which is how close
+// How far the right-stick picker reaches, as opposed to IP_RANGE_TILES (2) which is how close
 // something must be for the prompt to offer it on its own. Pointing at a thing says what you mean,
 // so it does not need the proximity guess -- but it stays bounded so the picker can't grab the far
 // side of a warehouse, and everything it offers must additionally be ON SCREEN.
-#define IP_PICK_RANGE_TILES 12
+// 12 -> 6 at his request (cfg interact_pick_range); synced into the default 2026-10-10.
+#define IP_PICK_RANGE_TILES 6
 
 // Both ranges are cfg levers (`interact_range` / `interact_pick_range`), read once on first tick.
 // They are pure feel and the right value only shows up in play, so they must be tunable without a

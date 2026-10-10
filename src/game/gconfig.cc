@@ -81,21 +81,26 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_SPEED_KEY, 0);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PLAYER_SPEED_KEY, 0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ANIM_SPEED_KEY, 1.0);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOVE_SPEED_KEY, 1.0);
+    // ⚠️ THE TUNED BALANCE (synced 2026-10-10). The realtime levers below were tuned in play, but
+    // only ever in his own build/Release/fallout.cfg -- these defaults were still the first-pass
+    // numbers, so the first release build (a fresh cfg) attacked at base 1.0 / factor 0.09, the
+    // pairing he had already called "moc rychlé" in August. Every value here must match what he
+    // plays; when a lever is retuned in his cfg, bring it here too. See balance-schemes.
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOVE_SPEED_KEY, 1.3);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_WEAPON_SWAP_STAT_FACTOR_KEY, 0.09);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ANIM_ATTACK_STAT_FACTOR_KEY, 0.09);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_REGEN_KEY, 0.7);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_REGEN_KEY, 0.666667);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_REGEN_AGILITY_FACTOR_KEY, 0.05);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_BASE_KEY, 1.0);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_STAT_FACTOR_KEY, 0.09);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_BASE_KEY, 2.6);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_STAT_FACTOR_KEY, 0.12);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_AP_COST_KEY, 8.0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_AP_ENDURANCE_FACTOR_KEY, 0.4);
-    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_RESUME_AP_KEY, 5);
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_RESUME_AP_KEY, 3);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_WALK_AP_COST_KEY, 2.0);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_KEY, 2.0);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_KEY, 1.4);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, 0.6);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FALLOFF_TILES_KEY, 12);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY, 0.0);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY, 0.4);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY, 0.7);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_MOVING_NPC_KEY, 0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_SPEED_AP_MAX_KEY, 2.0);
@@ -103,9 +108,9 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SEQ_INITIATIVE_POWER_KEY, 2.0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_INITIATIVE_SPAN_KEY, 1.0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_POST_DIALOG_GRACE_KEY, 1.5);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_KNOCKDOWN_DWELL_KEY, 2.0);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_KNOCKDOWN_DWELL_KEY, 1.7);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_SKILL_FACTOR_KEY, 0.15);
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_BURST_DUCK_KEY, 0.25);
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SFX_BURST_DUCK_KEY, 0.0); // neutral since the sound rework: vanilla mixing
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RANGED_POINT_HOLD_KEY, 2.0);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_GUARD_JOIN_AGGRESSION_KEY, 20);
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MEDIC_ENABLED_KEY, 1);

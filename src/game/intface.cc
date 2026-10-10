@@ -549,8 +549,9 @@ int intface_init()
         return intface_fatal_error(-1);
     }
 
-    // MODS "Combat box sound" -- default ON, the vanilla clunk and chime.
-    int boxSound = 1;
+    // MODS "Combat box sound" -- default OFF since the release (his setting); 1 = the vanilla clunk
+    // and chime.
+    int boxSound = 0;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_COMBAT_BOX_SOUND_KEY, &boxSound);
     intface_set_combat_box_sound(boxSound != 0);
 

@@ -431,7 +431,7 @@ void anim_init()
     // Movement-only speed (WALK / RUN). A SPEED, so higher = faster. Clamped either side of 1.0:
     // below ~0.3 a chase would never close, above ~3 the sprite skates across tiles faster than the
     // art can read.
-    double moveSpeed = 1.0;
+    double moveSpeed = 1.3;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOVE_SPEED_KEY, &moveSpeed);
     if (moveSpeed < 0.3) {
         moveSpeed = 0.3;
@@ -476,8 +476,9 @@ void anim_init()
     }
     anim_attack_stat_high_bias = (float)attackStatHighBias;
 
-    // MODS "Smooth movement" -- default OFF, the original step-per-frame motion.
-    int smoothMotion = 0;
+    // MODS "Smooth movement" -- default ON since the release (his setting); 0 = the original
+    // step-per-frame motion.
+    int smoothMotion = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_SMOOTH_MOTION_KEY, &smoothMotion);
     anim_set_smooth_motion(smoothMotion != 0);
 }
@@ -4297,7 +4298,7 @@ static int anim_reload_anim = -1;
 bool anim_get_reload_anim()
 {
     if (anim_reload_anim < 0) {
-        int v = 0;
+        int v = 1; // default ON since the release (his setting)
         config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, "reload_anim", &v);
         anim_reload_anim = v != 0 ? 1 : 0;
     }

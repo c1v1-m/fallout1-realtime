@@ -733,9 +733,9 @@ void crt_init()
     }
     crt_cfg_read = true;
 
-    // ON unless the cfg says otherwise -- the filter is meant to be the way the game
-    // looks, not something you have to go and switch on.
-    int enabled = 1;
+    // OFF unless the cfg says otherwise (2026-10-10, for the release: "vypni crt"). It used to
+    // default ON as "the way the game looks"; he plays without it, so a fresh install does too.
+    int enabled = 0;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CRT_KEY, &enabled);
     crt_enabled_flag = enabled != 0;
 

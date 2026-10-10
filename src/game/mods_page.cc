@@ -406,18 +406,37 @@ static const int mods_screen_sizes[4][2] = {
 // ⚠️ WRITTEN BY HAND, LINE BY LINE, INSTEAD OF THROUGH Config. config_save() rewrites the file from
 // the parsed key/values -- which would throw away every comment in f1_res.ini, and those comments
 // ARE the documentation for a file you edit with a text editor on a Steam Deck. So: replace the
-// INTERNAL_HEIGHT line if there is one (commented out or not), append it if there is not, and leave
-// every other byte exactly where it was.
+// key's line in [MAIN] if there is one (commented out or not), add it to [MAIN] if there is not, and
+// leave every other byte exactly where it was.
+//
+// ⚠️ TWO THINGS THE STEAM INSTALL TAUGHT (2026-10-10, the release check). Steam ships the High
+// Resolution Patch's f1_res.ini: 228 lines and TEN sections, [MAIN] first. (1) The buffer held 128
+// lines, so the overflow guard fired and both resolution rows silently never stuck -- now 1024,
+// static rather than 256 KB of stack. (2) A missing key was APPENDED AT THE END OF THE FILE, i.e.
+// into [OTHER_SETTINGS], where game.cc (which reads "MAIN") never looks. Keys are now matched only
+// inside [MAIN] and a new one goes in right after [MAIN]'s last line.
+#define MODS_RES_MAX_LINES 1024
+
+// "[MAIN]" (any case, any leading blanks) -> true; any section header sets *isHeader.
+static bool mods_res_line_is_main(const char* line, bool* isHeader)
+{
+    while (*line == ' ' || *line == '\t') {
+        line++;
+    }
+    *isHeader = *line == '[';
+    return *isHeader && SDL_strncasecmp(line, "[MAIN]", 6) == 0;
+}
+
 static void mods_write_res_keys(const char* key1, int value1, const char* key2, int value2)
 {
     const char* keys[2] = { key1, key2 };
     int values[2] = { value1, value2 };
-    char lines[128][256];
+    static char lines[MODS_RES_MAX_LINES][256];
     int count = 0;
 
     FILE* in = fopen("f1_res.ini", "rt");
     if (in != NULL) {
-        while (count < 128 && fgets(lines[count], sizeof(lines[0]), in) != NULL) {
+        while (count < MODS_RES_MAX_LINES && fgets(lines[count], sizeof(lines[0]), in) != NULL) {
             count++;
         }
 
@@ -425,11 +444,41 @@ static void mods_write_res_keys(const char* key1, int value1, const char* key2, 
         // what we managed to read would silently delete the rest of someone's config, and a
         // setting that does not stick is a complaint; a truncated file is a disaster.
         char overflow[8];
-        bool tooLong = (count == 128 && fgets(overflow, sizeof(overflow), in) != NULL);
+        bool tooLong = (count == MODS_RES_MAX_LINES && fgets(overflow, sizeof(overflow), in) != NULL);
         fclose(in);
 
         if (tooLong) {
             return;
+        }
+    }
+
+    // Where [MAIN] is: its header line, and the line a new key goes before (just past its last
+    // non-blank line, so it does not land after the blank gap in front of the next section).
+    int mainHeader = -1;
+    int mainInsert = -1;
+    bool inMain = false;
+    for (int i = 0; i < count; i++) {
+        bool isHeader;
+        bool isMain = mods_res_line_is_main(lines[i], &isHeader);
+        if (isHeader) {
+            if (inMain) {
+                break; // [MAIN] ended; the parser keeps the first [MAIN], so a later one is moot
+            }
+            if (isMain) {
+                mainHeader = i;
+                mainInsert = i + 1;
+                inMain = true;
+            }
+            continue;
+        }
+        if (inMain) {
+            const char* p = lines[i];
+            while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') {
+                p++;
+            }
+            if (*p != '\0') {
+                mainInsert = i + 1;
+            }
         }
     }
 
@@ -439,9 +488,18 @@ static void mods_write_res_keys(const char* key1, int value1, const char* key2, 
             replaced[k] = true; // nothing asked for, nothing to append
             continue;
         }
+        if (mainHeader == -1) {
+            continue; // no [MAIN]: nothing to replace, it gets written fresh below
+        }
 
         size_t keyLen = strlen(keys[k]);
-        for (int i = 0; i < count; i++) {
+        for (int i = mainHeader + 1; i < count; i++) {
+            bool isHeader;
+            mods_res_line_is_main(lines[i], &isHeader);
+            if (isHeader) {
+                break;
+            }
+
             const char* p = lines[i];
             while (*p == ' ' || *p == '\t' || *p == ';') {
                 p++;
@@ -460,25 +518,48 @@ static void mods_write_res_keys(const char* key1, int value1, const char* key2, 
     }
 
     if (count == 0) {
-        // No file at all (the game then runs on its built-in 640x480 default): write one that
-        // still says what the numbers mean.
+        // No file at all (the game then runs on its built-in default, 480 lines on the desktop's
+        // size): write one that still says what the numbers mean.
         fprintf(out, "[MAIN]\n; SCR_* is the output; INTERNAL_HEIGHT is what the game renders at,\n"
                      "; and 480 is the element size the game shipped with.\n");
     }
 
-    for (int i = 0; i < count; i++) {
-        fputs(lines[i], out);
+    for (int i = 0; i <= count; i++) {
+        if (i == mainInsert) {
+            // A line with no newline of its own (the last one of a file) would otherwise get the
+            // first added key glued onto the end of it.
+            if (i > 0 && lines[i - 1][0] != '\0' && strchr(lines[i - 1], '\n') == NULL) {
+                fputc('\n', out);
+            }
+            for (int k = 0; k < 2; k++) {
+                if (!replaced[k]) {
+                    fprintf(out, "%s=%d\n", keys[k], values[k]);
+                    replaced[k] = true;
+                }
+            }
+        }
+        if (i < count) {
+            fputs(lines[i], out);
+        }
     }
 
-    // A file whose last line has no newline of its own would otherwise get the first appended key
-    // glued onto the end of it.
-    if (count > 0 && lines[count - 1][0] != '\0' && strchr(lines[count - 1], '\n') == NULL) {
-        fputc('\n', out);
-    }
-
+    // No [MAIN] anywhere (a file with only other sections, or the fresh one above): the keys go at
+    // the end, under a [MAIN] of their own when the file had other sections for them to fall into.
+    bool needMain = false;
     for (int k = 0; k < 2; k++) {
-        if (!replaced[k]) {
-            fprintf(out, "%s=%d\n", keys[k], values[k]);
+        needMain = needMain || !replaced[k];
+    }
+    if (needMain) {
+        if (count > 0) {
+            if (lines[count - 1][0] != '\0' && strchr(lines[count - 1], '\n') == NULL) {
+                fputc('\n', out);
+            }
+            fprintf(out, "\n[MAIN]\n");
+        }
+        for (int k = 0; k < 2; k++) {
+            if (!replaced[k]) {
+                fprintf(out, "%s=%d\n", keys[k], values[k]);
+            }
         }
     }
 

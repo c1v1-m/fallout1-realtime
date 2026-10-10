@@ -153,7 +153,11 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
 
     Config resolutionConfig;
     if (config_init(&resolutionConfig)) {
-        if (config_load(&resolutionConfig, "f1_res.ini", false)) {
+        // ⚠️ NO FILE STILL RUNS THE MATHS BELOW (2026-10-10, the release check). It used to skip the
+        // whole block, leaving a fixed 640x480 -- pillarboxed 4:3 on any modern screen. Every key
+        // simply falls back to its default instead, so a missing f1_res.ini behaves like an empty one.
+        config_load(&resolutionConfig, "f1_res.ini", false);
+        {
             int screenWidth;
             if (config_get_value(&resolutionConfig, "MAIN", "SCR_WIDTH", &screenWidth)) {
                 video_options.width = std::max(screenWidth, 640);
@@ -195,6 +199,18 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
             int internalHeight = 0;
             config_get_value(&resolutionConfig, "MAIN", "INTERNAL_WIDTH", &internalWidth);
             config_get_value(&resolutionConfig, "MAIN", "INTERNAL_HEIGHT", &internalHeight);
+
+            // ⚠️ AND WITH NEITHER KEY, THE DEFAULT IS THE ORIGINAL'S SCALING: 480 lines (2026-10-10).
+            // The Steam and GOG installs ship the High Resolution Patch's f1_res.ini, which has
+            // SCALE_2X=0 and no INTERNAL_* -- and SCALE_2X=0 on the legacy path below means "render
+            // at the full screen size": a 1080p desktop got a 1920x1080 internal picture with a
+            // postage-stamp interface. So SCALE_2X is honoured only when it actually asks for a
+            // divider (1 or more); 0 or absent means INTERNAL_HEIGHT=480.
+            int legacyScale = 0;
+            bool haveLegacyScale = config_get_value(&resolutionConfig, "MAIN", "SCALE_2X", &legacyScale) && legacyScale > 0;
+            if (internalWidth <= 0 && internalHeight <= 0 && !haveLegacyScale) {
+                internalHeight = 480;
+            }
 
             // ⚠️ FULLSCREEN IS THE SCREEN, WHATEVER SCR_* SAYS (2026-10-08, on a Steam Deck: "takhle
             // to vypadá ... fix it"). Fullscreen is SDL_WINDOW_FULLSCREEN_DESKTOP, so the real output
@@ -239,13 +255,10 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
                 int fitY = outputHeight / internalHeight;
                 int fit = fitX < fitY ? fitX : fitY;
                 video_options.scale = fit < 1 ? 1 : fit;
-            } else {
-                int scaleValue;
-                if (config_get_value(&resolutionConfig, "MAIN", "SCALE_2X", &scaleValue)) {
-                    video_options.scale = scaleValue + 1;
-                    video_options.width /= video_options.scale;
-                    video_options.height /= video_options.scale;
-                }
+            } else if (haveLegacyScale) {
+                video_options.scale = legacyScale + 1;
+                video_options.width /= video_options.scale;
+                video_options.height /= video_options.scale;
             }
 
             // The floor, applied to whichever path produced the numbers. Clamping keeps the game

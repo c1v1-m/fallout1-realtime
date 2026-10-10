@@ -292,9 +292,9 @@ bool svga_init(VideoOptions* video_options)
     // keys are readable. The GL objects themselves are built lazily on the first present.
     crt_init();
 
-    // MODS "VSync" -- default OFF, the original sleep-paced present. Applied at the first present,
-    // when the renderer's GL context is current.
-    int vsync = 0;
+    // MODS "VSync" -- default ON since the release (his setting); 0 = the original sleep-paced
+    // present. Applied at the first present, when the renderer's GL context is current.
+    int vsync = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VSYNC_KEY, &vsync);
     svga_set_vsync(vsync != 0);
 

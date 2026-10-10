@@ -90,7 +90,7 @@ namespace fallout {
 // (GAME_CONFIG_AP_REGEN_KEY) into rt_ap_regen_seconds at combat_rt_init, so the
 // firing cadence can be retuned in the cfg without a rebuild. 0.7 => ~1.4 AP/sec
 // => ~3.5s between 5-AP shots once the pool is drained.
-#define RT_AP_REGEN_SECONDS 0.7f
+#define RT_AP_REGEN_SECONDS 0.666667f
 
 // How long a latched player attack intent stays live (seconds). A held attack
 // button refreshes it every frame so it never expires while held; a one-shot
@@ -679,7 +679,10 @@ static float rt_attack_cooldown_skill_factor = RT_ATTACK_COOLDOWN_SKILL_FACTOR;
 // that is a 60% cut off the 2.6 s base. The BASE was not wrong (a STR 1 cave rat sat at a perfectly
 // reasonable 4.04 s) -- only the reward at the top of the curve was. Damping just that side takes
 // him to ~1.68 s and leaves every weaker critter untouched.
-#define RT_ATTACK_COOLDOWN_HIGH_BIAS 0.6f
+// 2026-08-24: 0.6 -> 0.83, bracketed by his own two verdicts (1.05 s "too fast", 1.59 s "STR 10
+// should hit fast"); 0.83 gives the 1.25 s he asked to try. Synced here 2026-10-10 -- until then
+// it lived only in his fallout.cfg and the release build fell back to 0.6.
+#define RT_ATTACK_COOLDOWN_HIGH_BIAS 0.83f
 static float rt_attack_cooldown_high_bias = RT_ATTACK_COOLDOWN_HIGH_BIAS;
 #define RT_ATTACK_COOLDOWN_MIN 0.25f
 // The dude has no RtActor, so his cooldown lives here. Reset with the rest of the session state.
@@ -9681,7 +9684,8 @@ void combat_rt_init()
     rt_npc_slide = npcSlide != 0;
 
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
-    int lookAround = 0;
+    // Default ON since the release (his setting).
+    int lookAround = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, "enemies_look_around", &lookAround);
     rt_look_around = lookAround != 0;
 
@@ -9698,7 +9702,7 @@ void combat_rt_init()
 
     // How hard AGILITY bends that cadence per critter (0 = the old flat rate for everyone).
     // Capped at 0.3 so the spread stays inside the clamps in rt_regen_interval.
-    double apRegenAgi = 0.09;
+    double apRegenAgi = 0.05; // = the gconfig_init default
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AP_REGEN_AGILITY_FACTOR_KEY, &apRegenAgi);
     if (apRegenAgi < 0.0) {
         apRegenAgi = 0.0;
@@ -9709,7 +9713,7 @@ void combat_rt_init()
 
     // Physical rate of fire. 0 = disabled (previous behaviour exactly). Capped well above any sane
     // value so a typo can't leave a critter unable to attack for a whole fight.
-    double atkCd = 1.0;
+    double atkCd = 2.6;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_BASE_KEY, &atkCd);
     if (atkCd < 0.0) {
         atkCd = 0.0;
@@ -9718,7 +9722,7 @@ void combat_rt_init()
     }
     rt_attack_cooldown_base = (float)atkCd;
 
-    double atkCdStat = 0.09;
+    double atkCdStat = 0.12;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_ATTACK_COOLDOWN_STAT_FACTOR_KEY, &atkCdStat);
     if (atkCdStat < 0.0) {
         atkCdStat = 0.0;
@@ -9983,8 +9987,8 @@ void combat_rt_init()
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CAM_SMOOTH_KEY, &camK);
     rt_cam_smooth_k = camK < 0.0 ? 0.0f : (camK > 40.0 ? 40.0f : (float)camK);
 
-    // Lean toward an aimed target off the screen. Default OFF (MODS).
-    int camLean = 0;
+    // Lean toward an aimed target off the screen (MODS). Default ON since the release (his setting).
+    int camLean = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CAM_LOCK_LEAN_KEY, &camLean);
     rt_cam_lean_on = camLean != 0;
 

@@ -459,10 +459,12 @@ static void main_game_loop()
         main_ms_input = main_ms_since(sectionStart);
 
         // Debug: F11 toggles a red ring at 15 hex tiles around the dude (the gunshot-
-        // hearing distance, so you can see how far that reaches in-world).
+        // hearing distance, so you can see how far that reaches in-world). Development build only.
+#ifndef FALLOUT_RELEASE
         if (keyCode == KEY_F11) {
             tile_debug_ring_set(tile_debug_ring_get() > 0 ? 0 : 15);
         }
+#endif
 
         // Route input to realtime combat first (WASD movement, click-to-attack);
         // anything it doesn't consume falls through to normal handling.
