@@ -4392,15 +4392,23 @@ static int AgeWindow()
             bool rightNow = SDL_GameControllerGetButton(agePad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0
                 || SDL_GameControllerGetAxis(agePad, SDL_CONTROLLER_AXIS_LEFTX) > 16000;
 
+            // ⚠️ ARROW KEYS, NOT THE ARROW BUTTONS' 501/502 (2026-10-11, on a Deck: "snažil jsem se zmáčknout
+            // left or right ale prostě to dělalo brikule"). 501/502 are the arrows' MOUSE-DOWN codes, and the
+            // vanilla code answers a mouse-down by entering its own hold-to-repeat loop (below, "change"),
+            // which steps the age again and again until the matching MOUSE-UP code (503/504) arrives. A
+            // mouse sends that on release; the pad never did -- so one press ran the age to its limit, the
+            // pad was not even read inside that loop, and every press meanwhile piled up in the queue and
+            // fell out later into the next window (501 is also OPTIONS on the creation screen). The arrow
+            // keys step once with no loop, and the pad does its own repeat here anyway.
             int dir = rightNow ? 1 : (leftNow ? -1 : 0);
             if (dir != ageHeldDir) {
                 ageHeldDir = dir;
                 if (dir != 0) {
-                    GNW_add_input_buffer(dir > 0 ? 501 : 502);
+                    GNW_add_input_buffer(dir > 0 ? KEY_ARROW_RIGHT : KEY_ARROW_LEFT);
                     ageNextStepAt = get_time() + CE_REPEAT_DELAY_MS;
                 }
             } else if (dir != 0 && get_time() >= ageNextStepAt) {
-                GNW_add_input_buffer(dir > 0 ? 501 : 502);
+                GNW_add_input_buffer(dir > 0 ? KEY_ARROW_RIGHT : KEY_ARROW_LEFT);
                 ageNextStepAt = get_time() + CE_REPEAT_RATE_MS;
             }
 
