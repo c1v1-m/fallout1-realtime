@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Paper Fallout</title>
+<style>
+  :root {
+    --bg: #0a0a09;
+    --fg: #ddd6c4;
+    --dim: #8f8877;
+    --panel: rgba(10, 10, 9, 0.8);
+    --accent: #9ad26f;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); overflow: hidden;
+    font: 12px/1.5 ui-monospace, Consolas, "Cascadia Mono", monospace; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 12px; top: 12px; max-width: calc(100vw - 48px); padding: 8px 11px;
+    background: var(--panel); border-radius: 6px; pointer-events: none; white-space: pre-wrap; }
+  #hud b { color: var(--accent); font-weight: 600; }
+  #hud .d { color: var(--dim); }
+  #msg { position: fixed; inset: 0; display: grid; place-items: center; color: var(--dim); }
+</style>
+</head>
+<body>
+<div id="msg">building the paper…</div>
+<div id="hud" hidden></div>
+<script>window.SCENE = /*SCENE*/null;</script>
+<script>/*GEOMETRY*/</script>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+// The engine's projection read as a camera, and all of the map's geometry: geometry.js (shared
+// with the glTF exporter, inlined here by build.js).
+const G = window.PaperGeometry;
+const { S, SIN, COS, KZ, KY, W } = G;
+const TO_CAMERA = new THREE.Vector3(...G.TO_CAMERA);
+
+const SC = window.SCENE;
+const msg = document.getElementById('msg');
+const hud = document.getElementById('hud');
+
+async function inflate(b64) {
+  const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  const stream = new Blob([bin]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// ------------------------------------------------------------------ palette (+ colour cycling)
+const palData = new Uint8Array(256 * 4);
+{
+  const pal = Uint8Array.from(atob(SC.palette), (c) => c.charCodeAt(0));
+  for (let i = 0; i < 256; i++) {
+    palData.set([pal[i * 3], pal[i * 3 + 1], pal[i * 3 + 2], 255], i * 4);
+  }
+}
+const palTex = new THREE.DataTexture(palData, 256, 1, THREE.RGBAFormat);
+palTex.magFilter = palTex.minFilter = THREE.NearestFilter;
+palTex.needsUpdate = true;
+
+// cycle.cc: the animated slots (slime, shoreline, fire, monitors, alarm)
+const CYCLES = [
+  { at: 229, ms: 200, c: [[0, 108, 0], [11, 115, 7], [27, 123, 15], [43, 131, 27]] },
+  { at: 248, ms: 200, c: [[83, 63, 43], [75, 59, 43], [67, 55, 39], [63, 51, 39], [55, 47, 35], [51, 43, 35]] },
+  { at: 238, ms: 200, c: [[255, 0, 0], [215, 0, 0], [147, 43, 11], [255, 119, 0], [255, 59, 0]] },
+  { at: 243, ms: 142, c: [[71, 0, 0], [123, 0, 0], [179, 0, 0], [123, 0, 0], [71, 0, 0]] },
+  { at: 233, ms: 100, c: [[107, 107, 111], [99, 103, 127], [87, 107, 143], [0, 147, 163], [107, 187, 255]] },
+];
+function cycleColors(now) {
+  for (const cy of CYCLES) {
+    const phase = Math.floor(now / cy.ms);
+    for (let i = 0; i < cy.c.length; i++) palData.set(cy.c[(i + phase) % cy.c.length], (cy.at + i) * 4);
+  }
+  palData.set([Math.floor(now / 33) % 2 ? 180 : 90, 0, 0], 254 * 4);
+  palTex.needsUpdate = true;
+}
+
+// ------------------------------------------------------------------ shaders
+// Projective: every fragment asks where the ORIGINAL camera would see it, and takes that pixel
+// of the sprite -- so the proxy's shape only matters when you look from somewhere else.
+const PROJ_VS = `
+uniform float uS, uKZ, uKY;
+attribute vec4 aRect;
+attribute vec2 aAtlas;
+attribute vec3 aShift;
+varying vec2 vScreen;
+varying vec4 vRect;
+varying vec2 vAtlas;
+varying float vDepth;
+void main() {
+  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vec3 sp = wp.xyz + aShift; // a face behind the front samples the front: the back is its mirror
+  vScreen = vec2(uS * sp.x, uKZ * sp.z - uKY * sp.y);
+  vRect = aRect;
+  vAtlas = aAtlas;
+  vec4 mv = viewMatrix * wp;
+  vDepth = -mv.z;
+  gl_Position = projectionMatrix * mv;
+}`;
+// Distance haze, perspective view only (fog.x = start, fog.y = end; the original view passes
+// numbers so large that it never kicks in, and stays pixel exact).
+const FOG = `
+uniform vec3 uFogColor;
+uniform vec2 uFog;
+vec3 haze(vec3 c, float d) { return mix(c, uFogColor, smoothstep(uFog.x, uFog.y, d)); }`;
+const PROJ_FS = `
+uniform sampler2D uAtlas, uPal;
+uniform vec2 uAtlasSize;
+uniform float uOpacity, uBack;
+varying vec2 vScreen;
+varying vec4 vRect;
+varying vec2 vAtlas;
+varying float vDepth;
+${FOG}
+void main() {
+  vec2 l = vScreen - vRect.xy;
+  if (l.x < 0.0 || l.y < 0.0 || l.x >= vRect.z || l.y >= vRect.w) discard;
+  float idx = texture2D(uAtlas, (vAtlas + floor(l) + 0.5) / uAtlasSize).r * 255.0;
+  if (idx < 0.5) discard;
+  vec3 c = texture2D(uPal, vec2((floor(idx + 0.5) + 0.5) / 256.0, 0.5)).rgb;
+  gl_FragColor = vec4(haze(c * (gl_FrontFacing ? 1.0 : uBack), vDepth), uOpacity);
+}`;
+// Billboards: plain sprite mapping, pixel coordinates carried per vertex.
+const BILL_VS = `
+attribute vec2 aPix;
+varying vec2 vPix;
+varying float vDepth;
+void main() {
+  vPix = aPix;
+  vec4 mv = modelViewMatrix * vec4(position, 1.0);
+  vDepth = -mv.z;
+  gl_Position = projectionMatrix * mv;
+}`;
+const BILL_FS = `
+uniform sampler2D uAtlas, uPal;
+uniform vec2 uAtlasSize;
+uniform vec4 uImg;
+varying vec2 vPix;
+varying float vDepth;
+${FOG}
+void main() {
+  vec2 p = clamp(floor(vPix), vec2(0.0), uImg.zw - 1.0);
+  float idx = texture2D(uAtlas, (uImg.xy + p + 0.5) / uAtlasSize).r * 255.0;
+  if (idx < 0.5) discard;
+  gl_FragColor = vec4(haze(texture2D(uPal, vec2((floor(idx + 0.5) + 0.5) / 256.0, 0.5)).rgb, vDepth), 1.0);
+}`;
+const SKY = new THREE.Color(0x8a7f6c);
+const fogUniforms = { uFogColor: { value: new THREE.Vector3(SKY.r, SKY.g, SKY.b) }, uFog: { value: new THREE.Vector2(1e9, 2e9) } };
+
+// ------------------------------------------------------------------ geometry
+function makeBatch() { return { pos: [], rect: [], atlas: [], shift: [] }; }
+
+function pushQuad(batch, quad) {
+  const [, ax, ay, w, h] = SC.images[quad.id];
+  for (const i of G.frontOrder(quad.corners)) {
+    const v = quad.corners[i], sh = quad.shifts ? quad.shifts[i] : [0, 0, 0];
+    batch.pos.push(v[0], v[1], v[2]);
+    batch.rect.push(quad.x, quad.y, w, h);
+    batch.atlas.push(ax, ay);
+    batch.shift.push(sh[0], sh[1], sh[2]);
+  }
+}
+
+function batchMesh(batch, page, opts = {}) {
+  if (!batch.pos.length) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(batch.pos, 3));
+  g.setAttribute('aRect', new THREE.Float32BufferAttribute(batch.rect, 4));
+  g.setAttribute('aAtlas', new THREE.Float32BufferAttribute(batch.atlas, 2));
+  g.setAttribute('aShift', new THREE.Float32BufferAttribute(batch.shift, 3));
+  const m = new THREE.ShaderMaterial({
+    uniforms: {
+      uAtlas: { value: page.tex }, uPal: { value: palTex },
+      uAtlasSize: { value: new THREE.Vector2(page.w, page.h) },
+      uOpacity: { value: opts.opacity ?? 1 }, uBack: { value: opts.back ?? 0.55 },
+      uS: { value: S }, uKZ: { value: KZ }, uKY: { value: KY },
+      ...fogUniforms,
+    },
+    vertexShader: PROJ_VS, fragmentShader: PROJ_FS,
+    side: THREE.DoubleSide,
+    transparent: !!opts.transparent, depthWrite: !opts.transparent,
+    polygonOffset: !!opts.offset, polygonOffsetFactor: opts.offset ? -1 : 0, polygonOffsetUnits: opts.offset ? -4 : 0,
+  });
+  const mesh = new THREE.Mesh(g, m);
+  mesh.frustumCulled = false;
+  return mesh;
+}
+
+function makeBillboard([cx, cy, rot, dirs], pages) {
+  const group = new THREE.Group();
+  const g0 = W(cx, cy, 0);
+  group.position.set(g0[0], 0, g0[2]);
+  const views = dirs.map(([img, dx0, dy0]) => {
+    const [pg, ax, ay, w, h] = SC.images[img];
+    const x0 = dx0 / S, x1 = (dx0 + w) / S, top = -dy0 / KY, bot = -(dy0 + h) / KY;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute([x0, bot, 0, x1, bot, 0, x1, top, 0, x0, top, 0], 3));
+    g.setAttribute('aPix', new THREE.Float32BufferAttribute([0, h, w, h, w, 0, 0, 0], 2));
+    g.setIndex([0, 1, 2, 0, 2, 3]);
+    return { g, page: pages[pg], img: new THREE.Vector4(ax, ay, w, h) };
+  });
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uAtlas: { value: views[rot].page.tex }, uPal: { value: palTex },
+      uAtlasSize: { value: new THREE.Vector2(views[rot].page.w, views[rot].page.h) },
+      uImg: { value: views[rot].img.clone() },
+      ...fogUniforms,
+    },
+    vertexShader: BILL_VS, fragmentShader: BILL_FS, side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(views[rot].g, mat);
+  mesh.frustumCulled = false;
+  group.add(mesh);
+  const facing = (rot - 1) * Math.PI / 3; // ROTATION_E faces +x; each step turns 60 deg toward +z
+  return {
+    group,
+    face(psi) {
+      group.rotation.y = -psi;
+      const r = (((Math.round((facing - psi) / (Math.PI / 3)) + 1) % 6) + 6) % 6;
+      const v = views[r];
+      if (mesh.geometry !== v.g) {
+        mesh.geometry = v.g;
+        mat.uniforms.uImg.value.copy(v.img);
+        mat.uniforms.uAtlas.value = v.page.tex;
+        mat.uniforms.uAtlasSize.value.set(v.page.w, v.page.h);
+      }
+    },
+  };
+}
+
+// Scenery as Doom stood it up (build.js --doom): one picture turned to the eye, every piece of a
+// many-sprite object where the game drew it, the object's lowest pixel on the ground. The pieces
+// come back to front, each a hair nearer the eye than the last, so overlaps don't flicker.
+function makeBoard([cx, cy, pieces], pages) {
+  const group = new THREE.Group();
+  const g0 = W(cx, cy, 0);
+  group.position.set(g0[0], 0, g0[2]);
+  pieces.forEach(([img, dx0, dy0], i) => {
+    const [pg, ax, ay, w, h] = SC.images[img];
+    const x0 = dx0 / S, x1 = (dx0 + w) / S, top = -dy0 / KY, bot = -(dy0 + h) / KY, z = i * 0.004;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute([x0, bot, z, x1, bot, z, x1, top, z, x0, top, z], 3));
+    g.setAttribute('aPix', new THREE.Float32BufferAttribute([0, h, w, h, w, 0, 0, 0], 2));
+    g.setIndex([0, 1, 2, 0, 2, 3]);
+    const page = pages[pg];
+    const mesh = new THREE.Mesh(g, new THREE.ShaderMaterial({
+      uniforms: {
+        uAtlas: { value: page.tex }, uPal: { value: palTex },
+        uAtlasSize: { value: new THREE.Vector2(page.w, page.h) },
+        uImg: { value: new THREE.Vector4(ax, ay, w, h) },
+        ...fogUniforms,
+      },
+      vertexShader: BILL_VS, fragmentShader: BILL_FS, side: THREE.DoubleSide,
+    }));
+    mesh.frustumCulled = false;
+    group.add(mesh);
+  });
+  return { group, face(psi) { group.rotation.y = -psi; } };
+}
+
+// ------------------------------------------------------------------ voxel bodies (hull.js)
+// Faces from geometry.js; each takes its voxel's palette colour, shaded a little by which way it
+// faces (sRGB palette -> linear, so the renderer's output conversion gives the palette back).
+const voxMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+
+function voxelGeometry(bytes, n) {
+  const { pos, colour, shade, index } = G.voxelFaces(bytes, n);
+  const col = new Float32Array(colour.length * 3);
+  const tint = new THREE.Color();
+  colour.forEach((c, i) => {
+    tint.setRGB(palData[c * 4] / 255, palData[c * 4 + 1] / 255, palData[c * 4 + 2] / 255, THREE.SRGBColorSpace);
+    col.set([tint.r * shade[i], tint.g * shade[i], tint.b * shade[i]], i * 3);
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setIndex(index);
+  return g;
+}
+
+// A critter standing somewhere, turned to a heading in degrees (0 = +x, growing towards +z).
+function placeBody(geometry, [cx, cy], headingDeg) {
+  const mesh = new THREE.Mesh(geometry, voxMaterial);
+  const p = W(cx, cy, 0);
+  mesh.position.set(p[0], 0, p[2]);
+  mesh.rotation.y = -headingDeg * Math.PI / 180;
+  return mesh;
+}
+
+// The vault dweller, walkable: one mesh per animation frame, the current one visible.
+function makeWalker(dude, models) {
+  const group = new THREE.Group();
+  const anims = {};
+  for (const kind of ['stand', 'walk', 'run']) {
+    const a = dude[kind];
+    if (!a) continue;
+    anims[kind] = {
+      fps: a.fps, speed: a.speed,
+      meshes: a.frames.map((id) => {
+        const m = new THREE.Mesh(models[id], voxMaterial);
+        m.visible = false;
+        group.add(m);
+        return m;
+      }),
+    };
+  }
+  const p = W(dude.b[0], dude.b[1], 0);
+  const state = { x: p[0], z: p[2], facing: dude.facing * Math.PI / 180, anim: 'stand', t: 0 };
+  let shown = null;
+  const show = (kind, frame) => {
+    const list = anims[kind].meshes;
+    const m = list[frame % list.length];
+    if (m === shown) return;
+    if (shown) shown.visible = false;
+    m.visible = true;
+    shown = m;
+  };
+  show('stand', 0);
+  const place = () => { group.position.set(state.x, 0, state.z); group.rotation.y = -state.facing; };
+  place();
+  return { group, anims, state, show, place };
+}
+
+function buildLevel(L, pages, elevation, models) {
+  const group = new THREE.Group();
+  const roofs = new THREE.Group();
+  const bills = [];
+  const perPage = () => pages.map(() => ({ floor: makeBatch(), roof: makeBatch(), decal: makeBatch(), panel: makeBatch(), card: makeBatch(), trans: makeBatch() }));
+  const B = perPage();
+  const pageOf = (id) => SC.images[id][0];
+
+  G.levelQuads(L, SC.images, (kind, quad) => pushQuad(B[pageOf(quad.id)][kind], quad), { deepBoxes: !!SC.doom });
+  B.forEach((b, i) => {
+    const page = pages[i];
+    const add = (mesh, parent = group) => mesh && parent.add(mesh);
+    add(batchMesh(b.floor, page, { back: 1 }));
+    add(batchMesh(b.roof, page, { back: 1 }), roofs);
+    add(batchMesh(b.decal, page, { back: 1, offset: true }));
+    add(batchMesh(b.panel, page)); // walls: the unpainted back is darker
+    add(batchMesh(b.card, page, { back: 0.8 })); // plants, rocks, furniture: a mirrored card reads fine
+    add(batchMesh(b.trans, page, { transparent: true, opacity: 0.5 }));
+  });
+  group.add(roofs);
+  for (const b of L.bill) { const bb = makeBillboard(b, pages); bills.push(bb); group.add(bb.group); }
+  for (const b of L.board || []) { const bb = makeBoard(b, pages); bills.push(bb); group.add(bb.group); }
+  for (const [cx, cy, heading, id] of L.vox || []) group.add(placeBody(models[id], [cx, cy], heading));
+  // the dude: walkable in 3D when his animations carved, else the old six-direction billboard
+  let dudeBill = null;
+  if (SC.dude && SC.dude.elevation === elevation && !(SC.dude.walk && SC.dude.stand)) {
+    dudeBill = makeBillboard([...SC.dude.b, SC.dude.dirs], pages);
+    bills.push(dudeBill);
+    group.add(dudeBill.group);
+  }
+  return { group, roofs, bills, dudeBill, counts: L, blocked: new Set(L.blocked || []) };
+}
+
+// ------------------------------------------------------------------ scene
+async function main() {
+  if (!SC) throw new Error('no scene data (build this page with build.js)');
+  if (typeof DecompressionStream === 'undefined') throw new Error('this browser has no DecompressionStream');
+  const pages = [];
+  for (const pg of SC.pages) {
+    const tex = new THREE.DataTexture(await inflate(pg.z), pg.w, pg.h, THREE.RedFormat, THREE.UnsignedByteType);
+    tex.magFilter = tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.unpackAlignment = 1;
+    tex.needsUpdate = true;
+    pages.push({ tex, w: pg.w, h: pg.h });
+  }
+
+  const renderer = new THREE.WebGLRenderer({ antialias: false });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.setClearColor(0x0a0a09);
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  const sceneFog = new THREE.Fog(SKY, 50, 200); // for the plain ground plane under the map
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.MeshBasicMaterial({ color: 0x050505 }));
+  ground.rotation.x = -Math.PI / 2;
+  ground.position.y = -0.02;
+  scene.add(ground);
+
+  const models = [];
+  for (const m of SC.models || []) models.push(voxelGeometry(await inflate(m.z), m.n));
+  const levels = SC.levels.map((L, e) => (L ? buildLevel(L, pages, e, models) : null));
+  levels.forEach((lv) => lv && scene.add(lv.group));
+  // Set pieces (build.js --doom, setpieces.js): what the game only painted -- Junktown's gate --
+  // stands as the model in build/paper3d/replace/<id>.glb: a placeholder box until one is made
+  // in Blender. Its own axes: +X along it, +Y up, +Z across; origin on the ground at its middle.
+  const gltfLoader = new GLTFLoader();
+  // light for models made in Blender with ordinary (lit) materials -- everything else here is
+  // unlit and doesn't notice it
+  scene.add(new THREE.HemisphereLight(0xfff4e0, 0x3a3228, 1.6));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+  sun.position.set(-0.5, 1, 0.3);
+  scene.add(sun);
+  SC.levels.forEach((L, e) => {
+    for (const sp of (L && L.setpieces) || []) {
+      const b64 = SC.replacements && SC.replacements[sp.id];
+      if (!b64) continue;
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      gltfLoader.parse(bytes.buffer, '', (gltf) => {
+        gltf.scene.position.set(sp.at[0], 0, sp.at[1]);
+        gltf.scene.rotation.y = -sp.angle;
+        levels[e].group.add(gltf.scene);
+      }, (err) => console.error('set piece', sp.id, err));
+    }
+  });
+  const walker = SC.dude && SC.dude.walk && SC.dude.stand && levels[SC.dude.elevation] ? makeWalker(SC.dude, models) : null;
+  if (walker) levels[SC.dude.elevation].group.add(walker.group);
+  let walkMode = false;
+  let fpMode = false, retro = true; // first person, and its low-resolution look (see setFpMode)
+
+  // A ground point -> the hex it stands in: tile_coord inverted on the even-column lattice, then
+  // the nearest of the candidate centres, measured in world units (where hexes are regular).
+  function tileAt(x, z) {
+    const X = x * S + SC.origin[0] - 16, Y = z * KZ + SC.origin[1] - 8;
+    const colF = (12 * X - 16 * Y) / 384, rowF = (6 * X + 24 * Y) / 384;
+    let best = -1, bestD = Infinity;
+    for (let c = Math.floor(colF) - 1; c <= Math.floor(colF) + 2; c++) {
+      for (let r = Math.floor(rowF) - 1; r <= Math.floor(rowF) + 2; r++) {
+        if (c < 0 || c > 199 || r < 0 || r > 199) continue;
+        const cx = 24 * c + (c & 1 ? 8 : 0) + 16 * r, cy = -6 * c + (c & 1 ? 6 : 0) + 12 * r;
+        const d = ((cx - X) / S) ** 2 + ((cy - Y) / KZ) ** 2;
+        if (d < bestD) { bestD = d; best = r * 200 + (199 - c); }
+      }
+    }
+    return best;
+  }
+  const blockedAt = (x, z) => {
+    const t = tileAt(x, z);
+    return t < 0 || levels[SC.dude.elevation].blocked.has(t);
+  };
+
+  // WASD in walk mode: relative to where the camera looks; Shift runs. He turns towards where he
+  // goes (smoothly -- a 3D body has every heading, not six), slides along what blocks him, and
+  // the camera travels with him.
+  function updateWalker(dt) {
+    if (!walker) return;
+    const st = walker.state;
+    let mx = 0, mz = 0;
+    if (walkMode) {
+      if (held.has('w')) mz -= 1;
+      if (held.has('s')) mz += 1;
+      if (held.has('a')) mx -= 1;
+      if (held.has('d')) mx += 1;
+    }
+    if (mx || mz) {
+      const yaw = Math.atan2(fwd.x, -fwd.z), len = Math.hypot(mx, mz);
+      const dx = (mx * Math.cos(yaw) - mz * Math.sin(yaw)) / len;
+      const dz = (mx * Math.sin(yaw) + mz * Math.cos(yaw)) / len;
+      const turn = Math.atan2(Math.sin(Math.atan2(dz, dx) - st.facing), Math.cos(Math.atan2(dz, dx) - st.facing));
+      st.facing += turn * Math.min(1, dt * 12);
+      const kind = held.has('shift') && walker.anims.run ? 'run' : 'walk';
+      const step = walker.anims[kind].speed * dt;
+      let nx = st.x + dx * step, nz = st.z + dz * step;
+      if (blockedAt(nx, nz)) {
+        if (!blockedAt(nx, st.z)) nz = st.z;
+        else if (!blockedAt(st.x, nz)) nx = st.x;
+        else { nx = st.x; nz = st.z; }
+      }
+      controls.target.x += nx - st.x; camera.position.x += nx - st.x;
+      controls.target.z += nz - st.z; camera.position.z += nz - st.z;
+      st.x = nx; st.z = nz;
+      if (st.anim !== kind) { st.anim = kind; st.t = 0; }
+      st.t += dt;
+      walker.show(kind, Math.floor(st.t * walker.anims[kind].fps));
+    } else if (st.anim !== 'stand') {
+      st.anim = 'stand';
+      walker.show('stand', 0);
+    }
+    walker.place();
+  }
+  function setWalkMode(on) {
+    walkMode = on && !!walker;
+    controls.enablePan = !walkMode;
+    controls.minDistance = walkMode ? 2 : 0;
+    controls.maxDistance = walkMode ? 40 : Infinity;
+    if (!walkMode) return;
+    elevation = SC.dude.elevation;
+    showLevel();
+    const yaw = Math.atan2(fwd.x, -fwd.z), pitch = 24 * Math.PI / 180, dist = 7;
+    camera = persp;
+    controls.object = persp;
+    controls.target.set(walker.state.x, 1.2, walker.state.z);
+    persp.position.set(walker.state.x - Math.sin(yaw) * Math.cos(pitch) * dist, 1.2 + Math.sin(pitch) * dist,
+      walker.state.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+    persp.lookAt(controls.target);
+    controls.update();
+  }
+  let elevation = levels[SC.entering.elevation] ? SC.entering.elevation : levels.findIndex(Boolean);
+  let roofsOn = true;
+  const showLevel = () => levels.forEach((lv, e) => lv && (lv.group.visible = e === elevation));
+  showLevel();
+
+  // cameras: the original one (orthographic, pixel exact at zoom 1) and a perspective one
+  const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, -2000, 2000);
+  const persp = new THREE.PerspectiveCamera(32, 1, 0.5, 3000);
+  let camera = ortho;
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.screenSpacePanning = false;
+  controls.maxPolarAngle = Math.PI * 0.495;
+  controls.listenToKeyEvents(window);
+
+  function resize() {
+    // first person draws at about 400 lines and blows them up unsmoothed, the way Doom looked
+    renderer.setPixelRatio(fpMode && retro ? Math.min(devicePixelRatio, 400 / innerHeight) : devicePixelRatio);
+    renderer.domElement.style.imageRendering = fpMode && retro ? 'pixelated' : '';
+    renderer.setSize(innerWidth, innerHeight);
+    ortho.left = -innerWidth / (2 * S); ortho.right = innerWidth / (2 * S);
+    ortho.top = innerHeight / (2 * S); ortho.bottom = -innerHeight / (2 * S);
+    ortho.updateProjectionMatrix();
+    persp.aspect = innerWidth / innerHeight;
+    // first person sees 90 deg across, as Doom did, whatever the window's shape (three.js takes
+    // the vertical angle; a fixed 75 deg vertical was 106 deg across and shrank everyone)
+    persp.fov = fpMode ? 2 * Math.atan(1 / persp.aspect) * 180 / Math.PI : 32;
+    persp.updateProjectionMatrix();
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  function useCamera(next, dist) {
+    const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+    camera = next;
+    controls.object = next;
+    next.position.copy(controls.target).addScaledVector(dir, dist);
+    next.lookAt(controls.target);
+    controls.update();
+  }
+  function originalView() {
+    camera = ortho;
+    controls.object = ortho;
+    ortho.zoom = 2;
+    ortho.updateProjectionMatrix();
+    ortho.position.copy(controls.target).addScaledVector(TO_CAMERA, 200);
+    ortho.lookAt(controls.target);
+    controls.update();
+  }
+  controls.target.set(0, 0, 0);
+  originalView();
+
+  // double-click: orbit around the ground point under the cursor
+  const ray = new THREE.Raycaster();
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  renderer.domElement.addEventListener('dblclick', (e) => {
+    const ndc = new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+    ray.setFromCamera(ndc, camera);
+    const hit = ray.ray.intersectPlane(groundPlane, new THREE.Vector3());
+    if (!hit) return;
+    const delta = hit.sub(controls.target);
+    controls.target.add(delta);
+    camera.position.add(delta);
+  });
+
+  // WASD: slide the view across the ground, relative to where the camera faces
+  const held = new Set();
+  addEventListener('keyup', (e) => held.delete(e.key.toLowerCase()));
+  addEventListener('blur', () => held.clear());
+  function slide(dt) {
+    if (walkMode) return; // WASD walks the man instead
+    let fx = 0, fz = 0;
+    if (held.has('w')) fz -= 1;
+    if (held.has('s')) fz += 1;
+    if (held.has('a')) fx -= 1;
+    if (held.has('d')) fx += 1;
+    if (!fx && !fz) return;
+    const dist = camera === ortho ? 12 / ortho.zoom : camera.position.distanceTo(controls.target) * 0.5;
+    const yaw = Math.atan2(fwd.x, -fwd.z);
+    const step = dist * dt * (held.has('shift') ? 3 : 1) / Math.hypot(fx, fz);
+    const move = new THREE.Vector3(
+      (fx * Math.cos(yaw) - fz * Math.sin(yaw)) * step, 0,
+      (fx * Math.sin(yaw) + fz * Math.cos(yaw)) * step);
+    controls.target.add(move);
+    camera.position.add(move);
+  }
+
+  // ---------------------------------------------------------------- first person (Doom)
+  // The eyes of the vault dweller: WASD walks, the mouse (click the picture to capture it) or the
+  // arrow keys look, Shift runs, the hexes block as in walk mode. Critters are billboards of their
+  // own six sprites (build.js --doom), each turned to the eye and showing the direction it is seen
+  // from -- exactly how Doom drew its monsters.
+  const fp = { x: 0, z: 0, yaw: 0, pitch: 0, placed: false };
+  // Eye height and the body's radius, in units (a hex is about 1). Critters' heads top out around
+  // 2.0 (median of Junktown's; the dude 2.05): at 1.9 the eyes looked over everyone's head.
+  const EYE = 1.72, BODY = 0.3;
+  function setFpMode(on) {
+    if (on && !SC.dude) return;
+    fpMode = on;
+    if (on) {
+      if (walkMode) setWalkMode(false);
+      elevation = SC.dude.elevation;
+      showLevel();
+      if (!fp.placed) {
+        const p = W(SC.dude.b[0], SC.dude.b[1], 0), f = SC.dude.facing * Math.PI / 180;
+        Object.assign(fp, { x: p[0], z: p[2], yaw: Math.atan2(Math.cos(f), -Math.sin(f)), pitch: 0, placed: true });
+      }
+      camera = persp;
+      controls.object = persp;
+      controls.enabled = false;
+      persp.near = 0.05; // (the field of view is set in resize: it follows the window's shape)
+    } else {
+      controls.enabled = true;
+      persp.near = 0.5;
+      if (document.pointerLockElement) document.exitPointerLock();
+      controls.target.set(fp.x, 0, fp.z); // the free camera takes over looking at where you stood
+      persp.position.set(fp.x - Math.sin(fp.yaw) * 9, 6, fp.z + Math.cos(fp.yaw) * 9);
+      persp.lookAt(controls.target);
+    }
+    levels.forEach((lv) => lv && lv.dudeBill && (lv.dudeBill.group.visible = !on)); // you are him now
+    if (walker) walker.group.visible = !on;
+    resize();
+    if (!on) controls.update();
+  }
+  const freeAt = (x, z) => !blockedAt(x, z) && !blockedAt(x + BODY, z) && !blockedAt(x - BODY, z) && !blockedAt(x, z + BODY) && !blockedAt(x, z - BODY);
+  function updateFp(dt) {
+    fp.yaw += ((held.has('arrowright') ? 1 : 0) - (held.has('arrowleft') ? 1 : 0)) * 2.2 * dt;
+    let mx = 0, mz = 0;
+    if (held.has('w') || held.has('arrowup')) mz -= 1;
+    if (held.has('s') || held.has('arrowdown')) mz += 1;
+    if (held.has('a')) mx -= 1;
+    if (held.has('d')) mx += 1;
+    if (mx || mz) {
+      const step = (held.has('shift') ? 5 : 2.4) * dt / Math.hypot(mx, mz);
+      const dx = (mx * Math.cos(fp.yaw) - mz * Math.sin(fp.yaw)) * step;
+      const dz = (mx * Math.sin(fp.yaw) + mz * Math.cos(fp.yaw)) * step;
+      // slide along whatever blocks; standing too near a wall already, only the hex itself counts
+      const ok = freeAt(fp.x, fp.z) ? freeAt : (x, z) => !blockedAt(x, z);
+      if (ok(fp.x + dx, fp.z + dz)) { fp.x += dx; fp.z += dz; }
+      else if (ok(fp.x + dx, fp.z)) fp.x += dx;
+      else if (ok(fp.x, fp.z + dz)) fp.z += dz;
+    }
+    const cp = Math.cos(fp.pitch);
+    persp.position.set(fp.x, EYE, fp.z);
+    persp.lookAt(fp.x + Math.sin(fp.yaw) * cp, EYE + Math.sin(fp.pitch), fp.z - Math.cos(fp.yaw) * cp);
+  }
+  renderer.domElement.addEventListener('click', () => {
+    if (fpMode && document.pointerLockElement !== renderer.domElement) {
+      try { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); } catch { /* not allowed here: drag to look */ }
+    }
+  });
+  addEventListener('mousemove', (e) => {
+    // a captured pointer looks freely; where capture isn't allowed (an app's browser pane), drag
+    if (!fpMode || (document.pointerLockElement !== renderer.domElement && !(e.buttons & 1))) return;
+    fp.yaw += e.movementX * 0.0025;
+    fp.pitch = Math.max(-1.2, Math.min(1.2, fp.pitch - e.movementY * 0.0025));
+  });
+
+  addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if ('wasd'.includes(k) || k === 'shift') { held.add(k); return; }
+    if (fpMode && k.startsWith('arrow')) { held.add(k); e.preventDefault(); return; }
+    if (k === 'f') setFpMode(!fpMode);
+    else if (k === 'l' && fpMode) { retro = !retro; resize(); }
+    else if (fpMode && 'cop123'.includes(k)) return; // the free camera's keys wait until F leaves
+    else if (k === 'c') setWalkMode(!walkMode);
+    else if (k === 'o') { setWalkMode(false); originalView(); }
+    else if (k === 'p' && !walkMode) {
+      if (camera === ortho) useCamera(persp, Math.min(60 / ortho.zoom, 70));
+      else { useCamera(ortho, 200); }
+    } else if (k === 'r') {
+      roofsOn = !roofsOn;
+      levels.forEach((lv) => lv && (lv.roofs.visible = roofsOn));
+    } else if (k >= '1' && k <= '3' && levels[+k - 1] && !walkMode) {
+      elevation = +k - 1;
+      showLevel();
+    } else if (k === 'h') hud.hidden = !hud.hidden;
+    else return;
+    drawHud();
+  });
+
+  function drawHud() {
+    const lv = levels[elevation].counts;
+    const cam = fpMode ? 'první osoba (Doom)' : walkMode ? 'za postavou' : camera === ortho ? (isOriginal() ? 'původní' : 'ortografická') : 'perspektiva';
+    const bodies = (lv.vox || []).length + (walker && elevation === SC.dude.elevation ? 1 : 0);
+    hud.innerHTML =
+      `<b>FALLOUT 3D — test</b>  ${SC.map} <span class="d">(${SC.name}, patro ${elevation + 1})</span>\n` +
+      `<span class="d">${bodies} objektů ve 3D · ${lv.panel.length + lv.trans.length} stojících spritů · ${lv.floor.length} dlaždic · ${lv.roof.length} střešních</span>\n` +
+      `kamera: <b>${cam}</b>\n` +
+      (fpMode
+        ? `<b>nejdřív klikni do obrazu</b>, pak: <b>WASD</b> chůze  <b>Shift</b> běh  <b>šipky</b> otáčení  <b>táhni myší</b> rozhlížení\n` +
+          `<b>L</b> retro rozlišení ${retro ? 'zap' : 'vyp'}  <b>R</b> střechy ${roofsOn ? 'zap' : 'vyp'}  <b>F</b> volná kamera  <b>H</b> skrýt`
+        : walkMode
+        ? `<b>WASD</b> chůze  <b>Shift</b> běh  <span class="d">myš</span> rozhlížení  <span class="d">kolečko</span> vzdálenost  <b>C</b> volná kamera  <b>R</b> střechy ${roofsOn ? 'zap' : 'vyp'}  <b>H</b> skrýt`
+        : `<span class="d">táhnutí</span> otáčení  <span class="d">pravé tl. / WASD</span> posun  <span class="d">kolečko</span> zoom  <span class="d">dvojklik</span> otáčet kolem místa\n` +
+          `${SC.dude ? '<b>F</b> první osoba  ' : ''}${walker ? '<b>C</b> chodit s postavou  ' : ''}<b>O</b> původní pohled  <b>P</b> perspektiva/orto  <b>R</b> střechy ${roofsOn ? 'zap' : 'vyp'}  ` +
+          `${levels.filter(Boolean).length > 1 ? '<b>1-3</b> patro  ' : ''}<b>H</b> skrýt`);
+  }
+  const isOriginal = () => {
+    const d = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+    return d.distanceTo(TO_CAMERA) < 1e-3;
+  };
+  controls.addEventListener('end', drawHud);
+
+  // for scripted checks: paper.view(x, z, yawDeg, pitchDeg, dist) -- yaw 0 = the original heading,
+  // pitch = degrees above the ground (the original is 25.7), x/z = the ground point looked at
+  window.paper = {
+    view(x, z, yawDeg, pitchDeg, dist) {
+      setWalkMode(false);
+      if (camera !== persp) { camera = persp; controls.object = persp; }
+      const yaw = yawDeg * Math.PI / 180, pitch = pitchDeg * Math.PI / 180;
+      controls.target.set(x, 0, z);
+      persp.position.set(x - Math.sin(yaw) * Math.cos(pitch) * dist, Math.sin(pitch) * dist, z + Math.cos(yaw) * Math.cos(pitch) * dist);
+      persp.lookAt(controls.target);
+      controls.update();
+      drawHud();
+    },
+    screenToGround: (sx, sy) => [sx / S, sy / KZ],
+    // walk mode checks: paper.walk(true); paper.hold('w', 1500) holds W for 1.5 s
+    walk(on) { setWalkMode(on); drawHud(); },
+    hold(key, ms) { held.add(key); setTimeout(() => held.delete(key), ms); },
+    // deterministic: hold `keys` for `seconds` of simulated 60 Hz steps (a hidden pane throttles
+    // the real loop to almost nothing, so real-time holds can't test walking there)
+    simulate(keys, seconds) {
+      keys.forEach((k) => held.add(k));
+      for (let t = 0; t < seconds; t += 1 / 60) { camera.getWorldDirection(fwd); updateWalker(1 / 60); }
+      keys.forEach((k) => held.delete(k));
+      updateWalker(1 / 60);
+      controls.update();
+      return this.where();
+    },
+    turn(deg) { // orbit the camera around the target by `deg` (walk-mode steering for checks)
+      const off = new THREE.Vector3().subVectors(camera.position, controls.target);
+      off.applyAxisAngle(new THREE.Vector3(0, 1, 0), -deg * Math.PI / 180);
+      camera.position.copy(controls.target).add(off);
+      camera.lookAt(controls.target);
+      controls.update();
+    },
+    where: () => walker && { x: walker.state.x, z: walker.state.z, tile: tileAt(walker.state.x, walker.state.z) },
+    // first person checks: paper.fp(true); paper.fpLook(yaw, pitch); paper.fpWalk(['w'], 2)
+    fp(on) { setFpMode(on); drawHud(); },
+    fpLook(yawDeg, pitchDeg = 0) { fp.yaw = yawDeg * Math.PI / 180; fp.pitch = pitchDeg * Math.PI / 180; updateFp(0); },
+    fpWalk(keys, seconds) {
+      keys.forEach((k) => held.add(k));
+      for (let t = 0; t < seconds; t += 1 / 60) updateFp(1 / 60);
+      keys.forEach((k) => held.delete(k));
+      return this.fpAt();
+    },
+    fpAt: () => ({ x: +fp.x.toFixed(2), z: +fp.z.toFixed(2), yaw: +(fp.yaw * 180 / Math.PI).toFixed(1), tile: tileAt(fp.x, fp.z) }),
+  };
+
+  msg.remove();
+  hud.hidden = false;
+  if (SC.doom) setFpMode(true); // a --doom page opens in his eyes
+  drawHud();
+
+  const fwd = new THREE.Vector3();
+  let lastW = innerWidth, lastH = innerHeight, lastT = 0;
+  renderer.setAnimationLoop((now) => {
+    if (innerWidth !== lastW || innerHeight !== lastH) { lastW = innerWidth; lastH = innerHeight; resize(); }
+    camera.getWorldDirection(fwd);
+    const dt = Math.min(0.05, (now - lastT) / 1000);
+    if (fpMode) updateFp(dt);
+    else { slide(dt); updateWalker(dt); }
+    lastT = now;
+    if (!fpMode) controls.update(); // the orbit camera would pull the eyes back to its target
+    cycleColors(now);
+    if (fpMode) { // a hazy wasteland: the far end of a street fades out
+      fogUniforms.uFog.value.set(18, 75);
+      sceneFog.near = 18;
+      sceneFog.far = 75;
+      scene.fog = sceneFog;
+      renderer.setClearColor(SKY);
+      ground.material.color.set(0x3a3228);
+    } else if (camera === persp) {
+      const d = camera.position.distanceTo(controls.target);
+      fogUniforms.uFog.value.set(d + 15, d + 140);
+      sceneFog.near = d + 15;
+      sceneFog.far = d + 140;
+      scene.fog = sceneFog;
+      renderer.setClearColor(SKY);
+      ground.material.color.set(0x3a3228); // the desert goes on past the map's edge
+    } else {
+      fogUniforms.uFog.value.set(1e9, 2e9);
+      scene.fog = null;
+      renderer.setClearColor(0x0a0a09);
+      ground.material.color.set(0x050505); // the original: black past the edge
+    }
+    camera.getWorldDirection(fwd);
+    const psi = Math.atan2(fwd.x, -fwd.z);
+    for (const lv of levels) {
+      if (!lv || !lv.group.visible) continue;
+      for (const b of lv.bills) {
+        // first person: each billboard turns to the eye and shows the side it is seen from --
+        // from right in front, the camera's heading alone would pick the wrong sprite
+        if (fpMode) { const p = b.group.position; b.face(Math.atan2(p.x - persp.position.x, -(p.z - persp.position.z))); }
+        else b.face(psi);
+      }
+    }
+    renderer.render(scene, camera);
+  });
+}
+
+main().catch((err) => { msg.textContent = 'error: ' + err.message; console.error(err); });
+</script>
+</body>
+</html>

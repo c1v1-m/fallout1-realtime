@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "paper3d",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [".claude/tools/paper3d/serve.js", "8765"],
+      "port": 8765
+    }
+  ]
+}
