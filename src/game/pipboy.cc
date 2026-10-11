@@ -490,7 +490,7 @@ static const PipboyControl ctrl_lines[] = {
     // first page they are a single LB away. That is the whole reason the entry spells LB out.
     { "Y", "Weapons + ammo; LB = drugs, items (Stealth Boy...)" },
     { "B", "Drugs and quick items - aim LEFT" },
-    { "L3", "Skilldex: stick moves, A picks, B closes" },
+    { "L3 (press)", "Skills: stays open, RIGHT stick, A picks" },
     { "A", "Take what is highlighted" },
     { NULL, NULL },
     { NULL, "D-PAD - HOLD each of these; a TAP cycles the action" },

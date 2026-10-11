@@ -59,8 +59,7 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 | LB | Reload |
 | RB | Stimpack |
 | A | Use what is lit up |
-| L3 | Skilldex |
-| Y, B | Weapon and item wheels |
+| L3, Y, B | Skill, weapon and item wheels |
 | BACK | Inventory, hold to run to the nearest exit |
 | START (hold) | Quick save |
 
