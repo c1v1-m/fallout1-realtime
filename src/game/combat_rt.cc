@@ -5079,6 +5079,14 @@ static bool rt_do_step_back(Object* npc)
     return false;
 }
 
+// ⚠️ THE PLAYER'S AP POOL RIDES ON THE SAME CHUNK (2026-10-11: "load savu který byl v combatu a měl
+// jsem jen 3 ap, se načetl s full ap"). The realtime pool lives here, not in the critter data vanilla
+// saves (combat.ap is kept topped up on purpose), and PrepLoad's game_reset -> combat_rt_reset fills
+// it, so every load came back with a full pool -- a free refill for anyone who saves mid-fight.
+// Appended AFTER the opt-out ids behind a tag, so the forgiving-read rule below still holds: an
+// older save ends before the tag and simply keeps the full pool it always had.
+#define RT_SAVE_AP_TAG 0x52544150 // 'RTAP'
+
 int combat_rt_medic_optout_save(DB_FILE* stream)
 {
     if (db_fwriteInt(stream, rt_medic_optout_count) == -1) {
@@ -5088,6 +5096,16 @@ int combat_rt_medic_optout_save(DB_FILE* stream)
         if (db_fwriteInt(stream, rt_medic_optout[i]) == -1) {
             return -1;
         }
+    }
+
+    // INT_MAX means "not clamped yet" (the first update after a reset sets it to the maximum), so
+    // it is written as -1 = full, never as a number no stat could ever reach.
+    int ap = rt_player_ap == INT_MAX ? -1 : rt_player_ap;
+    int bonus = rt_bonus_move_ap == INT_MAX ? -1 : rt_bonus_move_ap;
+    if (db_fwriteInt(stream, RT_SAVE_AP_TAG) == -1
+        || db_fwriteInt(stream, ap) == -1
+        || db_fwriteInt(stream, bonus) == -1) {
+        return -1;
     }
     return 0;
 }
@@ -5117,6 +5135,23 @@ int combat_rt_medic_optout_load(DB_FILE* stream)
         rt_medic_optout[i] = id;
     }
     rt_medic_optout_count = count;
+
+    // The AP pool, if this save has it (see RT_SAVE_AP_TAG). Anything missing or odd leaves the
+    // full pool combat_rt_reset already set. Clamped to the maximum on the first update as usual.
+    int tag;
+    int ap;
+    int bonus;
+    if (db_freadInt(stream, &tag) == -1 || tag != RT_SAVE_AP_TAG
+        || db_freadInt(stream, &ap) == -1 || db_freadInt(stream, &bonus) == -1) {
+        return 0;
+    }
+    if (ap >= 0) {
+        rt_player_ap = ap;
+    }
+    if (bonus >= 0) {
+        rt_bonus_move_ap = bonus;
+    }
+    trace_event(TRACE_STATE, "ap-restore", "ap=%d bonus=%d", ap, bonus);
     return 0;
 }
 
