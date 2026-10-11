@@ -527,7 +527,7 @@ static const PipboyControl ctrl2_lines[] = {
     // is what ce_focus_jump actually walks.
     { "LB / RB", "Jump to the next section" },
     { "A", "Spend a point" },
-    { "A (hold)", "Done" },
+    { "START", "Done (A held works too)" },
     { "X", "Take a point back" },
     { "Y", "Spend them all" },
     { "B", "Cancel" },

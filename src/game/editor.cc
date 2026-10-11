@@ -831,6 +831,10 @@ static const CeButton ce_buttons[] = {
 #define CE_BUTTON_Y 454
 
 static int ce_button_sel = 1; // start on DONE -- the one you came here to press
+
+// Points still to spend on the previous pad frame (-1 = the screen just opened). When the last one
+// goes, the highlight jumps to DONE -- see the end of ce_pad_poll.
+static int ce_points_left_prev = -1;
 static int ce_status_sel = 0;
 static int ce_derived_sel = 0;
 
@@ -1648,7 +1652,31 @@ static void ce_pad_poll(SDL_GameController* pad)
         ce_spend_all();
     } else if (x && !ce_prev_x) {
         ce_pad_undo();
+    } else if (start && !ce_prev_start) {
+        // ⚠️ START IS DONE (2026-10-11, "hráč musí držet áčko aby mohl potvrdit level, napadá tě jiná
+        // možnost?" -> "jak to ten hráč pozná?"). The way consoles confirm a menu, and START had no job
+        // on this screen. The label beside DONE says so (see the button labels where the window opens).
+        // With creation points still unspent, DONE answers with vanilla's own "spend them" box, which
+        // is the right thing to tell a player who pressed it then.
+        gsound_play_sfx_file("ib1p1xx1");
+        GNW_add_input_buffer(500); // DONE
     }
+
+    // ⚠️ THE LAST POINT SPENT -> THE HIGHLIGHT GOES TO DONE (2026-10-11, same report). A player who
+    // does not know any button sees DONE light up the moment there is nothing left to do, and A then
+    // presses it -- no hold, no manual. Only on that edge, so moving away again stays free, and never
+    // as the screen opens (-1). Creation counts character points, the sheet the unspent skill points.
+    int pointsLeft = glblmode ? character_points : stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+    if (ce_points_left_prev > 0 && pointsLeft <= 0) {
+        for (int i = 0; i < ce_item_count; i++) {
+            if (ce_items[i].kind == CE_ITEM_BUTTON && ce_buttons[ce_items[i].index].code == 500) {
+                ce_focus = i;
+                trace_event(TRACE_INPUT, "ce-focus-done", "glbl=%d", glblmode ? 1 : 0);
+                break;
+            }
+        }
+    }
+    ce_points_left_prev = pointsLeft;
 
     ce_prev_up = up;
     ce_prev_down = down;
@@ -1811,6 +1839,7 @@ int editor_design(bool isCreationMode)
         // The sheet has only one editable column, so start (and stay) on it. Creation still opens
         // on stats, where you spend your character points first.
         ce_build_items();
+        ce_points_left_prev = -1;
         // Creation opens on SPECIAL (where the points go first); the sheet opens on the skills,
         // which is what that screen is for. Everything else is one push away.
         ce_focus = 0;
@@ -2327,10 +2356,34 @@ static int CharEditStart()
     // CANCEL
     str = getmsg(&editor_message_file, &mesg, 102);
     text_to_buf(win_buf + (EDITOR_WINDOW_WIDTH * CANCEL_BTN_Y) + CANCEL_BTN_X, str, EDITOR_WINDOW_WIDTH, EDITOR_WINDOW_WIDTH, colorTable[18979]);
+    int cancelLabelEnd = CANCEL_BTN_X + text_width(str);
 
     // DONE
     str = getmsg(&editor_message_file, &mesg, 100);
     text_to_buf(win_buf + (EDITOR_WINDOW_WIDTH * DONE_BTN_Y) + DONE_BTN_X, str, EDITOR_WINDOW_WIDTH, EDITOR_WINDOW_WIDTH, colorTable[18979]);
+    int doneLabelEnd = DONE_BTN_X + text_width(str);
+
+    // ⚠️ THE PAD'S KEYS BESIDE THEM (2026-10-11, "jak to ten hráč pozná?"): START closes with DONE, B
+    // with CANCEL, so each says so right after its own label, in the small font and the yellow the
+    // bar uses for bindings. Only with a controller connected; a mouse player sees vanilla. Each is
+    // dropped rather than drawn over the next button if a longer (translated) label leaves no room.
+    if (gamepad_ui_get_controller() != NULL) {
+        int labelFont = text_curr();
+        int labelH = text_height();
+        text_font(101);
+        int hintY = DONE_BTN_Y + (labelH - text_height()) / 2;
+        const char* doneHint = "START";
+        if (doneLabelEnd + 5 + text_width((char*)doneHint) < ce_buttons[2].x - 2) {
+            text_to_buf(win_buf + (EDITOR_WINDOW_WIDTH * hintY) + doneLabelEnd + 5, (char*)doneHint,
+                EDITOR_WINDOW_WIDTH, EDITOR_WINDOW_WIDTH, colorTable[32747]);
+        }
+        const char* cancelHint = "B";
+        if (cancelLabelEnd + 5 + text_width((char*)cancelHint) < EDITOR_WINDOW_WIDTH - 4) {
+            text_to_buf(win_buf + (EDITOR_WINDOW_WIDTH * hintY) + cancelLabelEnd + 5, (char*)cancelHint,
+                EDITOR_WINDOW_WIDTH, EDITOR_WINDOW_WIDTH, colorTable[32747]);
+        }
+        text_font(labelFont);
+    }
 
     PrintBasicStat(RENDER_ALL_STATS, 0, 0);
     ListDrvdStats();
