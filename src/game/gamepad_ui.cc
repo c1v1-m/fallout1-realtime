@@ -3209,7 +3209,12 @@ static void gpui_quick_use(int pid)
     // The test is FIRST because the charge below happens after the item has been consumed and
     // destroyed -- refusing down there would eat the drug and heal nothing. Out of combat the
     // pool sits at maximum, so this never bites outside a fight.
-    if (combat_rt_player_ap() < 2) {
+    //
+    // QUICK POCKETS TAKES ONE OFF (2026-10-11, his idea: "quick pocket by mohl snížit cenu stimpacku
+    // o 1"). Vanilla's perk makes reaching into the pack cheaper (inventory 4 AP -> 3, inventry.cc);
+    // in realtime the quick-use IS reaching into the pack, so every drug taken this way costs 1 AP.
+    int apCost = perk_level(PERK_QUICK_POCKETS) > 0 ? 1 : 2;
+    if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=ap ap=%d", pid, combat_rt_player_ap());
         return;
@@ -3289,7 +3294,7 @@ static void gpui_quick_use(int pid)
 
     // Vanilla charges 2 AP for taking a drug. Unconditional now: affordability was settled at
     // the top of this function, before the item was spent.
-    combat_rt_spend_ap(2);
+    combat_rt_spend_ap(apCost);
 
     trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d lock=%ums fight=%d",
         pid, hpBefore, critter_get_hits(obj_dude), apBefore, combat_rt_player_ap(),
