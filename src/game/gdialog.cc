@@ -1186,6 +1186,12 @@ int gDialogReply(Program* program, int messageListId, int messageId)
 {
     gdAddReviewReply(messageListId, messageId);
 
+    // What was said to the player, paired with dialog-choice for what he answered (see there).
+    {
+        const char* said = scr_get_msg_str(messageListId, messageId);
+        trace_event(TRACE_FLOW, "dialog-reply", "msg=%d text=%.80s", messageId, said != NULL ? said : "-");
+    }
+
     dialogBlock.program = program;
     dialogBlock.replyMessageListId = messageListId;
     dialogBlock.replyMessageId = messageId;
@@ -2104,6 +2110,19 @@ static int gDialogProcessChoice(int a1)
         gdAddReviewOptionChosenStr(dialogOptionEntry->text);
     } else {
         gdAddReviewOptionChosen(dialogOptionEntry->messageListId, dialogOptionEntry->messageId);
+    }
+
+    // WHICH ANSWER WAS GIVEN (2026-10-13). "Killian turned on me after I saved him" could be a bug or
+    // simply a rude line picked in his night-trespass talk, and the trace could not tell the two
+    // apart: it named the conversation and nothing that was said in it. The line as the player read it.
+    {
+        const char* chosen = dialogOptionEntry->messageListId == -4
+            ? dialogOptionEntry->text
+            : (dialogOptionEntry->messageListId >= 0
+                    ? scr_get_msg_str(dialogOptionEntry->messageListId, dialogOptionEntry->messageId)
+                    : NULL);
+        trace_event(TRACE_INPUT, "dialog-choice", "idx=%d msg=%d text=%.80s", a1,
+            dialogOptionEntry->messageId, chosen != NULL ? chosen : "-");
     }
 
     can_start_new_fidget = false;

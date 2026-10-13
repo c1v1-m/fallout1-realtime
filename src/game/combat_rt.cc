@@ -7280,7 +7280,8 @@ static float rt_lock_score(int dist, float offDeg)
     return dist + offDeg / RT_LOCK_STEP_DEG_PER_TILE;
 }
 
-static Object* rt_lock_pick_facing()
+// minClass 2 = enemies only (see the re-aim rule where LT takes its lock); 0 = anyone lockable.
+static Object* rt_lock_pick_facing(int minClass)
 {
     RtLockFacing facing = rt_lock_facing();
 
@@ -7304,9 +7305,13 @@ static Object* rt_lock_pick_facing()
             continue;
         }
 
+        int cls = rt_lock_class(critter);
+        if (cls < minClass) {
+            continue;
+        }
+
         float offDeg = rt_lock_off_facing(&facing, critter);
         bool front = offDeg <= RT_LOCK_FRONT_DEG;
-        int cls = rt_lock_class(critter);
         float score = rt_lock_score(dist, offDeg);
         bool better;
         if (best == NULL) {
@@ -7344,9 +7349,9 @@ static Object* rt_lock_pick_facing()
 // same fight takes back the one you had.
 #define RT_LOCK_KEEP_MARGIN 4.0f
 
-static Object* rt_lock_pick_initial()
+static Object* rt_lock_pick_initial(int minClass)
 {
-    Object* fresh = rt_lock_pick_facing();
+    Object* fresh = rt_lock_pick_facing(minClass);
     Object* remembered = rt_lock_last_target;
     bool keep = false;
     float rememberedOff = -1.0f;
@@ -7354,6 +7359,7 @@ static Object* rt_lock_pick_initial()
     if (remembered != NULL
         && rt_in_registry(remembered)
         && rt_is_lockable(remembered)
+        && rt_lock_class(remembered) >= minClass
         && obj_dist(obj_dude, remembered) <= rt_lock_range()
         && rt_lock_in_sight(remembered)) {
         RtLockFacing facing = rt_lock_facing();
@@ -10734,9 +10740,23 @@ void combat_rt_poll_gamepad()
     // ...or Shift held on the keyboard, which is LT there.
     bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT);
 
+    // ⚠️ A HELD LT RE-AIMS AT ENEMIES ONLY (2026-10-13). When the target dies the lock empties, and a
+    // trigger still held used to take the best of whatever was left -- neutrals included, because a
+    // fresh aim may lock a neutral (that is how you start a fight). Killian's store, trace_2026-10-11
+    // _215834: Kenji fell at s=2372.18 and the same frame the lock jumped to KILLIAN, with RT pressed
+    // a third of a second later; at 2595 it happened again. *"asi jsem zaútočil dřív a útočí teď na
+    // mě jen Killian"* -- the man he had just saved, one held trigger away from being shot. So within
+    // one hold that has already aimed at something, the next pick must be someone fighting you; a
+    // neutral takes a fresh LT press (or the right stick), i.e. a decision, never a leftover finger.
+    static bool rt_lt_hold_aimed = false;
+    if (!ltAim) {
+        rt_lt_hold_aimed = false;
+    }
+
     if (ltAim && rt_lock_target == NULL) {
-        rt_lock_target = rt_lock_pick_initial();
+        rt_lock_target = rt_lock_pick_initial(rt_lt_hold_aimed ? 2 : 0);
         if (rt_lock_target != NULL) {
+            rt_lt_hold_aimed = true;
             rt_lt_owns_lock = true;
             trace_event(TRACE_ACTION, "lock-on", "target=%d src=LT t=%.2f",
                 rt_lock_target->pid, rt_clock);
