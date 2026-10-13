@@ -2882,7 +2882,17 @@ static void op_reg_anim_func(Program* program)
     ProgramValue param = programStackPopValue(program);
     int cmd = programStackPopInteger(program);
 
-    if (!isInCombat()) {
+    // ⚠️ BEGIN AND END PASS IN REALTIME (2026-10-13, "gizmovo bilboard se první netočí a po odchodu a
+    // příchodu k němu zase jo"). ANIMFRVR.INT starts a decorative loop at map_enter as
+    // reg_anim_func(BEGIN) -> reg_anim_animate_forever -> reg_anim_func(END). The middle opcode was
+    // let through in realtime long ago (op_reg_anim_animate_forever) -- but these two were not, and
+    // Junktown's maps enter with the realtime combat bit warm (Kenji, the Skulz), so the loop was
+    // registered into no sequence and the billboard stood still until a visit that began calm.
+    // Every animation step a script can put between them is still gated on its own opcode, so the
+    // worst a passed BEGIN/END can make is an empty sequence, which ends at once. CLEAR stays gated:
+    // it would cut whatever combat_rt is playing on a fighter.
+    bool passes = !isInCombat() || (combat_rt_enabled() && cmd != OP_REG_ANIM_FUNC_CLEAR);
+    if (passes) {
         switch (cmd) {
         case OP_REG_ANIM_FUNC_BEGIN:
             register_begin(param.integerValue);
