@@ -18,6 +18,7 @@ int perk_make_list(int* perks);
 int perk_level(int perk);
 char* perk_name(int perk);
 char* perk_description(int perk);
+const char* perk_realtime_note(int perk);
 void perk_add_effect(Object* critter, int perk);
 void perk_remove_effect(Object* critter, int perk);
 int perk_adjust_skill(int skill);

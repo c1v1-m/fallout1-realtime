@@ -2156,10 +2156,15 @@ int gmouse_3d_build_to_hit_frame(const char* string, int color, const char* line
         color);
 
     // Optional second line straight under the first (the Awareness hit points). The canvas is 21 px
-    // tall and font 101 is 9, so two lines with a one-pixel gap fit exactly; the guard only matters
-    // if someone swaps the font.
+    // tall; font 101's glyphs are 9, and text_height() is 10 because it already carries the font's
+    // one-pixel line spacing. So line 1 is rows 1..9, line 2 rows 11..19, and row 20 is left for
+    // the outline under it -- an exact fit, which the guard checks.
+    //
+    // ⚠️ IT WAS NEVER DRAWN UNTIL 2026-10-13 ("mířím na něj a nic se neukazuje"). This used to add
+    // another pixel of gap on top of text_height(), putting line 2 at 12 and asking for 22 rows of
+    // a 21-row canvas -- the guard dropped it on every frame, silently, for every target.
     if (line2 != NULL) {
-        int lineY = 1 + text_height() + 1;
+        int lineY = 1 + text_height();
         if (lineY + text_height() <= gmouse_3d_to_hit_frame_height) {
             text_to_buf(gmouse_3d_to_hit_frame_data + gmouse_3d_to_hit_frame_width * lineY + crosshairFrmWidth + 1,
                 line2,

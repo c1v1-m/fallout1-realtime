@@ -3296,9 +3296,9 @@ static void gpui_quick_use(int pid)
     // the top of this function, before the item was spent.
     combat_rt_spend_ap(apCost);
 
-    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d lock=%ums fight=%d",
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d",
         pid, hpBefore, critter_get_hits(obj_dude), apBefore, combat_rt_player_ap(),
-        gpui_injection_ms, combat_rt_active() ? 1 : 0);
+        apCost, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0);
 }
 
 // What the dedicated heal button (LB+B) reaches for, best first. Fallout 1 has no other

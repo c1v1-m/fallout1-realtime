@@ -513,6 +513,29 @@ void trace_init()
     fprintf(g_file, "=== fallout-ce trace v%d.%d%c  %s ===\n", VERSION_MAJOR, VERSION_MINOR, VERSION_RELEASE, stamp);
     fputs("legend: <seq> s=<sessionSec> [CAT/sub] msg [ xN/span if coalesced]\n", g_file);
     fputs("cats: INPUT ACTION COMBAT ANIM STATE FLOW WARN ERR\n", g_file);
+
+#ifdef _WIN32
+    // WHICH BUILD WROTE THIS (2026-10-13). A report about a fix not working is first a question of
+    // whether the exe that played had it; the header used to carry no answer, and the PC, the Deck
+    // and the two build trees each hold a different one. The exe's own write time pins it against
+    // the commit log -- __DATE__ would not, it only changes when this one file is recompiled.
+    {
+        char exePath[MAX_PATH];
+        WIN32_FILE_ATTRIBUTE_DATA attributes;
+        SYSTEMTIME utc;
+        SYSTEMTIME local;
+        DWORD length = GetModuleFileNameA(NULL, exePath, sizeof(exePath));
+        if (length != 0 && length < sizeof(exePath)
+            && GetFileAttributesExA(exePath, GetFileExInfoStandard, &attributes)
+            && FileTimeToSystemTime(&attributes.ftLastWriteTime, &utc)
+            && SystemTimeToTzSpecificLocalTime(NULL, &utc, &local)) {
+            const char* exeName = strrchr(exePath, '\\');
+            fprintf(g_file, "build: %s %04d-%02d-%02d %02d:%02d:%02d\n",
+                exeName != NULL ? exeName + 1 : exePath,
+                local.wYear, local.wMonth, local.wDay, local.wHour, local.wMinute, local.wSecond);
+        }
+    }
+#endif
     fflush(g_file);
 
     trace_install_crash_handlers();

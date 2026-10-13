@@ -305,6 +305,27 @@ char* perk_description(int perk)
     return perk >= 0 && perk < PERK_COUNT ? perk_data[perk].description : NULL;
 }
 
+// WHAT A PERK DOES ON TOP OF ITS VANILLA TEXT IN REALTIME (2026-10-13, "do popisku quickpocket bych
+// napsal i tuto změnu"), or NULL when nothing changed. The character screen prints it as its own
+// paragraph under the description (editor.cc, card_footer_for_perk); perk.msg lives in MASTER.DAT,
+// and the vanilla sentences stay true -- these perks only GAINED something.
+//
+// ⚠️ KEEP THEM THIS SHORT. The level-up window has room for exactly three more lines under the
+// longest of these descriptions (Quick Pockets ends 3 px above the paper's edge); a longer note
+// is cut off there, not wrapped past the card.
+const char* perk_realtime_note(int perk)
+{
+    switch (perk) {
+    case PERK_QUICK_POCKETS:
+        // gpui_quick_use: the RB / H heal and the item wheel's drugs.
+        return "Realtime: drugs used with RB, H or the item wheel cost 1 AP, not 2.";
+    case PERK_AWARENESS:
+        // gmouse_3d_awareness_hp: the second line of the to-hit cursor, lock-on or mouse.
+        return "Realtime: aim at someone to see their hit points.";
+    }
+    return NULL;
+}
+
 // 0x4868A8
 void perk_add_effect(Object* critter, int perk)
 {

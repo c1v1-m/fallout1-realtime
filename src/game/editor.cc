@@ -468,14 +468,12 @@ static char old_str1[48];
 
 // --- CARD FOOTER ------------------------------------------------------------
 //
-// Two optional lines DrawCard prints under the vanilla description. Set by DrawInfoWin just
-// before the call, consumed and cleared by DrawCard. See the note at the print site for why this
-// is a buffer and not a parameter.
-//
-// 40-odd characters is the practical width: the card text column is 348..613 at font 101, and
-// word_wrap is not applied to these, so an over-long line would run off the card art.
+// Two optional lines DrawCard (and, for the perk notes, DrawCard2) prints under the vanilla
+// description. Set just before the call, consumed and cleared by the card. See the note at the
+// DrawCard print site for why this is a buffer and not a parameter. Each line is word-wrapped at
+// the card's own text column there.
 #define CARD_FOOTER_LINES 2
-#define CARD_FOOTER_LEN 64
+#define CARD_FOOTER_LEN 96
 static char card_footer[CARD_FOOTER_LINES][CARD_FOOTER_LEN];
 
 static void card_footer_clear()
@@ -570,6 +568,16 @@ static void card_footer_for_stat(int stat)
     snprintf(card_footer[0], CARD_FOOTER_LEN, "%s rate: %+d%%",
         card_attack_category(attackType), pct);
     snprintf(card_footer[1], CARD_FOOTER_LEN, "%.2f s -> %.2f s", base, base * mult);
+}
+
+// A perk that does more in realtime than its vanilla text says (perk_realtime_note). On both perk
+// cards: the character screen's and the one in the level-up window, where the choice is made.
+static void card_footer_for_perk(int perk)
+{
+    const char* note = combat_rt_enabled() ? perk_realtime_note(perk) : NULL;
+    if (note != NULL) {
+        snprintf(card_footer[0], CARD_FOOTER_LEN, "%s", note);
+    }
 }
 
 // 0x56E5B0
@@ -4025,6 +4033,7 @@ static void DrawInfoWin()
                     title = perk_name(perk);
                     description = perk_description(perk);
                     graphicId = perk + 72;
+                    card_footer_for_perk(perk);
                     DrawCard(graphicId, title, NULL, description);
                 }
             } else if (info_line - 10 >= 7 && info_line - 10 < 11) {
@@ -6893,6 +6902,7 @@ static void RedrwDPrks()
 
     ListDPerks();
 
+    card_footer_for_perk(name_sort_list[crow + cline].value);
     if (perk_level(name_sort_list[crow + cline].value)) {
         snprintf(perkRankBuffer, sizeof(perkRankBuffer), "(%d)", perk_level(name_sort_list[crow + cline].value));
         DrawCard2(name_sort_list[crow + cline].value + 72,
@@ -7052,6 +7062,7 @@ static int perks_dialog()
 
     int count = ListDPerks();
 
+    card_footer_for_perk(name_sort_list[crow + cline].value);
     if (perk_level(name_sort_list[crow + cline].value)) {
         char perkRankBuffer[32];
         snprintf(perkRankBuffer, sizeof(perkRankBuffer), "(%d)", perk_level(name_sort_list[crow + cline].value));
@@ -7808,6 +7819,39 @@ static int DrawCard2(int frmId, const char* name, const char* rank, char* descri
 
         y += yStep;
     }
+
+    // The realtime note (card_footer_for_perk), as DrawCard prints it but tighter: this card is
+    // half as tall, so the paragraph gets a 4 px gap instead of a blank line, and it wraps in the
+    // same column as the description beside the picture. The paper ends at y 196 (PERKWIN.FRM);
+    // a line that would cross it is dropped rather than painted onto the frame -- vanilla's text
+    // keeps precedence, ours is the addition.
+    int footerY = y + 4;
+    for (int i = 0; i < CARD_FOOTER_LINES; i++) {
+        if (card_footer[i][0] == '\0') {
+            continue;
+        }
+
+        short footerBreaks[WORD_WRAP_MAX_COUNT];
+        short footerBreakCount;
+        if (word_wrap(card_footer[i], 133 + extraDescriptionWidth, footerBreaks, &footerBreakCount) != 0) {
+            continue;
+        }
+
+        for (short j = 0; j < footerBreakCount - 1; j++) {
+            if (footerY + text_height() > 196 + 1) {
+                break;
+            }
+
+            char* footerBeginning = card_footer[i] + footerBreaks[j];
+            char* footerEnding = card_footer[i] + footerBreaks[j + 1];
+            char footerCh = *footerEnding;
+            *footerEnding = '\0';
+            text_to_buf(pwin_buf + PERK_WINDOW_WIDTH * footerY + 280, footerBeginning, PERK_WINDOW_WIDTH, PERK_WINDOW_WIDTH, colorTable[0]);
+            *footerEnding = footerCh;
+            footerY += yStep;
+        }
+    }
+    card_footer_clear();
 
     if (frmId != old_fid2 || strcmp(old_str2, name) != 0) {
         if (frstc_draw2) {
