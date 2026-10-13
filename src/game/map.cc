@@ -998,7 +998,14 @@ int map_load_file(DB_FILE* stream)
         error = "Error reading objects";
         if (obj_load(stream) != 0) break;
 
-        if ((map_data.flags & 1) == 0) {
+        // ⚠️ IN REALTIME ON EVERY LOAD, NOT ONLY A FRESH MAP (2026-10-11 crash: obj_save, read 0x81, during
+        // the location autosave on walking back into Junktown). Vanilla skips this for a SAVED map (flag
+        // 1 -- every map you return to, and every map in a save game), because its turn-based combat_load
+        // turns the saved whoHitMeCid back into a pointer. Realtime never does that, so a critter that
+        // had been fighting when the map was left came back with the cid (1) sitting in the low half of
+        // the 8-byte pointer and zeros above it: whoHitMe = 0x1, and the next obj_save read 0x1->cid.
+        // Who hit whom is re-established by the next fight, so clearing it always is safe.
+        if ((map_data.flags & 1) == 0 || combat_rt_enabled()) {
             map_fix_critter_combat_data();
         }
 
