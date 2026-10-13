@@ -3454,7 +3454,6 @@ static void rt_keep_offset(Object* o, int keepX, int keepY);
 
 static void rt_play_hit_react(Object* attacker, Object* defender)
 {
-    (void)attacker; // direction TODO: front-only for now (always-present art)
     if (defender == NULL || !rt_is_combatant(defender) || rt_is_heavy_reaction(defender)) {
         return;
     }
@@ -3488,10 +3487,21 @@ static void rt_play_hit_react(Object* attacker, Object* defender)
     anim_force_clear(defender);
     rt_keep_offset(defender, keepX, keepY);
 
+    // FROM BEHIND WHEN IT CAME FROM BEHIND (2026-10-13, "ať to vypadá plynule"), by vanilla's own
+    // rule (is_hit_from_front: attacker and defender facing the same way, give or take one step)
+    // and with vanilla's fallback: a critter that has no HIT_FROM_BACK art takes the front one.
+    // Front-only made a mutant shot in the back recoil towards the shooter.
+    int anim = ANIM_HIT_FROM_FRONT;
+    if (attacker != NULL && !is_hit_from_front(attacker, defender)
+        && art_exists(art_id(OBJ_TYPE_CRITTER, defender->fid & 0xFFF, ANIM_HIT_FROM_BACK,
+            (defender->fid & 0xF000) >> 12, defender->rotation + 1))) {
+        anim = ANIM_HIT_FROM_BACK;
+    }
+
     if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "hit-react")) {
         return;
     }
-    register_object_animate(defender, ANIM_HIT_FROM_FRONT, 0);
+    register_object_animate(defender, anim, 0);
     register_end();
 }
 
@@ -11588,6 +11598,13 @@ void combat_rt_set_cam_smooth(float k)
 float combat_rt_get_cam_smooth()
 {
     return rt_cam_smooth_k;
+}
+
+// How long a light stagger holds a body (RT_FLINCH_MAX_SECONDS), for compute_tpf, which fits the
+// whole hit animation inside it.
+float combat_rt_flinch_seconds()
+{
+    return RT_FLINCH_MAX_SECONDS;
 }
 
 float combat_rt_time_scale()

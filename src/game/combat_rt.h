@@ -354,6 +354,7 @@ int combat_rt_bonus_move_ap();
 // combat model slow together -- a critter that decides at quarter speed but walks at full speed
 // looks broken. Never returns 0: this is a slow-down, never a stop.
 float combat_rt_time_scale();
+float combat_rt_flinch_seconds();
 
 } // namespace fallout
 

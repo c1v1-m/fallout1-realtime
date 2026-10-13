@@ -5281,6 +5281,31 @@ unsigned int compute_tpf(Object* object, int fid)
             tpf = 1;
         }
     }
+    // ⚠️ A FLINCH PLAYS WHOLE (2026-10-13, "ne bez cuknutí, ale ať to vypadá plynule, staggering tam
+    // chci mít jak mám"). A light stagger holds the body for combat_rt_flinch_seconds() (0.4 s) --
+    // that length is gameplay and stays -- but the hit art is longer: every moving NPC's flinch in
+    // trace_2026-10-11_215834 (14 of 14) ended by the cap, i.e. the recoil was cut off partway and
+    // the body jumped from a mid-recoil frame straight to standing and walking. That jump is the
+    // "uncanny" look. So the whole hit animation is fitted into 90 % of the window: it recoils and
+    // recovers on its own last frame, and the stagger lasts exactly as long as before. Only ever
+    // faster than the art's own rate, never slower; before the time scale below, which then scales
+    // the animation and the window alike.
+    if (combat_rt_enabled() && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
+        && (animType == ANIM_HIT_FROM_FRONT || animType == ANIM_HIT_FROM_BACK)) {
+        CacheEntry* hitHandle;
+        Art* hitArt = art_ptr_lock(fid, &hitHandle);
+        if (hitArt != NULL) {
+            int frames = art_frame_max_frame(hitArt);
+            art_ptr_unlock(hitHandle);
+            if (frames > 0) {
+                unsigned int fitTpf = (unsigned int)(combat_rt_flinch_seconds() * 1000.0f * 0.9f / frames);
+                if (fitTpf >= 1 && fitTpf < tpf) {
+                    tpf = fitTpf;
+                }
+            }
+        }
+    }
+
     {
         float timeScale = combat_rt_time_scale();
         if (timeScale != 1.0f) {
