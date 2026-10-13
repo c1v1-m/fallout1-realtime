@@ -3336,6 +3336,22 @@ static int intface_change_fid_callback(Object* a1, Object* a2)
 // This is a REPAIR path, not the normal one: it only acts when the dude is idle and no swap is in
 // flight, and it corrects the fid outright rather than replaying a put-away/take-out, because by
 // the time we get here the animation that should have done it is already gone.
+// ⚠️ THE DUDE ON THE FLOOR HAS NO WEAPON POSE (2026-10-13, "spadl jsem na zem, zvednul se a zase
+// spadnul"). Knocked down, or getting up, his sprite is a fall/standup animation, and neither the
+// swap below nor the repair here may touch it: the swap began with register_clear, which wiped the
+// knockdown, and with an empty hand it set the STAND fid outright -- so a Y tap on the floor stood
+// him up while the reaction layer still held him down, and when his dwell ran out the standup played
+// from the lying pose: down again, up again (trace_2026-10-11_215834 s=1919.3-1922.7). The hand
+// still changes; the sprite catches up through the repair once he is on his feet.
+static bool intface_dude_is_down()
+{
+    if (obj_dude == NULL) {
+        return false;
+    }
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    return critter_is_prone(obj_dude) || anim == ANIM_BACK_TO_STANDING || anim == ANIM_PRONE_TO_STANDING;
+}
+
 void intface_reconcile_weapon_fid()
 {
     if (interfaceWindow == -1 || obj_dude == NULL || intface_fid_is_changing) {
@@ -3344,6 +3360,11 @@ void intface_reconcile_weapon_fid()
 
     // Never fight a running animation -- that is how the fid got out of step in the first place.
     if (anim_busy(obj_dude) != 0) {
+        return;
+    }
+
+    // ...nor a body on the floor: a fall pose has no weapon variant to switch to.
+    if (intface_dude_is_down()) {
         return;
     }
 
@@ -3378,6 +3399,13 @@ void intface_reconcile_weapon_fid()
 // 0x455C74
 static void intface_change_fid_animate(int previousWeaponAnimationCode, int weaponAnimationCode)
 {
+    // Down: the hand has already changed, show it, and leave the body alone (intface_dude_is_down).
+    // Realtime only -- turn-based never lets the dude act while he is down in the first place.
+    if (combat_rt_enabled() && intface_dude_is_down()) {
+        intface_redraw_items();
+        return;
+    }
+
     intface_fid_is_changing = true;
 
     register_clear(obj_dude);

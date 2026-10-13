@@ -4083,6 +4083,16 @@ static void gpui_weapon_equip(int index)
 
     Object* item = index == GPUI_WEAPON_UNARMED_ID ? NULL : gpui_weapon_slot[index];
 
+    // Not from the floor, like the reload (gpui_reload_anim_start): inven_wield/inven_unwield
+    // register the put-away/take-out as a RESERVED sequence, which takes the body off its knockdown
+    // and stands it up while the reaction layer still holds it down -- the standup then plays from
+    // the lying pose and he goes down a second time (see intface_dude_is_down, 2026-10-13).
+    if (critter_is_prone(obj_dude)) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "weapon-equip-refused", "why=down");
+        return;
+    }
+
     // Into the ACTIVE hand. inven_wield only plays the put-away/take-out animation when the target
     // hand is the one the interface bar is showing (its internal `hand == a3` test), and that
     // animation is the point -- the swap should read on screen, not appear in your fist.
