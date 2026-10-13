@@ -142,7 +142,6 @@ static int ip_win = -1;            // floating icon overlay window
 static int ip_icon_num = 0;        // interface FRM number currently shown (hand vs talk face)
 static int ip_hand_w = 0;          // current icon dimensions
 static int ip_hand_h = 0;
-static bool ip_win_arrows = false; // the window carries the D-pad arrows column (2+ actions)
 static int ip_win_x = -32000;
 static int ip_win_y = -32000;
 
@@ -1035,70 +1034,6 @@ static int ip_icon_art_num(int kind)
     }
 }
 
-// THE D-PAD ARROWS (2026-10-13, "přidej indikátor, že D-pad nahoru/dolů přepíná akci"). An object
-// with more than one action -- the roped shaft's USE and LOOK, a companion's TALK and PUSH -- showed
-// one icon and nothing to say the others existed, so a player whose first press did the wrong thing
-// had no reason to try the D-pad. Two small triangles, up and down, in a column right of the icon,
-// only while there IS something to cycle to. Drawn, not art: no vanilla FRM is a pair of arrows this
-// small, and scaling one down would break the pixel grid.
-#define IP_ARROW_COL_W 10 // 2 px gap + a 7 px triangle + its 1 px outline overhang
-
-static int ip_win_width()
-{
-    return ip_hand_w + (ip_win_arrows ? IP_ARROW_COL_W : 0);
-}
-
-// One filled triangle, `rows` tall, apex up or down, centred on column cx. Row i spans cx-i..cx+i.
-static void ip_fill_triangle(unsigned char* buf, int pitch, int height, int cx, int topY, int rows, bool up, int color)
-{
-    for (int i = 0; i < rows; i++) {
-        int y = topY + (up ? i : rows - 1 - i);
-        if (y < 0 || y >= height) {
-            continue;
-        }
-        for (int x = cx - i; x <= cx + i; x++) {
-            if (x >= 0 && x < pitch) {
-                buf[y * pitch + x] = (unsigned char)color;
-            }
-        }
-    }
-}
-
-static void ip_hline(unsigned char* buf, int pitch, int height, int x0, int x1, int y, int color)
-{
-    if (y < 0 || y >= height) {
-        return;
-    }
-    for (int x = x0; x <= x1; x++) {
-        if (x >= 0 && x < pitch) {
-            buf[y * pitch + x] = (unsigned char)color;
-        }
-    }
-}
-
-static void ip_draw_arrows(unsigned char* buf, int pitch, int height)
-{
-    // Yellow like the bindings on the bar, over a near-black outline that cannot be index 0 (index 0
-    // is this window's transparency) -- so they read on sand and on a dark vault floor alike.
-    int fill = colorTable[32747];
-    int outline = colorTable[2114];
-    int cx = ip_hand_w + 2 + 4;
-    int mid = height / 2;
-
-    // Each arrow is a 4-row fill (widths 1, 3, 5, 7) inside a 1 px outline: a triangle one row
-    // bigger towards the apex, plus a 9 px line across the base side the bigger triangle does not
-    // cover. Up sits on rows mid-7..mid-2, down on mid+1..mid+6.
-    int upTop = mid - 6;
-    ip_fill_triangle(buf, pitch, height, cx, upTop - 1, 5, true, outline);
-    ip_hline(buf, pitch, height, cx - 4, cx + 4, upTop + 4, outline);
-    ip_fill_triangle(buf, pitch, height, cx, upTop, 4, true, fill);
-
-    int downTop = mid + 2;
-    ip_fill_triangle(buf, pitch, height, cx, downTop, 5, false, outline);
-    ip_hline(buf, pitch, height, cx - 4, cx + 4, downTop - 1, outline);
-    ip_fill_triangle(buf, pitch, height, cx, downTop, 4, false, fill);
-}
-
 // Blit the current icon (frame 0, index-0 transparent) into the overlay window and present it.
 static void ip_draw_icon()
 {
@@ -1109,8 +1044,7 @@ static void ip_draw_icon()
     if (buf == NULL) {
         return;
     }
-    int pitch = ip_win_width();
-    memset(buf, 0, (size_t)pitch * ip_hand_h); // index 0 = transparent (WINDOW_TRANSPARENT)
+    memset(buf, 0, (size_t)ip_hand_w * ip_hand_h); // index 0 = transparent (WINDOW_TRANSPARENT)
 
     CacheEntry* handle;
     Art* art = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, ip_icon_num, 0, 0, 0), &handle);
@@ -1122,15 +1056,11 @@ static void ip_draw_icon()
             for (int x = 0; x < sw && x < ip_hand_w; x++) {
                 unsigned char p = src[y * sw + x];
                 if (p != 0) {
-                    buf[y * pitch + x] = p;
+                    buf[y * ip_hand_w + x] = p;
                 }
             }
         }
         art_ptr_unlock(handle);
-    }
-
-    if (ip_win_arrows) {
-        ip_draw_arrows(buf, pitch, ip_hand_h);
     }
 
     win_draw(ip_win);
@@ -1154,10 +1084,6 @@ static void ip_show_overlay(Object* obj, int kind)
         return;
     }
 
-    // The window grows a column for the D-pad arrows while there is more than one action -- with a
-    // controller connected, since only the D-pad cycles them (the keyboard has no such key).
-    bool arrows = ip_actions_count >= 2 && gamepad_ui_get_controller() != NULL;
-    int ww = iw + (arrows ? IP_ARROW_COL_W : 0);
 
     Rect r;
     obj_bound(obj, &r); // object bounding rect in screen coordinates
@@ -1168,13 +1094,13 @@ static void ip_show_overlay(Object* obj, int kind)
     // Just to the RIGHT of the object, vertically centered on it. No room on the right (near the
     // screen edge) -> flip to the left side.
     int x = r.lrx + 2;
-    if (x + ww > sw) {
-        x = r.ulx - ww - 2;
+    if (x + iw > sw) {
+        x = r.ulx - iw - 2;
     }
     if (x < 0) {
         x = 0;
-    } else if (x + ww > sw) {
-        x = sw - ww;
+    } else if (x + iw > sw) {
+        x = sw - iw;
     }
 
     // Nudged up from the vertical centre so the icon floats over the object's upper part.
@@ -1186,13 +1112,12 @@ static void ip_show_overlay(Object* obj, int kind)
     }
 
     // Recreate the window when the icon or its size changes; otherwise move it to track.
-    if (ip_win == -1 || iconNum != ip_icon_num || iw != ip_hand_w || ih != ip_hand_h || arrows != ip_win_arrows) {
+    if (ip_win == -1 || iconNum != ip_icon_num || iw != ip_hand_w || ih != ip_hand_h) {
         ip_hide_overlay();
         ip_icon_num = iconNum;
         ip_hand_w = iw;
         ip_hand_h = ih;
-        ip_win_arrows = arrows;
-        ip_win = win_add(x, y, ww, ih, colorTable[0], WINDOW_MOVE_ON_TOP | WINDOW_TRANSPARENT);
+        ip_win = win_add(x, y, iw, ih, colorTable[0], WINDOW_MOVE_ON_TOP | WINDOW_TRANSPARENT);
         if (ip_win == -1) {
             return;
         }
