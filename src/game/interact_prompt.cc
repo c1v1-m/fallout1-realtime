@@ -486,6 +486,104 @@ static int ip_priority(int kind)
     return kind == IP_GET ? 0 : 1;
 }
 
+// ⚠️ NOTHING THROUGH A WALL (2026-10-13, "mohu interagovat s trezorem přes zeď v posledním patře ve
+// vaultu 15"). Every scan here measured tiles and nothing else, so a safe two tiles away on the far
+// side of a wall was as good a target as one in front of you. Each one now asks whether he can get
+// NEXT TO the thing (the tile under a loose item counts) within a few walking steps.
+//
+// Not a line of sight, which is wrong both ways at this range: walking along a wall towards a door,
+// the line to the door clips the wall tile beside it and the door would vanish, while a gap one tile
+// wide can pass the line with the object in another room. Reaching it is what "it is right here"
+// means. A breadth-first search over the hexes around him, with a generation-stamped visited map so
+// a step costs O(1); the picker's reach of 6 is a couple of hundred tiles at most.
+#define IP_REACH_MAX_TILES 1024
+
+static unsigned short ip_reach_seen[HEX_GRID_SIZE];
+static unsigned short ip_reach_gen = 0;
+
+static bool ip_reachable_within(Object* obj, int maxSteps)
+{
+    if (obj_dude == NULL || obj == NULL) {
+        return false;
+    }
+
+    // ⚠️ NOT FOR PEOPLE. A conversation never needed you beside anyone -- vanilla talks across a
+    // counter, and gdialog_enter makes its own "can you see there" check -- and a shopkeeper behind
+    // one has no free tile next to him at all, so this test would have taken the TALK hand off
+    // Killian and every merchant like him. Corpses lie where people stood, so they go with them.
+    if (FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER) {
+        return true;
+    }
+
+    int goalDist = (obj->flags & OBJECT_MULTIHEX) != 0 ? 2 : 1;
+    if (tile_dist(obj_dude->tile, obj->tile) <= goalDist) {
+        return true;
+    }
+
+    // A new stamp per search; on wrap-around the map is wiped so an old stamp can never read as seen.
+    ip_reach_gen++;
+    if (ip_reach_gen == 0) {
+        memset(ip_reach_seen, 0, sizeof(ip_reach_seen));
+        ip_reach_gen = 1;
+    }
+
+    static int queue[IP_REACH_MAX_TILES];
+    static unsigned char depth[IP_REACH_MAX_TILES];
+    int head = 0;
+    int tail = 0;
+    queue[tail] = obj_dude->tile;
+    depth[tail] = 0;
+    tail++;
+    ip_reach_seen[obj_dude->tile] = ip_reach_gen;
+
+    while (head < tail) {
+        int tile = queue[head];
+        int d = depth[head];
+        head++;
+
+        if (tile_dist(tile, obj->tile) <= goalDist) {
+            return true;
+        }
+        if (d >= maxSteps) {
+            continue;
+        }
+
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int next = tile_num_in_direction(tile, rotation, 1);
+            if (next < 0 || next >= HEX_GRID_SIZE || ip_reach_seen[next] == ip_reach_gen) {
+                continue;
+            }
+            ip_reach_seen[next] = ip_reach_gen;
+
+            if (next != obj->tile && obj_blocking_at(obj_dude, next, obj_dude->elevation) != NULL) {
+                continue;
+            }
+
+            if (tail >= IP_REACH_MAX_TILES) {
+                return false; // far beyond any reach used here; a bound, not a verdict
+            }
+            queue[tail] = next;
+            depth[tail] = (unsigned char)(d + 1);
+            tail++;
+        }
+    }
+
+    return false;
+}
+
+// The automatic prompt guesses, so it only takes what is right there: a detour of two steps at most.
+// Pointing the stick (the picker, a skill cursor) is a decision and may cost a short walk round
+// something, but never the trip into another room that a wall between you would mean.
+static bool ip_auto_reach(Object* obj)
+{
+    return ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) + 2);
+}
+
+static bool ip_pick_reach(Object* obj)
+{
+    return ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) * 2 + 2);
+}
+
 // Best interactable within range, or NULL. Sets *kindOut to its interaction kind.
 static Object* ip_find_nearest(int* kindOut)
 {
@@ -503,7 +601,7 @@ static Object* ip_find_nearest(int* kindOut)
         // Validated against the PICKER's reach, not the automatic one -- a deliberately chosen
         // cabinet across the room would otherwise be discarded on the very next tick.
         if (kind != IP_NONE && !stale && obj_dist(obj_dude, ip_manual_target) <= ip_pick_range_tiles
-            && ip_on_screen(ip_manual_target)) {
+            && ip_on_screen(ip_manual_target) && ip_pick_reach(ip_manual_target)) {
             if (kindOut != NULL) {
                 *kindOut = kind;
             }
@@ -524,6 +622,9 @@ static Object* ip_find_nearest(int* kindOut)
         }
         int d = obj_dist(obj_dude, obj);
         if (d > ip_range_tiles) {
+            continue;
+        }
+        if (!ip_auto_reach(obj)) {
             continue;
         }
         int prio = ip_priority(kind);
@@ -584,6 +685,9 @@ static int ip_collect(Object** out, int max)
             continue;
         }
         if (!ip_on_screen(obj)) {
+            continue;
+        }
+        if (!ip_pick_reach(obj)) {
             continue;
         }
         out[n++] = obj;
@@ -687,6 +791,10 @@ Object* interact_prompt_skill_target(int skill)
 
             int dist = obj_dist(obj_dude, obj);
             if (dist > ip_pick_range_tiles) {
+                continue;
+            }
+
+            if (!ip_pick_reach(obj)) {
                 continue;
             }
 
