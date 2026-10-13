@@ -689,6 +689,9 @@ void gdialog_enter(Object* target, int a2)
         MessageListItem messageListItem;
 
         if (make_path_func(obj_dude, obj_dude->tile, target->tile, NULL, 0, obj_sight_blocking_at) == 0) {
+            // A script's request (a2 == 0) used to die here without a word anywhere; see op_dialogue_system_enter.
+            trace_event(TRACE_FLOW, "dialog-refused", "pid=%d id=%d name=%s why=no-sight-path",
+                target->pid, target->id, object_name(target));
             // You can't see there.
             messageListItem.num = 660;
             if (message_search(&proto_main_msg_file, &messageListItem)) {
@@ -704,6 +707,8 @@ void gdialog_enter(Object* target, int a2)
         }
 
         if (tile_dist(obj_dude->tile, target->tile) > 12) {
+            trace_event(TRACE_FLOW, "dialog-refused", "pid=%d id=%d name=%s why=too-far dist=%d",
+                target->pid, target->id, object_name(target), tile_dist(obj_dude->tile, target->tile));
             // Too far away.
             messageListItem.num = 661;
             if (message_search(&proto_main_msg_file, &messageListItem)) {

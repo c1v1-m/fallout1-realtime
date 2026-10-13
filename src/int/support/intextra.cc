@@ -2310,14 +2310,28 @@ static void op_dialogue_system_enter(Program* program)
         }
     }
 
-    if (isInCombat()) {
+    // ⚠️ THE SAME NARROW QUESTION gdialog_enter ASKS -- "is somebody actually coming for me?" --
+    // not vanilla's isInCombat() (identical in turn-based: combat_rt_under_threat falls back to it).
+    // 2026-10-13, Killian's guards "attack while saying put your weapon away": a fight between
+    // Kenji and Killian kept realtime's combat bit warm, the critter heartbeat runs through such a
+    // fight (script_chk_critters asks combat_rt_under_threat too), and JTGENGRD's critter_p_proc saw
+    // the dude armed: it scheduled its 10 s "Put that weapon away, or face the consequences!" timer
+    // and THEN asked for the warning conversation -- which this refused, silently. The countdown ran
+    // on with nobody told anything, and fifteen seconds later the guards opened fire. In vanilla the
+    // heartbeat never runs in combat, so the two halves could not come apart.
+    if (combat_rt_under_threat()) {
+        trace_event(TRACE_FLOW, "dialog-refused", "pid=%d id=%d name=%s why=script-under-threat",
+            self->pid, self->id, object_name(self));
         return;
     }
 
     if (game_state_request(GAME_STATE_4) == -1) {
+        trace_event(TRACE_FLOW, "dialog-refused", "pid=%d id=%d name=%s why=state",
+            self->pid, self->id, object_name(self));
         return;
     }
 
+    trace_event(TRACE_FLOW, "dialog-request", "pid=%d id=%d name=%s", self->pid, self->id, object_name(self));
     dialog_target = scr_find_obj_from_program(program);
 }
 

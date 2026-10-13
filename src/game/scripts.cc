@@ -1245,6 +1245,42 @@ int exec_script_proc(int sid, int action)
     return 0;
 }
 
+// ⚠️ LOAD A SCRIPT BEFORE THE FIRST THING THE PLAYER DOES TO ITS OBJECT (2026-10-13, the roped shaft
+// in Vault 15: "na A se jako první ukáže a udělá dalekohled, takže se mapa nenačte").
+//
+// The FIRST event a script ever gets does not run that event's procedure: exec_script_proc loads the
+// program and runs only its `start` body (the `programLoaded` branch above), which the compiler's
+// boilerplate makes dispatch on script_action. Vanilla, and so is the bug it exposes: BVElv1W/2E's
+// start sends USE (6) to proc 4, use_obj_on_p_proc, instead of use_p_proc. The rope script creates a
+// NEW shaft object with that script, so the first USE on it ran the wrong procedure, nothing claimed
+// the action, and obj_use printed its generic "You see: Elevator Shaft" -- which reads exactly like
+// the Examine eye. The second press worked.
+//
+// With a mouse nobody ever met it: hovering an object runs look_at on it before you can click, and
+// that is what loads the program. The pad prompt highlights without hovering, so a freshly created
+// object's first real event was the one that got swallowed. This is the hover's half of that: run the
+// start body once, with an action no dispatcher answers, so the press that follows reaches the
+// procedure it asked for. Objects present when the map loaded were already loaded by map_enter.
+void scr_load_before_first_event(Object* obj)
+{
+    if (obj == NULL || obj->sid == -1) {
+        return;
+    }
+
+    Script* script;
+    if (scr_ptr(obj->sid, &script) == -1) {
+        return;
+    }
+
+    // Loaded already: running START again would re-run the body, which is not what this is for.
+    if ((script->scr_flags & SCRIPT_FLAG_0x01) != 0) {
+        return;
+    }
+
+    trace_event(TRACE_FLOW, "script-preload", "pid=%d id=%d sid=%d", obj->pid, obj->id, obj->sid);
+    exec_script_proc(obj->sid, SCRIPT_PROC_START);
+}
+
 // Locate built-in procs for given script.
 //
 // 0x492AA0

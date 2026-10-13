@@ -170,6 +170,7 @@ int scripts_request_loot_container(Object* a1, Object* a2);
 int scripts_request_steal_container(Object* a1, Object* a2);
 void script_make_path(char* path);
 int exec_script_proc(int sid, int proc);
+void scr_load_before_first_event(Object* obj);
 int scr_find_str_run_info(int a1, int* a2, int sid);
 int scr_list_str(int index, char* name, size_t size);
 int scr_set_dude_script();
