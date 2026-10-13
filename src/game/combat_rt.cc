@@ -447,6 +447,13 @@ typedef struct RtActor {
     int rest_x;
     int rest_y;
 
+    // Where its death began (copied from the DYING reaction's keep, which retires 2 s after the body
+    // settles). The corpse grounding measures from here when it can -- see rt_update_actor.
+    bool death_valid;
+    int death_x;
+    int death_y;
+    int death_tile;
+
     // NOTE: the knockdown clocks that used to live here (prone_since / prone_fall_end) belong to
     // the critter's RtReaction entry now -- see the REACTION OWNERSHIP block. They were per-actor,
     // so the dude needed his own duplicate pair and bystanders had none at all.
@@ -3591,6 +3598,12 @@ typedef struct RtReaction {
     float dwellUntil; // PRONE: when the ground dwell expires (restarted by every damaging hit)
     float groundAnchor; // PRONE: when the fall ENDED -- never restarted, so the anti-pin cap is real
     int repairs; // how many times the reconciler had to fix this body
+    // FLINCH / DYING: where the body stood (sub-tile offset and tile) the moment the reaction took
+    // it. A flinch hands the body back there; a corpse is judged against it. See rt_reaction_enter.
+    bool keepValid;
+    int keepX;
+    int keepY;
+    int keepTile;
 } RtReaction;
 
 static RtReaction rt_reactions[RT_REACTION_SLOTS];
@@ -3642,6 +3655,7 @@ static RtReaction* rt_reaction_slot(Object* obj)
     r->dwellUntil = -1.0f;
     r->groundAnchor = -1.0f;
     r->repairs = 0;
+    r->keepValid = false;
     return r;
 }
 
@@ -3685,6 +3699,34 @@ static bool rt_reaction_starting(const RtReaction* r)
     return r != NULL && rt_clock - r->tEnter < RT_REACT_START_GRACE;
 }
 
+// ⚠️ A FLINCH ENDS WHERE IT STARTED (2026-10-13, "scorpion sprite poletoval sem a tam při boji").
+// rt_keep_offset saves the body's sub-tile position when the hit cuts what it was doing -- but the
+// hit animation's own end runs through obj_move_to_tile too, which zeroes obj->x/y, so a critter
+// standing between tiles was thrown to the centre of its tile the moment it finished flinching.
+// trace_2026-10-11_215834, a radscorpion: flinch from -9,18, its hit art pushed it to 15,34, then
+// 0,0 -- a lurch back and forth on every hit. The dude is not touched: dude_stand restores his own
+// rest offset (combat_rt_dude_rest_offset). Only when the end really zeroed it on the same tile; a
+// body that has started walking, or was knocked somewhere, is where it means to be.
+static void rt_reaction_restore_keep(RtReaction* r)
+{
+    Object* o = r->obj;
+    if (!r->keepValid || o == NULL || o == obj_dude || critter_is_dead(o)) {
+        return;
+    }
+    int anim = FID_ANIM_TYPE(o->fid);
+    if (anim == ANIM_WALK || anim == ANIM_RUNNING || critter_is_prone(o)) {
+        return;
+    }
+    if (o->tile != r->keepTile || o->x != 0 || o->y != 0 || (r->keepX == 0 && r->keepY == 0)) {
+        return;
+    }
+    Rect rect;
+    obj_offset(o, r->keepX, r->keepY, &rect);
+    tile_refresh_rect(&rect, o->elevation);
+    trace_event(TRACE_COMBAT, "flinch-keep", "pid=%d id=%d x=%d y=%d t=%.2f",
+        o->pid, o->id, r->keepX, r->keepY, rt_clock);
+}
+
 static void rt_reaction_enter(RtReaction* r, int kind, const char* why)
 {
     if (r == NULL) {
@@ -3708,6 +3750,16 @@ static void rt_reaction_enter(RtReaction* r, int kind, const char* why)
     }
 
     Object* o = r->obj;
+
+    // Where the reaction found the body. In realtime a critter stands BETWEEN tiles as often as on
+    // one (the movers own obj->x/y), and both ends of a reaction used to forget that: see the flinch
+    // hand-back in rt_reaction_tick and the corpse grounding in rt_update_actor.
+    if (kind == RT_REACT_FLINCH || kind == RT_REACT_DYING) {
+        r->keepValid = true;
+        r->keepX = o->x;
+        r->keepY = o->y;
+        r->keepTile = o->tile;
+    }
     trace_event(TRACE_COMBAT, "react", "pid=%d id=%d %s->%s why=%s anim=%d busy=%d prone=%d t=%.2f",
         o->pid, o->id, rt_react_name(from), rt_react_name(kind), why != NULL ? why : "unknown",
         FID_ANIM_TYPE(o->fid), anim_busy(o), critter_is_prone(o) ? 1 : 0, rt_clock);
@@ -3761,6 +3813,33 @@ static bool rt_reaction_supersedes(int cur, int req)
 // stopping) and the note in anim.cc names obj_connect_to_tile as the cause -- but nobody had ever
 // done it for the thing being SHOT AT, which is where it is most visible: you are looking straight
 // at it when it happens.
+// How far a death animation carries its body, start to finish: what object_animate adds frame by
+// frame (art_frame_hot of every frame, at the body's rotation). Only for the multi-frame death and
+// knockdown art; a settled _SF frame has no travel of its own, and then this says 0,0.
+static void rt_death_anim_travel(Object* obj, int* dx, int* dy)
+{
+    *dx = 0;
+    *dy = 0;
+    int anim = FID_ANIM_TYPE(obj->fid);
+    if (anim < FIRST_KNOCKDOWN_AND_DEATH_ANIM || anim >= FIRST_SF_DEATH_ANIM) {
+        return;
+    }
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(obj->fid, &handle);
+    if (art == NULL) {
+        return;
+    }
+    int frames = art_frame_max_frame(art);
+    for (int frame = 0; frame < frames; frame++) {
+        int hx = 0;
+        int hy = 0;
+        art_frame_hot(art, frame, obj->rotation, &hx, &hy);
+        *dx += hx;
+        *dy += hy;
+    }
+    art_ptr_unlock(handle);
+}
+
 static void rt_keep_offset(Object* o, int keepX, int keepY)
 {
     if (o == NULL || (keepX == 0 && keepY == 0)) {
@@ -4285,9 +4364,11 @@ static void rt_reaction_tick(float dt)
             // Cosmetic and bounded. Its damage committed at swing-connect, so cutting the tail
             // costs nothing, and never cutting it is what froze the player mid-stagger.
             if (!animating && !starting) {
+                rt_reaction_restore_keep(r);
                 rt_reaction_enter(r, RT_REACT_NONE, "flinch-done");
             } else if (held >= RT_FLINCH_MAX_SECONDS) {
                 anim_clear_pending(o);
+                rt_reaction_restore_keep(r);
                 rt_reaction_enter(r, RT_REACT_NONE, "flinch-cap");
             }
             break;
@@ -7980,6 +8061,10 @@ static void rt_refresh_registry()
             a->dead_frame = prev->dead_frame;
             a->rest_x = prev->rest_x;
             a->rest_y = prev->rest_y;
+            a->death_valid = prev->death_valid;
+            a->death_x = prev->death_x;
+            a->death_y = prev->death_y;
+            a->death_tile = prev->death_tile;
             a->flinch_accum = prev->flinch_accum;
             a->immune_until = prev->immune_until;
             a->stuck_tile = prev->stuck_tile;
@@ -8057,6 +8142,7 @@ static void rt_refresh_registry()
             a->dead_frame = -1;
             a->rest_x = obj->x;
             a->rest_y = obj->y;
+            a->death_valid = false;
             a->flinch_accum = 0.0f;
             a->immune_until = 0.0f;
             a->stuck_tile = obj->tile;
@@ -8369,10 +8455,34 @@ static void rt_update_actor(RtActor* a, float dt)
         // vanilla away. The stranded-anim test above misses them whenever the body ends up prone
         // or its animation has already stopped, which is exactly when nobody else will fix it.
         // Measured from where this body STANDS, not from the tile centre (RtActor.rest_x).
-        int offX = npc->x - a->rest_x;
-        int offY = npc->y - a->rest_y;
-        bool strayOffset = offX > RT_CORPSE_FALL_OFFSET_MAX || offX < -RT_CORPSE_FALL_OFFSET_MAX
-            || offY > RT_CORPSE_FALL_OFFSET_MAX || offY < -RT_CORPSE_FALL_OFFSET_MAX;
+        //
+        // ⚠️ ...AND FROM WHERE IT BEGAN TO DIE, WHEN THAT IS KNOWN (2026-10-13, "scorpion umřel na jiném
+        // místě"). rest_x is where the body last STOOD IDLE, and a critter that has been fighting in
+        // realtime rarely stands idle on its tile centre: the radscorpion of trace_2026-10-11_215834
+        // began its fall at 35,16, its art carried it to 47,29 (a big creature travels further than
+        // the <= 11 px measured on people), and measured from rest 0,0 that read as stray -- the
+        // corpse jumped 47 px back onto its tile after it had visibly come to rest. The DYING
+        // reaction records the start; the death art's own travel (rt_death_anim_travel) is then the
+        // expected offset, and only what lies beyond it is stray.
+        if (!a->death_valid) {
+            RtReaction* rr = rt_reaction_find(npc);
+            if (rr != NULL && rr->keepValid && (rr->kind == RT_REACT_DYING || rr->kind == RT_REACT_DEAD)) {
+                a->death_valid = true;
+                a->death_x = rr->keepX;
+                a->death_y = rr->keepY;
+                a->death_tile = rr->keepTile;
+            }
+        }
+        bool fromDeath = a->death_valid && a->death_tile == npc->tile;
+        int offX = npc->x - (fromDeath ? a->death_x : a->rest_x);
+        int offY = npc->y - (fromDeath ? a->death_y : a->rest_y);
+        int travelX = 0;
+        int travelY = 0;
+        if (fromDeath) {
+            rt_death_anim_travel(npc, &travelX, &travelY);
+        }
+        bool strayOffset = offX - travelX > RT_CORPSE_FALL_OFFSET_MAX || offX - travelX < -RT_CORPSE_FALL_OFFSET_MAX
+            || offY - travelY > RT_CORPSE_FALL_OFFSET_MAX || offY - travelY < -RT_CORPSE_FALL_OFFSET_MAX;
 
         // ...and a THIRD: a fall that was cut before its last frame (see rt_death_fall_was_cut --
         // the dialogue-interrupts-a-death case). Its leftover offset can be well UNDER the stray
