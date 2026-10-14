@@ -1610,7 +1610,16 @@ static void op_start_gdialog(Program* program)
     Object* obj = static_cast<Object*>(programStackPopPointer(program));
     programStackPopInteger(program);
 
-    if (isInCombat()) {
+    // ⚠️ THE SAME QUESTION AS op_dialogue_system_enter, OR THE TWO HALVES COME APART (2026-10-15, "šel
+    // na Killiana guy, a když jsem vytáhl zbraň dřív, dostal jsem šedý dialogue okno"). That op lets a
+    // conversation in while a fight that is not about you keeps realtime's combat bit warm (the
+    // 2026-10-13 guard-warning fix); this one still asked isInCombat(), so the warning conversation
+    // was let in and then its frame refused -- no scr_dialogue_init, no talk frame, and the guard's
+    // gsay_reply and options came up in the engine's bare grey windows over the map (trace_2026-10-15_
+    // 010931 s=553.90: Kenji attacking Killian, guard 2089, dialog-request with no dialog-start; the
+    // same guard script opened properly for Kalnor at s=495 with no fight on). Identical to vanilla
+    // in turn-based, where combat_rt_under_threat falls back to isInCombat.
+    if (combat_rt_under_threat()) {
         return;
     }
 
