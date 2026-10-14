@@ -499,6 +499,7 @@ static const PipboyControl ctrl_lines[] = {
     { "Left", "Automap" },
     { "Right", "End combat (refused if enemies still want you)" },
     { "Tap", "Next action (on a follower: push past)" },
+    { "Tap Up / Down", "Nothing lit up: scroll the messages" },
     { NULL, NULL },
     { NULL, "OTHER" },
     { "BACK", "Inventory" },

@@ -1795,10 +1795,24 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
             // the tap: cycle the prompt's action. Up/Left step backwards, Down/Right forwards, so
             // both axes read the way the ring is laid out. Refuse audibly when there is nothing
             // highlighted or it has only one action, so the D-pad never just silently does nothing.
+            //
+            // ⚠️ WITH NOTHING LIT UP, UP / DOWN SCROLL THE MESSAGES (2026-10-14, "když dude nebude na nic
+            // mířit, tak dpad bude posouvat pipboye; když bude mířit na prompt, tak šipky prohodí akce;
+            // podržení jak je teď"). The message window on the bar keeps a history the pad could never
+            // reach -- vanilla scrolls it only by clicking its upper or lower half. Up shows the older
+            // line, down the newer one, exactly those two halves. Left / right have nothing to do there
+            // and still refuse audibly. A target, even a one-action one, keeps the taps for itself.
             if (gpui_dpad_held != -1 && !gpui_dpad_handled) {
                 bool back = gpui_dpad_held == GPUI_DPAD_PIPBOY || gpui_dpad_held == GPUI_DPAD_AUTOMAP;
+                bool vertical = gpui_dpad_held == GPUI_DPAD_PIPBOY || gpui_dpad_held == GPUI_DPAD_CHAR;
                 if (interact_prompt_cycle(back ? -1 : 1)) {
                     gsound_play_sfx_file("ib1p1xx1");
+                } else if (interact_prompt_target() == NULL && vertical) {
+                    if (gpui_dpad_held == GPUI_DPAD_PIPBOY) {
+                        display_scroll_up(-1, -1);
+                    } else {
+                        display_scroll_down(-1, -1);
+                    }
                 } else {
                     gsound_play_sfx_file("iisxxxx1");
                 }
