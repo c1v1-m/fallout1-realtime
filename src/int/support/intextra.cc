@@ -2384,6 +2384,9 @@ static void op_game_time_advance(Program* program)
     int days = data / GAME_TIME_TICKS_PER_DAY;
     int remainder = data % GAME_TIME_TICKS_PER_DAY;
 
+    // A skip nobody can interrupt: poison may wound but not kill inside it (critter_check_poison).
+    critter_set_poison_spares_life(true);
+
     for (int day = 0; day < days; day++) {
         inc_game_time(GAME_TIME_TICKS_PER_DAY);
         queue_process();
@@ -2391,6 +2394,8 @@ static void op_game_time_advance(Program* program)
 
     inc_game_time(remainder);
     queue_process();
+
+    critter_set_poison_spares_life(false);
 }
 
 // 0x44EFE8

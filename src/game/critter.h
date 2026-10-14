@@ -66,6 +66,7 @@ int critter_adjust_hits(Object* critter, int amount);
 int critter_get_poison(Object* critter);
 int critter_adjust_poison(Object* obj, int amount);
 int critter_check_poison(Object* obj, void* data);
+void critter_set_poison_spares_life(bool spares);
 int critter_get_rads(Object* critter);
 int critter_adjust_rads(Object* obj, int amount);
 bool critter_get_radaway_cancels();

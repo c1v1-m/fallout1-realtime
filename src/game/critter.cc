@@ -300,6 +300,25 @@ int critter_adjust_poison(Object* critter, int amount)
 }
 
 // 0x427BAC
+// ⚠️ POISON CANNOT KILL WHILE A SCRIPT SKIPS TIME (2026-10-14, "dal jsem doktorovi rad scorp tail
+// za heal, měl jsem jeden život... dostal jsem od něho full heal, ale dead screen"). Razlo's
+// treatment (RAZLO.INT razlo06nb) is game_time_advance FIRST -- twenty minutes per hit point he
+// heals -- and critter_heal AFTER. The advance runs every queued event of those hours, and at 1 HP
+// the first poison dose killed the dude inside the conversation; the heal then filled the corpse
+// (trace_2026-10-13_222906 s=1513: critter_kill <- critter_check_poison <- queue_process <- the
+// dialogue). Vanilla code, vanilla script order.
+//
+// Vanilla's own answer to "poison while time passes" is the return value below: at 5 HP or less it
+// stops a REST so the player can do something about it. A scripted skip cannot be stopped, so the
+// same intent is kept the only way it can be: while one runs, a dose leaves the dude at 1 HP at the
+// least. It still costs every other point and still counts down. Set by op_game_time_advance.
+static bool critter_poison_spares_life = false;
+
+void critter_set_poison_spares_life(bool spares)
+{
+    critter_poison_spares_life = spares;
+}
+
 int critter_check_poison(Object* obj, void* data)
 {
     MessageListItem messageListItem;
@@ -309,7 +328,11 @@ int critter_check_poison(Object* obj, void* data)
     }
 
     critter_adjust_poison(obj, -2);
-    critter_adjust_hits(obj, -1);
+    if (critter_poison_spares_life && critter_get_hits(obj) <= 1) {
+        trace_event(TRACE_FLOW, "poison-spared", "hp=%d poison=%d", critter_get_hits(obj), critter_get_poison(obj));
+    } else {
+        critter_adjust_hits(obj, -1);
+    }
 
     intface_update_hit_points(false);
 
