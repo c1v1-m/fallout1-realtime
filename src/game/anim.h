@@ -139,6 +139,7 @@ void anim_notify_object_freed(Object* obj);
 // register_clear variant that only ends a sequence in which `a1` still has UNPLAYED work.
 // MUST be used instead of register_clear by anything gated on anim_busy_blocking (see anim.cc).
 int anim_clear_pending(Object* a1);
+int anim_end_moves(Object* obj);
 int register_end();
 int check_registry(Object* obj);
 int anim_busy(Object* a1);

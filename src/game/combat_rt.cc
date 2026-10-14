@@ -3774,6 +3774,17 @@ static void rt_reaction_enter(RtReaction* r, int kind, const char* why)
         r->keepY = o->y;
         r->keepTile = o->tile;
     }
+
+    // A body that starts to die stops walking: a walk left running animates the death art as steps
+    // (anim_end_moves has the Skulz in the club). The commit pass already clears a defender it kills;
+    // this is for every death that came from somewhere else -- a script, an explosion, undead-kill.
+    if (kind == RT_REACT_DYING) {
+        int ended = anim_end_moves(o);
+        if (ended > 0) {
+            trace_event(TRACE_COMBAT, "dying-walk-cut", "pid=%d id=%d sequences=%d t=%.2f",
+                o->pid, o->id, ended, rt_clock);
+        }
+    }
     trace_event(TRACE_COMBAT, "react", "pid=%d id=%d %s->%s why=%s anim=%d busy=%d prone=%d t=%.2f",
         o->pid, o->id, rt_react_name(from), rt_react_name(kind), why != NULL ? why : "unknown",
         FID_ANIM_TYPE(o->fid), anim_busy(o), critter_is_prone(o) ? 1 : 0, rt_clock);

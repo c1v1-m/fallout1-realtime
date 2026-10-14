@@ -806,6 +806,56 @@ int anim_force_clear(Object* a1)
     return -1;
 }
 
+// ⚠️ A DYING BODY DOES NOT KEEP WALKING (2026-10-14, "když ten týpek umírá ... v tom klubu ten Skulz":
+// the death animation looped and the body slid away). A script sent a Skulz ganger on a 111-step
+// walk to the off-map pen (tile 7000) and he was killed half a second later by a scripted hit, so his
+// death animation started as a SECOND sequence while the walk's was still live. A walk step animates
+// whatever fid the body has -- now the death art -- so it ran those 22 frames round and round and
+// took their hot-spot shifts for steps: the corpse-to-be cycled its fall and drifted 144 px down the
+// screen until the reaper settled it (trace_2026-10-14_210449 s=34.46-37.10, id=1242). Ends every
+// live sequence of the object that WALKS or RUNS it somewhere and leaves the
+// rest -- the death animation itself -- running. Returns how many were ended.
+int anim_end_moves(Object* obj)
+{
+    if (obj == NULL) {
+        return 0;
+    }
+
+    int ended = 0;
+    for (int index = 0; index < ANIMATION_SEQUENCE_LIST_CAPACITY; index++) {
+        AnimationSequence* sequence = &(anim_set[index]);
+        if (sequence->field_0 == -1000) {
+            continue;
+        }
+        bool moves = false;
+        for (int at = 0; at < sequence->length; at++) {
+            AnimationDescription* description = &(sequence->animations[at]);
+            if (description->owner != obj) {
+                continue;
+            }
+            // Walking or running only: a KNOCKBACK death is a straight move too, but it moves the body
+            // with the fall animation (action_knockback), and that one IS the death.
+            switch (description->kind) {
+            case ANIM_KIND_MOVE_TO_OBJECT:
+            case ANIM_KIND_MOVE_TO_TILE:
+            case ANIM_KIND_MOVE_TO_TILE_STRAIGHT:
+            case ANIM_KIND_MOVE_TO_TILE_STRAIGHT_AND_WAIT_FOR_COMPLETE:
+                if (description->anim == ANIM_WALK || description->anim == ANIM_RUNNING) {
+                    moves = true;
+                }
+                break;
+            default:
+                break;
+            }
+        }
+        if (moves) {
+            anim_set_end(index);
+            ended++;
+        }
+    }
+    return ended;
+}
+
 // Called from obj_erase_object() (object.cc) in the instant before an Object is freed.
 //
 // anim.cc holds RAW Object pointers in TWO tables and obj_remove() cleans NEITHER -- it frees the
