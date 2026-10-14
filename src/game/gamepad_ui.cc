@@ -6726,8 +6726,11 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     }
 
     // Aimed shot possible only in combat, with an aimable weapon and a target, and no modal /
-    // inventory / disabled bar over the screen.
-    bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_can_aim();
+    // inventory / disabled bar over the screen. ⚠️ combat_rt_can_aim is asked ONLY at a press: since
+    // R3 also takes a target out of reach (rt_window_target) it runs the lock's facing search, sight
+    // lines included, and asked every frame it did that 60 times a second and flooded the trace with
+    // lock-pick lines (trace_2026-10-14_204520: 1541 in 2.5 minutes).
+    bool uiBlocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled();
 
     // PICKER UP (LB is down): the right stick moves the mark and RT attacks the chosen part as
     // often as the cooldown allows. LETTING GO OF LB is the way out -- it puts the markers away
@@ -6743,7 +6746,7 @@ static void gpui_aim_wheel(SDL_GameController* pad)
         // assignment further down, so it has to say so itself.
         gpui_aim_gesture = true;
         Object* target = combat_rt_aim_target();
-        if (blocked || target == NULL || !lbNow) {
+        if (uiBlocked || !combat_rt_can_aim() || target == NULL || !lbNow) {
             // LB released (or the shot became impossible): put the markers away. NOT a shot.
             gpui_aim_picker_close();
         } else {
@@ -6780,6 +6783,7 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     // nothing else (its release, gpui_button_shortcuts), and the lock is LT's hold alone.
     // R3: open the called-shot window on the click, or refuse audibly.
     if (r3Edge) {
+        bool blocked = uiBlocked || !combat_rt_can_aim();
         if (blocked) {
             // ⚠️ THE REFUSAL IS A SOUND, NOT A SENTENCE. It used to print the reason into the
             // message window, because refusing in silence is indistinguishable from a dead button.

@@ -10614,17 +10614,24 @@ Object* combat_rt_mouse_target()
 // click-to-walk and its right-click cursor toggle never see one. Over the bar and in menus nothing
 // changes. Off in MODS, all of this stands down and the mouse is vanilla plus the old aim layer.
 #define RT_MOUSE_WALK_DEADZONE 10 // screen pixels from his feet: a press on the dude walks nowhere
-#define RT_MOUSE_RUN_PX 150 // the cursor further than this from his feet runs (his pick, "daleko = běh")
+#define RT_MOUSE_RUN_PX 160 // the cursor further than this from his feet starts a run (his pick, "daleko = běh")
+#define RT_MOUSE_WALK_PX 120 // ...and nearer than this drops back to a walk: the gap is the hysteresis
 
 static bool rt_mouse_rmb_lock = false; // the right button holds a lock (a fight was on at the press)
 
-// The dude's feet on screen, which is where "towards the cursor" is measured from.
+// The dude's feet on screen, which is where "towards the cursor" is measured from -- ⚠️ WHERE THE
+// CAMERA IS TAKING THEM, not where they are drawn this frame. The follow-cam lags him by up to
+// RT_CAM_SMOOTH_MAX px (rt_cam_lag_x/y) and catches up when he slows, so his drawn position drifts
+// while the mouse holds still; measured from it, the heading swung (291 -> 352 degrees over one
+// second with the hand at rest) and the distance kept crossing the run threshold, so the gait flipped
+// walk/run/walk and every flip restarted the animation -- "dude se zadrhává při běhu, animace se
+// opakuje" (trace_2026-10-14_204520 s=7.4-9.1). Minus the lag it is a fixed point under a fixed cursor.
 static void rt_dude_feet(int* x, int* y)
 {
     Rect b;
     obj_bound(obj_dude, &b);
-    *x = (b.ulx + b.lrx) / 2;
-    *y = b.lry - 4;
+    *x = (b.ulx + b.lrx) / 2 - (int)rt_cam_lag_x;
+    *y = b.lry - 4 - (int)rt_cam_lag_y;
 }
 
 static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
@@ -10665,9 +10672,22 @@ static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
         return false;
     }
 
+    // Run / walk with a dead band between, so a cursor near the line cannot flip the gait (each flip
+    // restarts the stride). The state is per hold: a new press starts from a walk.
+    static bool running = false;
+    static unsigned int lastFrame = 0;
+    unsigned int now = SDL_GetTicks();
+    if (now - lastFrame > 200) {
+        running = false; // the button was let go in between
+    }
+    lastFrame = now;
+    if (running ? len < RT_MOUSE_WALK_PX : len > RT_MOUSE_RUN_PX) {
+        running = !running;
+    }
+
     *outX = dx / len;
     *outY = dy / len;
-    *outRun = len > RT_MOUSE_RUN_PX;
+    *outRun = running;
     return true;
 }
 
