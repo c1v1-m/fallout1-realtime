@@ -3854,6 +3854,25 @@ static void rt_death_anim_travel(Object* obj, int* dx, int* dy)
     art_ptr_unlock(handle);
 }
 
+// ⚠️ A CORPSE MAY KEEP ITS FALL, BUT NOT INSIDE A TABLE (2026-10-14, "Saul zabil jednoho ze Skulz ve
+// scripted eventu a ta mrtvola klipovala se stolem"). The grounding below keeps a death animation's
+// own travel (the radscorpion fix of 2026-10-13), and a scripted CHUNKS_OF_FLESH death carried a
+// Skulz ganger -21,25 px off his tile, onto the table beside him (trace_2026-10-14_205530 s=98-100,
+// id=767). Where the drawn body ends up is asked here: the tile under its middle, if that is not its
+// own tile and something solid that is not a critter stands there -- a table, a wall, a machine --
+// the travel is not kept and the body goes back to where it began to die.
+static bool rt_corpse_in_obstacle(Object* corpse)
+{
+    Rect b;
+    obj_bound(corpse, &b);
+    int tile = tile_num((b.ulx + b.lrx) / 2, (b.uly + b.lry) / 2, corpse->elevation);
+    if (tile == -1 || tile == corpse->tile) {
+        return false;
+    }
+    Object* blocker = obj_blocking_at(corpse, tile, corpse->elevation);
+    return blocker != NULL && FID_TYPE(blocker->fid) != OBJ_TYPE_CRITTER;
+}
+
 static void rt_keep_offset(Object* o, int keepX, int keepY)
 {
     if (o == NULL || (keepX == 0 && keepY == 0)) {
@@ -8543,7 +8562,12 @@ static void rt_update_actor(RtActor* a, float dt)
         // threshold above, because the body simply never travelled the rest of the way, so
         // neither of the other two tests sees it. Grounding it puts the body on its tile instead
         // of part-way through a fall it will never finish.
-        if ((strandedDeadAnim || strayOffset || rt_death_fall_was_cut(npc))
+        bool inObstacle = (offX != 0 || offY != 0) && anim_busy(npc) == 0 && rt_corpse_in_obstacle(npc);
+        if (inObstacle) {
+            trace_event(TRACE_FLOW, "corpse-obstacle", "pid=%d id=%d off=%d,%d t=%.2f",
+                npc->pid, npc->id, offX, offY, rt_clock);
+        }
+        if ((strandedDeadAnim || strayOffset || rt_death_fall_was_cut(npc) || inObstacle)
             && (offX != 0 || offY != 0) && anim_busy(npc) == 0) {
             Rect off;
             obj_offset(npc, -offX, -offY, &off);
