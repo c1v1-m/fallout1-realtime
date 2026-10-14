@@ -1198,6 +1198,21 @@ static bool rt_mouse_hold_walk = true;
 // retaliation AND the script learning who fired (scr_set_objs source NULL), because a Junktown guard's
 // own damage_p_proc raises the town alarm (GVAR 247) and changes team when source_obj is the dude.
 static bool rt_forgive_stray = true;
+
+// ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
+// prostě vypnout to s tou zbraní, ať se mě neptají při tom konfliktu? zabiju assassina a ještě se jim
+// nelíbí, že držím po činu zbraň"). JTGENGRD's critter_p_proc sees the dude's weapon in hand, asks
+// for the "You'd better put that away" talk and sets a 10 s timer; its timed_event_p_proc looks
+// again, floats "Put that weapon away, or face the consequences!" and 5 s later the guard attacks.
+// Vanilla never ran that heartbeat during combat, so it could not nag mid-fight; realtime runs it
+// whenever the fight is not against you -- Kenji attacking Killian -- and the guard warned him while
+// he was shooting Kenji (trace_2026-10-15_012127 s=33.74) with the countdown running into the fight.
+// While any fight is on and for RT_WEAPON_AMNESTY_SECONDS after the last one, those two procs see
+// the dude's hand as empty when it holds a WEAPON (op_critter_inven_obj, intextra.cc): no talk, no
+// countdown, and a countdown already running finds the gun "put away" and stands down. Talks and
+// every other proc still see the real hand.
+#define RT_WEAPON_AMNESTY_SECONDS 15.0f
+static float rt_last_fight_clock = -1000.0f;
 #define RT_FORGIVEN_MAX 32
 static int rt_forgiven_ids[RT_FORGIVEN_MAX];
 static int rt_forgiven_count = 0;
@@ -10145,6 +10160,7 @@ static void rt_reset_session_state()
 {
     // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
     rt_forgiven_count = 0;
+    rt_last_fight_clock = -1000.0f;
 
     // The reaction table is session state like everything else here: a load must not resurrect a
     // knockdown from the game that was running a second ago.
@@ -12198,6 +12214,10 @@ void combat_rt_update(float dt)
 
     rt_clock += dt;
 
+    if (isInCombat()) {
+        rt_last_fight_clock = rt_clock; // the weapon amnesty runs from the last moment of a fight
+    }
+
     // Step the dude's HP counter. Deliberately here, below the radial-wheel return and above
     // every other early-out: the counter is part of the combat model's presentation, so it
     // holds still exactly when the world does.
@@ -14099,6 +14119,12 @@ void combat_rt_set_forgive_stray(bool enabled)
 bool combat_rt_get_forgive_stray()
 {
     return rt_forgive_stray;
+}
+
+// See RT_WEAPON_AMNESTY_SECONDS.
+bool combat_rt_weapon_amnesty()
+{
+    return rt_enabled && (isInCombat() || rt_clock - rt_last_fight_clock < RT_WEAPON_AMNESTY_SECONDS);
 }
 
 // Called by apply_damage (combat.cc) for a critter an attack hit WITHOUT being aimed at -- a burst's

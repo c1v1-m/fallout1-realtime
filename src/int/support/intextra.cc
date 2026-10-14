@@ -2606,6 +2606,32 @@ static void op_message_str(Program* program)
 }
 
 // 0x44F5D0
+// The dude's weapon is hidden from a critter's HEARTBEAT and TIMER procs during a fight and a short
+// while after it -- the guards' "put that weapon away" countdown (see RT_WEAPON_AMNESTY_SECONDS in
+// combat_rt.cc). Only those two procs and only a weapon: a talk still sees what you hold.
+static Object* critter_inven_obj_amnesty(Program* program, Object* item)
+{
+    if (item == NULL || item_get_type(item) != ITEM_TYPE_WEAPON || !combat_rt_weapon_amnesty()) {
+        return item;
+    }
+    Script* script;
+    if (scr_ptr(scr_find_sid_from_program(program), &script) == -1) {
+        return item;
+    }
+    if (script->action != SCRIPT_PROC_CRITTER && script->action != SCRIPT_PROC_TIMED) {
+        return item;
+    }
+    // Traced at most every two seconds: every guard heartbeat asks, several times a second in a crowd.
+    static unsigned int lastTrace = 0;
+    if (get_time() - lastTrace > 2000) {
+        lastTrace = get_time();
+        Object* self = scr_find_obj_from_program(program);
+        trace_event(TRACE_FLOW, "weapon-amnesty", "pid=%d id=%d proc=%d",
+            self != NULL ? self->pid : -1, self != NULL ? self->id : -1, script->action);
+    }
+    return NULL;
+}
+
 static void op_critter_inven_obj(Program* program)
 {
     int type = programStackPopInteger(program);
@@ -2619,7 +2645,7 @@ static void op_critter_inven_obj(Program* program)
         case INVEN_TYPE_RIGHT_HAND:
             if (critter == obj_dude) {
                 if (intface_is_item_right_hand() != HAND_LEFT) {
-                    programStackPushPointer(program, inven_right_hand(critter));
+                    programStackPushPointer(program, critter_inven_obj_amnesty(program, inven_right_hand(critter)));
                 } else {
                     programStackPushPointer(program, NULL);
                 }
@@ -2630,7 +2656,7 @@ static void op_critter_inven_obj(Program* program)
         case INVEN_TYPE_LEFT_HAND:
             if (critter == obj_dude) {
                 if (intface_is_item_right_hand() == HAND_LEFT) {
-                    programStackPushPointer(program, inven_left_hand(critter));
+                    programStackPushPointer(program, critter_inven_obj_amnesty(program, inven_left_hand(critter)));
                 } else {
                     programStackPushPointer(program, NULL);
                 }
