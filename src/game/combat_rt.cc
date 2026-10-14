@@ -455,6 +455,17 @@ typedef struct RtActor {
     int death_y;
     int death_tile;
 
+    // The pull that keeps a fall from carrying the body under the furniture (rt_corpse_pull):
+    // decided once, when the death art first shows, then spread over the frames still to play.
+    int pull_state; // RT_PULL_UNDECIDED / RT_PULL_ACTIVE / RT_PULL_DONE
+    int pull_fid;
+    int pull_from;
+    int pull_last;
+    int pull_x;
+    int pull_y;
+    int pull_done_x;
+    int pull_done_y;
+
     // NOTE: the knockdown clocks that used to live here (prone_since / prone_fall_end) belong to
     // the critter's RtReaction entry now -- see the REACTION OWNERSHIP block. They were per-actor,
     // so the dude needed his own duplicate pair and bystanders had none at all.
@@ -3882,6 +3893,204 @@ static bool rt_corpse_in_obstacle(Object* corpse)
     }
     Object* blocker = obj_blocking_at(corpse, tile, corpse->elevation);
     return blocker != NULL && FID_TYPE(blocker->fid) != OBJ_TYPE_CRITTER;
+}
+
+// ⚠️ A FALL MUST NOT CARRY THE BODY UNDER THE FURNITURE (2026-10-14, the same Skulz a third time:
+// "viděl jsem pult, který byl přes hlavu. Tělo bylo na podlaze"). A corpse is FLAT, and
+// obj_render_pre_roof paints every flat object before any upright one, so a bar, a wall or a machine
+// is drawn OVER a body whatever their tiles say. The death art moves its body by itself --
+// CHUNKS_OF_FLESH at rotation 4 takes a man 34 px left (NMLTHRBF.FR4) -- and in Gizmo's club that
+// put the ganger's head and shoulders under the bar (trace_2026-10-14_211442 s=28.1-30.3, id=1242:
+// x 0 -> -34). rt_corpse_in_obstacle asks one tile, and the tile under the middle of that body was
+// free, so it saw nothing. This asks the picture itself: of the pixels of the body's final pose, how
+// many would an upright object that is not a critter paint over -- where the fall ends, and where it
+// began.
+#define RT_PULL_UNDECIDED 0
+#define RT_PULL_ACTIVE 1
+#define RT_PULL_DONE 2
+#define RT_CORPSE_COVER_MIN_PX 24 // ...and at least 1/16 of the body: a head is about a tenth of it
+
+// Where FRAME of O's art is drawn with the body at offset x,y on its tile -- obj_bound's sum for a
+// frame and an offset it is not showing yet, and without the outline's extra pixel.
+static bool rt_frame_rect(Object* o, Art* art, int frame, int x, int y, Rect* r)
+{
+    int sx;
+    int sy;
+    if (o->tile == -1 || tile_coord(o->tile, &sx, &sy, o->elevation) != 0) {
+        return false;
+    }
+    int w = art_frame_width(art, frame, o->rotation);
+    int h = art_frame_length(art, frame, o->rotation);
+    sx += 16 + art->xOffsets[o->rotation] + x;
+    sy += 8 + art->yOffsets[o->rotation] + y;
+    r->ulx = sx - w / 2;
+    r->uly = sy - h + 1;
+    r->lrx = r->ulx + w - 1;
+    r->lry = sy;
+    return w > 0 && h > 0;
+}
+
+// How many pixels of the corpse's FRAME, with the body at x,y, an upright scenery, wall, item or misc
+// object paints over (a pixel under two of them counts once). Critters are left out -- they walk on
+// -- and so are flat objects, which lie in tile order with the corpse. *opaque gets the frame's
+// pixel count, the measure for "how much of him".
+static int rt_corpse_cover(Object* corpse, int frame, int x, int y, int* opaque)
+{
+    *opaque = 0;
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(corpse->fid, &handle);
+    if (art == NULL) {
+        return 0;
+    }
+    Rect body;
+    unsigned char* data = art_frame_data(art, frame, corpse->rotation);
+    if (data == NULL || !rt_frame_rect(corpse, art, frame, x, y, &body)) {
+        art_ptr_unlock(handle);
+        return 0;
+    }
+    int w = body.lrx - body.ulx + 1;
+    int h = body.lry - body.uly + 1;
+    for (int i = 0; i < w * h; i++) {
+        if (data[i] != 0) {
+            (*opaque)++;
+        }
+    }
+
+    unsigned char* seen = new unsigned char[w * h]();
+    int covered = 0;
+    static const int kTypes[] = { OBJ_TYPE_SCENERY, OBJ_TYPE_WALL, OBJ_TYPE_ITEM, OBJ_TYPE_MISC };
+    for (int t = 0; t < 4; t++) {
+        Object** list = NULL;
+        int count = obj_create_list(-1, corpse->elevation, kTypes[t], &list);
+        for (int k = 0; k < count; k++) {
+            Object* o = list[k];
+            if (o == corpse || (o->flags & OBJECT_FLAT) != 0) {
+                continue;
+            }
+            CacheEntry* oHandle;
+            Art* oArt = art_ptr_lock(o->fid, &oHandle);
+            if (oArt == NULL) {
+                continue;
+            }
+            Rect r;
+            unsigned char* oData = art_frame_data(oArt, o->frame, o->rotation);
+            if (oData != NULL && rt_frame_rect(o, oArt, o->frame, o->x, o->y, &r)) {
+                int ow = r.lrx - r.ulx + 1;
+                int x0 = body.ulx > r.ulx ? body.ulx : r.ulx;
+                int x1 = body.lrx < r.lrx ? body.lrx : r.lrx;
+                int y0 = body.uly > r.uly ? body.uly : r.uly;
+                int y1 = body.lry < r.lry ? body.lry : r.lry;
+                for (int py = y0; py <= y1; py++) {
+                    for (int px = x0; px <= x1; px++) {
+                        int bi = (py - body.uly) * w + (px - body.ulx);
+                        if (data[bi] != 0 && seen[bi] == 0
+                            && oData[(py - r.uly) * ow + (px - r.ulx)] != 0) {
+                            seen[bi] = 1;
+                            covered++;
+                        }
+                    }
+                }
+            }
+            art_ptr_unlock(oHandle);
+        }
+        if (count > 0) {
+            obj_delete_list(list);
+        }
+    }
+    delete[] seen;
+    art_ptr_unlock(handle);
+    return covered;
+}
+
+// Decided ONCE, the first time the death art shows: where would the fall leave the body, and would
+// more of it be painted over there than where it began to die? If so, the fall still plays frame for
+// frame, but the distance the art carries the body is taken back again, spread evenly over the
+// frames still to come, so it comes to rest where it stood -- no jump at the end (the old grounding
+// snapped corpses back once they had lain still, the 2026-10-13 radscorpion), no head under the bar.
+// Only the drift is removed; every frame keeps its place against the one before.
+static void rt_corpse_pull(Object* npc, RtActor* a)
+{
+    if (!a->death_valid || a->death_tile != npc->tile || a->pull_state == RT_PULL_DONE) {
+        return;
+    }
+    int anim = FID_ANIM_TYPE(npc->fid);
+    bool fallArt = anim >= FIRST_KNOCKDOWN_AND_DEATH_ANIM && anim < FIRST_SF_DEATH_ANIM;
+
+    if (a->pull_state == RT_PULL_UNDECIDED) {
+        if (!fallArt) {
+            return; // the fall has not begun yet
+        }
+        a->pull_state = RT_PULL_DONE;
+        CacheEntry* handle;
+        Art* art = art_ptr_lock(npc->fid, &handle);
+        if (art == NULL) {
+            return;
+        }
+        int last = art_frame_max_frame(art) - 1;
+        int endX = npc->x;
+        int endY = npc->y;
+        for (int frame = npc->frame + 1; frame <= last; frame++) {
+            int hx = 0;
+            int hy = 0;
+            art_frame_hot(art, frame, npc->rotation, &hx, &hy);
+            endX += hx;
+            endY += hy;
+        }
+        art_ptr_unlock(handle);
+        if (last <= 0 || (endX == a->death_x && endY == a->death_y)) {
+            return;
+        }
+
+        int opaque = 0;
+        int coverEnd = rt_corpse_cover(npc, last, endX, endY, &opaque);
+        int coverStart = rt_corpse_cover(npc, last, a->death_x, a->death_y, &opaque);
+        int need = opaque / 16 > RT_CORPSE_COVER_MIN_PX ? opaque / 16 : RT_CORPSE_COVER_MIN_PX;
+        bool pull = coverEnd - coverStart >= need;
+        trace_event(TRACE_FLOW, "corpse-cover", "pid=%d id=%d anim=%d end=%d,%d covered=%d start=%d,%d covered=%d of=%d pull=%d t=%.2f",
+            npc->pid, npc->id, anim, endX, endY, coverEnd, a->death_x, a->death_y, coverStart, opaque,
+            pull ? 1 : 0, rt_clock);
+        if (!pull) {
+            return;
+        }
+        a->pull_state = RT_PULL_ACTIVE;
+        a->pull_fid = npc->fid;
+        a->pull_from = npc->frame;
+        a->pull_last = last;
+        a->pull_x = a->death_x - endX;
+        a->pull_y = a->death_y - endY;
+        a->pull_done_x = 0;
+        a->pull_done_y = 0;
+    }
+
+    // A fall that stopped short was cut, and the grounding in rt_update_actor puts that body back on
+    // its start by itself; what is left of the pull would only drag it off again.
+    if (npc->fid != a->pull_fid || (anim_busy(npc) == 0 && npc->frame < a->pull_last)) {
+        a->pull_state = RT_PULL_DONE;
+        return;
+    }
+    int wantX = a->pull_x;
+    int wantY = a->pull_y;
+    int span = a->pull_last - a->pull_from;
+    if (npc->frame < a->pull_last && span > 0) {
+        int step = npc->frame - a->pull_from;
+        if (step < 0) {
+            step = 0;
+        }
+        wantX = a->pull_x * step / span;
+        wantY = a->pull_y * step / span;
+    }
+    int dx = wantX - a->pull_done_x;
+    int dy = wantY - a->pull_done_y;
+    if (dx != 0 || dy != 0) {
+        Rect r;
+        obj_offset(npc, dx, dy, &r);
+        tile_refresh_rect(&r, npc->elevation);
+        a->pull_done_x = wantX;
+        a->pull_done_y = wantY;
+    }
+    if (wantX == a->pull_x && wantY == a->pull_y) {
+        a->pull_state = RT_PULL_DONE;
+    }
 }
 
 static void rt_keep_offset(Object* o, int keepX, int keepY)
@@ -8149,6 +8358,14 @@ static void rt_refresh_registry()
             a->death_x = prev->death_x;
             a->death_y = prev->death_y;
             a->death_tile = prev->death_tile;
+            a->pull_state = prev->pull_state;
+            a->pull_fid = prev->pull_fid;
+            a->pull_from = prev->pull_from;
+            a->pull_last = prev->pull_last;
+            a->pull_x = prev->pull_x;
+            a->pull_y = prev->pull_y;
+            a->pull_done_x = prev->pull_done_x;
+            a->pull_done_y = prev->pull_done_y;
             a->flinch_accum = prev->flinch_accum;
             a->immune_until = prev->immune_until;
             a->stuck_tile = prev->stuck_tile;
@@ -8227,6 +8444,7 @@ static void rt_refresh_registry()
             a->rest_x = obj->x;
             a->rest_y = obj->y;
             a->death_valid = false;
+            a->pull_state = RT_PULL_UNDECIDED;
             a->flinch_accum = 0.0f;
             a->immune_until = 0.0f;
             a->stuck_tile = obj->tile;
@@ -8459,6 +8677,25 @@ static void rt_update_actor(RtActor* a, float dt)
         critter_kill(npc, -1, true);
         trace_event(TRACE_FLOW, "undead-kill", "pid=%d anim=%d t=%.2f",
             npc->pid, FID_ANIM_TYPE(npc->fid), rt_clock);
+
+        // ⚠️ ...BUT NOT FLAT WHILE IT STILL FALLS (2026-10-14, the Skulz in the Skum Pitt: "neviděl
+        // jsem jeho hlavu, viděl jsem pult, který byl přes hlavu"). critter_kill is vanilla's
+        // kill_critter, made for a body that is put down at once, and it flattens on the spot. Here
+        // the fall is still playing -- CHUNKS_OF_FLESH, 22 frames that throw the body up to 133 px
+        // high -- and a flat object is painted before every upright one, so the whole fall went on
+        // UNDER the bar counter behind him (trace_2026-10-14_211442 s=28.11: obj-flat <- critter_kill
+        // <- rt_update_actor, dead=0, at the fall's first frame). Stood back up, it is drawn in its
+        // tile's turn like any living body until the fall ends, and show_death -- which toggles, and
+        // so stood the early-flattened corpse UP at the end ("unflat dead=1" at s=30.34) -- or the
+        // settle below lays it down, as for every other death.
+        if ((npc->flags & OBJECT_FLAT) != 0 && anim_busy(npc) != 0) {
+            Rect upRect;
+            if (obj_toggle_flat(npc, &upRect) == 0) {
+                tile_refresh_rect(&upRect, npc->elevation);
+            }
+            trace_event(TRACE_FLOW, "undead-upright", "pid=%d id=%d anim=%d frame=%d t=%.2f",
+                npc->pid, npc->id, FID_ANIM_TYPE(npc->fid), npc->frame, rt_clock);
+        }
     }
 
     // A corpse is "at rest" only when it's prone AND its fall animation has finished.
@@ -8557,6 +8794,8 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->death_tile = rr->keepTile;
             }
         }
+        rt_corpse_pull(npc, a);
+
         bool fromDeath = a->death_valid && a->death_tile == npc->tile;
         int offX = npc->x - (fromDeath ? a->death_x : a->rest_x);
         int offY = npc->y - (fromDeath ? a->death_y : a->rest_y);
