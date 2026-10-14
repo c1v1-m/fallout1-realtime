@@ -1393,6 +1393,30 @@ bool interact_prompt_request()
     return true;
 }
 
+// The mouse's way into the same queue (combat_rt, the right button outside a fight): the object the
+// cursor is on, with its default action -- what A does when that object is the one lit up. Refused
+// for anything the prompt itself would not offer, behind a wall (ip_pick_reach), or while the dude is
+// still busy with the last one. The walk there is the action's own, as for A.
+bool interact_prompt_request_object(Object* obj)
+{
+    if (obj == NULL || obj == obj_dude || ip_pending != NULL) {
+        return false;
+    }
+    if (obj_dude != NULL && anim_busy(obj_dude) != 0) {
+        return false;
+    }
+    int actions[IP_ACTIONS_MAX];
+    if (ip_build_actions(obj, actions) <= 0 || !ip_pick_reach(obj)) {
+        return false;
+    }
+
+    ip_pending = obj;
+    ip_pending_kind = actions[0];
+    trace_event(TRACE_ACTION, "interact-queue", "kind=%d pid=%d objType=%d src=mouse",
+        actions[0], obj->pid, FID_TYPE(obj->fid));
+    return true;
+}
+
 Object* interact_prompt_target()
 {
     return ip_target;

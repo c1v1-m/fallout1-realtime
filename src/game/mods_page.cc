@@ -80,6 +80,7 @@ enum {
     MODS_CAM_LEAN,
     MODS_SCRIPT_FLOAT,
     MODS_HIT_STAGGER,
+    MODS_MOUSE,
     MODS_SCREEN_RES,
     MODS_INTERNAL_RES,
     MODS_COUNT,
@@ -312,6 +313,19 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         2,
     },
     {
+        "Mouse",
+        { "Vanilla", "Hold to walk" },
+        {
+            "Click a spot to walk there, as in the original.",
+            "Hold the left button: walk to the cursor, run when it is far.",
+        },
+        {
+            "Right-click switches the cursor.",
+            "Left on an enemy attacks. Right: lock in a fight, else use.",
+        },
+        2,
+    },
+    {
         "Screen resolution",
         { "1280x720", "1920x1080", "2560x1440", "Desktop" },
         {
@@ -376,6 +390,7 @@ static_assert(mods_label_is(MODS_COMBAT_BOX_SOUND, "Combat box sound"), "MODS ro
 static_assert(mods_label_is(MODS_CAM_LEAN, "Camera leans to target"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCRIPT_FLOAT, "Script lines as floating text"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_HIT_STAGGER, "Hits stagger"), "MODS row order drifted");
+static_assert(mods_label_is(MODS_MOUSE, "Mouse"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCREEN_RES, "Screen resolution"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_INTERNAL_RES, "Internal resolution"), "MODS row order drifted");
 
@@ -622,6 +637,7 @@ static void mods_load()
     mods_value[MODS_CAM_LEAN] = combat_rt_get_cam_lean() ? 1 : 0;
     mods_value[MODS_SCRIPT_FLOAT] = gdialog_get_script_float() ? 1 : 0;
     mods_value[MODS_HIT_STAGGER] = combat_rt_get_flinch_chance() > 0.0f ? 1 : 0;
+    mods_value[MODS_MOUSE] = combat_rt_get_mouse_hold_walk() ? 1 : 0;
 
     {
         // The OUTPUT the file asks for, matched against the sizes the row offers; anything else
@@ -825,6 +841,13 @@ static void mods_apply(int index)
         bool v = mods_value[index] != 0;
         combat_rt_set_cam_lean(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CAM_LOCK_LEAN_KEY, v ? 1 : 0);
+        break;
+    }
+    case MODS_MOUSE: {
+        // DEFAULT "Hold to walk" -- his design (2026-10-14), so ON without being vanilla. Live.
+        bool v = mods_value[index] != 0;
+        combat_rt_set_mouse_hold_walk(v);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_HOLD_WALK_KEY, v ? 1 : 0);
         break;
     }
     case MODS_HIT_STAGGER: {

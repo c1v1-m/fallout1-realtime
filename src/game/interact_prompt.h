@@ -19,6 +19,7 @@ void interact_prompt_tick();
 // from the tick, never from the input hook) and return true so the caller suppresses the walk-click.
 // No target -> false (A falls through to its normal behaviour).
 bool interact_prompt_request();
+bool interact_prompt_request_object(Object* obj);
 
 // The object currently prompted, or NULL. Lets the A arbitration know a world interaction is offered.
 Object* interact_prompt_target();

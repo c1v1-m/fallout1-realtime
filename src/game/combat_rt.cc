@@ -23,6 +23,7 @@
 #include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
+#include "game/interact_prompt.h"
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "game/inventry.h"
@@ -1165,6 +1166,9 @@ static float rt_door_magnet = 0.7f;
 // Crowd assist, from cfg npc_slide. See rt_bystander_blocks / the slide block in
 // combat_rt_poll_gamepad.
 static bool rt_npc_slide = true;
+
+// Mouse like Diablo, from cfg mouse_hold_walk (MODS "Mouse"). See RT_MOUSE_WALK_DEADZONE.
+static bool rt_mouse_hold_walk = true;
 
 // Idle hostiles look around, from cfg enemies_look_around (MODS "Enemies look around", default off
 // = vanilla). See rt_idle_look_around.
@@ -9905,6 +9909,11 @@ void combat_rt_init()
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_NPC_SLIDE_KEY, &npcSlide);
     rt_npc_slide = npcSlide != 0;
 
+    // Mouse like Diablo (MODS "Mouse"). Default ON: his design, 2026-10-14.
+    int mouseHoldWalk = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_HOLD_WALK_KEY, &mouseHoldWalk);
+    rt_mouse_hold_walk = mouseHoldWalk != 0;
+
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
     // Default ON since the release (his setting).
     int lookAround = 1;
@@ -10462,10 +10471,23 @@ static bool rt_point_in_world(int x, int y)
     return display_win != -1 && win_get_top_win(x, y) == display_win;
 }
 
+// An enemy for the mouse: anyone fighting you, or -- like RT without a lock (rt_unlocked_attack_target)
+// -- an enemy by nature, a rat or a radscorpion that has not noticed you yet, unless it is one of
+// yours. People who are not fighting you stay a click for vanilla (talk, look) or the right button.
+static bool rt_mouse_enemy(Object* critter)
+{
+    if (rt_is_hostile(critter)) {
+        return true;
+    }
+    return rt_hostile_by_nature(critter)
+        && critter->data.critter.combat.team != obj_dude->data.critter.combat.team
+        && !isPartyMember(critter);
+}
+
 static Object* rt_pick_mouse_target(int mx, int my)
 {
     Object* under = object_under_mouse(OBJ_TYPE_CRITTER, false, map_elevation);
-    if (under != NULL && under != obj_dude && rt_in_registry(under) && rt_is_hostile(under) && rt_is_targetable(under)) {
+    if (under != NULL && under != obj_dude && rt_in_registry(under) && rt_mouse_enemy(under) && rt_is_targetable(under)) {
         return under;
     }
 
@@ -10476,7 +10498,7 @@ static Object* rt_pick_mouse_target(int mx, int my)
     for (int i = 0; i < rt_actor_count; i++) {
         Object* critter = rt_actors[i].obj;
         if (critter == NULL || critter == obj_dude || critter->elevation != map_elevation
-            || (critter->flags & OBJECT_HIDDEN) != 0 || !rt_is_hostile(critter) || !rt_is_targetable(critter)) {
+            || (critter->flags & OBJECT_HIDDEN) != 0 || !rt_mouse_enemy(critter) || !rt_is_targetable(critter)) {
             continue;
         }
 
@@ -10571,6 +10593,115 @@ Object* combat_rt_mouse_target()
     return rt_mouse_target;
 }
 
+// --- THE MOUSE LIKE DIABLO (2026-10-14) --------------------------------------------------------------
+//
+// His words: *"šlo by diablo like movement? Prostě držím myš jedním směrem a dude furt chodí? Když
+// zamířím na enemy tak zaútočí. Pravé tlačítko při combatu udělá terč, jinak funguje jako prompts k
+// otevření dveří atd."* -- and from the two follow-up choices: the right button in a fight is the LOCK
+// (LT's job), and the walk turns into a run when the cursor is far from the dude.
+//
+//   - LEFT held over the world: the dude walks towards the cursor, through the very heading code the
+//     left stick and the arrows use (doorway and crowd assists, free movement, the AP model all apply).
+//     Over an enemy (rt_mouse_target) it is the attack instead, rt_mouse_update's; out of reach the
+//     same hold walks him at the enemy until it is in reach, then swings.
+//   - RIGHT in a fight (anyone coming for you, or the cursor on an enemy): held = the lock, LT's, on the
+//     critter under the cursor. The cursor is NOT glued to the target (that is the pad's lock, which has
+//     no cursor of its own); left then attacks the locked one.
+//   - RIGHT otherwise: use what is under the cursor -- the door, the body, the person -- with the
+//     prompt's default action, or else what the prompt has lit up (interact_prompt_request_object).
+//
+// Every press of either button that starts in the world is ours (combat_rt_handle_input), so vanilla's
+// click-to-walk and its right-click cursor toggle never see one. Over the bar and in menus nothing
+// changes. Off in MODS, all of this stands down and the mouse is vanilla plus the old aim layer.
+#define RT_MOUSE_WALK_DEADZONE 10 // screen pixels from his feet: a press on the dude walks nowhere
+#define RT_MOUSE_RUN_PX 150 // the cursor further than this from his feet runs (his pick, "daleko = běh")
+
+static bool rt_mouse_rmb_lock = false; // the right button holds a lock (a fight was on at the press)
+
+// The dude's feet on screen, which is where "towards the cursor" is measured from.
+static void rt_dude_feet(int* x, int* y)
+{
+    Rect b;
+    obj_bound(obj_dude, &b);
+    *x = (b.ulx + b.lrx) / 2;
+    *y = b.lry - 4;
+}
+
+static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
+{
+    if (!rt_mouse_hold_walk || !rt_mouse_hold_claimed || !rt_mouse_armed || !gamepad_ui_mouse_in_use()) {
+        return false;
+    }
+    if ((SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) == 0) {
+        return false;
+    }
+
+    int tx;
+    int ty;
+    mouse_get_position(&tx, &ty);
+
+    // Over an enemy -- the locked one while the right button holds a lock, else the one under the
+    // cursor: in reach it is the attack's frame, out of reach the walk heads for it.
+    Object* goal = rt_mouse_rmb_lock ? rt_lock_target : rt_mouse_target;
+    if (goal != NULL) {
+        if (obj_dist(obj_dude, goal) <= item_w_range(obj_dude, rt_player_hit_mode())) {
+            return false;
+        }
+        Rect b;
+        obj_bound(goal, &b);
+        tx = (b.ulx + b.lrx) / 2;
+        ty = b.lry - 4;
+    } else if (rt_lock_target != NULL && !rt_mouse_rmb_lock) {
+        return false; // a pad lock owns the cursor
+    }
+
+    int fx;
+    int fy;
+    rt_dude_feet(&fx, &fy);
+    float dx = (float)(tx - fx);
+    float dy = (float)(ty - fy);
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < RT_MOUSE_WALK_DEADZONE) {
+        return false;
+    }
+
+    *outX = dx / len;
+    *outY = dy / len;
+    *outRun = len > RT_MOUSE_RUN_PX;
+    return true;
+}
+
+// Who a right-button lock takes: what the cursor is on (any lockable critter in sight, by the same
+// sprite-box distance the aim uses), else what a fresh LT press would.
+static Object* rt_mouse_lock_pick()
+{
+    int mx;
+    int my;
+    mouse_get_position(&mx, &my);
+
+    Object* best = NULL;
+    long bestScore = (long)(RT_MOUSE_AIM_RADIUS * RT_MOUSE_AIM_RADIUS + 1) * 100000L;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (critter == NULL || critter == obj_dude || critter->elevation != map_elevation
+            || (critter->flags & OBJECT_HIDDEN) != 0 || !rt_is_lockable(critter) || !rt_lock_in_sight(critter)) {
+            continue;
+        }
+        Rect b;
+        obj_bound(critter, &b);
+        int dx = mx < b.ulx ? b.ulx - mx : (mx > b.lrx ? mx - b.lrx : 0);
+        int dy = my < b.uly ? b.uly - my : (my > b.lry ? my - b.lry : 0);
+        int cx = (b.ulx + b.lrx) / 2 - mx;
+        int cy = (b.uly + b.lry) / 2 - my;
+        long score = (long)(dx * dx + dy * dy) * 100000L + (long)(cx * cx + cy * cy);
+        if (score < bestScore) {
+            bestScore = score;
+            best = critter;
+        }
+    }
+    return best != NULL ? best : rt_lock_pick_initial(0);
+}
+
 // Q / E on the keyboard step the lock one enemy left / right of the current one -- the right stick's
 // job (rt_directional_lock), one press per step. Asked from the key handler, done in the poll.
 static int rt_kb_lock_step = 0;
@@ -10645,6 +10776,20 @@ void combat_rt_poll_gamepad()
         }
     }
 
+    // ...AND SO DOES A HELD LEFT MOUSE BUTTON (the Diablo mouse, see rt_mouse_walk_vector), only when
+    // neither the stick nor the arrows are asking.
+    bool mouseWalk = false;
+    bool mouseRun = false;
+    if (x * x + y * y <= RT_GAMEPAD_DEADZONE * RT_GAMEPAD_DEADZONE) {
+        float mx;
+        float my;
+        if (rt_mouse_walk_vector(&mx, &my, &mouseRun)) {
+            x = mx;
+            y = my;
+            mouseWalk = true;
+        }
+    }
+
     // RUN instead of walk. IN COMBAT running drains the AP
     // pool (rt_run_ap_cost), so when it's empty -- or recovering while rt_run_blocked
     // -- the dude drops to a free walk. Feeding this effective gait into rt_stick_move
@@ -10656,7 +10801,7 @@ void combat_rt_poll_gamepad()
     // keeps its name because every gait test below reads it as "the run key", but there is no key
     // being held any more -- gamepad_ui owns the state and this just asks for it.
     // ...and on the keyboard Alt is the run, held like X.
-    bool ltHeld = gamepad_ui_run_on() || (kbWalk && rt_kb_mod_held(KMOD_ALT));
+    bool ltHeld = gamepad_ui_run_on() || (kbWalk && rt_kb_mod_held(KMOD_ALT)) || (mouseWalk && (mouseRun || rt_kb_mod_held(KMOD_ALT)));
     // The Bonus Move reserve pays for running as well -- it is movement, which is all it is for.
     bool run = ltHeld && (!rt_engaged || ((rt_player_ap > 0 || rt_bonus_move_ap > 0) && !rt_run_blocked));
 
@@ -10898,7 +11043,13 @@ void combat_rt_poll_gamepad()
     // hard zeros, and each one would read as "let go" and drop the aim for a frame.
     static bool rt_lt_owns_lock = false;
     // ...or Shift held on the keyboard, which is LT there.
-    bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT);
+    //
+    // ...or the RIGHT MOUSE BUTTON held in a fight (the Diablo mouse). Its release is read here, from
+    // SDL's own state, so a release over the bar or outside the window still lets go.
+    if (rt_mouse_rmb_lock && (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_RMASK) == 0) {
+        rt_mouse_rmb_lock = false;
+    }
+    bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT) || rt_mouse_rmb_lock;
 
     // ⚠️ A HELD LT RE-AIMS AT ENEMIES ONLY (2026-10-13). When the target dies the lock empties, and a
     // trigger still held used to take the best of whatever was left -- neutrals included, because a
@@ -10914,7 +11065,8 @@ void combat_rt_poll_gamepad()
     }
 
     if (ltAim && rt_lock_target == NULL) {
-        rt_lock_target = rt_lock_pick_initial(rt_lt_hold_aimed ? 2 : 0);
+        rt_lock_target = rt_mouse_rmb_lock && !rt_lt_hold_aimed ? rt_mouse_lock_pick()
+                                                                  : rt_lock_pick_initial(rt_lt_hold_aimed ? 2 : 0);
         if (rt_lock_target != NULL) {
             rt_lt_hold_aimed = true;
             rt_lt_owns_lock = true;
@@ -11005,7 +11157,9 @@ void combat_rt_poll_gamepad()
 
         // Glue the cursor to the target's centre -- but NOT while it is off screen, or we would be
         // parking the mouse outside the world window during the brief grace before the lock drops.
-        if (OnScreen::test(rt_lock_target)) {
+        // ...but never under a hand on a real mouse: a right-button lock leaves the cursor where the
+        // player put it (the Diablo mouse) -- gluing it would fight his hand every frame.
+        if (OnScreen::test(rt_lock_target) && !rt_mouse_rmb_lock) {
             Rect bounds;
             obj_bound(rt_lock_target, &bounds);
             mouse_set_position((bounds.ulx + bounds.lrx) / 2, (bounds.uly + bounds.lry) / 2);
@@ -11076,7 +11230,9 @@ void combat_rt_poll_gamepad()
     // ordinary attack at whatever the auto-target picked.
     bool attack = (gamepad_ui_attack_held() && !gamepad_ui_aim_gesture_active())
         // ...or Ctrl held on the keyboard, which is RT there.
-        || rt_kb_mod_held(KMOD_CTRL);
+        || rt_kb_mod_held(KMOD_CTRL)
+        // ...or the left mouse button while the right one holds a lock (the Diablo mouse).
+        || (rt_mouse_rmb_lock && rt_mouse_armed && (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) != 0);
     // Only trace the attack intent on the RT PRESS EDGE, not every held frame -- each actual fire
     // is already logged as [COMBAT/attack], so a per-frame ACTION line would be pure spam.
     static bool rt_prev_attack_btn = false;
@@ -12659,10 +12815,47 @@ bool combat_rt_handle_input(int keyCode)
     if (keyCode == -2 && rt_mouse_hold_claimed && (mouse_get_buttons() & (MOUSE_EVENT_LEFT_BUTTON_DOWN_REPEAT | MOUSE_EVENT_LEFT_BUTTON_UP)) != 0) {
         return true;
     }
+
+    // THE DIABLO MOUSE (rt_mouse_walk_vector has the design): every press that starts over the world
+    // with a plain cursor is ours. A skill or use-on cursor keeps its click; the bar and menus are not
+    // the world. Real buttons only -- the pad's synthesised clicks never set SDL's mouse state.
+    if (keyCode == -2 && rt_mouse_hold_walk && gamepad_ui_mouse_in_use()) {
+        Uint32 real = SDL_GetMouseState(NULL, NULL);
+        int buttons = mouse_get_buttons();
+        int mx;
+        int my;
+        mouse_get_position(&mx, &my);
+        int mode = gmouse_3d_get_mode();
+        bool plain = mode == GAME_MOUSE_MODE_MOVE || mode == GAME_MOUSE_MODE_ARROW || mode == GAME_MOUSE_MODE_CROSSHAIR;
+        if (plain && rt_point_in_world(mx, my)) {
+            if ((buttons & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0 && (real & SDL_BUTTON_LMASK) != 0) {
+                rt_mouse_armed = true;
+                rt_mouse_hold_claimed = true;
+                return true;
+            }
+            if ((buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0 && (real & SDL_BUTTON_RMASK) != 0) {
+                Object* critter = object_under_mouse(OBJ_TYPE_CRITTER, false, map_elevation);
+                bool enemyUnder = critter != NULL && critter != obj_dude && rt_is_combatant(critter)
+                    && (rt_is_hostile(critter) || rt_hostile_by_nature(critter));
+                if (combat_rt_under_threat() || rt_mouse_target != NULL || enemyUnder) {
+                    rt_mouse_rmb_lock = true;
+                    trace_event(TRACE_INPUT, "mouse-lock", "under=%d t=%.2f", critter != NULL ? critter->pid : -1, rt_clock);
+                } else {
+                    Object* thing = object_under_mouse(-1, false, map_elevation);
+                    bool done = interact_prompt_request_object(thing) || interact_prompt_request();
+                    trace_event(TRACE_INPUT, "mouse-use", "under=%d done=%d", thing != NULL ? thing->pid : -1, done ? 1 : 0);
+                }
+                return true;
+            }
+            if ((buttons & (MOUSE_EVENT_RIGHT_BUTTON_UP | MOUSE_EVENT_RIGHT_BUTTON_DOWN_REPEAT)) != 0) {
+                return true; // vanilla's right-click cursor toggle stays out of it
+            }
+        }
+    }
     if (keyCode == -2 && rt_mouse_target != NULL) {
         Uint32 real = SDL_GetMouseState(NULL, NULL);
         int buttons = mouse_get_buttons();
-        if ((real & SDL_BUTTON_RMASK) != 0 && (buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
+        if (!rt_mouse_hold_walk && (real & SDL_BUTTON_RMASK) != 0 && (buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
             trace_event(TRACE_INPUT, "kbm-key", "key=RMB target=%d", rt_mouse_target->pid);
             gamepad_ui_request_called_shot();
             return true;
@@ -13555,6 +13748,16 @@ bool combat_rt_dude_rest_offset(int* x, int* y)
 bool combat_rt_get_free_move()
 {
     return rt_free_move;
+}
+
+void combat_rt_set_mouse_hold_walk(bool enabled)
+{
+    rt_mouse_hold_walk = enabled;
+}
+
+bool combat_rt_get_mouse_hold_walk()
+{
+    return rt_mouse_hold_walk;
 }
 
 void combat_rt_set_npc_slide(bool enabled)

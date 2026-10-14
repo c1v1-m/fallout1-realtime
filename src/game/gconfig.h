@@ -80,6 +80,9 @@ namespace fallout {
 // (bump and stand, the pre-assist behaviour). Hostiles and scenery/walls always block -- stopping
 // against them is deliberate (see rt_stick_segment_start). -> rt_npc_slide at combat_rt_init.
 #define GAME_CONFIG_NPC_SLIDE_KEY "npc_slide"
+// Mouse play like Diablo (MODS "Mouse"): hold the left button to walk to the cursor, left on an enemy
+// attacks it, right holds a lock in a fight and uses things outside one. 0 = vanilla click-to-walk.
+#define GAME_CONFIG_MOUSE_HOLD_WALK_KEY "mouse_hold_walk"
 // FREE MOVEMENT: the body is integrated from a velocity and obj->tile is re-anchored to whichever
 // cell it has moved into, instead of the body following a chain of whole tile steps. The engine
 // goes on reading obj->tile, which never stops being a real walkable tile, so nothing else in the

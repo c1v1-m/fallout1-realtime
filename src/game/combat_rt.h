@@ -107,6 +107,8 @@ void combat_rt_set_door_magnet(float strength);
 float combat_rt_get_door_magnet();
 void combat_rt_set_npc_slide(bool enabled);
 bool combat_rt_get_npc_slide();
+void combat_rt_set_mouse_hold_walk(bool enabled);
+bool combat_rt_get_mouse_hold_walk();
 // MODS "Enemies look around" (cfg enemies_look_around): idle hostiles turn toward gunshots and
 // scan around, so a back turned to you is not a permanent blind spot. See rt_idle_look_around.
 void combat_rt_set_look_around(bool enabled);
