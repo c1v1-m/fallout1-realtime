@@ -7874,6 +7874,16 @@ static void rt_aim_outlines_update()
         if ((o->flags & OBJECT_HIDDEN) != 0 || critter_is_dead(o) || !rt_obj_on_screen(o)) {
             continue;
         }
+        // ⚠️ ONLY WHAT YOU CAN SEE (2026-10-15, "krtkopotkan byl v Necropolis v artu za kanálem").
+        // An outline is painted after everything (obj_render_outline), so a critter behind a wall
+        // showed through it: the HOTEL map parks a Greater Mole Rat (tile 28896) in a walkable pocket
+        // behind the cave-wall art under the sewer, and one LT press drew it red inside the rock
+        // (trace_2026-10-15_004613 s=291.6, id=2873 at 29101). Same sight rule as the lock itself, so
+        // the rat stays the surprise vanilla meant -- his pick. The one you are locked on keeps its
+        // outline even behind a pillar: you are aiming at it.
+        if (o != rt_lock_target && !rt_lock_in_sight(o)) {
+            continue;
+        }
 
         int type = rt_aim_outline_type_for(o);
 
