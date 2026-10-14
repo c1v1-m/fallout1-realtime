@@ -2760,6 +2760,10 @@ static const struct {
 
 // Drive the wheel from the per-frame safe tick (gamepad_ui_tick). Open on the L3 press
 // edge, aim while held, execute + close on release.
+// How long the right stick must rest in the centre before letting go counts as a pick: longer than
+// the frame or two a deliberate swing through the middle spends there, short enough not to be felt.
+#define GPUI_SKILL_RELEASE_MS 70
+
 static void gpui_skill_wheel(SDL_GameController* pad)
 {
     // ⚠️ BACK ON L3, WHERE IT LIVED FOR MONTHS. It spent about an hour on an LB hold in this
@@ -2775,8 +2779,17 @@ static void gpui_skill_wheel(SDL_GameController* pad)
     // held down while the other thumb aims. Now it behaves like the R3 called-shot window: a press
     // opens it and it stays; the right stick aims, A or another L3 press takes the highlighted
     // skill, B closes it without one.
+    //
+    // ⚠️ ...AND LETTING GO OF THE RIGHT STICK ON A SKILL TAKES IT (2026-10-14, "kliknu L3, nasměruji
+    // skill a když pustím na tom skillu, tak se ten skill vybere"). The stick springs back to the
+    // centre, which clears the highlight, so the pick is the skill that WAS highlighted the moment
+    // it went -- confirmed only after the stick has stayed centred for GPUI_SKILL_RELEASE_MS, so
+    // swinging from one side of the ring to the other through the middle does not pick on the way.
+    // A, L3 and B keep their jobs.
     static bool prevL3 = false;
     static bool prevB = false;
+    static int releasedOn = -1;                // skill highlighted when the stick went to centre
+    static unsigned int releasedSince = 0;
     bool l3Now = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSTICK) != 0;
     bool l3Edge = l3Now && !prevL3;
     prevL3 = l3Now;
@@ -2808,18 +2821,37 @@ static void gpui_skill_wheel(SDL_GameController* pad)
             radial_wheel_close();
             gpui_wheel_owner = GPUI_WHEEL_NONE;
             gpui_icons_release();
+            releasedOn = -1;
             if (skill != -1) {
                 gpui_use_skill(skill);
             }
         } else {
             float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / GPUI_AXIS_MAX;
             float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / GPUI_AXIS_MAX;
+            int before = radial_wheel_highlight_id();
             radial_wheel_update(x, y);
+            int now = radial_wheel_highlight_id();
+
+            if (now != -1) {
+                releasedOn = -1; // aiming (again): nothing pending
+            } else if (before != -1) {
+                releasedOn = before; // just went to the centre from this skill
+                releasedSince = get_time();
+            } else if (releasedOn != -1 && get_time() - releasedSince >= GPUI_SKILL_RELEASE_MS) {
+                int skill = releasedOn;
+                releasedOn = -1;
+                radial_wheel_close();
+                gpui_wheel_owner = GPUI_WHEEL_NONE;
+                gpui_icons_release();
+                trace_event(TRACE_INPUT, "skill-wheel-release", "skill=%d", skill);
+                gpui_use_skill(skill);
+            }
         }
         return;
     }
 
     if (l3Edge && !blocked) {
+        releasedOn = -1;
         gpui_open_skill_wheel();
         if (radial_wheel_is_open()) {
             gpui_wheel_owner = GPUI_WHEEL_SKILL;
