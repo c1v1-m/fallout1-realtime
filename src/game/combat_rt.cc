@@ -11194,6 +11194,22 @@ static Object* rt_aim_target()
     return rt_nearest_aimable_in_range(rt_player_hit_mode());
 }
 
+// ⚠️ THE CALLED-SHOT WINDOW OPENS WITHOUT AIMING FIRST (2026-10-14, "nemůžu kdykoliv s R3 aimnout
+// body, musím zamířit"). Without a lock, rt_aim_target looks only inside WEAPON range, and with
+// fists or a knife that is one tile: trace_2026-10-14_195057 has R3 refused twelve times, "Nothing in
+// range to aim at.", with people a few tiles off -- and LT then R3 worked, because the lock reaches as
+// far as you can see. So when nothing is in reach, the window (R3, V) takes what a fresh LT press
+// would: in front of you first, enemies before others, in sight (rt_lock_pick_initial). It only
+// chooses which picture and which chances the window shows; it locks nothing and fires nothing.
+static Object* rt_window_target()
+{
+    Object* target = rt_aim_target();
+    if (target != NULL) {
+        return target;
+    }
+    return rt_lock_pick_initial(0);
+}
+
 bool combat_rt_can_aim()
 {
     if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {
@@ -11204,7 +11220,7 @@ bool combat_rt_can_aim()
     if (!item_w_called_shot(obj_dude, rt_player_hit_mode())) {
         return false;
     }
-    return rt_aim_target() != NULL;
+    return rt_window_target() != NULL;
 }
 
 Object* combat_rt_aim_target()
@@ -11212,7 +11228,7 @@ Object* combat_rt_aim_target()
     if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {
         return NULL;
     }
-    return rt_aim_target();
+    return rt_window_target();
 }
 
 // The critter currently green-highlighted for aiming, and the outline state it had before
@@ -11302,8 +11318,8 @@ const char* combat_rt_aim_refusal()
         return "This weapon can't be aimed.";
     }
 
-    if (rt_aim_target() == NULL) {
-        return "Nothing in range to aim at.";
+    if (rt_window_target() == NULL) {
+        return "Nothing to aim at.";
     }
 
     return NULL;
