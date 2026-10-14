@@ -1589,6 +1589,12 @@ int map_save_in_game(bool a1)
         return 0;
     }
 
+    // Saving without leaving (a1 false): the map stays, so its decorative loops come back after the
+    // write -- see anim_forever_snapshot. Leaving the map tears everything down anyway.
+    Object* foreverOwners[32];
+    int foreverAnims[32];
+    int foreverCount = a1 ? 0 : anim_forever_snapshot(foreverOwners, foreverAnims, 32);
+
     anim_stop();
 
     if (a1) {
@@ -1624,6 +1630,8 @@ int map_save_in_game(bool a1)
         strcpy(name, map_data.name);
         strmfe(map_data.name, name, "SAV");
         if (map_save() == -1) {
+            strcpy(map_data.name, name);
+            anim_forever_restore(foreverOwners, foreverAnims, foreverCount);
             return -1;
         }
 
@@ -1638,6 +1646,8 @@ int map_save_in_game(bool a1)
         proto_remove_all();
         square_reset();
         gtime_q_add();
+    } else {
+        anim_forever_restore(foreverOwners, foreverAnims, foreverCount);
     }
 
     return 0;

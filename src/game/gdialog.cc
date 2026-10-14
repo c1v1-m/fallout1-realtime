@@ -245,6 +245,13 @@ static bool gdDialogTurnMouseOff = false;
 // 0x505014
 Object* dialog_target = NULL;
 
+// The decorative ANIMATE_FOREVER loops a conversation's anim_stop ended, put back when it closes
+// (anim_forever_snapshot / anim_forever_restore).
+#define GDIALOG_FOREVER_MAX 32
+static Object* gdialog_forever_owners[GDIALOG_FOREVER_MAX];
+static int gdialog_forever_anims[GDIALOG_FOREVER_MAX];
+static int gdialog_forever_count = 0;
+
 // 0x505018
 int dialogue_scr_id = -1;
 
@@ -799,6 +806,11 @@ void gdialog_enter(Object* target, int a2)
     map_enable_bk_processes();
     scr_exec_map_update_scripts();
 
+    // The decorative loops the conversation stopped (scr_dialogue_init) -- after map_update, so a
+    // prop its own script already restarted is busy and skipped.
+    anim_forever_restore(gdialog_forever_owners, gdialog_forever_anims, gdialog_forever_count);
+    gdialog_forever_count = 0;
+
     dialog_state_fix = 0;
 }
 
@@ -881,6 +893,8 @@ int scr_dialogue_init(int headFid, int reaction)
         return 0;
     }
 
+    // Decorative loops (Gizmo's sign...) stopped below come back when the conversation ends.
+    gdialog_forever_count = anim_forever_snapshot(gdialog_forever_owners, gdialog_forever_anims, GDIALOG_FOREVER_MAX);
     anim_stop();
 
     // Every conversation, named: who, which head (-1 = no head: the top window shows the world

@@ -218,6 +218,8 @@ void dude_standup(Object* a1);
 int anim_hide(Object* object, int animationSequenceIndex);
 int anim_change_fid(Object* obj, int animationSequenceIndex, int fid);
 void anim_stop();
+int anim_forever_snapshot(Object** owners, int* anims, int max);
+void anim_forever_restore(Object** owners, int* anims, int count);
 unsigned int compute_tpf(Object* object, int fid);
 
 // Realtime combat: multiplies the ticks-per-frame of subsequently-registered

@@ -4231,6 +4231,56 @@ void anim_stop()
     curr_sad = 0;
 }
 
+// ⚠️ DECORATIVE LOOPS SURVIVE A SAVE AND A CONVERSATION (2026-10-14, "hele netočí se billboard";
+// first reported as "gizmovo bilboard se první netočí a po odchodu a příchodu k němu zase jo").
+// Gizmo's sign and every other ANIMFRVR.INT prop loops on an ANIMATE_FOREVER sequence started at
+// map_enter. anim_stop() ends every sequence, and two everyday things call it: saving
+// (map_save_in_game) and opening a conversation (scr_dialogue_init). Our autosave on entering a NEW
+// place is exactly the first visit -- so the sign stopped the moment you arrived, and a return visit
+// (no autosave) kept it turning. Vanilla only got it back through ANIMFRVR's map_update_p_proc, at
+// most every 30 s and only while combat_is_initialized is 0, which realtime's warm combat bit often
+// is not. So the loops running before such a stop are noted here and put back after it. A body that
+// is playing something by then is left alone.
+int anim_forever_snapshot(Object** owners, int* anims, int max)
+{
+    int count = 0;
+    for (int index = 0; index < ANIMATION_SEQUENCE_LIST_CAPACITY && count < max; index++) {
+        AnimationSequence* sequence = &(anim_set[index]);
+        if (sequence->field_0 == -1000) {
+            continue;
+        }
+        for (int at = 0; at < sequence->length && count < max; at++) {
+            AnimationDescription* description = &(sequence->animations[at]);
+            if (description->kind == ANIM_KIND_ANIMATE_FOREVER && description->owner != NULL) {
+                owners[count] = description->owner;
+                anims[count] = description->anim;
+                count++;
+            }
+        }
+    }
+    return count;
+}
+
+void anim_forever_restore(Object** owners, int* anims, int count)
+{
+    for (int index = 0; index < count; index++) {
+        Object* owner = owners[index];
+        if (owner == NULL || owner->tile == -1 || anim_busy(owner) != 0) {
+            continue;
+        }
+        if (register_begin(ANIMATION_REQUEST_UNRESERVED) == -1) {
+            continue;
+        }
+        // On a refusal register_object_animate_forever closes the registration itself.
+        if (register_object_animate_forever(owner, anims[index], -1) == 0) {
+            register_end();
+        }
+    }
+    if (count > 0) {
+        trace_event(TRACE_ANIM, "forever-restore", "loops=%d", count);
+    }
+}
+
 // 0x418040
 static int check_gravity(int tile, int elevation)
 {
