@@ -81,6 +81,7 @@ enum {
     MODS_SCRIPT_FLOAT,
     MODS_HIT_STAGGER,
     MODS_MOUSE,
+    MODS_FORGIVE_STRAY,
     MODS_SCREEN_RES,
     MODS_INTERNAL_RES,
     MODS_COUNT,
@@ -326,6 +327,19 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         2,
     },
     {
+        "Stray hits on allies",
+        { "Vanilla", "Forgive once" },
+        {
+            "A stray bullet in anyone turns them, and their friends, on you.",
+            "A stray bullet in someone fighting your target is forgiven once.",
+        },
+        {
+            "A burst beside Killian can set the whole town on you.",
+            "Your target, and a second stray hit, still count.",
+        },
+        2,
+    },
+    {
         "Screen resolution",
         { "1280x720", "1920x1080", "2560x1440", "Desktop" },
         {
@@ -391,6 +405,7 @@ static_assert(mods_label_is(MODS_CAM_LEAN, "Camera leans to target"), "MODS row 
 static_assert(mods_label_is(MODS_SCRIPT_FLOAT, "Script lines as floating text"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_HIT_STAGGER, "Hits stagger"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_MOUSE, "Mouse"), "MODS row order drifted");
+static_assert(mods_label_is(MODS_FORGIVE_STRAY, "Stray hits on allies"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCREEN_RES, "Screen resolution"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_INTERNAL_RES, "Internal resolution"), "MODS row order drifted");
 
@@ -638,6 +653,7 @@ static void mods_load()
     mods_value[MODS_SCRIPT_FLOAT] = gdialog_get_script_float() ? 1 : 0;
     mods_value[MODS_HIT_STAGGER] = combat_rt_get_flinch_chance() > 0.0f ? 1 : 0;
     mods_value[MODS_MOUSE] = combat_rt_get_mouse_hold_walk() ? 1 : 0;
+    mods_value[MODS_FORGIVE_STRAY] = combat_rt_get_forgive_stray() ? 1 : 0;
 
     {
         // The OUTPUT the file asks for, matched against the sizes the row offers; anything else
@@ -848,6 +864,13 @@ static void mods_apply(int index)
         bool v = mods_value[index] != 0;
         combat_rt_set_mouse_hold_walk(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_HOLD_WALK_KEY, v ? 1 : 0);
+        break;
+    }
+    case MODS_FORGIVE_STRAY: {
+        // DEFAULT "Forgive once" -- his call (2026-10-15), ON without being vanilla. Live.
+        bool v = mods_value[index] != 0;
+        combat_rt_set_forgive_stray(v);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FORGIVE_STRAY_KEY, v ? 1 : 0);
         break;
     }
     case MODS_HIT_STAGGER: {

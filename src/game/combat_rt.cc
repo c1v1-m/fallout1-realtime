@@ -1181,6 +1181,27 @@ static bool rt_npc_slide = true;
 // Mouse like Diablo, from cfg mouse_hold_walk (MODS "Mouse"). See RT_MOUSE_WALK_DEADZONE.
 static bool rt_mouse_hold_walk = true;
 
+// ⚠️ A STRAY BULLET IN SOMEONE WHO IS ON YOUR SIDE OF THE FIGHT IS FORGIVEN, ONCE (2026-10-15, "zase to
+// samé" -- Killian's guards turned on him after he saved Killian). He killed Kenji with an SMG burst
+// while Kenji stood beating Killian; the spray (compute_spray, shoot_along_path) put rounds into
+// Killian as well, and apply_damage did what vanilla does with every extra: combatai_check_retaliation
+// made the dude Killian's whoHitMe, and the guards defended Killian against him
+// (trace_2026-10-15_012127 s=39.37: Kenji dies in DANCING_AUTOFIRE, guard-threat victim=Killian
+// attacker=dude in the same frame). Vanilla, and just as harsh in turn-based -- his call: forgive it,
+// a MODS row to turn it off, and "pokud vystřelí znovu po spojenci, už je problém".
+//
+// ONLY A STRAY: a burst's extra or a miss that went into someone else (attack->defender != oops).
+// Whoever you AIM at is never forgiven -- shooting random people works exactly as it always did.
+// ONLY AN ALLY OF THE MOMENT: the one hit is fighting the very critter you aimed at (its whoHitMe is
+// that critter, or that critter's is it) and is not already after you. ONLY ONCE per critter per map
+// visit: the second stray hit is vanilla again. The damage always lands; what is skipped is the
+// retaliation AND the script learning who fired (scr_set_objs source NULL), because a Junktown guard's
+// own damage_p_proc raises the town alarm (GVAR 247) and changes team when source_obj is the dude.
+static bool rt_forgive_stray = true;
+#define RT_FORGIVEN_MAX 32
+static int rt_forgiven_ids[RT_FORGIVEN_MAX];
+static int rt_forgiven_count = 0;
+
 // Idle hostiles look around, from cfg enemies_look_around (MODS "Enemies look around", default off
 // = vanilla). See rt_idle_look_around.
 static bool rt_look_around = false;
@@ -10122,6 +10143,9 @@ static void rt_abandon_encounter()
 // set rt_enabled (each caller does), or touch combat_state (game-reset clears the warm bit).
 static void rt_reset_session_state()
 {
+    // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
+    rt_forgiven_count = 0;
+
     // The reaction table is session state like everything else here: a load must not resurrect a
     // knockdown from the game that was running a second ago.
     rt_reaction_clear_all();
@@ -10197,6 +10221,12 @@ void combat_rt_init()
     int mouseHoldWalk = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_HOLD_WALK_KEY, &mouseHoldWalk);
     rt_mouse_hold_walk = mouseHoldWalk != 0;
+
+    // A stray hit on an ally of the moment is forgiven once (MODS "Stray hits on allies"). Default
+    // ON: his call, 2026-10-15. See rt_forgive_stray.
+    int forgiveStray = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FORGIVE_STRAY_KEY, &forgiveStray);
+    rt_forgive_stray = forgiveStray != 0;
 
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
     // Default ON since the release (his setting).
@@ -13770,6 +13800,8 @@ void combat_rt_validate_who_hit_me(Object* a, Object* b)
 // re-engages there normally. obj_remove_all's objects-freed hook will also fire on load.
 void combat_rt_end_for_map_exit()
 {
+    rt_forgiven_count = 0;
+
     trace_event(TRACE_FLOW, "map-exit-combat-end", "actors=%d eng=%d t=%.2f",
         rt_actor_count, rt_engaged ? 1 : 0, rt_clock);
 
@@ -14057,6 +14089,58 @@ bool combat_rt_get_free_move()
 void combat_rt_set_mouse_hold_walk(bool enabled)
 {
     rt_mouse_hold_walk = enabled;
+}
+
+void combat_rt_set_forgive_stray(bool enabled)
+{
+    rt_forgive_stray = enabled;
+}
+
+bool combat_rt_get_forgive_stray()
+{
+    return rt_forgive_stray;
+}
+
+// Called by apply_damage (combat.cc) for a critter an attack hit WITHOUT being aimed at -- a burst's
+// extra, or the random target of a miss. True = do not retaliate and do not tell its script who fired.
+// See rt_forgive_stray for the rule and the report.
+bool combat_rt_forgive_stray(Object* attacker, Object* bystander, Object* intended)
+{
+    if (!rt_enabled || !rt_forgive_stray || attacker == NULL || bystander == NULL || intended == NULL) {
+        return false;
+    }
+    if (attacker != obj_dude && !isPartyMember(attacker)) {
+        return false;
+    }
+    if (bystander == obj_dude || bystander == intended || isPartyMember(bystander)
+        || FID_TYPE(bystander->fid) != OBJ_TYPE_CRITTER || FID_TYPE(intended->fid) != OBJ_TYPE_CRITTER) {
+        return false;
+    }
+
+    // Already after you (or your people): nothing to forgive, it is a fight.
+    Object* grudge = bystander->data.critter.combat.whoHitMe;
+    if (grudge == obj_dude || (grudge != NULL && isPartyMember(grudge))) {
+        return false;
+    }
+
+    // An ally of the moment: it and the one you aimed at are fighting each other.
+    if (grudge != intended && intended->data.critter.combat.whoHitMe != bystander) {
+        return false;
+    }
+
+    for (int i = 0; i < rt_forgiven_count; i++) {
+        if (rt_forgiven_ids[i] == bystander->id) {
+            trace_event(TRACE_COMBAT, "stray-again", "pid=%d id=%d by=%d intended=%d t=%.2f",
+                bystander->pid, bystander->id, attacker->pid, intended->pid, rt_clock);
+            return false;
+        }
+    }
+    if (rt_forgiven_count < RT_FORGIVEN_MAX) {
+        rt_forgiven_ids[rt_forgiven_count++] = bystander->id;
+    }
+    trace_event(TRACE_COMBAT, "stray-forgiven", "pid=%d id=%d by=%d intended=%d t=%.2f",
+        bystander->pid, bystander->id, attacker->pid, intended->pid, rt_clock);
+    return true;
 }
 
 bool combat_rt_get_mouse_hold_walk()

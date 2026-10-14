@@ -3600,7 +3600,12 @@ void apply_damage(Attack* attack, bool animated)
     if (defenderIsCritter && (defender->data.critter.combat.results & DAM_DEAD) == 0) {
         set_new_results(defender, attack->defenderFlags);
 
-        if (attackerIsCritter) {
+        // A miss that went into someone else (DAM_RANDOM_HIT): forgiven once if it is an ally of
+        // the moment -- see rt_forgive_stray (combat_rt.cc). Never the one aimed at (oops).
+        bool forgiven = attackerIsCritter && defender != attack->oops
+            && combat_rt_forgive_stray(attack->attacker, defender, attack->oops);
+
+        if (attackerIsCritter && !forgiven) {
             if ((defender->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
                 critter_set_who_hit_me(defender, attack->attacker);
             } else if (defender == attack->oops || defender->data.critter.combat.team != attack->attacker->data.critter.combat.team) {
@@ -3608,7 +3613,7 @@ void apply_damage(Attack* attack, bool animated)
             }
         }
 
-        scr_set_objs(defender->sid, attack->attacker, NULL);
+        scr_set_objs(defender->sid, forgiven ? NULL : attack->attacker, NULL);
         damage_object(defender, attack->defenderDamage, animated, attack->defender != attack->oops);
         combatai_notify_onlookers(defender);
 
@@ -3624,7 +3629,11 @@ void apply_damage(Attack* attack, bool animated)
         if (FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER && (obj->data.critter.combat.results & DAM_DEAD) == 0) {
             set_new_results(obj, attack->extrasFlags[index]);
 
-            if (attackerIsCritter) {
+            // A burst's stray round in an ally of the moment: forgiven once (rt_forgive_stray).
+            bool forgiven = attackerIsCritter
+                && combat_rt_forgive_stray(attack->attacker, obj, attack->oops);
+
+            if (attackerIsCritter && !forgiven) {
                 if ((obj->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
                     critter_set_who_hit_me(obj, attack->attacker);
                 } else if (obj->data.critter.combat.team != attack->attacker->data.critter.combat.team) {
@@ -3632,7 +3641,7 @@ void apply_damage(Attack* attack, bool animated)
                 }
             }
 
-            scr_set_objs(obj->sid, attack->attacker, NULL);
+            scr_set_objs(obj->sid, forgiven ? NULL : attack->attacker, NULL);
             damage_object(obj, attack->extrasDamage[index], animated, attack->defender != attack->oops);
             combatai_notify_onlookers(obj);
 
