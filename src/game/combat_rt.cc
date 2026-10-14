@@ -7534,6 +7534,46 @@ static bool rt_hostile_by_nature(Object* critter)
     }
 }
 
+// ⚠️ RT WITHOUT A LOCK ALSO TAKES A RED-OUTLINED ANIMAL (2026-10-14, "bylo těžké zasáhnout krysu s RT
+// bez míření"). Unlocked, RT went to rt_nearest_hostile_in_range -- only whoever is ALREADY fighting
+// you -- so a rat idling next to you, drawn red because rats are enemies by nature, could not be hit
+// until it bit first: trace_2026-10-13_222906 s=554.8-558.3, four RT pulls with two idle rats one tile
+// away, nothing; the first swing came after the rat had turned on him. LT always could (a lock takes
+// neutrals too), which is why aiming "worked". So when nobody is fighting you, RT takes the nearest
+// enemy-by-nature in weapon range and in sight -- a rat, a radscorpion, never a person: people stay a
+// deliberate LT. rt_nearest_hostile_in_range itself is untouched, because it also decides the A-vs-
+// prompt split, and an idle rat must not switch the interact prompt off.
+static Object* rt_unlocked_attack_target(int hitMode)
+{
+    Object* target = rt_nearest_hostile_in_range(hitMode);
+    if (target != NULL) {
+        return target;
+    }
+
+    int range = item_w_range(obj_dude, hitMode);
+    Object* best = NULL;
+    int bestDist = range + 1;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (critter == obj_dude || !rt_is_combatant(critter) || !rt_hostile_by_nature(critter)) {
+            continue;
+        }
+        if (critter->data.critter.combat.team == obj_dude->data.critter.combat.team || isPartyMember(critter)) {
+            continue; // an animal that joined you stays yours (rt_aim_outline_type_for: green)
+        }
+        if (!rt_is_lockable(critter)) {
+            continue;
+        }
+        int dist = obj_dist(obj_dude, critter);
+        if (dist > range || dist >= bestDist || !rt_lock_in_sight(critter)) {
+            continue;
+        }
+        bestDist = dist;
+        best = critter;
+    }
+    return best;
+}
+
 static int rt_aim_outline_type_for(Object* critter)
 {
     if (rt_is_hostile(critter)) {
@@ -11058,7 +11098,7 @@ void combat_rt_poll_gamepad()
                 }
             }
         } else {
-            Object* target = rt_nearest_hostile_in_range(hitMode);
+            Object* target = rt_unlocked_attack_target(hitMode);
             if (target != NULL) {
                 rt_set_player_intent(target, hitMode, loc);
                 if (attackEdge) {
