@@ -2445,6 +2445,29 @@ bool inven_equip_under_cursor(int hand)
 // currently-worn armor to the list, run adjust_ac, and set it as worn. If the displaced
 // armor can't fit back in the inventory the swap is rolled back (item stays in the list).
 // Returns false (no-op) unless the normal inventory is open and ARMOR is under the cursor.
+Object* inven_list_item_under_cursor()
+{
+    if (!normal_inventory_open || i_wid == -1) {
+        return NULL;
+    }
+    // Same list region and row mapping as inven_equip_under_cursor.
+    if (!mouseHitTestInWindow(i_wid, INVENTORY_SCROLLER_X, INVENTORY_SCROLLER_Y, INVENTORY_SCROLLER_MAX_X, INVENTORY_SLOT_HEIGHT * inven_cur_disp + INVENTORY_SCROLLER_Y)) {
+        return NULL;
+    }
+    int x;
+    int y;
+    mouseGetPositionInWindow(i_wid, &x, &y);
+    int displayIndex = (y - 39) / INVENTORY_SLOT_HEIGHT;
+    if (displayIndex < 0 || displayIndex >= inven_cur_disp) {
+        return NULL;
+    }
+    int itemIndex = stack_offset[curr_stack] + displayIndex;
+    if (itemIndex >= pud->length) {
+        return NULL;
+    }
+    return pud->items[itemIndex].item;
+}
+
 bool inven_wear_under_cursor()
 {
     if (!normal_inventory_open || i_wid == -1) {

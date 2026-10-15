@@ -5527,6 +5527,7 @@ static bool rt_do_step_back(Object* npc)
 // Appended AFTER the opt-out ids behind a tag, so the forgiving-read rule below still holds: an
 // older save ends before the tag and simply keeps the full pool it always had.
 #define RT_SAVE_AP_TAG 0x52544150 // 'RTAP'
+#define RT_SAVE_QS_TAG 0x52545153 // 'RTQS' -- the LB / RB quick-slot bindings (gamepad_ui), 2026-10-15
 
 int combat_rt_medic_optout_save(DB_FILE* stream)
 {
@@ -5548,6 +5549,14 @@ int combat_rt_medic_optout_save(DB_FILE* stream)
         || db_fwriteInt(stream, bonus) == -1) {
         return -1;
     }
+
+    // The quick slots' bound items (a pid, -1 = the slot picks by itself). Appended after the AP pool
+    // the same way the pool was appended after the medic list, so older saves end before it.
+    if (db_fwriteInt(stream, RT_SAVE_QS_TAG) == -1
+        || db_fwriteInt(stream, gamepad_ui_quick_slot_get(0)) == -1
+        || db_fwriteInt(stream, gamepad_ui_quick_slot_get(1)) == -1) {
+        return -1;
+    }
     return 0;
 }
 
@@ -5558,6 +5567,7 @@ int combat_rt_medic_optout_save(DB_FILE* stream)
 int combat_rt_medic_optout_load(DB_FILE* stream)
 {
     rt_medic_optout_count = 0;
+    gamepad_ui_quick_slots_reset(); // a save without the chunk has both slots on auto
 
     int count;
     if (db_freadInt(stream, &count) == -1) {
@@ -5593,6 +5603,18 @@ int combat_rt_medic_optout_load(DB_FILE* stream)
         rt_bonus_move_ap = bonus;
     }
     trace_event(TRACE_STATE, "ap-restore", "ap=%d bonus=%d", ap, bonus);
+
+    // The quick-slot bindings, if this save has them (see RT_SAVE_QS_TAG).
+    int qsTag;
+    int lbPid;
+    int rbPid;
+    if (db_freadInt(stream, &qsTag) == -1 || qsTag != RT_SAVE_QS_TAG
+        || db_freadInt(stream, &lbPid) == -1 || db_freadInt(stream, &rbPid) == -1) {
+        return 0;
+    }
+    gamepad_ui_quick_slot_set(0, lbPid);
+    gamepad_ui_quick_slot_set(1, rbPid);
+    trace_event(TRACE_STATE, "quick-slots-restore", "lb=%d rb=%d", lbPid, rbPid);
     return 0;
 }
 
@@ -10716,6 +10738,7 @@ void combat_rt_exit()
 void combat_rt_reset()
 {
     rt_reset_session_state();
+    gamepad_ui_quick_slots_reset(); // a new game or a load starts both quick slots on auto
     combat_state &= ~COMBAT_STATE_0x01;
 
     // ⚠️ CLEARED HERE SO IT CANNOT SURVIVE A MID-SESSION LOAD -- the exact shape of bug that has
@@ -11046,6 +11069,51 @@ static void rt_mouse_update()
                 rt_mouse_target->pid, obj_dist(obj_dude, rt_mouse_target), item_w_range(obj_dude, hitMode), rt_clock);
         }
     }
+}
+
+// --- QUICK THROW (2026-10-15) --------------------------------------------------------------------
+// The LB / RB quick slots (gamepad_ui, "QUICK SLOTS") draw a throwable into the active hand and, when
+// the button is let go, throw it here. His pick for the target: the lock while LT holds one, else the
+// nearest enemy the way RT without a lock finds it; nobody in range = the throwable is put away.
+Object* combat_rt_quick_throw_target()
+{
+    if (!rt_enabled || obj_dude == NULL) {
+        return NULL;
+    }
+    int hitMode = rt_player_hit_mode();
+    if (rt_lock_target != NULL) {
+        if (rt_is_combatant(rt_lock_target)
+            && obj_dist(obj_dude, rt_lock_target) <= item_w_range(obj_dude, hitMode)) {
+            return rt_lock_target;
+        }
+        return NULL;
+    }
+    return rt_unlocked_attack_target(hitMode);
+}
+
+bool combat_rt_request_throw(Object* target)
+{
+    if (!rt_enabled || obj_dude == NULL || target == NULL) {
+        return false;
+    }
+    int hitMode = rt_player_hit_mode();
+    rt_set_player_intent(target, hitMode);
+    trace_event(TRACE_ACTION, "quick-throw", "target=%d id=%d hm=%d dist=%d range=%d t=%.2f",
+        target->pid, target->id, hitMode, obj_dist(obj_dude, target), item_w_range(obj_dude, hitMode), rt_clock);
+    return true;
+}
+
+bool combat_rt_player_attack_pending()
+{
+    if (rt_player_intent_target != NULL) {
+        return true;
+    }
+    for (int i = 0; i < rt_inflight_count; i++) {
+        if (rt_inflight[i].attacker == obj_dude) {
+            return true;
+        }
+    }
+    return false;
 }
 
 Object* combat_rt_mouse_target()

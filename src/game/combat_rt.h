@@ -364,6 +364,14 @@ int combat_rt_bonus_move_ap();
 float combat_rt_time_scale();
 float combat_rt_flinch_seconds();
 
+// QUICK THROW (the LB / RB quick slots, gamepad_ui): whom a throw from the slot goes at -- the locked
+// target while LT holds a lock (if it is in throwing range), else whom RT without a lock would hit;
+// NULL when there is nobody. combat_rt_request_throw fires the active hand at it like an RT press;
+// combat_rt_player_attack_pending says whether that attack has not happened yet.
+Object* combat_rt_quick_throw_target();
+bool combat_rt_request_throw(Object* target);
+bool combat_rt_player_attack_pending();
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_COMBAT_RT_H_ */

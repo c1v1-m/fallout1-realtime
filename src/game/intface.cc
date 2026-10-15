@@ -280,12 +280,17 @@ static void intface_side_art_init(int barX, int barY)
 {
     if (barX > 0) {
         Art* art = load_frame("art\\intrface\\HR_IFACELFT1.FRM");
-        if (art != NULL) {
+        // ⚠️ A WINDOW OF ITS OWN EVEN WITHOUT THE HRP ART (2026-10-15): the LB quick slot lives in this
+        // strip (intface_update_quick_slot_lb), and the release ships no HRP pieces -- without the art
+        // the strip is plain black, like the side panel on the right.
+        if (art != NULL || barX >= SIDE_PANEL_MIN_WIDTH) {
             sideArtLeftWindow = win_add(0, barY, barX, INTERFACE_BAR_HEIGHT, colorTable[0], WINDOW_HIDDEN);
             unsigned char* buf = sideArtLeftWindow != -1 ? win_get_buf(sideArtLeftWindow) : NULL;
-            if (buf != NULL) {
+            if (buf != NULL && art != NULL) {
                 intface_side_art_paint(art, true, buf, barX, barX);
             }
+        }
+        if (art != NULL) {
             mem_free(art);
         }
     }
@@ -1318,10 +1323,88 @@ static IntfaceSlot intface_slot_at(int barX, int y, int width)
 static int heal_slot_pid = -2;
 static int heal_slot_count = -1;
 
+// The LB quick slot's painted state, the same cache shape as the heal slot's.
+static int lb_slot_pid = -2;
+static int lb_slot_count = -1;
+static int lb_slot_armed = -1;
+
 void intface_invalidate_heal_slot()
 {
     heal_slot_pid = -2;
     heal_slot_count = -1;
+    lb_slot_pid = -2; // the left strip is repainted by the same full redraws
+    lb_slot_count = -1;
+    lb_slot_armed = -1;
+}
+
+// --- THE LB QUICK SLOT (2026-10-15) ----------------------------------------------------------------
+//
+// His layout: *"vlevo dole u pásku bude LB s granátem pro quick throw"* -- the twin of the heal slot,
+// which became the RB quick slot. It lives in the strip LEFT of the bar, in a column hugging the bar
+// the way the heal slot's does on the right, and wears the same end-turn-box frame. A drawn item
+// (held, waiting for the release) gets its label in red. Keyboard: T.
+void intface_update_quick_slot_lb(Object* item, int count, bool armed)
+{
+    if (interfaceWindow == -1 || !combat_rt_enabled() || sideArtLeftWindow == -1) {
+        return;
+    }
+    unsigned char* buffer = win_get_buf(sideArtLeftWindow);
+    int stripW = (screenGetWidth() - INTERFACE_BAR_WIDTH) / 2;
+    if (buffer == NULL || stripW < HEAL_SLOT_W + 4) {
+        return;
+    }
+
+    int pad = gamepad_ui_get_controller() != NULL ? 1 : 0;
+    int pid = item != NULL ? item->pid : -1;
+    int armedNow = (armed ? 1 : 0) + pad * 2;
+    if (pid == lb_slot_pid && count == lb_slot_count && armedNow == lb_slot_armed) {
+        return;
+    }
+    lb_slot_pid = pid;
+    lb_slot_count = count;
+    lb_slot_armed = armedNow;
+
+    const int columnW = 78 < stripW - 4 ? 78 : stripW - 4;
+    int columnRight = stripW - 4; // 4 px short of the bar, the mirror of the heal slot's column
+    int x = columnRight - columnW + (columnW - HEAL_SLOT_W) / 2;
+    if (x < 0) {
+        x = 0;
+    }
+    int pitch = stripW;
+    unsigned char* base = buffer + pitch * HEAL_SLOT_Y + x;
+
+    CacheEntry* frameHandle;
+    unsigned char* frame = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 104, 0, 0, 0), 0, 0, &frameHandle);
+    if (frame != NULL) {
+        buf_to_buf(frame, HEAL_SLOT_W, HEAL_SLOT_H, HEAL_SLOT_W, base, pitch);
+        art_ptr_unlock(frameHandle);
+    }
+    buf_fill(base + pitch * 2 + 2, HEAL_SLOT_W - 4, HEAL_SLOT_H - 4, pitch, colorTable[0]);
+
+    int oldFont = text_curr();
+    text_font(101);
+    int lineH = text_height();
+    int iconH = HEAL_SLOT_H - 8 - lineH * 2;
+    if (item != NULL) {
+        scale_art(item_inv_fid(item), base + pitch * 4 + 4, HEAL_SLOT_W - 8, iconH, pitch);
+    }
+
+    const char* label = pad ? "LB" : "T";
+    int labelY = 4 + iconH;
+    int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
+    text_to_buf(base + pitch * labelY + labelX, (char*)label, pitch, pitch,
+        armed ? colorTable[31744] : colorTable[32747]);
+
+    char countText[8];
+    snprintf(countText, sizeof(countText), "%d", count);
+    int countY = labelY + lineH;
+    int countX = (HEAL_SLOT_W - text_width(countText)) / 2;
+    text_to_buf(base + pitch * countY + countX, countText, pitch, pitch,
+        count > 0 ? colorTable[992] : colorTable[31744]);
+    text_font(oldFont);
+
+    Rect rect = { x, HEAL_SLOT_Y, x + HEAL_SLOT_W - 1, HEAL_SLOT_Y + HEAL_SLOT_H - 1 };
+    win_draw_rect(sideArtLeftWindow, &rect);
 }
 
 void intface_update_heal_slot(Object* item, int count)

@@ -57,6 +57,9 @@ void intface_update_move_points(int actionPoints, int bonusMove);
 // Realtime heal slot (the RB stimpak indicator) -- see the block above intface_redraw.
 void intface_update_heal_slot(Object* item, int count);
 void intface_invalidate_heal_slot();
+// The LB quick slot, in the strip LEFT of the bar (gamepad_ui "QUICK SLOTS"); armed = the item is
+// drawn and waiting for the release. No strip (a 640-wide screen) = nothing is drawn.
+void intface_update_quick_slot_lb(Object* item, int count, bool armed);
 // The part an aimed RT goes to, printed in the weapon slot beside its bullseye.
 void intface_update_aim_part(int hitLocation);
 // REALTIME: the end-turn box on the bar opens its combat curtains while a fight is live and closes

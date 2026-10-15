@@ -150,6 +150,13 @@ bool gamepad_ui_skill_cursor_sticky();
 struct Object;
 Object* gamepad_ui_targeting_pick();
 
+// THE QUICK SLOTS (2026-10-15): 0 = LB, 1 = RB. A slot holds a bound item pid, or -1 = it picks by
+// itself (LB the best throwable, RB the best heal). Saved in combat_rt's save chunk; reset to auto on
+// a new game and on every load before the chunk is read.
+int gamepad_ui_quick_slot_get(int slot);
+void gamepad_ui_quick_slot_set(int slot, int pid);
+void gamepad_ui_quick_slots_reset();
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_GAMEPAD_UI_H_ */

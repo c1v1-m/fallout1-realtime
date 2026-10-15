@@ -841,10 +841,16 @@ static bool gpui_in_mouse_hook = false;
 // click talk/loot/use an object or open the inventory item popup, so RB is how a
 // controller reaches all of those. Injected on the press edge only (a single
 // RIGHT_BUTTON_DOWN, no auto-repeat) so one press is exactly one mode toggle.
+// The quick slots (see the note at gpui_consumed_lb), declared up here for the binding in this hook.
+#define GPUI_QS_LB 0
+#define GPUI_QS_RB 1
+static void gpui_qs_bind_under_cursor(int slot);
+
 static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* buttons)
 {
     static bool prevA = false;
     static bool prevRB = false;
+    static bool prevLB = false;
     // Set on the A press edge when the tap is routed to looting an adjacent
     // corpse/container; suppresses the walk-click for that press.
     static bool aLooting = false;
@@ -857,8 +863,11 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     bool rbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
     bool aEdge = aNow && !prevA;
     bool rbEdge = rbNow && !prevRB;
+    bool lbHookNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+    bool lbEdge = lbHookNow && !prevLB;
     prevA = aNow;
     prevRB = rbNow;
+    prevLB = lbHookNow;
 
     // ⚠️ A SCREEN JUST RAN ITS OWN INPUT LOOP -- our edges describe the world before it, so adopt
     // the live pad state and emit NOTHING this frame.
@@ -1137,7 +1146,13 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     // the overlay -- you would put the gun away and find yourself in the wrong cursor.
     //
     // LB+RB (run to the nearest map exit) died with the modifier button; it is a BACK hold now.
-    if (rbEdge && !radial_wheel_is_open()
+    // THE QUICK SLOTS ARE BOUND HERE (2026-10-15): in your own inventory, LB / RB over an item binds
+    // it to that slot. RB's right-click there only switched the hand/arrow cursor, which the pad never
+    // needed -- a held A opens the action menu.
+    bool invNormal = invOpen && inven_current_window_type() == INVENTORY_WINDOW_TYPE_NORMAL;
+    if (invNormal && (lbEdge || rbEdge)) {
+        gpui_qs_bind_under_cursor(lbEdge ? GPUI_QS_LB : GPUI_QS_RB);
+    } else if (rbEdge && !radial_wheel_is_open()
         && (gamepad_ui_menu_active() || inven_any_open() || dialog_active())) {
         *buttons |= MOUSE_STATE_RIGHT_BUTTON_DOWN;
         gpui_cursor_show_time = get_time();
@@ -1246,8 +1261,41 @@ static void gpui_open_dpad_screen(int which)
 static bool gpui_consumed_b = false;  // B:  tap cancels, hold opens the DRUG wheel
 static bool gpui_consumed_y = false;  // Y:  tap swaps hands, hold opens the WEAPON wheel, LT+Y spends it
 static bool gpui_consumed_x = false;  // X:  tap switches firing mode, hold RUNS (no wheel any more)
-static bool gpui_consumed_lb = false; // LB: tap reloads, hold opens the aim picker
+static bool gpui_consumed_lb = false; // LB: tap reloads, hold draws the LB quick slot (2026-10-15)
 static bool gpui_consumed_rb = false; // RB: a press already spent (paging a wheel, a screen closing)
+
+// --- THE QUICK SLOTS: LB AND RB (2026-10-15) ---------------------------------------------------------
+//
+// His design, in three messages: *"když držím LB, dude si prohodí zbraň a bude držet granát a jakmile
+// LB pustí, tak granát hodí ... vlevo dole u pásku bude LB s granátem pro quick throw nebo nějaký item
+// na bindování, ale primárně throwable. Quick Pockets je tím taky ovlivněn, swap bude stát jeden bod.
+// Kliknutí LB je reload"*, then *"RB uděláme jako LB, ale prvně se tam dá stimpack -- prostě taky jako
+// quick slot"*. And his picks: the throw goes at the LT lock, else at the nearest enemy (RT without a
+// lock); a slot picks its item by itself but can be bound in the inventory; drawing costs 2 AP, 1 with
+// Quick Pockets, and putting the old weapon back is free.
+//
+//   LB  tap = reload (as always). Held past GPUI_QS_HOLD_MS = the LB slot: a THROWABLE is drawn into
+//       the active hand and thrown on the release; a DRUG is taken on the release.
+//   RB  the RB slot: a drug (the default, a stimpak) is taken on the press, as the heal always was; a
+//       throwable is drawn on the press and thrown on the release.
+//   B   while one is drawn: put it away, nothing thrown (costs the draw, like any swap).
+//   In your own inventory LB / RB over an item binds it to that slot; again on the same item = auto.
+//   Keyboard: T is the LB slot, H the RB slot -- a throwable is drawn and thrown in one go there.
+//
+// Nobody in range at the release: the throwable goes back and the old weapon comes out (buzz).
+#define GPUI_QS_COUNT 2 // GPUI_QS_LB / GPUI_QS_RB are defined above gpui_action_buttons
+#define GPUI_QS_HOLD_MS 220 // the same tap-vs-hold line the face-button wheels use
+static int gpui_qs_bound[GPUI_QS_COUNT] = { -1, -1 };
+
+static Object* gpui_quick_slot_item(int slot, int* count);
+static bool gpui_item_is_throwable(Object* item);
+static void gpui_qs_press(int slot, bool throwOnDraw);
+static void gpui_qs_release(int slot);
+static bool gpui_qs_cancel();
+static bool gpui_qs_drawn(int slot);
+// A slot item to TAKE (a drug), asked from the hook and used on the safe tick like every item use.
+static int gpui_qs_use_pending_slot = -1;
+static unsigned int gpui_qs_use_pending_since = 0;
 
 // Y = DEDICATED HEAL (it was LB+B until the 2026-09-16 layout -- he moved it himself, having
 // decided on 2026-08-31 to keep the combo; the modifier button is simply gone now). Set on the Y
@@ -1526,8 +1574,15 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // ⚠️ Every one of these reads belongs at the top, before the first early return: an edge that
     // is only computed on some paths reports a press that already happened as brand new.
     bool lbNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
-    bool lbReleased = !lbNow && prevLb; // LB is the reload, on its release -- no hold to time
+    bool lbPressed = lbNow && !prevLb;
+    bool lbReleased = !lbNow && prevLb; // tap = the reload, on its release; a hold = the LB quick slot
     prevLb = lbNow;
+    static unsigned int lbDownTime = 0;
+    static bool lbSlotHeld = false; // this hold has become the LB quick slot
+    if (lbPressed) {
+        lbDownTime = get_time();
+        lbSlotHeld = false;
+    }
     bool rbPressed = rbNow && !prevRb;
     bool rbReleased = !rbNow && prevRb;
     // NOTE: no hold timer for RB -- it is a single action on its press (the heal), nothing to split.
@@ -1903,11 +1958,34 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // are the two things you reach for with the same finger in the same fight.
     //
     // LT is not involved at all any more: it is the aim/lock (combat_rt), the same job R3 does.
+    // THE LB QUICK SLOT (2026-10-15, see gpui_consumed_lb): held past the tap line, LB stops being the
+    // reload and becomes the slot -- a throwable is drawn now and thrown on the release, a drug is
+    // taken on the release.
+    if (lbNow && !lbSlotHeld && !gpui_consumed_lb && elapsed_time(lbDownTime) >= GPUI_QS_HOLD_MS
+        && !radial_wheel_is_open() && !inven_any_open()) {
+        lbSlotHeld = true;
+        int count;
+        Object* item = gpui_quick_slot_item(GPUI_QS_LB, &count);
+        if (gpui_item_is_throwable(item)) {
+            gpui_qs_press(GPUI_QS_LB, false);
+        }
+    }
+
     if (lbReleased) {
         if (gpui_consumed_lb) {
             // This press was spent: an LB+B heal, a weapon-wheel page, or a
             // screen that closed on it.
             gpui_consumed_lb = false;
+        } else if (lbSlotHeld) {
+            lbSlotHeld = false;
+            int count;
+            Object* item = gpui_quick_slot_item(GPUI_QS_LB, &count);
+            if (gpui_qs_drawn(GPUI_QS_LB)) {
+                gpui_qs_release(GPUI_QS_LB);
+            } else if (item == NULL || !gpui_item_is_throwable(item)) {
+                gpui_qs_press(GPUI_QS_LB, false); // a drug in the slot: taken now (or the empty buzz)
+            }
+            // (a throwable whose draw was refused stays put: its buzz already answered the hold)
         } else {
             // ⚠️ ANY RELEASE RELOADS, HOWEVER LONG THE PRESS (2026-10-09). The 220 ms tap limit was
             // there to tell the reload from the hold (the called-shot window, then for a moment a
@@ -1942,13 +2020,17 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // stay instant). NOT while a radial wheel is up -- there RB turns its page -- and DEFERRED to
     // the safe tick like every other item use (gpui_use_best_heal). LB+B still heals too; it costs
     // nothing to leave.
+    //
+    // ⚠️ RB IS THE RB QUICK SLOT NOW (2026-10-15), whose own pick is that same best heal: a drug in it
+    // is taken on the press as before; a throwable bound to it is drawn on the press and thrown on the
+    // release, like LB's.
     if (rbPressed && !radial_wheel_is_open() && !inven_any_open()) {
-        gpui_heal_pending = true;
-        gpui_heal_pending_since = get_time();
         trace_event(TRACE_INPUT, "heal-press", "src=rb");
+        gpui_qs_press(GPUI_QS_RB, false);
     }
     if (rbReleased) {
         gpui_consumed_rb = false;
+        gpui_qs_release(GPUI_QS_RB);
     }
 
     // B: TAP CANCELS, HOLD OPENS THE DRUG WHEEL. The firing mode that briefly lived on this hold
@@ -2017,7 +2099,14 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // refuses to open while LB is held), so there is nothing to disambiguate and no reason to make
     // a heal wait for a release. Marks the press spent so the release neither cancels anything nor
     // opens the wheel. DEFERRED to the safe tick like every other item use.
-    if (bPressed && lbNow) {
+    if (bPressed && (gpui_qs_drawn(GPUI_QS_LB) || gpui_qs_drawn(GPUI_QS_RB))) {
+        // A quick-slot throwable is out: B puts it away (B is cancel everywhere on the pad).
+        gpui_consumed_b = true;
+        if (lbNow) {
+            gpui_consumed_lb = true;
+        }
+        gpui_qs_cancel();
+    } else if (bPressed && lbNow) {
         gpui_consumed_b = true;
         gpui_consumed_lb = true;
         gpui_heal_pending = true;
@@ -3474,6 +3563,333 @@ static void gpui_run_to_exit()
 
     gsound_play_sfx_file("ib1p1xx1");
     display_print("Heading for the exit.");
+}
+
+// --- QUICK SLOTS: the items and the throw (see the note at gpui_consumed_lb) ---
+
+int gamepad_ui_quick_slot_get(int slot)
+{
+    return slot >= 0 && slot < GPUI_QS_COUNT ? gpui_qs_bound[slot] : -1;
+}
+
+void gamepad_ui_quick_slot_set(int slot, int pid)
+{
+    if (slot >= 0 && slot < GPUI_QS_COUNT) {
+        gpui_qs_bound[slot] = pid;
+    }
+}
+
+static bool gpui_item_is_throwable(Object* item)
+{
+    return item != NULL && item_get_type(item) == ITEM_TYPE_WEAPON
+        && item_w_subtype(item, HIT_MODE_RIGHT_WEAPON_PRIMARY) == ATTACK_TYPE_THROW;
+}
+
+// The LB slot's own pick: the hardest-hitting throwable carried (grenades before knives and rocks).
+static Object* gpui_best_throwable()
+{
+    Object* best = NULL;
+    int bestDamage = -1;
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        Object* item = inventory->items[i].item;
+        if (!gpui_item_is_throwable(item)) {
+            continue;
+        }
+        int minDamage = 0;
+        int damage = 0;
+        item_w_damage_min_max(item, &minDamage, &damage);
+        if (damage > bestDamage) {
+            best = item;
+            bestDamage = damage;
+        }
+    }
+    return best;
+}
+
+static Object* gpui_next_heal(int* count);
+
+// What a slot would act on now: its bound item while one is carried, else its own pick.
+static Object* gpui_quick_slot_item(int slot, int* count)
+{
+    *count = 0;
+    if (obj_dude == NULL) {
+        return NULL;
+    }
+    int pid = gpui_qs_bound[slot];
+    if (pid != -1) {
+        Object* bound = inven_pid_is_carried_ptr(obj_dude, pid);
+        if (bound != NULL) {
+            *count = inven_pid_quantity_carried(obj_dude, pid);
+            return bound;
+        }
+    }
+    if (slot == GPUI_QS_LB) {
+        Object* item = gpui_best_throwable();
+        if (item != NULL) {
+            *count = inven_pid_quantity_carried(obj_dude, item->pid);
+        }
+        return item;
+    }
+    return gpui_next_heal(count);
+}
+
+// The throw, as a small state machine driven from the safe tick (it wields and fires, both of which
+// register animations): press -> DRAW_REQ -> DRAWING (the take-out plays) -> READY (held) -> release
+// -> THROW_REQ -> THROWING (the attack runs) -> RESTORE (the old weapon back) -> IDLE.
+enum {
+    GPUI_QT_IDLE,
+    GPUI_QT_DRAW_REQ,
+    GPUI_QT_DRAWING,
+    GPUI_QT_READY,
+    GPUI_QT_THROW_REQ,
+    GPUI_QT_THROWING,
+    GPUI_QT_RESTORE,
+};
+static int gpui_qt_state = GPUI_QT_IDLE;
+static int gpui_qt_slot = -1;
+static int gpui_qt_pid = -1;
+static int gpui_qt_hand = 0;
+static int gpui_qt_prev_pid = -1; // what the hand held before the draw (-1 = empty)
+static bool gpui_qt_release_seen = false; // let go while it was still coming out
+static unsigned int gpui_qt_since = 0;
+
+void gamepad_ui_quick_slots_reset()
+{
+    gpui_qs_bound[GPUI_QS_LB] = -1;
+    gpui_qs_bound[GPUI_QS_RB] = -1;
+    gpui_qt_state = GPUI_QT_IDLE;
+    gpui_qt_slot = -1;
+    gpui_qs_use_pending_slot = -1;
+}
+
+static void gpui_qt_set(int state)
+{
+    gpui_qt_state = state;
+    gpui_qt_since = get_time();
+}
+
+static bool gpui_qs_drawn(int slot)
+{
+    return gpui_qt_state != GPUI_QT_IDLE && gpui_qt_slot == slot;
+}
+
+// From the hook (no animation here): a press of a slot's button, or its hold for LB.
+static void gpui_qs_press(int slot, bool throwOnDraw)
+{
+    int count;
+    Object* item = gpui_quick_slot_item(slot, &count);
+    if (item == NULL) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "quick-slot-empty", "slot=%d", slot);
+        return;
+    }
+    if (!gpui_item_is_throwable(item)) {
+        // A drug: taken on the safe tick (RB on the press, LB on the release -- the caller decides
+        // when to call this).
+        gpui_qs_use_pending_slot = slot;
+        gpui_qs_use_pending_since = get_time();
+        trace_event(TRACE_INPUT, "quick-slot-use", "slot=%d pid=%d", slot, item->pid);
+        return;
+    }
+    if (gpui_qt_state != GPUI_QT_IDLE) {
+        return; // one throw at a time
+    }
+    gpui_qt_slot = slot;
+    gpui_qt_pid = item->pid;
+    gpui_qt_release_seen = throwOnDraw;
+    gpui_qt_set(GPUI_QT_DRAW_REQ);
+    trace_event(TRACE_INPUT, "quick-draw-press", "slot=%d pid=%d", slot, item->pid);
+}
+
+// From the hook: the slot's button came up.
+static void gpui_qs_release(int slot)
+{
+    if (gpui_qt_slot != slot) {
+        return;
+    }
+    if (gpui_qt_state == GPUI_QT_DRAW_REQ || gpui_qt_state == GPUI_QT_DRAWING) {
+        gpui_qt_release_seen = true;
+    } else if (gpui_qt_state == GPUI_QT_READY) {
+        gpui_qt_set(GPUI_QT_THROW_REQ);
+    }
+}
+
+// B while one is out: put it away. True if there was one to cancel.
+static bool gpui_qs_cancel()
+{
+    if (gpui_qt_state == GPUI_QT_DRAW_REQ) {
+        gpui_qt_set(GPUI_QT_IDLE);
+        trace_event(TRACE_INPUT, "quick-draw-cancel", "stage=request");
+        return true;
+    }
+    if (gpui_qt_state == GPUI_QT_DRAWING || gpui_qt_state == GPUI_QT_READY) {
+        gpui_qt_set(GPUI_QT_RESTORE);
+        trace_event(TRACE_INPUT, "quick-draw-cancel", "stage=drawn");
+        return true;
+    }
+    return false;
+}
+
+// LB / RB over an item in your own inventory: bind it to that slot (only what a slot can act on -- a
+// throwable or a drug); the same press on the bound item gives the slot back to its own pick.
+static void gpui_qs_bind_under_cursor(int slot)
+{
+    Object* item = inven_list_item_under_cursor();
+    if (item == NULL) {
+        return;
+    }
+    char msg[120];
+    if (!gpui_item_is_throwable(item) && item_get_type(item) != ITEM_TYPE_DRUG) {
+        gsound_play_sfx_file("iisxxxx1");
+        snprintf(msg, sizeof(msg), "%s: only something to throw or take.", slot == GPUI_QS_LB ? "LB" : "RB");
+        inven_display_msg(msg);
+        return;
+    }
+    if (gpui_qs_bound[slot] == item->pid) {
+        gpui_qs_bound[slot] = -1;
+        snprintf(msg, sizeof(msg), "%s quick slot: automatic.", slot == GPUI_QS_LB ? "LB" : "RB");
+    } else {
+        gpui_qs_bound[slot] = item->pid;
+        snprintf(msg, sizeof(msg), "%s quick slot: %s.", slot == GPUI_QS_LB ? "LB" : "RB", item_name(item));
+    }
+    gsound_play_sfx_file("ib1p1xx1");
+    inven_display_msg(msg);
+    trace_event(TRACE_INPUT, "quick-slot-bind", "slot=%d pid=%d", slot, gpui_qs_bound[slot]);
+}
+
+static Object* gpui_qt_hand_item()
+{
+    return gpui_qt_hand ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
+}
+
+// The safe-tick half (gpui_drain_requests): every wield and every throw happens here.
+static void gpui_qt_tick()
+{
+    if (obj_dude == NULL || gpui_qt_state == GPUI_QT_IDLE) {
+        return;
+    }
+
+    bool screenUp = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled();
+
+    switch (gpui_qt_state) {
+    case GPUI_QT_DRAW_REQ: {
+        if (screenUp || critter_is_prone(obj_dude) || elapsed_time(gpui_qt_since) > 1000) {
+            gpui_qt_set(GPUI_QT_IDLE);
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "quick-draw-refused", "why=%s", screenUp ? "screen" : "busy");
+            return;
+        }
+        if (anim_busy(obj_dude) != 0) {
+            return; // a step or a swing tail -- the request waits a moment for the body
+        }
+        Object* item = inven_pid_is_carried_ptr(obj_dude, gpui_qt_pid);
+        if (item == NULL) {
+            gpui_qt_set(GPUI_QT_IDLE);
+            gsound_play_sfx_file("iisxxxx1");
+            return;
+        }
+        gpui_qt_hand = intface_is_item_right_hand();
+        Object* current = gpui_qt_hand_item();
+        if (current != NULL && current->pid == gpui_qt_pid) {
+            // Already in the hand: nothing to draw, nothing to pay, nothing to put back.
+            gpui_qt_prev_pid = gpui_qt_pid;
+            gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
+            return;
+        }
+        int apCost = perk_level(PERK_QUICK_POCKETS) > 0 ? 1 : 2;
+        if (combat_rt_player_ap() < apCost) {
+            gpui_qt_set(GPUI_QT_IDLE);
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "quick-draw-refused", "why=ap ap=%d", combat_rt_player_ap());
+            return;
+        }
+        // The art inven_wield is about to check itself (see gpui_weapon_equip for why first).
+        int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF,
+            item_w_anim_weap(item, HIT_MODE_RIGHT_WEAPON_PRIMARY), item_w_anim_code(item),
+            obj_dude->rotation + 1);
+        if (!art_exists(fid)) {
+            gpui_qt_set(GPUI_QT_IDLE);
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "quick-draw-refused", "why=art pid=%d", gpui_qt_pid);
+            return;
+        }
+        gpui_qt_prev_pid = current != NULL ? current->pid : -1;
+        combat_rt_spend_ap(apCost);
+        inven_wield(obj_dude, item, gpui_qt_hand);
+        intface_update_items(true);
+        trace_event(TRACE_ACTION, "quick-draw", "slot=%d pid=%d prev=%d ap=%d", gpui_qt_slot, gpui_qt_pid,
+            gpui_qt_prev_pid, combat_rt_player_ap());
+        gpui_qt_set(GPUI_QT_DRAWING);
+        return;
+    }
+    case GPUI_QT_DRAWING:
+        if (anim_busy(obj_dude) == 0 || elapsed_time(gpui_qt_since) > 1500) {
+            gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
+        }
+        return;
+    case GPUI_QT_READY:
+        // Held. A screen, a fall or a swapped hand ends it; RT throwing it the ordinary way counts as
+        // the throw (the release must not throw a second one).
+        if (screenUp || critter_is_prone(obj_dude)) {
+            gpui_qt_set(GPUI_QT_RESTORE);
+        } else if (intface_is_item_right_hand() != gpui_qt_hand) {
+            gpui_qt_set(GPUI_QT_IDLE);
+        } else if (combat_rt_player_attack_pending()) {
+            gpui_qt_set(GPUI_QT_THROWING);
+        }
+        return;
+    case GPUI_QT_THROW_REQ: {
+        Object* inHand = gpui_qt_hand_item();
+        Object* target = inHand != NULL && inHand->pid == gpui_qt_pid ? combat_rt_quick_throw_target() : NULL;
+        if (target == NULL) {
+            gsound_play_sfx_file("iisxxxx1");
+            trace_event(TRACE_INPUT, "quick-throw-none", "slot=%d pid=%d", gpui_qt_slot, gpui_qt_pid);
+            gpui_qt_set(GPUI_QT_RESTORE);
+            return;
+        }
+        combat_rt_request_throw(target);
+        gpui_qt_set(GPUI_QT_THROWING);
+        return;
+    }
+    case GPUI_QT_THROWING:
+        if ((elapsed_time(gpui_qt_since) > 150 && !combat_rt_player_attack_pending() && anim_busy(obj_dude) == 0)
+            || elapsed_time(gpui_qt_since) > 4000) {
+            gpui_qt_set(GPUI_QT_RESTORE);
+        }
+        return;
+    case GPUI_QT_RESTORE: {
+        if (anim_busy(obj_dude) != 0 && elapsed_time(gpui_qt_since) < 2000) {
+            return;
+        }
+        if (critter_is_prone(obj_dude)) {
+            return; // never wield on the floor (gpui_weapon_equip) -- back on his feet, then
+        }
+        gpui_qt_set(GPUI_QT_IDLE);
+        if (gpui_qt_prev_pid == gpui_qt_pid) {
+            return; // it was in the hand before the draw; it stays
+        }
+        Object* current = gpui_qt_hand_item();
+        if (gpui_qt_prev_pid == -1) {
+            if (current != NULL) {
+                inven_unwield(obj_dude, gpui_qt_hand);
+            }
+        } else {
+            Object* previous = inven_pid_is_carried_ptr(obj_dude, gpui_qt_prev_pid);
+            if (previous != NULL && previous != current) {
+                inven_wield(obj_dude, previous, gpui_qt_hand);
+            } else if (previous == NULL && current != NULL) {
+                inven_unwield(obj_dude, gpui_qt_hand);
+            }
+        }
+        intface_update_items(true);
+        trace_event(TRACE_ACTION, "quick-restore", "slot=%d prev=%d", gpui_qt_slot, gpui_qt_prev_pid);
+        return;
+    }
+    default:
+        gpui_qt_set(GPUI_QT_IDLE);
+        return;
+    }
 }
 
 // Uses the best healing item carried. Drained once per press from gamepad_ui_tick.
@@ -7212,6 +7628,22 @@ static void gpui_trace_buttons(SDL_GameController* pad)
 // a controller -- a keyboard player has none.
 static void gpui_drain_requests()
 {
+    // A quick slot's drug (RB's stimpak, or whatever is bound), then the throw's state machine.
+    if (gpui_qs_use_pending_slot != -1) {
+        int slot = gpui_qs_use_pending_slot;
+        gpui_qs_use_pending_slot = -1;
+        int count;
+        Object* item = gpui_quick_slot_item(slot, &count);
+        if (elapsed_time(gpui_qs_use_pending_since) > GPUI_HEAL_STALE_MS) {
+            trace_event(TRACE_INPUT, "quick-slot-stale", "slot=%d", slot);
+        } else if (item == NULL || gpui_item_is_throwable(item)) {
+            gsound_play_sfx_file("iisxxxx1");
+        } else {
+            gpui_quick_use(item->pid);
+        }
+    }
+    gpui_qt_tick();
+
     // The heal, drained before the rest: it is a completed gesture, not an overlay, and doing it here
     // keeps every item use on the same safe tick.
     if (gpui_heal_pending) {
@@ -7356,10 +7788,21 @@ bool gamepad_ui_handle_key(int* keyCode)
     case KEY_LOWERCASE_H:
     case KEY_UPPERCASE_H:
     case KEY_ALT_H:
+        // The RB quick slot (its own pick is the best heal). A throwable bound to it is drawn and
+        // thrown in one go: the keyboard reports no release.
         if (!radial_wheel_is_open() && !inven_any_open()) {
-            gpui_heal_pending = true;
-            gpui_heal_pending_since = get_time();
             trace_event(TRACE_INPUT, "heal-press", "src=key");
+            gpui_qs_press(GPUI_QS_RB, true);
+        }
+        return true;
+    case KEY_LOWERCASE_T:
+    case KEY_UPPERCASE_T:
+    case KEY_CTRL_T:
+    case KEY_ALT_T:
+        // The LB quick slot: draw and throw in one go (or take the drug bound to it).
+        if (!radial_wheel_is_open() && !inven_any_open()) {
+            trace_event(TRACE_INPUT, "kbm-key", "key=T");
+            gpui_qs_press(GPUI_QS_LB, true);
         }
         return true;
     case KEY_LOWERCASE_R:
@@ -7408,12 +7851,14 @@ void gamepad_ui_tick()
         // No controller -> restore the pointer (a mouse/keyboard player needs it).
         gmouse_set_move_cursor_hidden(false);
 
-        // ...and everything a keyboard player asks for still needs this tick: the heal slot beside
-        // the bar, the requests (H, R, G, V) and the use prompt Space acts on.
+        // ...and everything a keyboard player asks for still needs this tick: the quick slots beside
+        // the bar, the requests (H, T, R, G, V) and the use prompt Space acts on.
         {
-            int healCount;
-            Object* heal = gpui_next_heal(&healCount);
-            intface_update_heal_slot(heal, healCount);
+            int count;
+            Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
+            intface_update_heal_slot(item, count);
+            item = gpui_quick_slot_item(GPUI_QS_LB, &count);
+            intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
         }
         intface_update_aim_part(gpui_aim_last_part);
         gpui_drain_requests();
@@ -7447,9 +7892,11 @@ void gamepad_ui_tick()
     // is the one place that sees all of them. intface_update_heal_slot is a no-op unless the
     // item or the count actually changed.
     {
-        int healCount;
-        Object* heal = gpui_next_heal(&healCount);
-        intface_update_heal_slot(heal, healCount);
+        int count;
+        Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
+        intface_update_heal_slot(item, count);
+        item = gpui_quick_slot_item(GPUI_QS_LB, &count);
+        intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
     }
 
     // ...and the aimed part for the weapon slot, which prints it beside the bullseye while the slot is

@@ -66,6 +66,9 @@ bool inven_equip_under_cursor(int hand);
 // body slot), swapping out any currently-worn armor back to the list. Returns
 // false (no-op) unless the normal inventory is open with armor under the cursor.
 bool inven_wear_under_cursor();
+// The item in the player's own inventory LIST under the cursor (normal inventory only), or NULL --
+// what LB / RB bind to their quick slot there (gamepad_ui).
+Object* inven_list_item_under_cursor();
 // Controller A-tap quick action for the player's own inventory list: use drugs/
 // usables, wear armor, otherwise equip into a free hand. See inventry.cc.
 bool inven_gamepad_quick_normal();
