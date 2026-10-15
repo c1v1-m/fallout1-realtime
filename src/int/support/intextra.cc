@@ -534,6 +534,53 @@ static void op_roll_dice(Program* program)
     programStackPushInteger(program, 0);
 }
 
+// ⚠️ THE SKULZ DO NOT GO TO BED WHILE VINNIE IS IN THE SKUM PITT (2026-10-15, his call: "je to trochu
+// divné, když ti odejdou ven a pak se vrátí na tebe střílet"). The night jump to Neal's bar starts
+// GenSkulz's sleep schedule (set_sleep_tile: on this map the bed is the off-map pen, tile 7000;
+// sleeping walks there with animate_move_obj_to_tile, later just move_to), while Vinnie's script
+// shouts and waits four game seconds (add_timer_event) before he goes for Neal. Vanilla does the
+// same -- its gang walks off for those four seconds and combat_begin's anim_stop freezes them
+// wherever they got to -- and in realtime that reads as the gang leaving the bar and coming back
+// in to shoot (trace_2026-10-15_211635 s=12.5-16.9). Vinnie is not on this map in the shipped
+// JUNKCSNO.MAP; he is here only for the attack on Neal, so "Vinnie alive in the Skum Pitt" IS
+// that scene. While it lasts, a Skulz member's errand to the pen is refused and it stays put; once
+// Vinnie is dead or gone, bed works again.
+#define SKUM_PITT_MAP_INDEX 11
+#define VINNIE_PID 16777318
+#define SKULZ_TEAM 14
+#define OFFMAP_PEN_TILE 7000
+
+static bool skulz_stay_for_ambush(Object* object, int tile)
+{
+    if (tile != OFFMAP_PEN_TILE || object == NULL || PID_TYPE(object->pid) != OBJ_TYPE_CRITTER
+        || object->pid == VINNIE_PID || object->data.critter.combat.team != SKULZ_TEAM
+        || map_get_index_number() != SKUM_PITT_MAP_INDEX) {
+        return false;
+    }
+
+    bool vinnieHere = false;
+    Object** critters = NULL;
+    int count = obj_create_list(-1, object->elevation, OBJ_TYPE_CRITTER, &critters);
+    for (int index = 0; index < count; index++) {
+        if (critters[index]->pid == VINNIE_PID && !critter_is_dead(critters[index])) {
+            vinnieHere = true;
+            break;
+        }
+    }
+    if (count > 0) {
+        obj_delete_list(critters);
+    }
+
+    if (vinnieHere) {
+        static unsigned int lastTrace = 0;
+        if (get_time() - lastTrace > 3000) {
+            lastTrace = get_time();
+            trace_event(TRACE_FLOW, "ambush-stay", "id=%d pid=%d tile=%d", object->id, object->pid, object->tile);
+        }
+    }
+    return vinnieHere;
+}
+
 // 0x44C1BC
 static void op_move_to(Program* program)
 {
@@ -542,6 +589,11 @@ static void op_move_to(Program* program)
     Object* object = static_cast<Object*>(programStackPopPointer(program));
 
     int newTile;
+
+    if (skulz_stay_for_ambush(object, tile)) {
+        programStackPushInteger(program, object->tile);
+        return;
+    }
 
     if (object != NULL) {
         if (object == obj_dude) {
@@ -1139,6 +1191,10 @@ static void op_animate_move_obj_to_tile(Program* program)
     }
 
     if (tile <= -1) {
+        return;
+    }
+
+    if (skulz_stay_for_ambush(object, tile)) {
         return;
     }
 
