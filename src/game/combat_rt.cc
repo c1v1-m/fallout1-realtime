@@ -11053,7 +11053,17 @@ Object* combat_rt_mouse_target()
     return rt_mouse_target;
 }
 
-// --- THE MOUSE LIKE DIABLO (2026-10-14) --------------------------------------------------------------
+// --- THE MOUSE LIKE DIABLO (2026-10-14), IN THE ARROW CURSOR ONLY (2026-10-15) ---------------------
+//
+// ⚠️ REDESIGNED 2026-10-15, his words: *"ovládání myši změň zpátky na vanillu. Přepnutím jako ve vanille
+// do kurzor módu bude hráč chodit jako v Diablu"* -- and his two picks: the ARROW is the Diablo mode,
+// and the MODS row stays (default on). So: the right button is vanilla's cursor toggle again, the
+// HEX cursor is vanilla's click-to-walk again, and only the ARROW (the crosshair in a fight, which is
+// what the toggle gives there) walks as below. The right-button lock and right-button use are gone;
+// a right click on the enemy the mouse aims at still opens the called-shot window, as it did before
+// the Diablo mouse. In the arrow a click on something to use, open or talk to stays vanilla's.
+//
+// What follows is the 2026-10-14 design; read "the right button" parts as history.
 //
 // His words: *"šlo by diablo like movement? Prostě držím myš jedním směrem a dude furt chodí? Když
 // zamířím na enemy tak zaútočí. Pravé tlačítko při combatu udělá terč, jinak funguje jako prompts k
@@ -11077,7 +11087,12 @@ Object* combat_rt_mouse_target()
 #define RT_MOUSE_RUN_PX 160 // the cursor further than this from his feet starts a run (his pick, "daleko = běh")
 #define RT_MOUSE_WALK_PX 120 // ...and nearer than this drops back to a walk: the gap is the hysteresis
 
-static bool rt_mouse_rmb_lock = false; // the right button holds a lock (a fight was on at the press)
+// The arrow or, in a fight, the crosshair: the cursors the Diablo walk lives in (see the 2026-10-15 note).
+static bool rt_mouse_cursor_mode()
+{
+    int mode = gmouse_3d_get_mode();
+    return mode == GAME_MOUSE_MODE_ARROW || mode == GAME_MOUSE_MODE_CROSSHAIR;
+}
 
 // The dude's feet on screen, which is where "towards the cursor" is measured from -- ⚠️ WHERE THE
 // CAMERA IS TAKING THEM, not where they are drawn this frame. The follow-cam lags him by up to
@@ -11096,7 +11111,8 @@ static void rt_dude_feet(int* x, int* y)
 
 static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
 {
-    if (!rt_mouse_hold_walk || !rt_mouse_hold_claimed || !rt_mouse_armed || !gamepad_ui_mouse_in_use()) {
+    if (!rt_mouse_hold_walk || !rt_mouse_hold_claimed || !rt_mouse_armed || !gamepad_ui_mouse_in_use()
+        || !rt_mouse_cursor_mode()) {
         return false;
     }
     if ((SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) == 0) {
@@ -11107,9 +11123,9 @@ static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
     int ty;
     mouse_get_position(&tx, &ty);
 
-    // Over an enemy -- the locked one while the right button holds a lock, else the one under the
-    // cursor: in reach it is the attack's frame, out of reach the walk heads for it.
-    Object* goal = rt_mouse_rmb_lock ? rt_lock_target : rt_mouse_target;
+    // Over an enemy (the one under the cursor): in reach it is the attack's frame, out of reach the
+    // walk heads for it.
+    Object* goal = rt_mouse_target;
     if (goal != NULL) {
         if (obj_dist(obj_dude, goal) <= item_w_range(obj_dude, rt_player_hit_mode())) {
             return false;
@@ -11118,7 +11134,7 @@ static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
         obj_bound(goal, &b);
         tx = (b.ulx + b.lrx) / 2;
         ty = b.lry - 4;
-    } else if (rt_lock_target != NULL && !rt_mouse_rmb_lock) {
+    } else if (rt_lock_target != NULL) {
         return false; // a pad lock owns the cursor
     }
 
@@ -11149,37 +11165,6 @@ static bool rt_mouse_walk_vector(float* outX, float* outY, bool* outRun)
     *outY = dy / len;
     *outRun = running;
     return true;
-}
-
-// Who a right-button lock takes: what the cursor is on (any lockable critter in sight, by the same
-// sprite-box distance the aim uses), else what a fresh LT press would.
-static Object* rt_mouse_lock_pick()
-{
-    int mx;
-    int my;
-    mouse_get_position(&mx, &my);
-
-    Object* best = NULL;
-    long bestScore = (long)(RT_MOUSE_AIM_RADIUS * RT_MOUSE_AIM_RADIUS + 1) * 100000L;
-    for (int i = 0; i < rt_actor_count; i++) {
-        Object* critter = rt_actors[i].obj;
-        if (critter == NULL || critter == obj_dude || critter->elevation != map_elevation
-            || (critter->flags & OBJECT_HIDDEN) != 0 || !rt_is_lockable(critter) || !rt_lock_in_sight(critter)) {
-            continue;
-        }
-        Rect b;
-        obj_bound(critter, &b);
-        int dx = mx < b.ulx ? b.ulx - mx : (mx > b.lrx ? mx - b.lrx : 0);
-        int dy = my < b.uly ? b.uly - my : (my > b.lry ? my - b.lry : 0);
-        int cx = (b.ulx + b.lrx) / 2 - mx;
-        int cy = (b.uly + b.lry) / 2 - my;
-        long score = (long)(dx * dx + dy * dy) * 100000L + (long)(cx * cx + cy * cy);
-        if (score < bestScore) {
-            bestScore = score;
-            best = critter;
-        }
-    }
-    return best != NULL ? best : rt_lock_pick_initial(0);
 }
 
 // Q / E on the keyboard step the lock one enemy left / right of the current one -- the right stick's
@@ -11523,13 +11508,7 @@ void combat_rt_poll_gamepad()
     // hard zeros, and each one would read as "let go" and drop the aim for a frame.
     static bool rt_lt_owns_lock = false;
     // ...or Shift held on the keyboard, which is LT there.
-    //
-    // ...or the RIGHT MOUSE BUTTON held in a fight (the Diablo mouse). Its release is read here, from
-    // SDL's own state, so a release over the bar or outside the window still lets go.
-    if (rt_mouse_rmb_lock && (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_RMASK) == 0) {
-        rt_mouse_rmb_lock = false;
-    }
-    bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT) || rt_mouse_rmb_lock;
+    bool ltAim = gamepad_ui_aim_trigger_held() || rt_kb_mod_held(KMOD_SHIFT);
 
     // ⚠️ A HELD LT RE-AIMS AT ENEMIES ONLY (2026-10-13). When the target dies the lock empties, and a
     // trigger still held used to take the best of whatever was left -- neutrals included, because a
@@ -11545,8 +11524,7 @@ void combat_rt_poll_gamepad()
     }
 
     if (ltAim && rt_lock_target == NULL) {
-        rt_lock_target = rt_mouse_rmb_lock && !rt_lt_hold_aimed ? rt_mouse_lock_pick()
-                                                                  : rt_lock_pick_initial(rt_lt_hold_aimed ? 2 : 0);
+        rt_lock_target = rt_lock_pick_initial(rt_lt_hold_aimed ? 2 : 0);
         if (rt_lock_target != NULL) {
             rt_lt_hold_aimed = true;
             rt_lt_owns_lock = true;
@@ -11637,9 +11615,7 @@ void combat_rt_poll_gamepad()
 
         // Glue the cursor to the target's centre -- but NOT while it is off screen, or we would be
         // parking the mouse outside the world window during the brief grace before the lock drops.
-        // ...but never under a hand on a real mouse: a right-button lock leaves the cursor where the
-        // player put it (the Diablo mouse) -- gluing it would fight his hand every frame.
-        if (OnScreen::test(rt_lock_target) && !rt_mouse_rmb_lock) {
+        if (OnScreen::test(rt_lock_target)) {
             Rect bounds;
             obj_bound(rt_lock_target, &bounds);
             mouse_set_position((bounds.ulx + bounds.lrx) / 2, (bounds.uly + bounds.lry) / 2);
@@ -11710,9 +11686,7 @@ void combat_rt_poll_gamepad()
     // ordinary attack at whatever the auto-target picked.
     bool attack = (gamepad_ui_attack_held() && !gamepad_ui_aim_gesture_active())
         // ...or Ctrl held on the keyboard, which is RT there.
-        || rt_kb_mod_held(KMOD_CTRL)
-        // ...or the left mouse button while the right one holds a lock (the Diablo mouse).
-        || (rt_mouse_rmb_lock && rt_mouse_armed && (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_LMASK) != 0);
+        || rt_kb_mod_held(KMOD_CTRL);
     // Only trace the attack intent on the RT PRESS EDGE, not every held frame -- each actual fire
     // is already logged as [COMBAT/attack], so a per-frame ACTION line would be pure spam.
     static bool rt_prev_attack_btn = false;
@@ -13320,46 +13294,32 @@ bool combat_rt_handle_input(int keyCode)
         return true;
     }
 
-    // THE DIABLO MOUSE (rt_mouse_walk_vector has the design): every press that starts over the world
-    // with a plain cursor is ours. A skill or use-on cursor keeps its click; the bar and menus are not
-    // the world. Real buttons only -- the pad's synthesised clicks never set SDL's mouse state.
-    if (keyCode == -2 && rt_mouse_hold_walk && gamepad_ui_mouse_in_use()) {
+    // THE DIABLO MOUSE, IN THE ARROW (rt_mouse_walk_vector has the design): a left press that starts
+    // over the world in the arrow -- the crosshair in a fight -- is ours, and holding it walks. A press
+    // on something to use, open or talk to stays vanilla's (an enemy is the attack, rt_mouse_update's).
+    // The hex cursor, the right button (vanilla's toggle), a skill or use-on cursor, the bar and the
+    // menus are untouched. Real buttons only -- the pad's synthesised clicks never set SDL's state.
+    if (keyCode == -2 && rt_mouse_hold_walk && gamepad_ui_mouse_in_use() && rt_mouse_cursor_mode()) {
         Uint32 real = SDL_GetMouseState(NULL, NULL);
         int buttons = mouse_get_buttons();
         int mx;
         int my;
         mouse_get_position(&mx, &my);
-        int mode = gmouse_3d_get_mode();
-        bool plain = mode == GAME_MOUSE_MODE_MOVE || mode == GAME_MOUSE_MODE_ARROW || mode == GAME_MOUSE_MODE_CROSSHAIR;
-        if (plain && rt_point_in_world(mx, my)) {
-            if ((buttons & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0 && (real & SDL_BUTTON_LMASK) != 0) {
-                rt_mouse_armed = true;
-                rt_mouse_hold_claimed = true;
-                return true;
+        if (rt_point_in_world(mx, my)
+            && (buttons & MOUSE_EVENT_LEFT_BUTTON_DOWN) != 0 && (real & SDL_BUTTON_LMASK) != 0) {
+            Object* thing = object_under_mouse(-1, false, map_elevation);
+            if (rt_mouse_target == NULL && interact_prompt_object_interactable(thing)) {
+                return false; // open it, talk to him, pick it up -- vanilla's click
             }
-            if ((buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0 && (real & SDL_BUTTON_RMASK) != 0) {
-                Object* critter = object_under_mouse(OBJ_TYPE_CRITTER, false, map_elevation);
-                bool enemyUnder = critter != NULL && critter != obj_dude && rt_is_combatant(critter)
-                    && (rt_is_hostile(critter) || rt_hostile_by_nature(critter));
-                if (combat_rt_under_threat() || rt_mouse_target != NULL || enemyUnder) {
-                    rt_mouse_rmb_lock = true;
-                    trace_event(TRACE_INPUT, "mouse-lock", "under=%d t=%.2f", critter != NULL ? critter->pid : -1, rt_clock);
-                } else {
-                    Object* thing = object_under_mouse(-1, false, map_elevation);
-                    bool done = interact_prompt_request_object(thing) || interact_prompt_request();
-                    trace_event(TRACE_INPUT, "mouse-use", "under=%d done=%d", thing != NULL ? thing->pid : -1, done ? 1 : 0);
-                }
-                return true;
-            }
-            if ((buttons & (MOUSE_EVENT_RIGHT_BUTTON_UP | MOUSE_EVENT_RIGHT_BUTTON_DOWN_REPEAT)) != 0) {
-                return true; // vanilla's right-click cursor toggle stays out of it
-            }
+            rt_mouse_armed = true;
+            rt_mouse_hold_claimed = true;
+            return true;
         }
     }
     if (keyCode == -2 && rt_mouse_target != NULL) {
         Uint32 real = SDL_GetMouseState(NULL, NULL);
         int buttons = mouse_get_buttons();
-        if (!rt_mouse_hold_walk && (real & SDL_BUTTON_RMASK) != 0 && (buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
+        if ((real & SDL_BUTTON_RMASK) != 0 && (buttons & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0) {
             trace_event(TRACE_INPUT, "kbm-key", "key=RMB target=%d", rt_mouse_target->pid);
             gamepad_ui_request_called_shot();
             return true;

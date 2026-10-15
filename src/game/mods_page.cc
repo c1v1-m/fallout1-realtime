@@ -315,14 +315,14 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
     },
     {
         "Mouse",
-        { "Vanilla", "Hold to walk" },
+        { "Vanilla", "Arrow walks" },
         {
             "Click a spot to walk there, as in the original.",
-            "Hold the left button: walk to the cursor, run when it is far.",
+            "Right-click to the arrow: hold left to walk, far = run.",
         },
         {
             "Right-click switches the cursor.",
-            "Left on an enemy attacks. Right: lock in a fight, else use.",
+            "The hex cursor stays vanilla. Left on an enemy attacks.",
         },
         2,
     },
@@ -860,7 +860,7 @@ static void mods_apply(int index)
         break;
     }
     case MODS_MOUSE: {
-        // DEFAULT "Hold to walk" -- his design (2026-10-14), so ON without being vanilla. Live.
+        // DEFAULT "Arrow walks" -- his design (2026-10-14, moved into the arrow cursor 2026-10-15), ON. Live.
         bool v = mods_value[index] != 0;
         combat_rt_set_mouse_hold_walk(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_MOUSE_HOLD_WALK_KEY, v ? 1 : 0);

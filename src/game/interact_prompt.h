@@ -43,6 +43,7 @@ Object* interact_prompt_skill_target(int skill);
 // scenery or wall that is interactable or scripted (never HIDDEN staged content). The list form
 // returns the ones on screen within the picker's reach.
 bool interact_prompt_is_use_target(Object* obj);
+bool interact_prompt_object_interactable(Object* obj);
 int interact_prompt_use_targets(Object** out, int max);
 
 // Move the prompt to the interactable lying in screen direction (dirX, dirY) from the CURRENT one
