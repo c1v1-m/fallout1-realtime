@@ -5370,6 +5370,82 @@ static Object* rt_guard_danger_source(Object* guard)
     return NULL;
 }
 
+// ⚠️ A DEAD TARGET IS NOT THE END OF THE FIGHT (2026-10-16, "během combatu je možné znovu aktivovat
+// script"). Gizmo's raid, trace_2026-10-16_013033 s=156-172: Lars and Killian (team 0, the dude's)
+// against Gizmo and Izo (team 13). Izo died and Lars, whose target he was, went IDLE; Gizmo killed
+// Killian and went IDLE too -- nobody had a target, the fight ended with GIZMO ALIVE, the casino
+// script (JUNKCAS) never closed the raid (it waits for GIZMO_DEAD and no combat), and Lars offered
+// it again: "You ready to help take down Gizmo?" -> load_map(11) -> the whole raid from the top.
+//
+// Vanilla never asks a critter to stand down because its target died. Every turn it asks
+// ai_danger_source (combatai.cc), and a dead target just moves it down that list: whoever hit me
+// while he lives; if he is dead, the nearest of HIS team; then someone I hit, whoever hit one of my
+// team (Killian's attacker, Gizmo -- the line that sends Lars after him), or someone my team hit.
+// That function cannot run here as it is -- it walks curr_crit_list, which only turn-based fills --
+// so this is the same list over the realtime registry, plus the dude, who is not in it.
+//
+// ⚠️ ONLY THIS FIGHT'S HITS COUNT. Realtime keeps whoHitMe across fights on purpose (hostility is
+// sticky), so an old grudge must not pick the next target. damageLastTurn is the per-fight record
+// -- the combat-exit pass zeroes it, as vanilla's combat_over did -- so a relation counts when its
+// victim was hurt in this fight or the one it points at is fighting right now.
+static Object* rt_next_danger_source(Object* critter)
+{
+    int team = critter->data.critter.combat.team;
+
+    // 1. Whoever hit me, while he lives -- vanilla returns him at once, seen or not.
+    Object* whoHitMe = critter->data.critter.combat.whoHitMe;
+    bool hurtThisFight = critter->data.critter.combat.damageLastTurn > 0;
+    if (whoHitMe != NULL && whoHitMe != critter && rt_is_combatant(whoHitMe)
+        && (hurtThisFight || rt_is_fighting_now(whoHitMe))) {
+        return whoHitMe;
+    }
+    // ...and if he is dead, his team is still here.
+    int deadAttackerTeam = -1;
+    if (whoHitMe != NULL && whoHitMe != critter && hurtThisFight
+        && (whoHitMe->data.critter.combat.results & DAM_DEAD) != 0
+        && whoHitMe->data.critter.combat.team != team) {
+        deadAttackerTeam = whoHitMe->data.critter.combat.team;
+    }
+
+    Object* best = NULL;
+    int bestDist = INT_MAX;
+    for (int i = 0; i <= rt_actor_count; i++) {
+        Object* c = i == rt_actor_count ? obj_dude : rt_actors[i].obj;
+        if (c == NULL || c == critter) {
+            continue;
+        }
+
+        Object* candidate = NULL;
+        Object* cHitBy = c->data.critter.combat.whoHitMe;
+        bool cHurt = c->data.critter.combat.damageLastTurn > 0;
+        int cTeam = c->data.critter.combat.team;
+
+        if (deadAttackerTeam != -1 && cTeam == deadAttackerTeam && rt_is_fighting_now(c)) {
+            candidate = c; // the nearest of the dead attacker's team
+        } else if (cHitBy == critter && cHurt) {
+            candidate = c; // someone I hit in this fight
+        } else if (cTeam == team && cHitBy != NULL && cHitBy != critter
+            && cHitBy->data.critter.combat.team != team
+            && (cHurt || rt_is_fighting_now(cHitBy))) {
+            candidate = cHitBy; // whoever hit one of mine -- the teammate may be dead already
+        } else if (cTeam != team && cHitBy != NULL && cHitBy->data.critter.combat.team == team && cHurt) {
+            candidate = c; // someone my team hit
+        }
+
+        if (candidate == NULL || candidate == critter || !rt_is_combatant(candidate)
+            || candidate->data.critter.combat.team == team) {
+            continue;
+        }
+        int d = obj_dist(critter, candidate);
+        if (d < bestDist && is_within_perception(critter, candidate)) {
+            best = candidate;
+            bestDist = d;
+        }
+    }
+
+    return best;
+}
+
 // --- THE MEDIC BEAT ----------------------------------------------------------------------------
 //
 // Vanilla's combat AI already heals: ai_check_drugs (combatai.cc:354) makes any biped below HALF
@@ -9176,6 +9252,26 @@ static void rt_update_actor(RtActor* a, float dt)
         // st=2/tgt=18000/dist=1 to st=0/tgt=0 with NO disengage and NO unreachable line, while
         // walk-seg showed it shuttling 23309<->22913 every ~0.46s ("furt chodím sem a tam").
         bool targetGone = !rt_is_combatant(a->target);
+
+        // The next one on vanilla's list first (rt_next_danger_source): a target that died hands
+        // the fight on rather than ending it.
+        if (targetGone) {
+            Object* next = rt_next_danger_source(npc);
+            if (next != NULL) {
+                trace_event(TRACE_FLOW, "retarget", "id=%d pid=%d was=%d now=%d nowPid=%d dist=%d t=%.2f",
+                    npc->id, npc->pid, a->target != NULL ? a->target->id : -1, next->id, next->pid,
+                    obj_dist(npc, next), rt_clock);
+                a->target = next;
+                a->state = RT_CHASE;
+                a->unperceived_since = -1.0f;
+                a->no_path_since = -1.0f;
+                if (next == obj_dude || isPartyMember(next)) {
+                    a->hostile = true; // everything downstream is written against `hostile`
+                }
+                targetGone = false;
+            }
+        }
+
         int leash = rt_chase_range(npc) + RT_DEAGGRO_MARGIN;
         int tgtDist = obj_dist(npc, a->target);
         bool giveUp = targetGone || tgtDist > leash;
