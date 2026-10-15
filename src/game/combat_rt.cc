@@ -592,6 +592,17 @@ static int rt_osc_dude_tile = -1;
 static int rt_actor_count = 0;
 static bool rt_engaged = false;
 
+// ⚠️ THE END OF A FIGHT RUNS THE MAP SCRIPTS, AS VANILLA'S DID (2026-10-15, "docela dlouho trvalo,
+// než se quest finishne"). Vanilla's combat loop ends with combat_over() and then
+// scr_exec_map_update_scripts() -- straight away. Realtime's fight end did not, so everything a map
+// script settles "once the shooting stops" waited for the periodic map update (queue_add 600 ticks):
+// JUNKCAS (the Skum Pitt) closes Lars's ambush -- GVAR 555 = 2, which is what Lars pays out on --
+// only when map_var 0 says the Skulz are gone AND combat_is_initialized() is false, so after the
+// last Skulz fell (trace_2026-10-15_214211 s=35.04, combat-exit) the quest sat open for up to a
+// minute. Set at combat-exit, run at the top of the next update (never mid-frame: a map script may
+// load a map), once.
+static bool rt_map_update_on_exit = false;
+
 // ⚠️ A FIGHT ON THE MAP IS NOT NECESSARILY YOURS (2026-10-15, Deck: "dude zase chodil divně, zasekával
 // se"). rt_engaged is "anyone tracked is fighting anyone", and the dude's movement economy was keyed
 // on it: while Kenji beat Killian across the room, the dude -- who attacked nobody and whom nobody
@@ -10275,6 +10286,7 @@ static void rt_abandon_encounter()
 // set rt_enabled (each caller does), or touch combat_state (game-reset clears the warm bit).
 static void rt_reset_session_state()
 {
+    rt_map_update_on_exit = false;
     rt_dude_last_attack = -1000.0f;
     // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
     rt_forgiven_count = 0;
@@ -12322,6 +12334,17 @@ void combat_rt_update(float dt)
         return;
     }
 
+    // The fight ended last frame: the map scripts get their look now, as vanilla's did at
+    // combat_over, and nothing else runs this frame -- one of them may change the map.
+    if (rt_map_update_on_exit) {
+        rt_map_update_on_exit = false;
+        if (!rt_engaged && !isInCombat() && !dialog_active()) {
+            trace_event(TRACE_FLOW, "combat-exit-map-update", "t=%.2f", rt_clock);
+            scr_exec_map_update_scripts();
+            return;
+        }
+    }
+
     // ...but the LIMB PICKER only SLOWS it. Scaling dt here rather than returning is what makes it
     // a slow-motion: rt_clock, AP regen, the movement drains, attack cooldowns, initiative and the
     // in-flight commit timers are all keyed off this one number, so every one of them stretches by
@@ -12845,6 +12868,7 @@ void combat_rt_update(float dt)
             rt_balance_begin();
         } else {
             rt_balance_report();
+            rt_map_update_on_exit = true; // vanilla's combat_over -> scr_exec_map_update_scripts
         }
     }
 
