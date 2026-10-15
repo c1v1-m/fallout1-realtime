@@ -5188,6 +5188,7 @@ static bool rt_swap_dry_weapon(RtActor* a, Object* npc, Object* dry)
 // Sands Guard 60, Bouncer 70), and it is paired with "actually carrying a weapon" so an aggressive
 // packet on an unarmed civilian still stays out of it.
 #define RT_GUARD_JOIN_AGGRESSION 20
+#define RT_BRAWLER_AGGRESSION 50 // unarmed, but this aggressive is a fighter (see rt_is_guard_type)
 static int rt_guard_join_aggression = RT_GUARD_JOIN_AGGRESSION;
 
 static bool rt_is_guard_type(Object* critter)
@@ -5195,8 +5196,18 @@ static bool rt_is_guard_type(Object* critter)
     if (rt_guard_join_aggression <= 0 || critter == NULL) {
         return false;
     }
-    if (combatai_aggression(critter) < rt_guard_join_aggression) {
+    int aggression = combatai_aggression(critter);
+    if (aggression < rt_guard_join_aggression) {
         return false;
+    }
+
+    // ...OR A BRAWLER (2026-10-15): the Skulz fight with their fists -- GenSkulz gives every member
+    // the Skulz packet, aggression 80, and no weapon -- so "armed" alone kept Vinnie's whole gang out
+    // of his fight with Neal. A packet that aggressive is a fighter's, never a townsperson's (Peasant
+    // 10, Careful 10, Loser 1; the brawlers start at Guard Quiet 55, Bouncer 70, Skulz 80, Junktown
+    // Thug 85), so it does not need the weapon to qualify.
+    if (aggression >= RT_BRAWLER_AGGRESSION) {
+        return true;
     }
 
     // Armed, in hand or in the pack -- rt_ensure_weapon_drawn will draw it once it engages.
@@ -9417,6 +9428,27 @@ static void rt_update_actor(RtActor* a, float dt)
             a->stuck_y = npc->y;
             trace_event(TRACE_FLOW, "unstick-move", "id=%d pid=%d tile=%d t=%.2f",
                 npc->id, npc->pid, npc->tile, rt_clock);
+        }
+    }
+
+    // ⚠️ AN ERRAND DOES NOT BLIND IT (2026-10-15, "jsem na PC a nic se nezměnilo"). The guard below
+    // skips every decision while a body animates -- and a scripted walk (a patrol, the way to bed)
+    // animates for as long as it lasts, so a guard-type on one never reached the IDLE branch where
+    // it would see its teammate fighting: at the Skum Pitt the two Skulz on GenSkulz's sleep walk
+    // walked straight past Vinnie's fight with Neal (trace_2026-10-15_180223 s=52.4-57.8, no
+    // guard-threat for 2608/2614 at all). While a fight is on, a walking guard-type still looks;
+    // if its own are fighting, the walk ends here and the IDLE branch takes it into the fight
+    // on the next frame -- the realtime half of vanilla's anim_stop at combat_begin.
+    if (rt_engaged && a->state == RT_IDLE && !a->hostile && !a->friendly && anim_busy(npc) != 0
+        && !critter_is_prone(npc)) {
+        int at = FID_ANIM_TYPE(npc->fid);
+        if ((at == ANIM_WALK || at == ANIM_RUNNING) && rt_is_guard_type(npc)
+            && rt_guard_danger_source(npc) != NULL) {
+            int walkCut = anim_end_moves(npc);
+            if (walkCut > 0) {
+                trace_event(TRACE_FLOW, "join-walk-cut", "id=%d pid=%d sequences=%d why=errand t=%.2f",
+                    npc->id, npc->pid, walkCut, rt_clock);
+            }
         }
     }
 
