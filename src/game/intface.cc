@@ -16,6 +16,7 @@
 #include "game/display.h"
 #include "game/endgame.h"
 #include "game/game.h"
+#include "game/gdialog.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/game_trace.h"
@@ -2293,7 +2294,16 @@ void intface_update_hit_points(bool animate)
     // on the realtime mode flag, because the roll only ticks from combat_rt_update -- a
     // stimpak taken inside the inventory's own modal loop would otherwise sit frozen
     // mid-roll until that screen closed.
-    if (animate && combat_rt_active()) {
+    //
+    // ⚠️ ...AND OUT OF A FIGHT TOO, WHEREVER THE FRAME LOOP IS RUNNING (2026-10-16). "Outside combat
+    // nothing is moving anyway" stopped being true with realtime: the blocking roll stood the whole
+    // world still -- free movement, every walker, the animations -- for 0.6-1.3 s on every stimpak
+    // taken outside a fight (trace_2026-10-16_011351: the heartbeat skipped from 8.06 to 9.58 and from
+    // 51.24 to 52.70, both at a jab). combat_rt_update ticks the roll on every frame, fight or not,
+    // so only a screen with a loop of its own -- the inventory, a conversation -- still gets the
+    // vanilla roll, where nothing moves while it plays.
+    if (animate
+        && (combat_rt_active() || (combat_rt_enabled() && !inven_any_open() && !dialog_active()))) {
         intface_hp_roll_start();
         return;
     }
