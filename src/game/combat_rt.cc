@@ -12611,7 +12611,9 @@ void combat_rt_update(float dt)
         // getting four more attacks in before it finally died.
         // ⚠️ MELEE ONLY (2026-08-10). For a gun or a thrown weapon the action frame is when the
         // weapon DISCHARGES, not when the target is struck -- the projectile still has to fly, and
-        // that flight is registered into this same sequence, so `swingDone` is the arrival. Using
+        // that flight is registered into this same sequence, so `swingDone` is the arrival. (⚠️ No
+        // longer: since 2026-10-16 the flight is a sequence of its own -- ActionFlight in actions.cc
+        // -- and a thrown or explosive attack commits on `landed`, a gun on its action frame.) Using
         // the action frame there made the defender flinch mid-flight ("the spear reacted just
         // before it landed") and, together with the stand-art bug fixed in
         // rt_attack_action_frame_reached, made a rifle's hit land before the shot was visible.

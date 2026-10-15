@@ -69,6 +69,9 @@ bool combatai_want_to_join(Object* critter);
 bool combatai_want_to_stop(Object* critter);
 int combatai_switch_team(Object* critter, int team);
 int combatai_msg(Object* critter, Attack* attack, int message_type, int delay);
+// The same with the hit location given instead of an Attack, for a bark registered after the attack
+// struct is gone (a realtime projectile flight, actions.cc).
+int combatai_msg_at(Object* critter, int hitLocation, int message_type, int delay);
 // Floats `text` over `critter` in its AI packet's font and colours -- the look of a combat taunt.
 int combatai_float_line(Object* critter, const char* text);
 Object* combat_ai_random_target(Attack* attack);

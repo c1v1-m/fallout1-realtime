@@ -718,7 +718,15 @@ bool action_defender_reaction(Attack* attack)
 // registered separately after register_end() instead. See action_split_defender_anim.
 void show_damage(Attack* attack, int a2, int delay, bool splitDefender)
 {
-    for (int index = 0; index < attack->extrasLength; index++) {
+    // ⚠️ NO PINGS UNDER splitDefender (2026-10-16). A ping reserves a sequence slot (flag 0x10) for
+    // the reaction vanilla registers right after the attack (show_damage_extras) and starts it when
+    // the attacker's sequence reaches the ping. Realtime registers those reactions at the COMMIT
+    // instead (action_extras_reaction), so the reserved slot was left for whoever registered next --
+    // some critter's walk, frozen until the ping -- and a ping reaching a slot nobody had filled ends
+    // the attacker's WHOLE sequence (ANIM_KIND_26: anim_set_continue -1 -> anim_set_end). Moving the
+    // flight into a sequence of its own put the ping right behind the release frame, where that
+    // would have cut every grenade throw that caught a bystander.
+    for (int index = 0; index < attack->extrasLength && !splitDefender; index++) {
         Object* object = attack->extras[index];
         if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER) {
             register_ping(2, delay);
@@ -1031,11 +1039,233 @@ static int action_melee(Attack* attack, int anim)
     return 0;
 }
 
+// --- REALTIME: a projectile's flight runs as its OWN animation sequence. ---
+//
+// ⚠️ 2026-10-16 ("oddělej ten let, ať se dude může hýbat hned"). Vanilla registers everything an
+// attack's projectile does -- appear at the release frame, fly, wear its blast, the blast ring, the
+// erase -- inline in the ATTACKER's sequence, ahead of his own closing pose (the take-out after a
+// throw, the lowering after a shot). check_registry refuses him any new animation while that
+// sequence lives, spent descriptions included, so he stood until his grenade had flown AND gone
+// off: ~1.6 s for a three-tile throw, ~3 s across eight tiles once thrown weapons flew at half pace
+// (RT_THROWN_SLOWDOWN in anim.cc). In realtime his sequence holds a must-call at the release frame
+// instead, and the callback registers the flight as a sequence of its own (action_rt_launch_flight);
+// his ends with his own pose.
+//
+// MUST-call, not call: anim_set_end runs a forced callback that never got its turn (a throw cut
+// short by a knockdown or a death, anim_stop for a save or a conversation), so the record is always
+// released and the projectile always either flies or is put away (action_flight_put_away).
+//
+// Unchanged: the commit. combat_rt hurts the target when the projectile wears its landing art
+// (action_take_explosive_projectile), whichever sequence carries it.
+typedef struct ActionFlight {
+    bool used; // a pool slot (realtime) in use
+    Object* projectile;
+    // Owns the hit sound of a projectile that does not blow up: the gun, or the thrown item itself.
+    // NULLed by action_notify_object_freed if it is freed before the launch.
+    Object* weapon;
+    int origin;
+    int tile;
+    int elevation;
+    bool hit;
+    bool thrown;
+    bool isGrenade;
+    // A grenade's or a rocket's: the tail erases it. It blows up unless the attack was a DAM_DROP.
+    bool eraseAtEnd;
+    bool explodes;
+    int damageType;
+    int weaponFid; // a thrown item's own art, worn again when it lands
+    int explosionFid;
+    char flySfx[32];
+    char hitSfx[32];
+    Object* neighbors[ROTATION_COUNT]; // the blast ring, created by action_register_flight
+    // The target's bark (combatai_msg) rides the flight too: in the attacker's sequence it would
+    // follow his pose, and a long throw had the target crying out before the grenade landed.
+    // NULL = none; NULLed by action_notify_object_freed.
+    Object* barker;
+    int barkType;
+    int barkHitLocation;
+} ActionFlight;
+
+#define ACTION_RT_FLIGHT_MAX 16
+static ActionFlight action_rt_flights[ACTION_RT_FLIGHT_MAX];
+
+// NULL when all are in the air -- action_ranged then flies it inline, the vanilla way.
+static ActionFlight* action_rt_flight_alloc()
+{
+    for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {
+        ActionFlight* fl = &(action_rt_flights[index]);
+        if (!fl->used) {
+            memset(fl, 0, sizeof(*fl));
+            fl->used = true;
+            return fl;
+        }
+    }
+    return NULL;
+}
+
+// The flight's descriptions, into the OPEN transaction, exactly as vanilla's action_ranged
+// registered them. releaseDelay = frames of the attacker's pose before the projectile appears (his
+// action frame inline, 0 for a flight of its own). Creates the blast ring. True when the blast took
+// the hit sound (vanilla's l56).
+static bool action_register_flight(ActionFlight* fl, int releaseDelay)
+{
+    register_object_funset(fl->projectile, OBJECT_HIDDEN, releaseDelay);
+    register_object_play_sfx(fl->projectile, fl->flySfx, 0);
+
+    register_object_move_straight_to_tile(fl->projectile, fl->tile, fl->elevation, ANIM_WALK, 0);
+    int hitSfxDelay = fl->hit ? make_straight_path(fl->projectile, fl->origin, fl->tile, NULL, NULL, 32) - 1 : 0;
+
+    if (fl->explodes) {
+        if (fl->isGrenade) {
+            register_object_change_fid(fl->projectile, fl->weaponFid, -1);
+        }
+
+        register_object_change_fid(fl->projectile, fl->explosionFid, -1);
+        register_object_play_sfx(fl->projectile, fl->hitSfx, 0);
+        register_object_animate_and_hide(fl->projectile, ANIM_STAND, 0);
+
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            if (obj_new(&(fl->neighbors[rotation]), fl->explosionFid, -1) != -1) {
+                obj_turn_off(fl->neighbors[rotation], NULL);
+
+                int v31 = tile_num_in_direction(fl->tile, rotation, 1);
+                obj_move_to_tile(fl->neighbors[rotation], v31, fl->projectile->elevation, NULL);
+
+                int delay;
+                if (rotation != ROTATION_NE) {
+                    delay = 0;
+                } else {
+                    if (fl->damageType == DAMAGE_TYPE_PLASMA) {
+                        delay = 4;
+                    } else {
+                        delay = 2;
+                    }
+                }
+
+                register_object_funset(fl->neighbors[rotation], OBJECT_HIDDEN, delay);
+                register_object_animate_and_hide(fl->neighbors[rotation], ANIM_STAND, 0);
+            }
+        }
+
+        return true;
+    }
+
+    if (!fl->eraseAtEnd && !fl->thrown) {
+        register_object_must_erase(fl->projectile);
+    }
+
+    register_object_play_sfx(fl->weapon != NULL ? fl->weapon : fl->projectile, fl->hitSfx, hitSfxDelay);
+
+    return false;
+}
+
+// The flight's closing descriptions -- vanilla registers them after show_damage.
+static void action_register_flight_tail(ActionFlight* fl)
+{
+    if (fl->eraseAtEnd) {
+        register_object_must_erase(fl->projectile);
+    } else if (fl->thrown) {
+        register_object_change_fid(fl->projectile, fl->weaponFid, -1);
+    }
+
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        if (fl->neighbors[rotation] != NULL) {
+            register_object_must_erase(fl->neighbors[rotation]);
+        }
+    }
+}
+
+// A flight that cannot register (anim_stop under way, the table full): put away the way a cut
+// vanilla sequence put it away, by its forced erases -- except that a thrown knife or rock drops
+// at the thrower's feet as itself, where vanilla left it lying hidden in its projectile art.
+static void action_flight_put_away(ActionFlight* fl)
+{
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        if (fl->neighbors[rotation] != NULL) {
+            obj_erase_object(fl->neighbors[rotation], NULL);
+            fl->neighbors[rotation] = NULL;
+        }
+    }
+
+    Object* projectile = fl->projectile;
+    if (projectile == NULL) {
+        return;
+    }
+
+    if (fl->eraseAtEnd || !fl->thrown) {
+        obj_erase_object(projectile, NULL);
+    } else {
+        Rect rect;
+        obj_change_fid(projectile, fl->weaponFid, NULL);
+        if (obj_turn_on(projectile, &rect) == 0) {
+            tile_refresh_rect(&rect, projectile->elevation);
+        }
+    }
+}
+
+// The must-call at the attacker's release frame (or at his sequence's end, if it was cut first).
+static int action_rt_launch_flight(void* a1, void* a2)
+{
+    (void)a2;
+    ActionFlight* fl = (ActionFlight*)a1;
+
+    bool flying = false;
+    if (fl->projectile != NULL && register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
+        action_register_flight(fl, 0);
+        // Where action_ranged registers it inline: after the landing, before the tail.
+        if (fl->barker != NULL) {
+            combatai_msg_at(fl->barker, fl->barkHitLocation, fl->barkType, -1);
+        }
+        action_register_flight_tail(fl);
+        flying = register_end() == 0;
+    }
+
+    trace_event(TRACE_COMBAT, "flight", "pid=%d to=%d from=%d hit=%d explodes=%d thrown=%d %s",
+        fl->projectile != NULL ? fl->projectile->pid : -1, fl->tile, fl->origin,
+        fl->hit ? 1 : 0, fl->explodes ? 1 : 0, fl->thrown ? 1 : 0, flying ? "flying" : "put-away");
+
+    if (!flying) {
+        action_flight_put_away(fl);
+    }
+
+    fl->used = false;
+    return 0;
+}
+
+// obj_erase_object (object.cc), just before `obj` is freed: no flight waiting for its launch may
+// keep a pointer to it. The gun goes with its owner's inventory, hence the environment test.
+void action_notify_object_freed(Object* obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+
+    for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {
+        ActionFlight* fl = &(action_rt_flights[index]);
+        if (!fl->used) {
+            continue;
+        }
+        if (fl->projectile == obj) {
+            fl->projectile = NULL;
+        }
+        if (fl->barker == obj) {
+            fl->barker = NULL;
+        }
+        if (fl->weapon == obj || (fl->weapon != NULL && obj_top_environment(fl->weapon) == obj)) {
+            fl->weapon = NULL;
+        }
+    }
+}
+
 // 0x4114DC
 static int action_ranged(Attack* attack, int anim)
 {
-    Object* neighboors[6];
-    memset(neighboors, 0, sizeof(neighboors));
+    // The projectile's flight: inline (vanilla, or a full pool) or, in realtime, a pool record that
+    // flies on its own (rtFlight) -- see ActionFlight.
+    ActionFlight inlineFlight;
+    memset(&inlineFlight, 0, sizeof(inlineFlight));
+    ActionFlight* flight = NULL;
+    ActionFlight* rtFlight = NULL;
 
     bool splitDefender = action_split_defender_anim();
 
@@ -1152,102 +1382,74 @@ static int action_ranged(Attack* attack, int anim)
                 int projectileRotation = tile_dir(attack->attacker->tile, attack->defender->tile);
                 obj_set_rotation(projectile, projectileRotation, NULL);
 
-                register_object_funset(projectile, OBJECT_HIDDEN, actionFrame);
-
-                const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_AMMO_FLYING, weapon, attack->hitMode, attack->defender);
-                register_object_play_sfx(projectile, sfx, 0);
-
-                int v24;
-                if ((attack->attackerFlags & DAM_HIT) != 0) {
-                    register_object_move_straight_to_tile(projectile, attack->defender->tile, attack->defender->elevation, ANIM_WALK, 0);
-                    actionFrame = make_straight_path(projectile, projectileOrigin, attack->defender->tile, NULL, NULL, 32) - 1;
-                    v24 = attack->defender->tile;
-                } else {
-                    register_object_move_straight_to_tile(projectile, attack->tile, attack->defender->elevation, ANIM_WALK, 0);
-                    actionFrame = 0;
-                    v24 = attack->tile;
+                // In realtime the flight flies on its own (ActionFlight); a full pool falls back to
+                // vanilla's inline flight, which only costs the attacker his wait.
+                ActionFlight* fl = combat_rt_enabled() ? action_rt_flight_alloc() : NULL;
+                if (fl == NULL) {
+                    fl = &inlineFlight;
                 }
 
-                if (isGrenade || damageType == DAMAGE_TYPE_EXPLOSION) {
-                    if ((attack->attackerFlags & DAM_DROP) == 0) {
-                        int explosionFrmId;
-                        if (isGrenade) {
-                            switch (damageType) {
-                            case DAMAGE_TYPE_EMP:
-                                explosionFrmId = 2;
-                                break;
-                            case DAMAGE_TYPE_PLASMA:
-                                explosionFrmId = 31;
-                                break;
-                            default:
-                                explosionFrmId = 29;
-                                break;
-                            }
-                        } else {
-                            explosionFrmId = 10;
+                fl->projectile = projectile;
+                fl->weapon = weapon;
+                fl->origin = projectileOrigin;
+                fl->hit = (attack->attackerFlags & DAM_HIT) != 0;
+                fl->tile = fl->hit ? attack->defender->tile : attack->tile;
+                fl->elevation = attack->defender->elevation;
+                fl->thrown = anim == ANIM_THROW_ANIM;
+                fl->isGrenade = isGrenade;
+                fl->damageType = damageType;
+                fl->eraseAtEnd = isGrenade || damageType == DAMAGE_TYPE_EXPLOSION;
+                fl->explodes = fl->eraseAtEnd && (attack->attackerFlags & DAM_DROP) == 0;
+                fl->weaponFid = weaponFid;
+                fl->explosionFid = -1;
+                strncpy(fl->flySfx, gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_AMMO_FLYING, weapon, attack->hitMode, attack->defender), sizeof(fl->flySfx) - 1);
+                strncpy(fl->hitSfx, gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_HIT, weapon, attack->hitMode, attack->defender), sizeof(fl->hitSfx) - 1);
+
+                if (fl->explodes) {
+                    int explosionFrmId;
+                    if (isGrenade) {
+                        switch (damageType) {
+                        case DAMAGE_TYPE_EMP:
+                            explosionFrmId = 2;
+                            break;
+                        case DAMAGE_TYPE_PLASMA:
+                            explosionFrmId = 31;
+                            break;
+                        default:
+                            explosionFrmId = 29;
+                            break;
                         }
-
-                        if (isGrenade) {
-                            register_object_change_fid(projectile, weaponFid, -1);
-                        }
-
-                        int explosionFid = art_id(OBJ_TYPE_MISC, explosionFrmId, 0, 0, 0);
-                        register_object_change_fid(projectile, explosionFid, -1);
-
-                        // For combat_rt: the blast goes off the moment this projectile wears that
-                        // art, which is when the attack commits (`landed` in its resolve loop).
-                        action_rt_explosive_projectile = projectile;
-                        action_rt_explosion_fid = explosionFid;
-
-                        const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_HIT, weapon, attack->hitMode, attack->defender);
-                        register_object_play_sfx(projectile, sfx, 0);
-
-                        register_object_animate_and_hide(projectile, ANIM_STAND, 0);
-
-                        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
-                            if (obj_new(&(neighboors[rotation]), explosionFid, -1) != -1) {
-                                obj_turn_off(neighboors[rotation], NULL);
-
-                                int v31 = tile_num_in_direction(v24, rotation, 1);
-                                obj_move_to_tile(neighboors[rotation], v31, projectile->elevation, NULL);
-
-                                int delay;
-                                if (rotation != ROTATION_NE) {
-                                    delay = 0;
-                                } else {
-                                    if (damageType == DAMAGE_TYPE_PLASMA) {
-                                        delay = 4;
-                                    } else {
-                                        delay = 2;
-                                    }
-                                }
-
-                                register_object_funset(neighboors[rotation], OBJECT_HIDDEN, delay);
-                                register_object_animate_and_hide(neighboors[rotation], ANIM_STAND, 0);
-                            }
-                        }
-
-                        l56 = true;
+                    } else {
+                        explosionFrmId = 10;
                     }
-                } else {
-                    if (anim != ANIM_THROW_ANIM) {
-                        register_object_must_erase(projectile);
-                    } else if (combat_rt_enabled()) {
-                        // ⚠️ A THROWN KNIFE OR ROCK HITS WHEN IT ARRIVES TOO (2026-10-16). It used to
-                        // commit when the throw POSE ended, which was after the landing only while the
-                        // flight was quick; thrown weapons now fly at half pace (RT_THROWN_SLOWDOWN in
-                        // anim.cc) and a long throw would hurt the target with the knife still in the
-                        // air. It lands wearing its own item art again (the change_fid below), so that
-                        // fid is its "explosion" for combat_rt's landing test.
-                        action_rt_explosive_projectile = projectile;
-                        action_rt_explosion_fid = weaponFid;
-                    }
+
+                    fl->explosionFid = art_id(OBJ_TYPE_MISC, explosionFrmId, 0, 0, 0);
+
+                    // For combat_rt: the blast goes off the moment this projectile wears that
+                    // art, which is when the attack commits (`landed` in its resolve loop).
+                    action_rt_explosive_projectile = projectile;
+                    action_rt_explosion_fid = fl->explosionFid;
+                } else if (fl->thrown && !fl->eraseAtEnd && combat_rt_enabled()) {
+                    // ⚠️ A THROWN KNIFE OR ROCK HITS WHEN IT ARRIVES TOO (2026-10-16). It used to
+                    // commit when the throw POSE ended, which was after the landing only while the
+                    // flight was quick; thrown weapons now fly at half pace (RT_THROWN_SLOWDOWN in
+                    // anim.cc) and a long throw would hurt the target with the knife still in the
+                    // air. It lands wearing its own item art again (the flight's tail), so that
+                    // fid is its "explosion" for combat_rt's landing test.
+                    action_rt_explosive_projectile = projectile;
+                    action_rt_explosion_fid = weaponFid;
                 }
 
-                if (!l56) {
-                    const char* sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_HIT, weapon, attack->hitMode, attack->defender);
-                    register_object_play_sfx(weapon, sfx, actionFrame);
+                if (fl == &inlineFlight) {
+                    l56 = action_register_flight(fl, actionFrame);
+                } else {
+                    // At the release frame, exactly where the inline flight's first description
+                    // waited -- see ActionFlight for why it must be a MUST-call.
+                    register_object_must_call(fl, NULL, action_rt_launch_flight, actionFrame);
+                    rtFlight = fl;
                 }
+                flight = fl;
+                (void)l56;
 
                 actionFrame = 0;
             } else {
@@ -1268,24 +1470,29 @@ static int action_ranged(Attack* attack, int anim)
     int defenderDelay = actionFrame;
     show_damage(attack, anim, actionFrame, splitDefender);
 
+    int barkType = -1;
     if ((attack->attackerFlags & DAM_HIT) == 0) {
-        combatai_msg(attack->defender, attack, AI_MESSAGE_TYPE_MISS, -1);
+        barkType = AI_MESSAGE_TYPE_MISS;
     } else {
         if ((attack->defenderFlags & DAM_DEAD) == 0) {
-            combatai_msg(attack->defender, attack, AI_MESSAGE_TYPE_HIT, -1);
+            barkType = AI_MESSAGE_TYPE_HIT;
         }
     }
 
-    if (projectile != NULL && (isGrenade || damageType == DAMAGE_TYPE_EXPLOSION)) {
-        register_object_must_erase(projectile);
-    } else if (anim == ANIM_THROW_ANIM && projectile != NULL) {
-        register_object_change_fid(projectile, weaponFid, -1);
+    if (barkType != -1) {
+        if (rtFlight != NULL) {
+            // Said when the projectile lands -- see ActionFlight::barker.
+            rtFlight->barker = attack->defender;
+            rtFlight->barkType = barkType;
+            rtFlight->barkHitLocation = attack->defenderHitLocation;
+        } else {
+            combatai_msg(attack->defender, attack, barkType, -1);
+        }
     }
 
-    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
-        if (neighboors[rotation] != NULL) {
-            register_object_must_erase(neighboors[rotation]);
-        }
+    // A flight of its own registers its tail itself, at the launch.
+    if (flight == &inlineFlight) {
+        action_register_flight_tail(flight);
     }
 
     if ((attack->attackerFlags & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_DEAD)) == 0) {
@@ -1336,10 +1543,17 @@ static int action_ranged(Attack* attack, int anim)
             obj_erase_object(projectile, NULL);
         }
 
-        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
-            if (neighboors[rotation] != NULL) {
-                obj_erase_object(neighboors[rotation], NULL);
+        if (flight != NULL) {
+            for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+                if (flight->neighbors[rotation] != NULL) {
+                    obj_erase_object(flight->neighbors[rotation], NULL);
+                }
             }
+        }
+
+        // The aborted transaction dropped its must-call with it, so nothing else frees the record.
+        if (rtFlight != NULL) {
+            rtFlight->used = false;
         }
 
         return -1;

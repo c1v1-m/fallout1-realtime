@@ -5,6 +5,7 @@
 
 #include <algorithm>
 
+#include "game/actions.h"
 #include "game/anim.h"
 #include "game/art.h"
 #include "game/combat.h"
@@ -2051,6 +2052,9 @@ int obj_erase_object(Object* object, Rect* rect)
     // it's freed below, so a stale retaliation commit can't crash on freed memory. No-op
     // outside realtime / for non-critters.
     combat_rt_notify_critter_removed(object);
+
+    // ...and so may a projectile flight waiting for its release frame (actions.cc, ActionFlight).
+    action_notify_object_freed(object);
 
     // anim.cc also holds raw pointers to this object -- the sad[] frame stepper and the
     // animation-sequence table -- and obj_remove() below frees the Object without touching

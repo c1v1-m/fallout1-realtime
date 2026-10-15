@@ -1475,6 +1475,11 @@ int combatai_switch_team(Object* critter, int team)
 // 0x425F18
 int combatai_msg(Object* critter, Attack* attack, int type, int delay)
 {
+    return combatai_msg_at(critter, type == AI_MESSAGE_TYPE_HIT ? attack->defenderHitLocation : 0, type, delay);
+}
+
+int combatai_msg_at(Object* critter, int hitLocation, int type, int delay)
+{
     int combat_taunts = 1;
     AiPacket* ai;
     int start;
@@ -1529,8 +1534,8 @@ int combatai_msg(Object* critter, Attack* attack, int type, int delay)
         string = target_str;
         break;
     case AI_MESSAGE_TYPE_HIT:
-        start = ai->hit_start[attack->defenderHitLocation];
-        end = ai->hit_start[attack->defenderHitLocation + 1];
+        start = ai->hit_start[hitLocation];
+        end = ai->hit_start[hitLocation + 1];
         string = target_str;
         break;
     default:
