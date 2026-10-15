@@ -591,6 +591,19 @@ static void rt_missing_art_scan(); // defined below rt_clock
 static int rt_osc_dude_tile = -1;
 static int rt_actor_count = 0;
 static bool rt_engaged = false;
+
+// ⚠️ A FIGHT ON THE MAP IS NOT NECESSARILY YOURS (2026-10-15, Deck: "dude zase chodil divně, zasekával
+// se"). rt_engaged is "anyone tracked is fighting anyone", and the dude's movement economy was keyed
+// on it: while Kenji beat Killian across the room, the dude -- who attacked nobody and whom nobody
+// was after (host=0 for all 16 s) -- paid AP for every step, ran his pool dry three times and was
+// stopped dead each time, then crept on with 2-5 AP (steam_trace_2026-10-15_171916 s=30-46). The run
+// and walk drain exists against KITING, and kiting needs someone chasing you. His pick: movement
+// costs AP only while the fight is HIS -- a tracked critter is after him or his party (chasing or
+// attacking, seen or not: an enemy that lost sight of you is still hunting), or he attacked someone
+// within RT_DUDE_FIGHT_GRACE seconds.
+#define RT_DUDE_FIGHT_GRACE 5.0f
+static float rt_dude_last_attack = -1000.0f;
+static bool rt_dude_in_fight();
 static float rt_refresh_timer = 0.0f;
 
 // Flinch-immunity (anti-stunlock) for the dude -- the RtActor.flinch_accum/immune_until
@@ -6473,6 +6486,9 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     if (rc == 0) {
         // The swing started: hold the body where it stood, for as long as it lasts (rt_swing_keep_arm).
         rt_swing_keep_arm(attacker, swingKeepTile, swingKeepX, swingKeepY);
+        if (attacker == obj_dude) {
+            rt_dude_last_attack = rt_clock; // the fight is his now (rt_dude_in_fight)
+        }
 
         trace_event(TRACE_COMBAT, "attack", "%s aid=%d ->pid=%d did=%d hm=%d t=%.2f",
             attacker == obj_dude ? "DUDE" : "NPC", attacker != NULL ? attacker->id : -1,
@@ -7020,6 +7036,9 @@ static int rt_fm_facing = -1; // index into rt_hex_ccw, not a rotation
 // The tile rt_fm_x/y are measured from -- what combat_rt_dude_rest_offset checks before handing them
 // to dude_stand. -1 = no rest spot (map load, reset).
 static int rt_fm_rest_tile = -1;
+// TEMP DIAG (2026-10-15, the stride restart): true while rt_fm_drive itself is running, so a pose or
+// offset change of the dude made by anyone else during a free walk can be told apart and traced.
+static bool rt_fm_in_drive = false;
 
 // Pixel offset -> cell coordinates and back. Both are one line because the lattice is sheared, not
 // rotated: b contributes to x as well as y, so j comes out of y alone and i out of what is left.
@@ -7118,6 +7137,11 @@ static void rt_fm_drive(float angle, bool run, float dt)
     if (obj_dude == NULL || dt <= 0.0f) {
         return;
     }
+
+    struct InDrive {
+        InDrive() { rt_fm_in_drive = true; }
+        ~InDrive() { rt_fm_in_drive = false; }
+    } inDrive;
 
     // ⚠️ IT NEVER FIGHTS THE ANIMATION SYSTEM. An attack, a hit react, a knockdown, or the walk an
     // A-press registered: all of those own the body, and while any of them is registered this mode
@@ -10158,6 +10182,7 @@ static void rt_abandon_encounter()
 // set rt_enabled (each caller does), or touch combat_state (game-reset clears the warm bit).
 static void rt_reset_session_state()
 {
+    rt_dude_last_attack = -1000.0f;
     // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
     rt_forgiven_count = 0;
     rt_last_fight_clock = -1000.0f;
@@ -11153,7 +11178,7 @@ void combat_rt_poll_gamepad()
     // ...and on the keyboard Alt is the run, held like X.
     bool ltHeld = gamepad_ui_run_on() || (kbWalk && rt_kb_mod_held(KMOD_ALT)) || (mouseWalk && (mouseRun || rt_kb_mod_held(KMOD_ALT)));
     // The Bonus Move reserve pays for running as well -- it is movement, which is all it is for.
-    bool run = ltHeld && (!rt_engaged || ((rt_player_ap > 0 || rt_bonus_move_ap > 0) && !rt_run_blocked));
+    bool run = ltHeld && (!rt_dude_in_fight() || ((rt_player_ap > 0 || rt_bonus_move_ap > 0) && !rt_run_blocked));
 
     // Flight-recorder movement input: emit on a heading/gait EDGE (a held stick coalesces
     // to nothing after the first line). TRACE_INPUT reflects what the stick ASKED for even
@@ -12759,12 +12784,20 @@ void combat_rt_update(float dt)
     // Is the dude actively running this frame? (Drives both the regen pause below and
     // the drain block. FID_ANIM_TYPE == ANIM_RUNNING is the true "visually sprinting"
     // signal -- see the drain comment.)
-    bool dudeRunning = rt_engaged && FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING;
+    bool dudeInFight = rt_dude_in_fight();
+    bool dudeRunning = dudeInFight && FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING;
 
     // Variant C2: walking in combat also spends the pool. Detected the same way as
     // running (the live anim type), so post-attack flinch/swing anims read as neither
     // run nor walk = "standing" = full regen (an attack is not kiting).
-    bool dudeWalking = rt_engaged && FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK;
+    bool dudeWalking = dudeInFight && FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK;
+
+    // Out of his fight a stop he got in it has nothing left to protect: let him go at once.
+    if (!dudeInFight && (rt_move_blocked || rt_run_blocked)) {
+        rt_move_blocked = false;
+        rt_run_blocked = false;
+        trace_event(TRACE_ACTION, "move-unblocked", "ap=%d why=not-his-fight t=%.2f", rt_player_ap, rt_clock);
+    }
 
     // PROXIMITY REGEN: the multiplier comes from the DISTANCE to the nearest live hostile, and
     // from whether the dude is moving -- the two together, not from stance alone. The dude is on
@@ -12791,7 +12824,7 @@ void combat_rt_update(float dt)
     // died. Disengaging then achieved nothing the player could feel. Out of a fight there is
     // nothing to measure against, so the multiplier is a neutral 1.0 -- exactly what the NPC half
     // already does via npcInFight.
-    int dudeEnemyDist = rt_engaged ? rt_dude_nearest_hostile_dist() : -1;
+    int dudeEnemyDist = dudeInFight ? rt_dude_nearest_hostile_dist() : -1;
 
     // ⚠️ THE DEADLOCK GUARD FOR ap_empty_walks, AND IT IS NOT OPTIONAL. Under that mode the dude
     // keeps moving at 0 AP for free, which is EXACTLY the shape that deadlocked an early build:
@@ -12813,7 +12846,7 @@ void combat_rt_update(float dt)
     // discount on the walk drain, and a big enough discount makes walking free, i.e. kiting. Out of
     // a fight it is held full, so every fight opens with it available, as every vanilla turn did.
     int bonusMoveMax = rt_bonus_move_max();
-    if (!rt_engaged) {
+    if (!dudeInFight) {
         rt_bonus_move_ap = bonusMoveMax;
         rt_bonus_move_regen = 0.0f;
     } else {
@@ -13321,6 +13354,39 @@ bool combat_rt_death_anim_pending()
         }
     }
 
+    return false;
+}
+
+// TEMP DIAG (2026-10-15, Deck: "dude zase chodil divně, zasekával se"). In a fight 1 tile in 8 of a
+// free walk ended with the body sent BACK across the boundary it had just crossed, in its STAND pose,
+// and the stride restarted from frame 0 (steam_trace_2026-10-15_171916: 11 of 94 engaged tiles, e.g.
+// s=39.21 27110->26910 walking, s=39.23 26910->27110 anim=0 x=19 y=8). Something stands him or moves
+// his offset between two drive frames -- y grows ~2 px, which pushes the residual that sits at the
+// far edge of the new cell back over it. True when the dude is touched by someone other than the
+// free mover while it is driving him; object.cc traces the caller with a backtrace.
+bool combat_rt_fm_foreign_touch()
+{
+    return rt_enabled && rt_free_move && rt_fm_active && !rt_fm_in_drive;
+}
+
+// See RT_DUDE_FIGHT_GRACE.
+static bool rt_dude_in_fight()
+{
+    if (!rt_engaged || obj_dude == NULL) {
+        return false;
+    }
+    if (rt_clock - rt_dude_last_attack < RT_DUDE_FIGHT_GRACE) {
+        return true;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (!a->hostile || a->state == RT_IDLE || !rt_is_combatant(a->obj)) {
+            continue;
+        }
+        if (a->target == obj_dude || (a->target != NULL && isPartyMember(a->target))) {
+            return true;
+        }
+    }
     return false;
 }
 

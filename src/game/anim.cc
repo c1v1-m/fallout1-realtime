@@ -915,6 +915,25 @@ int register_end()
     }
 
     AnimationSequence* animationSequence = &(anim_set[curr_anim_set]);
+
+    // TEMP DIAG (the stride restart, see combat_rt_fm_foreign_touch): who registers an animation on
+    // the dude while free movement is walking him -- its end runs dude_stand.
+    if (trace_enabled() && combat_rt_fm_foreign_touch()) {
+        for (int index = 0; index < curr_anim_counter; index++) {
+            AnimationDescription* description = &(animationSequence->animations[index]);
+            if (description->owner == obj_dude) {
+                static int traced = 0;
+                if (traced < 8) {
+                    traced++;
+                    trace_event(TRACE_WARN, "fm-anim-registered", "kind=%d anim=%d length=%d",
+                        description->kind, description->anim, curr_anim_counter);
+                    trace_backtrace("fm-anim-registered");
+                }
+                break;
+            }
+        }
+    }
+
     animationSequence->field_0 = 0;
     animationSequence->length = curr_anim_counter;
     animationSequence->animationIndex = -1;

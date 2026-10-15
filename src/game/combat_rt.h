@@ -112,6 +112,7 @@ bool combat_rt_get_mouse_hold_walk();
 void combat_rt_set_forgive_stray(bool enabled);
 bool combat_rt_get_forgive_stray();
 bool combat_rt_weapon_amnesty();
+bool combat_rt_fm_foreign_touch();
 bool combat_rt_forgive_stray(Object* attacker, Object* bystander, Object* intended);
 // MODS "Enemies look around" (cfg enemies_look_around): idle hostiles turn toward gunshots and
 // scan around, so a back turned to you is not a permanent blind spot. See rt_idle_look_around.

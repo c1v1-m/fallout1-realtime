@@ -1139,6 +1139,17 @@ int obj_offset(Object* obj, int x, int y, Rect* rect)
         return -1;
     }
 
+    // TEMP DIAG (the stride restart, see combat_rt_fm_foreign_touch): who moves the dude mid free walk.
+    if (obj == obj_dude && (x != 0 || y != 0) && trace_enabled() && combat_rt_fm_foreign_touch()) {
+        static int traced = 0;
+        if (traced < 8) {
+            traced++;
+            trace_event(TRACE_WARN, "fm-offset-touch", "by=%d,%d tile=%d x=%d y=%d anim=%d",
+                x, y, obj->tile, obj->x, obj->y, FID_ANIM_TYPE(obj->fid));
+            trace_backtrace("fm-offset-touch");
+        }
+    }
+
     ObjectListNode* node = NULL;
     ObjectListNode* previousNode = NULL;
     if (obj_node_ptr(obj, &node, &previousNode) == -1) {
@@ -1530,6 +1541,19 @@ int obj_change_fid(Object* obj, int fid, Rect* dirtyRect)
 
     if (obj == NULL) {
         return -1;
+    }
+
+    // TEMP DIAG (the stride restart, see combat_rt_fm_foreign_touch): who stands the dude mid free walk.
+    if (obj == obj_dude && trace_enabled() && combat_rt_fm_foreign_touch()
+        && FID_ANIM_TYPE(fid) == ANIM_STAND
+        && (FID_ANIM_TYPE(obj->fid) == ANIM_WALK || FID_ANIM_TYPE(obj->fid) == ANIM_RUNNING)) {
+        static int traced = 0;
+        if (traced < 8) {
+            traced++;
+            trace_event(TRACE_WARN, "fm-pose-cut", "was=%d tile=%d x=%d y=%d frame=%d",
+                FID_ANIM_TYPE(obj->fid), obj->tile, obj->x, obj->y, obj->frame);
+            trace_backtrace("fm-pose-cut");
+        }
     }
 
     if (dirtyRect != NULL) {
