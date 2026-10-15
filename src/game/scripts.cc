@@ -635,7 +635,11 @@ static void script_chk_critters()
 
             if (scriptListExtent != NULL) {
                 Script* script = &(scriptListExtent->scripts[scriptIndex]);
-                exec_script_proc(script->scr_id, proc);
+                // ...and not for a critter that is itself in the fight (combat_rt_critter_fighting):
+                // vanilla gave no fighter a heartbeat, and its errands would pull it out of the fight.
+                if (!combat_rt_critter_fighting(script->owner)) {
+                    exec_script_proc(script->scr_id, proc);
+                }
             }
         }
     }

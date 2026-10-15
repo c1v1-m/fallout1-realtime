@@ -8681,6 +8681,23 @@ static void rt_refresh_registry()
                     fresh[j].hostile = true;
                     onlooker->data.critter.combat.maneuver |= CRITTER_MANEUVER_ENGAGING;
                     spread = true;
+
+                    // ⚠️ A RECRUIT STOPS WHERE IT WAS GOING (2026-10-15, "při teleportu k Nealovi
+                    // Skulz odcházejí"). Vanilla's combat_begin runs anim_stop(), so whoever was
+                    // walking somewhere when a fight broke out stood still and took its turn in it.
+                    // Realtime never stops anything: the night jump to the Skum Pitt had put two
+                    // Skulz on GenSkulz's sleep walk to the off-map pen (set_sleep_tile: map 11 ->
+                    // tile 7000, ~108 steps), Vinnie went for Neal, the spread pulled both in -- and
+                    // they walked on with their backs to the fight, never perceived the dude, never
+                    // engaged, and left (steam_trace_2026-10-15_173454 s=250.97-262, ids 2608/2614:
+                    // host=1 st=IDLE anim=WALK all the way). Ending the walk is the scoped anim_stop:
+                    // only this recruit, only its moves; it then turns to the fight (look-around)
+                    // and comes in like anyone else.
+                    int walkCut = anim_end_moves(onlooker);
+                    if (walkCut > 0) {
+                        trace_event(TRACE_FLOW, "join-walk-cut", "id=%d pid=%d sequences=%d t=%.2f",
+                            onlooker->id, onlooker->pid, walkCut, rt_clock);
+                    }
                     // Trace the aggro CHAIN: who got pulled in by whom (team + how). Lets a
                     // "the whole town turned on me" report be traced back to the seed hostile.
                     trace_event(TRACE_FLOW, "aggro-spread",
@@ -9476,6 +9493,14 @@ static void rt_update_actor(RtActor* a, float dt)
                 "id=%d pid=%d aggr=%d threat=%d threatPid=%d dude=%d t=%.2f",
                 npc->id, npc->pid, combatai_aggression(npc), guardThreat->id, guardThreat->pid,
                 guardThreat == obj_dude ? 1 : 0, rt_clock);
+
+            // Joining a fight ends the errand it was walking (the aggro-spread recruit has the
+            // report: vanilla's combat_begin stops every animation, realtime stops nothing).
+            int walkCut = anim_end_moves(npc);
+            if (walkCut > 0) {
+                trace_event(TRACE_FLOW, "join-walk-cut", "id=%d pid=%d sequences=%d t=%.2f",
+                    npc->id, npc->pid, walkCut, rt_clock);
+            }
         } else if (a->hostile) {
             // Engage the nearest target on the player's side (the dude OR a companion), out to
             // the full chase leash -- so a pack splits between the dude and his followers instead
@@ -14185,6 +14210,25 @@ void combat_rt_set_forgive_stray(bool enabled)
 bool combat_rt_get_forgive_stray()
 {
     return rt_forgive_stray;
+}
+
+// A critter that is IN the fight -- chasing, attacking, or pulled in as hostile -- while one is on.
+// script_chk_critters skips its heartbeat: vanilla ran no critter_p_proc at all during combat, and
+// realtime runs them through fights that are not after the player, so a fighter's own script could
+// send it off on an errand mid-fight -- the Skulz recruited at the Skum Pitt would have been ordered
+// back to their sleep walk (GenSkulz critter_p_proc, see the aggro-spread recruit) a heartbeat after
+// the walk was cut.
+bool combat_rt_critter_fighting(Object* critter)
+{
+    if (!rt_enabled || !rt_engaged || critter == NULL) {
+        return false;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == critter) {
+            return rt_actors[i].state != RT_IDLE || rt_actors[i].hostile;
+        }
+    }
+    return false;
 }
 
 // See RT_WEAPON_AMNESTY_SECONDS.
