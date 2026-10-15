@@ -5228,6 +5228,26 @@ static bool rt_attacked_team(Object* suspect, int team)
     return false;
 }
 
+static bool rt_hears_gunfire(Object* onlooker, Object* anchor);
+
+// Is this teammate fighting RIGHT NOW (not just carrying an old whoHitMe)? The dude by
+// rt_dude_in_fight; anyone else by its actor state, or a hit taken since its last turn.
+static bool rt_is_fighting_now(Object* critter)
+{
+    if (critter == obj_dude) {
+        return rt_dude_in_fight();
+    }
+    if (critter->data.critter.combat.damageLastTurn > 0) {
+        return true;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == critter) {
+            return rt_actors[i].state != RT_IDLE;
+        }
+    }
+    return false;
+}
+
 static Object* rt_guard_danger_source(Object* guard)
 {
     int team = guard->data.critter.combat.team;
@@ -5266,9 +5286,24 @@ static Object* rt_guard_danger_source(Object* guard)
             continue; // an inside scuffle -- not ours to police
         }
 
-        if (is_within_perception(guard, attacker)) {
-            trace_event(TRACE_FLOW, "guard-threat", "guard=%d victim=%d attacker=%d team=%d t=%.2f",
-                guard->id, victim->id, attacker->id, team, rt_clock);
+        // ⚠️ SEEING ITS OWN FIGHTING IS ENOUGH (2026-10-15, his call after the Skum Pitt ambush: "udělej
+        // to tedy"). The test used to be "can it see the ATTACKER", and two Skulz walking away from
+        // the bar with their backs to it could not -- Vinnie went for Neal, Lars's men and Neal
+        // fought him, and his own gang walked on to bed (steam_trace_2026-10-15_173454 s=254-262).
+        // Vanilla never asked: combat_begin stopped everyone and every critter on the map took its
+        // turn through ai_danger_source. So it is enough to see the teammate in the fight (in a warm
+        // fight that is PE*2 tiles in any direction, PE*5 in front) or to hear the shooting. Not
+        // a chain: only a teammate who is IN the fight recruits, and only guard-types answer.
+        // The two new ways in ask that the teammate is fighting NOW: whoHitMe is sticky, and a
+        // remembered old grudge must not send a guard who merely looks at a colleague into a fight.
+        bool sawAttacker = is_within_perception(guard, attacker);
+        bool fightingNow = !sawAttacker && rt_is_fighting_now(victim);
+        bool sawTeammate = fightingNow && is_within_perception(guard, victim);
+        bool heard = fightingNow && !sawTeammate && rt_hears_gunfire(guard, victim);
+        if (sawAttacker || sawTeammate || heard) {
+            trace_event(TRACE_FLOW, "guard-threat", "guard=%d victim=%d attacker=%d team=%d how=%s t=%.2f",
+                guard->id, victim->id, attacker->id, team,
+                sawAttacker ? "saw-attacker" : (sawTeammate ? "saw-teammate" : "heard"), rt_clock);
             return attacker;
         }
     }
