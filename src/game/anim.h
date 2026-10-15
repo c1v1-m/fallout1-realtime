@@ -139,6 +139,12 @@ void anim_notify_object_freed(Object* obj);
 // register_clear variant that only ends a sequence in which `a1` still has UNPLAYED work.
 // MUST be used instead of register_clear by anything gated on anim_busy_blocking (see anim.cc).
 int anim_clear_pending(Object* a1);
+// Ends every live sequence of obj that is a lone ANIM_STAND (invisible to anim_busy*), without
+// standing him -- for a mover about to take the body. See anim.cc.
+int anim_end_lone_stand(Object* obj);
+// The next take-out of obj inside this bracket is paced by AGILITY (the quick slots' draw).
+void anim_quick_draw_begin(Object* obj);
+void anim_quick_draw_end();
 int anim_end_moves(Object* obj);
 int register_end();
 int check_registry(Object* obj);

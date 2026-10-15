@@ -3651,6 +3651,12 @@ static int gpui_qt_slot = -1;
 static int gpui_qt_pid = -1;
 static int gpui_qt_hand = 0;
 static int gpui_qt_prev_pid = -1; // what the hand held before the draw (-1 = empty)
+// ...and WHICH one. ⚠️ The pid alone gave back the wrong gun (2026-10-16, "po granátu v mé pušce
+// nebyly náboje"): the save carried two Hunting Rifles, the loaded one in the hand (id 249, 10
+// rounds) and an empty spare earlier in the pack (id 2837), and inven_pid_is_carried_ptr returns the
+// first. Only ever compared against the pack's own pointers, never dereferenced, so a stale one is
+// harmless.
+static Object* gpui_qt_prev_obj = NULL;
 static bool gpui_qt_release_seen = false; // let go while it was still coming out
 static unsigned int gpui_qt_since = 0;
 
@@ -3660,6 +3666,7 @@ void gamepad_ui_quick_slots_reset()
     gpui_qs_bound[GPUI_QS_RB] = -1;
     gpui_qt_state = GPUI_QT_IDLE;
     gpui_qt_slot = -1;
+    gpui_qt_prev_obj = NULL;
     gpui_qs_use_pending_slot = -1;
 }
 
@@ -3794,6 +3801,7 @@ static void gpui_qt_tick()
         if (current != NULL && current->pid == gpui_qt_pid) {
             // Already in the hand: nothing to draw, nothing to pay, nothing to put back.
             gpui_qt_prev_pid = gpui_qt_pid;
+            gpui_qt_prev_obj = current;
             gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
             return;
         }
@@ -3815,8 +3823,12 @@ static void gpui_qt_tick()
             return;
         }
         gpui_qt_prev_pid = current != NULL ? current->pid : -1;
+        gpui_qt_prev_obj = current;
         combat_rt_spend_ap(apCost);
-        inven_wield(obj_dude, item, gpui_qt_hand);
+        // ⚠️ NO HOLSTER (2026-10-16, his pick "Bez schování" to "ať je přepínání víc smooth"): the
+        // put-away of the gun was ~0.6 s of nothing between the press and the throw. The grenade is
+        // in the hand at once; the gun comes back with its own take-out after the throw (RESTORE).
+        inven_wield_instant(obj_dude, item, gpui_qt_hand);
         intface_update_items(true);
         trace_event(TRACE_ACTION, "quick-draw", "slot=%d pid=%d prev=%d ap=%d", gpui_qt_slot, gpui_qt_pid,
             gpui_qt_prev_pid, combat_rt_player_ap());
@@ -3875,15 +3887,30 @@ static void gpui_qt_tick()
                 inven_unwield(obj_dude, gpui_qt_hand);
             }
         } else {
-            Object* previous = inven_pid_is_carried_ptr(obj_dude, gpui_qt_prev_pid);
+            // The very weapon that was in the hand while it is still in the pack; only then any of its pid.
+            Object* previous = NULL;
+            Inventory* inventory = &(obj_dude->data.inventory);
+            for (int index = 0; index < inventory->length; index++) {
+                if (inventory->items[index].item == gpui_qt_prev_obj) {
+                    previous = gpui_qt_prev_obj;
+                    break;
+                }
+            }
+            if (previous == NULL) {
+                previous = inven_pid_is_carried_ptr(obj_dude, gpui_qt_prev_pid);
+            }
             if (previous != NULL && previous != current) {
+                // Its take-out paced by AGILITY like the throw it follows (compute_tpf, isQuickDraw).
+                anim_quick_draw_begin(obj_dude);
                 inven_wield(obj_dude, previous, gpui_qt_hand);
+                anim_quick_draw_end();
             } else if (previous == NULL && current != NULL) {
                 inven_unwield(obj_dude, gpui_qt_hand);
             }
         }
         intface_update_items(true);
-        trace_event(TRACE_ACTION, "quick-restore", "slot=%d prev=%d", gpui_qt_slot, gpui_qt_prev_pid);
+        trace_event(TRACE_ACTION, "quick-restore", "slot=%d prev=%d id=%d", gpui_qt_slot, gpui_qt_prev_pid,
+            gpui_qt_hand_item() != NULL ? gpui_qt_hand_item()->id : -1);
         return;
     }
     default:

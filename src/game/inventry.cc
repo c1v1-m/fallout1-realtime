@@ -3397,7 +3397,22 @@ Object* inven_find_id(Object* obj, int id)
 }
 
 // 0x465B98
+static int inven_wield_func(Object* critter, Object* item, int a3, bool animate);
+
 int inven_wield(Object* critter, Object* item, int a3)
+{
+    return inven_wield_func(critter, item, a3, true);
+}
+
+// inven_wield without the ceremony: no holstering of what the hand held, no take-out of the new one
+// -- the stance changes at once. For the quick slots' grenade draw (2026-10-16, his pick "Bez
+// schování": the put-away was ~0.6 s of nothing between the press and the throw).
+int inven_wield_instant(Object* critter, Object* item, int a3)
+{
+    return inven_wield_func(critter, item, a3, false);
+}
+
+static int inven_wield_func(Object* critter, Object* item, int a3, bool animate)
 {
     register_begin(ANIMATION_REQUEST_RESERVED);
 
@@ -3498,13 +3513,16 @@ int inven_wield(Object* critter, Object* item, int a3)
         }
 
         if (hand == a3) {
-            if ((critter->fid & 0xF000) >> 12 != 0) {
+            if (animate && (critter->fid & 0xF000) >> 12 != 0) {
                 const char* soundEffectName = gsnd_build_character_sfx_name(critter, ANIM_PUT_AWAY, CHARACTER_SOUND_EFFECT_UNUSED);
                 register_object_play_sfx(critter, soundEffectName, 0);
                 register_object_animate(critter, ANIM_PUT_AWAY, 0);
             }
 
-            if (weaponAnimationCode != 0) {
+            if (!animate) {
+                int fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_STAND, weaponAnimationCode, critter->rotation + 1);
+                register_object_change_fid(critter, fid, -1);
+            } else if (weaponAnimationCode != 0) {
                 register_object_take_out(critter, weaponAnimationCode, -1);
             } else {
                 int fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, 0, 0, critter->rotation + 1);

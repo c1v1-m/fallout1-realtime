@@ -764,6 +764,49 @@ int anim_clear_pending(Object* a1)
     return -1;
 }
 
+// ⚠️ A LONE STAND (2026-10-16, "animace běhu se zasekávala"). A sequence holding nothing but one
+// ANIM_STAND for `obj` -- what a script's anim(obj, ANIM_STAND, 0) registers; Junktown's ladder
+// JTDN2UP.INT does it to the dude after its move_to -- is invisible to anim_busy and
+// anim_busy_blocking alike (both skip "length == 1 && ANIM_STAND"), so a mover that asks either of
+// them takes the body while the STAND's sad still lives. Free movement writes the walk pose every
+// frame; the sad finds a fid not its own on each of its ticks and stands the body again at frame 0
+// (object_animate's fid-change branch), and since it never sees its own fid it never finishes: the
+// stride restarted every step for as long as he walked (trace_2026-10-16_004402, s=9.26..10.00 at
+// the cap of the fm-pose-cut diag). Standing is moot for a body about to walk, so the movers end
+// these first. ANIM_SEQ_NO_STAND keeps anim_set_end from dude_stand-ing him -- that would snap a
+// free-moving body back onto its tile centre. Returns how many it ended.
+int anim_end_lone_stand(Object* obj)
+{
+    if (obj == NULL) {
+        return 0;
+    }
+
+    int ended = 0;
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequenceIndex == curr_anim_set || animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        if (animationSequence->length != 1 || (animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0) {
+            continue;
+        }
+
+        AnimationDescription* animationDescription = &(animationSequence->animations[0]);
+        if (animationDescription->owner != obj
+            || animationDescription->kind != ANIM_KIND_ANIMATE
+            || animationDescription->anim != ANIM_STAND) {
+            continue;
+        }
+
+        animationSequence->flags |= ANIM_SEQ_NO_STAND;
+        anim_set_end(animationSequenceIndex);
+        ended++;
+    }
+
+    return ended;
+}
+
 // Like register_clear, but ends the owning sequence even when it is PRIORITIZED (which
 // register_clear refuses with -2). Realtime combat uses this on an attack's DEFENDER: in
 // turn-based you can't be attacked mid-swing, but in realtime an attacker (incl. an enemy
@@ -5272,6 +5315,20 @@ void anim_move_speed(Object* object, int anim, float* tilesPerSec, float* frames
     *tilesPerSec = 1000.0f / (fpt * tpf);
 }
 
+// See isQuickDraw in compute_tpf. Set around the one inven_wield whose take-out it paces: the
+// take-out is the sequence's first description, so it starts -- and is timed -- inside that call.
+static Object* anim_quick_draw_obj = NULL;
+
+void anim_quick_draw_begin(Object* obj)
+{
+    anim_quick_draw_obj = obj;
+}
+
+void anim_quick_draw_end()
+{
+    anim_quick_draw_obj = NULL;
+}
+
 unsigned int compute_tpf(Object* object, int fid)
 {
     int fps;
@@ -5321,10 +5378,14 @@ unsigned int compute_tpf(Object* object, int fid)
     bool isRangedAttack = animType == ANIM_FIRE_SINGLE || animType == ANIM_FIRE_BURST
         || animType == ANIM_FIRE_CONTINUOUS;
     bool isThrowAttack = animType == ANIM_THROW_ANIM;
+    // The quick slots' weapon draw after a throw is paced like the throw itself, by AGILITY
+    // (anim_quick_draw_begin; his pick 2026-10-16). Only that one take-out -- every other weapon
+    // switch keeps the global lever.
+    bool isQuickDraw = animType == ANIM_TAKE_OUT && object != NULL && object == anim_quick_draw_obj;
 
     if (combat_rt_enabled() && object != NULL && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER
-        && (isMeleeAttack || isRangedAttack || isThrowAttack)) {
-        int stat = isMeleeAttack ? STAT_STRENGTH : (isThrowAttack ? STAT_AGILITY : STAT_PERCEPTION);
+        && (isMeleeAttack || isRangedAttack || isThrowAttack || isQuickDraw)) {
+        int stat = isMeleeAttack ? STAT_STRENGTH : ((isThrowAttack || isQuickDraw) ? STAT_AGILITY : STAT_PERCEPTION);
         // Asymmetric: above-average points are worth more than below-average ones, so investing
         // past 5 actually shows. See ANIM_ATTACK_STAT_HIGH_BIAS.
         int delta = stat_level(object, stat) - 5;

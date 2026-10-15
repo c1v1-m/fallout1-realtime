@@ -6907,6 +6907,9 @@ static void rt_stick_move(int rotation, bool run)
     // Only clear the stuck timer when a walk genuinely STARTED -- otherwise a segment_start that
     // fails every frame keeps resetting it and the backstop below can never trip.
     if (anim_busy_blocking(obj_dude) == 0) {
+        // A lone STAND (a script's anim(dude, ANIM_STAND, 0)) reads as free here yet makes
+        // check_registry refuse the walk -- see anim_end_lone_stand.
+        anim_end_lone_stand(obj_dude);
         if (rt_stick_segment_start(rotation, run)) {
             rt_move_stuck_since = -1.0f;
             return;
@@ -7285,6 +7288,14 @@ static void rt_fm_drive(float angle, bool run, float dt)
     }
 
     rt_move_stuck_since = -1.0f;
+
+    // ⚠️ ...AND A LONE STAND IS NOT OURS EITHER (2026-10-16). A script's anim(dude, ANIM_STAND, 0) --
+    // Junktown's ladder -- is a one-description sequence anim_busy_blocking does not see, so the gate
+    // above let us drive while its sad went on standing the body at frame 0 on every tick: the run
+    // restarted each step until he stopped. See anim_end_lone_stand.
+    if (anim_end_lone_stand(obj_dude) != 0) {
+        trace_event(TRACE_FLOW, "fm-lone-stand", "cut tile=%d t=%.2f", obj_dude->tile, rt_clock);
+    }
 
     rt_cancel_flinch_for_move(obj_dude);
     rt_move_input_age = 0.0f;
