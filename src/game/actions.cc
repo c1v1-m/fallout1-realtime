@@ -798,7 +798,9 @@ int action_attack(Attack* attack)
     // seven reloads died exactly on an enemy's COMBAT/attack line, two of them to clean misses. His
     // rule since: only a hit that makes you FLINCH (through-damage >= flinch_dt_factor x DT) or a
     // knockdown ends a reload, and both are decided at the commit, where the damage is known.
-    bool keepDefenderReload = combat_rt_enabled() && combat_rt_is_reloading(attack->defender);
+    // ...and so does a stimpak jab (2026-10-16): the stagger, not the trigger pull, ends it.
+    bool keepDefenderReload = combat_rt_enabled()
+        && (combat_rt_is_reloading(attack->defender) || combat_rt_is_injecting(attack->defender));
     if (!keepDefenderReload && register_clear(attack->defender) == -2) {
         // The defender is in a PRIORITIZED sequence -- almost always its OWN attack swing.
         // Turn-based can't reach here (you can't be attacked mid-swing), but realtime can, and
@@ -833,7 +835,8 @@ int action_attack(Attack* attack)
 
     for (int index = 0; index < attack->extrasLength; index++) {
         // Same rule for a body caught in the burst: its reload is only a hit's to end, at the commit.
-        if (combat_rt_enabled() && combat_rt_is_reloading(attack->extras[index])) {
+        if (combat_rt_enabled()
+            && (combat_rt_is_reloading(attack->extras[index]) || combat_rt_is_injecting(attack->extras[index]))) {
             continue;
         }
         if (register_clear(attack->extras[index]) == -2) {

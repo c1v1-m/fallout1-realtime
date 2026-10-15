@@ -44,6 +44,7 @@
 #include "game/stat_defs.h"
 #include "game/tile.h"
 #include "plib/gnw/gnw.h"
+#include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
 #include "plib/gnw/mouse.h"
 
@@ -1293,6 +1294,41 @@ void combat_rt_reload_begin(Object* critter)
 void combat_rt_reload_end(Object* critter)
 {
     rt_reloading_drop(critter);
+}
+
+// The dude's stimpak jab (gamepad_ui gpui_inject_start, 2026-10-16: "prvně animace píchnutí a pak
+// heal"). Protected exactly like a reload: an enemy's trigger pull must not end it (action_attack),
+// only a hit that staggers him or a knockdown does (rt_reaction_flinch -> anim_force_clear), and
+// then the stimpak is kept and the AP handed back. Counts while the body is in the use pose, plus a
+// short grace for the frame or two before the first frame of it is drawn.
+#define RT_INJECT_GRACE_MS 200
+static Object* rt_injecting = NULL;
+static unsigned int rt_injecting_at = 0;
+
+void combat_rt_inject_begin(Object* critter)
+{
+    rt_injecting = critter;
+    rt_injecting_at = get_time();
+}
+
+void combat_rt_inject_end(Object* critter)
+{
+    if (rt_injecting == critter) {
+        rt_injecting = NULL;
+    }
+}
+
+bool combat_rt_is_injecting(Object* critter)
+{
+    if (critter == NULL || critter != rt_injecting) {
+        return false;
+    }
+    if (FID_ANIM_TYPE(critter->fid) == ANIM_MAGIC_HANDS_MIDDLE
+        || elapsed_time(rt_injecting_at) < RT_INJECT_GRACE_MS) {
+        return true;
+    }
+    rt_injecting = NULL;
+    return false;
 }
 
 bool combat_rt_is_reloading(Object* critter)
@@ -10280,6 +10316,7 @@ static void rt_abandon_encounter()
     rt_noise_tile = -1;
     rt_noise_elev = -1;
     rt_reloading_count = 0; // pointers only -- the bodies are being freed by the caller
+    rt_injecting = NULL;
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;

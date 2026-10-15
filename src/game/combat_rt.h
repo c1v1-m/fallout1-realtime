@@ -327,6 +327,11 @@ void combat_rt_refund_ap(int amount);
 void combat_rt_reload_begin(Object* critter);
 void combat_rt_reload_end(Object* critter);
 bool combat_rt_is_reloading(Object* critter);
+// The dude's stimpak jab (gamepad_ui): spared by an enemy's trigger pull like a reload, ended only
+// by a stagger or a knockdown. The query drops a body that has left the use pose.
+void combat_rt_inject_begin(Object* critter);
+void combat_rt_inject_end(Object* critter);
+bool combat_rt_is_injecting(Object* critter);
 
 // Empty a critter's realtime pool. The realtime stand-in for vanilla's "lose your turn" critical
 // failure: there are no turns, so the cost is paid as points plus the wait for them to come back.

@@ -3330,9 +3330,152 @@ static unsigned int gpui_injection_duration()
     return ms;
 }
 
-// Use one of `pid` on the dude. This is deliberately the same sequence combatai.cc:370 runs
-// when an NPC self-medicates -- remove one, apply it, play the use animation, destroy it --
-// so the player's quick-use and the AI's go through identical engine paths.
+// ⚠️ THE JAB FIRST, THEN THE HEAL (2026-10-16, "šlo by že když dám rb tak je prvně animace píchnutí a
+// pak heal?"). The drug used to work at the press and the use animation to follow as decoration. Now
+// the animation plays first and the drug works at its ACTION FRAME, the moment the needle goes in
+// (his pick "Při píchnutí": frame 7 of 11 of the dude's use art, ~0.55 s at AGI/INT/PE 9) -- the rest
+// of the animation plays out after. His second pick, "Zruší se, stimpack zůstane": a hit that
+// STAGGERS him or a knockdown before that frame ends it (rt_reaction_flinch -> anim_force_clear), the
+// stimpak stays in the pack and the AP come back -- the reload's rules. A trigger pull alone does not
+// (combat_rt_is_injecting spares him in action_attack, like a reload).
+//
+// The AP go at the press, as with the reload, and are refunded by the tick on a cut
+// (gpui_inject_tick). The pack is only touched at the jab, so a cut jab costs nothing at all.
+static bool gpui_inject_pending = false; // a jab is playing and has not reached its frame yet
+static int gpui_inject_pid = -1;
+static int gpui_inject_ap = 0;
+static unsigned int gpui_inject_at = 0;
+
+static Object* gpui_carried_drug(int pid)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        Object* item = inventory->items[i].item;
+        if (item != NULL && item->pid == pid && item_get_type(item) == ITEM_TYPE_DRUG) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+// One of the dude's drugs, taken NOW: its effect, the item gone, the HP bar redrawn. This is
+// deliberately the same sequence combatai.cc:370 runs when an NPC self-medicates -- remove one,
+// apply it, destroy it -- so the player's quick-use and the AI's go through identical engine paths.
+// False = the drug code refused (robotic body, dead) and the item is back in the pack.
+static bool gpui_take_drug_now(Object* item)
+{
+    if (item_remove_mult(obj_dude, item, 1) != 0) {
+        return false;
+    }
+
+    if (item_d_take_drug(obj_dude, item) == -1) {
+        item_add_force(obj_dude, item, 1);
+        return false;
+    }
+
+    obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
+    obj_destroy(item);
+
+    intface_update_hit_points(true);
+    return true;
+}
+
+// The jab's action frame (a register_object_call -- NOT a must-call, so a cut jab never gets here).
+static int gpui_inject_done(void* a1, void* a2)
+{
+    (void)a1;
+    (void)a2;
+
+    if (!gpui_inject_pending) {
+        return 0;
+    }
+    gpui_inject_pending = false;
+    combat_rt_inject_end(obj_dude);
+
+    int hpBefore = critter_get_hits(obj_dude);
+    Object* item = gpui_carried_drug(gpui_inject_pid);
+    if (item == NULL || !gpui_take_drug_now(item)) {
+        // Gone from the pack while the needle was on its way, or refused: nothing taken, nothing paid.
+        combat_rt_refund_ap(gpui_inject_ap);
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=%s ap=%d", gpui_inject_pid,
+            item == NULL ? "gone" : "refused", combat_rt_player_ap());
+        return 0;
+    }
+
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d cost=%d qp=%d lock=%ums fight=%d jab=%ums",
+        gpui_inject_pid, hpBefore, critter_get_hits(obj_dude), combat_rt_player_ap(), gpui_inject_ap,
+        perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0,
+        elapsed_time(gpui_inject_at));
+    return 0;
+}
+
+// Starts the jab. False = it could not register (he is in another live sequence -- a swing, a walk
+// segment -- or a transaction is open), and the caller takes the drug at once, as before.
+static bool gpui_inject_start(Object* item, int apCost)
+{
+    int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_MAGIC_HANDS_MIDDLE,
+        (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+    int actionFrame = 0;
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art != NULL) {
+        actionFrame = art_frame_action_frame(art);
+        art_ptr_unlock(handle);
+    }
+
+    if (register_begin(ANIMATION_REQUEST_RESERVED) != 0) {
+        return false;
+    }
+    register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
+    // delay = frames of the animation before it: the call runs as the action frame is reached.
+    register_object_call(obj_dude, NULL, gpui_inject_done, actionFrame);
+
+    // The bracket makes compute_tpf time the jab by (AGI + INT + PE) / 3 (2026-10-06) -- for the
+    // animation, which starts inside register_end, and for the lock measured here alike.
+    anim_set_injection_timing(obj_dude);
+    int rc = register_end();
+    unsigned int ms = gpui_injection_duration();
+    anim_set_injection_timing(NULL);
+
+    if (rc != 0) {
+        return false;
+    }
+
+    gpui_injection_since = get_time();
+    gpui_injection_ms = ms;
+
+    combat_rt_spend_ap(apCost);
+    gpui_inject_pending = true;
+    gpui_inject_pid = item->pid;
+    gpui_inject_ap = apCost;
+    gpui_inject_at = get_time();
+    combat_rt_inject_begin(obj_dude);
+
+    trace_event(TRACE_ACTION, "inject-start", "pid=%d frame=%d lock=%ums ap=%d", item->pid, actionFrame, ms,
+        combat_rt_player_ap());
+    return true;
+}
+
+// From the safe tick: a jab that left its pose before its frame (a stagger, a knockdown, anim_stop
+// for a save or a conversation) gives the AP back and lifts the lock, so the next press can try again.
+static void gpui_inject_tick()
+{
+    if (!gpui_inject_pending || obj_dude == NULL) {
+        return;
+    }
+    if (combat_rt_is_injecting(obj_dude)) {
+        return;
+    }
+
+    gpui_inject_pending = false;
+    combat_rt_refund_ap(gpui_inject_ap);
+    gpui_injection_ms = 0;
+    trace_event(TRACE_ACTION, "inject-cut", "pid=%d refund=%d ap=%d anim=%d after=%ums", gpui_inject_pid,
+        gpui_inject_ap, combat_rt_player_ap(), FID_ANIM_TYPE(obj_dude->fid), elapsed_time(gpui_inject_at));
+}
+
+// Use one of `pid` on the dude: the jab, and the drug at its frame (see gpui_inject_pending).
 static void gpui_quick_use(int pid)
 {
     // ⚠️ COSTS 2 AP AND REFUSES WHEN YOU CANNOT PAY (2026-08-29). It used to charge only when
@@ -3355,54 +3498,20 @@ static void gpui_quick_use(int pid)
         return;
     }
 
-    if (combat_rt_active() && elapsed_time(gpui_injection_since) < gpui_injection_ms) {
+    if (gpui_inject_pending
+        || (combat_rt_active() && elapsed_time(gpui_injection_since) < gpui_injection_ms)) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=injecting left=%ums ap=%d",
             pid, gpui_injection_ms - elapsed_time(gpui_injection_since), combat_rt_player_ap());
         return;
     }
 
-    Object* item = NULL;
-    Inventory* inventory = &(obj_dude->data.inventory);
-    for (int i = 0; i < inventory->length; i++) {
-        if (inventory->items[i].item != NULL && inventory->items[i].item->pid == pid) {
-            item = inventory->items[i].item;
-            break;
-        }
-    }
-
-    if (item == NULL || item_get_type(item) != ITEM_TYPE_DRUG) {
+    Object* item = gpui_carried_drug(pid);
+    if (item == NULL) {
         gsound_play_sfx_file("iisxxxx1"); // out of stock: refuse audibly, never silently
         return;
     }
 
-    if (item_remove_mult(obj_dude, item, 1) != 0) {
-        return;
-    }
-
-    int hpBefore = critter_get_hits(obj_dude);
-    int apBefore = combat_rt_player_ap();
-
-    if (item_d_take_drug(obj_dude, item) == -1) {
-        // Refused (robotic body, dead) -- put it back rather than eating the item.
-        item_add_force(obj_dude, item, 1);
-        return;
-    }
-
-    // Taken: the next one waits out this injection (see gpui_injection_since). Armed whether or not
-    // the animation below can be registered -- the prone case is exactly the one it must cover.
-    //
-    // The bracket makes compute_tpf time the injection by (AGI + INT + PE) / 3 (2026-10-06) -- for the
-    // lock measured here and for the animation registered below alike, so the two end together.
-    anim_set_injection_timing(obj_dude);
-    gpui_injection_since = get_time();
-    gpui_injection_ms = gpui_injection_duration();
-
-    // The "using something" animation. This DOES tie up obj_dude until it finishes, which is
-    // intended. NOTE: combatai follows a failed register_end() with combat_turn_run(); that
-    // pumps the game loop and must never be called from this frame tick, so it is omitted --
-    // a refused registration just means no animation plays.
-    //
     // ⚠️ NOT WHILE HE IS DOWN. ANIMATION_REQUEST_RESERVED means this registration does not ask
     // permission -- it takes obj_dude off whatever he is currently playing. Fired during a
     // knockdown that is the FALL, so the dude snapped upright into the drug-taking pose in the
@@ -3411,27 +3520,32 @@ static void gpui_quick_use(int pid)
     // anim 20 (falling) -> anim 11 (this) -> anim 14, and the standup pass then reported
     // `fall=14`, i.e. it stood him up from a hit-react he should never have been in.
     //
-    // The HEAL still happens -- it is already applied above and the AP is charged below. Only the
-    // cosmetic animation is skipped, which is a state this code path already supports (see the
-    // refused-registration note directly above). Making the drug itself fail here would be a
+    // The HEAL still happens -- at once, below, with the AP; only the animation is skipped (the same
+    // fallback covers a jab that could not register). Making the drug itself fail here would be a
     // silent balance change: being knocked down would start costing you the heal.
-    if (!critter_is_prone(obj_dude)) {
-        register_begin(ANIMATION_REQUEST_RESERVED);
-        register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
-        register_end();
+    if (!critter_is_prone(obj_dude) && gpui_inject_start(item, apCost)) {
+        return;
     }
+
+    // On the floor, or the jab could not register: the drug works at once, with no animation.
+    int hpBefore = critter_get_hits(obj_dude);
+    int apBefore = combat_rt_player_ap();
+    if (!gpui_take_drug_now(item)) {
+        return;
+    }
+
+    // The lock still holds the next one off (gpui_injection_since) -- the prone case is exactly the
+    // one it must cover.
+    anim_set_injection_timing(obj_dude);
+    gpui_injection_since = get_time();
+    gpui_injection_ms = gpui_injection_duration();
     anim_set_injection_timing(NULL);
-
-    obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
-    obj_destroy(item);
-
-    intface_update_hit_points(true);
 
     // Vanilla charges 2 AP for taking a drug. Unconditional now: affordability was settled at
     // the top of this function, before the item was spent.
     combat_rt_spend_ap(apCost);
 
-    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d",
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d jab=0",
         pid, hpBefore, critter_get_hits(obj_dude), apBefore, combat_rt_player_ap(),
         apCost, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0);
 }
@@ -3668,6 +3782,9 @@ void gamepad_ui_quick_slots_reset()
     gpui_qt_slot = -1;
     gpui_qt_prev_obj = NULL;
     gpui_qs_use_pending_slot = -1;
+    // A jab from before a load never reaches its frame; its AP belonged to the old pool.
+    gpui_inject_pending = false;
+    combat_rt_inject_end(obj_dude);
 }
 
 static void gpui_qt_set(int state)
@@ -7655,6 +7772,9 @@ static void gpui_trace_buttons(SDL_GameController* pad)
 // a controller -- a keyboard player has none.
 static void gpui_drain_requests()
 {
+    // A jab cut before its frame gives its AP back -- before any new press is judged.
+    gpui_inject_tick();
+
     // A quick slot's drug (RB's stimpak, or whatever is bound), then the throw's state machine.
     if (gpui_qs_use_pending_slot != -1) {
         int slot = gpui_qs_use_pending_slot;
