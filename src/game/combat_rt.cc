@@ -1228,6 +1228,7 @@ static bool rt_forgive_stray = true;
 static float rt_last_fight_clock = -1000.0f;
 #define RT_FORGIVEN_MAX 32
 static int rt_forgiven_ids[RT_FORGIVEN_MAX];
+static float rt_forgiven_at[RT_FORGIVEN_MAX]; // rt_clock of the forgiveness (combat_rt_notify_victim)
 static int rt_forgiven_count = 0;
 
 // Idle hostiles look around, from cfg enemies_look_around (MODS "Enemies look around", default off
@@ -13673,6 +13674,18 @@ void combat_rt_notify_victim(Object* attacker, Object* victim)
         return;
     }
 
+    // ...and a stray that was forgiven on this very hit is no murder to witness, even when it
+    // killed (rt_forgive_stray: it hit an ally of the moment). Without this the forgiveness stopped
+    // at the victim -- Neal saw his barmaid die in the dude's burst at Vinnie and went for the
+    // dude and his dog (trace_2026-10-15_213201 s=11.96 witness-kill).
+    for (int i = 0; i < rt_forgiven_count; i++) {
+        if (rt_forgiven_ids[i] == victim->id && rt_clock - rt_forgiven_at[i] < 1.0f) {
+            trace_event(TRACE_FLOW, "witness-forgiven", "victim=%d(pid=%d) t=%.2f",
+                victim->id, victim->pid, rt_clock);
+            return;
+        }
+    }
+
     int team = victim->data.critter.combat.team;
 
     for (int i = 0; i < rt_actor_count; i++) {
@@ -14326,8 +14339,21 @@ bool combat_rt_forgive_stray(Object* attacker, Object* bystander, Object* intend
         return false;
     }
 
-    // An ally of the moment: it and the one you aimed at are fighting each other.
-    if (grudge != intended && intended->data.critter.combat.whoHitMe != bystander) {
+    // An ally of the moment: it and the one you aimed at are fighting each other -- by their
+    // whoHitMe, or (2026-10-15, the Skum Pitt again: Neal's barmaid had joined against Vinnie and was
+    // still running at him when the dude's burst killed her, so neither whoHitMe said so yet, and
+    // Neal turned on the dude for it -- trace_2026-10-15_213201 s=9.92-11.96) because it is chasing
+    // or attacking the one you aimed at in this fight.
+    bool allied = grudge == intended || intended->data.critter.combat.whoHitMe == bystander;
+    if (!allied) {
+        for (int i = 0; i < rt_actor_count; i++) {
+            if (rt_actors[i].obj == bystander) {
+                allied = rt_actors[i].state != RT_IDLE && rt_actors[i].target == intended;
+                break;
+            }
+        }
+    }
+    if (!allied) {
         return false;
     }
 
@@ -14339,7 +14365,9 @@ bool combat_rt_forgive_stray(Object* attacker, Object* bystander, Object* intend
         }
     }
     if (rt_forgiven_count < RT_FORGIVEN_MAX) {
-        rt_forgiven_ids[rt_forgiven_count++] = bystander->id;
+        rt_forgiven_ids[rt_forgiven_count] = bystander->id;
+        rt_forgiven_at[rt_forgiven_count] = rt_clock;
+        rt_forgiven_count++;
     }
     trace_event(TRACE_COMBAT, "stray-forgiven", "pid=%d id=%d by=%d intended=%d t=%.2f",
         bystander->pid, bystander->id, attacker->pid, intended->pid, rt_clock);
