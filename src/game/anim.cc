@@ -410,6 +410,8 @@ static float anim_attack_stat_factor = 0.09f;
 
 // How much faster a shot's own projectile flies in realtime (see compute_tpf).
 #define RT_PROJECTILE_SPEEDUP 4.0f
+// ...and how much SLOWER a thrown weapon flies (a grenade: 10 -> 5 tiles a second), 2026-10-16.
+#define RT_THROWN_SLOWDOWN 2.0f
 static float anim_attack_stat_high_bias = ANIM_ATTACK_STAT_HIGH_BIAS;
 
 void anim_init()
@@ -5394,11 +5396,33 @@ unsigned int compute_tpf(Object* object, int fid)
     // plasma, the Alien Blaster, a rocket: obj_new with no pid, MISC art) now fly RT_PROJECTILE_SPEEDUP
     // times faster; a THROWN weapon is the item itself (it keeps its pid) and keeps its pace, because
     // watching the spear or the grenade arc across is the point. Bullet guns have no projectile at all.
-    if (combat_rt_enabled() && object != NULL && object->pid == -1 && FID_TYPE(object->fid) == OBJ_TYPE_MISC) {
+    //
+    // ⚠️ THE FLIGHT ONLY (2026-10-16). A projectile flies as ANIM_WALK (action_ranged's straight move);
+    // the blast it turns into plays ANIM_STAND on the SAME object, and the eight ring sprites around it
+    // are obj_new'd with no pid too -- so without the walk test a grenade's ring flashed four times
+    // faster than its own centre (0.18 s against 0.7 s) and a rocket's whole blast was over in 0.18 s.
+    // An explosion plays at its art's pace again.
+    bool projectileFlight = combat_rt_enabled() && object != NULL && animType == ANIM_WALK
+        && FID_TYPE(object->fid) == OBJ_TYPE_MISC;
+    if (projectileFlight && object->pid == -1) {
         tpf = (unsigned int)(tpf / RT_PROJECTILE_SPEEDUP + 0.5f);
         if (tpf < 1) {
             tpf = 1;
         }
+    } else if (projectileFlight && PID_TYPE(object->pid) == OBJ_TYPE_ITEM) {
+        // ⚠️ ...AND A THROWN ONE FLIES SLOWER (2026-10-16, "ať je vidět projektil granátu, přišel mi hod
+        // granátu fakt fast"). A thrown weapon is the item itself, wearing its projectile art for the
+        // flight -- only then is an ITEM's fid MISC -- and a grenade's is GRNDTRO.FRM, a 7x7 px tumble
+        // at 10 fps that hops a tile per frame: 10 tiles a second, a three-tile throw over in 0.3 s,
+        // a dot nobody sees. RT_THROWN_SLOWDOWN times its pace; the quick slots made throwing a thing
+        // you do every fight.
+        //
+        // ⚠️ THE THROWER WAITS FOR IT. The flight and the blast sit in the thrower's own attack
+        // sequence, ahead of his take-out tail, and check_registry refuses him anything new while
+        // that sequence lives -- so a longer flight is a longer stand after a LONG throw (his throw
+        // pose, ~1.5 s at AGI 9, already outlasts a short one). combat_rt's explosive commit cap
+        // (RT_RESOLVE_MAX_SECONDS x3) is sized to outlast a full-range throw at this pace.
+        tpf = (unsigned int)(tpf * RT_THROWN_SLOWDOWN + 0.5f);
     }
     // ⚠️ A FLINCH PLAYS WHOLE (2026-10-13, "ne bez cuknutí, ale ať to vypadá plynule, staggering tam
     // chci mít jak mám"). A light stagger holds the body for combat_rt_flinch_seconds() (0.4 s) --

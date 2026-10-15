@@ -12638,6 +12638,9 @@ void combat_rt_update(float dt)
         // own sequence swaps the projectile for its explosion art (or the projectile is gone);
         // nothing else commits such an attack except the (longer) cap. The splash victims' falls
         // are registered at that same commit (action_extras_reaction), so they go down WITH the blast.
+        // ⚠️ "explosive" also covers a thrown knife or rock since 2026-10-16: action_ranged hands it
+        // over with its own item art as the landing fid, so it too hurts on ARRIVAL, not when the
+        // throw pose ends (thrown weapons fly at half pace now -- RT_THROWN_SLOWDOWN in anim.cc).
         bool explosive = f->explosionFid != -1;
         bool landed = explosive && (f->projectile == NULL || f->projectile->fid == f->explosionFid);
 
@@ -12665,8 +12668,11 @@ void combat_rt_update(float dt)
         // read as "pose already over" on frame one.
         bool poseEnded = thrown && f->tAnimStart >= 0.0f && f->tAnimEnd >= 0.0f;
 
-        // A rocket can fly further than a swing lasts, so its safety cap is longer.
-        bool capped = elapsed >= (explosive ? RT_RESOLVE_MAX_SECONDS * 2.0f : RT_RESOLVE_MAX_SECONDS);
+        // A rocket can fly further than a swing lasts, so its safety cap is longer. ⚠️ x3, not x2,
+        // since thrown weapons fly at half pace (RT_THROWN_SLOWDOWN in anim.cc, 2026-10-16): a
+        // full-range grenade is ~0.6 s of throw pose before the release plus 15 tiles at 5 a
+        // second = 3.6 s, and x2 committed its damage in mid-air.
+        bool capped = elapsed >= (explosive ? RT_RESOLVE_MAX_SECONDS * 3.0f : RT_RESOLVE_MAX_SECONDS);
         // Don't let action-frame / swing-done / connect commit before the swing has had time to play
         // (and its SFX to sound) -- that produced "shadow attacks" (damage + AP, no visible swing)
         // when the defender was already reacting or the swing read as done instantly. Cap still wins.

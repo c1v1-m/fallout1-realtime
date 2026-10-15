@@ -626,6 +626,7 @@ static bool show_damage_defender_split(Attack* attack, int a2, int delay)
 // CE: the explosive projectile (rocket, grenade) the LAST action_ranged put in the air, and the
 // explosion art it turns into when it lands. combat_rt takes it straight after the attack is issued
 // (action_take_explosive_projectile) and commits the blast when the projectile wears that art.
+// Since 2026-10-16 a thrown knife or rock rides here too, with its own item art as the "explosion".
 static Object* action_rt_explosive_projectile = NULL;
 static int action_rt_explosion_fid = -1;
 
@@ -1231,6 +1232,15 @@ static int action_ranged(Attack* attack, int anim)
                 } else {
                     if (anim != ANIM_THROW_ANIM) {
                         register_object_must_erase(projectile);
+                    } else if (combat_rt_enabled()) {
+                        // ⚠️ A THROWN KNIFE OR ROCK HITS WHEN IT ARRIVES TOO (2026-10-16). It used to
+                        // commit when the throw POSE ended, which was after the landing only while the
+                        // flight was quick; thrown weapons now fly at half pace (RT_THROWN_SLOWDOWN in
+                        // anim.cc) and a long throw would hurt the target with the knife still in the
+                        // air. It lands wearing its own item art again (the change_fid below), so that
+                        // fid is its "explosion" for combat_rt's landing test.
+                        action_rt_explosive_projectile = projectile;
+                        action_rt_explosion_fid = weaponFid;
                     }
                 }
 
