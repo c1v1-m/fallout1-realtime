@@ -11080,9 +11080,17 @@ static void rt_update_actor(RtActor* a, float dt)
             // weapon's own range), not just to max weapon range -- a ranged shooter that stops
             // at max range eats Fallout's per-tile to-hit penalty and misses forever. Melee /
             // short weapons: min(range, PREFERRED) == range, so they still close to contact.
+            //
+            // ⚠️ SUPERSEDED BY VANILLA'S OWN RULE (2026-10-17, his pick: "jako vanilla: podle
+            // min_to_hit"). In the Military Base the super mutants carried miniguns (35), rockets
+            // (40) and laser rifles (45) and walked to 8 tiles before firing a shot -- 86-100% of
+            // each fight spent approaching, while he shot them down from range (trace_2026-10-17_
+            // 233405). The miss-forever problem this cap was for is what min_to_hit answers: the
+            // whole weapon reach counts as in range now, and rt_min_to_hit_verdict decides whether
+            // the shot is good enough or the critter must close in -- exactly ai_try_attack.
             int mode = rt_hit_mode(npc);
             int range = item_w_range(npc, mode);
-            int engage = range < RT_PREFERRED_ENGAGE_TILES ? range : RT_PREFERRED_ENGAGE_TILES;
+            int engage = range;
             // ⚠️ A CRITTER THAT CANNOT WALK FIRES FROM WHERE IT IS (2026-10-09). The preferred
             // distance is something to close TO; the Master cannot close at all (rt_can_walk), so
             // with you past 8 tiles he sat in CHASE asking for a route, was marked unreachable and
