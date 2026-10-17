@@ -113,6 +113,8 @@ void combat_rt_set_forgive_stray(bool enabled);
 bool combat_rt_get_forgive_stray();
 void combat_rt_set_crowd_make_room(bool enabled);
 bool combat_rt_get_crowd_make_room();
+void combat_rt_set_tactical_ai(bool enabled);
+bool combat_rt_get_tactical_ai();
 bool combat_rt_weapon_amnesty();
 bool combat_rt_critter_fighting(Object* critter);
 bool combat_rt_fm_foreign_touch();

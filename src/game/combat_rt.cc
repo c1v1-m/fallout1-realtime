@@ -1263,6 +1263,11 @@ static bool rt_forgive_stray = true;
 // MODS "Crowds make room" (cfg crowd_make_room). Default ON: his call, 2026-10-17. See rt_room_wait.
 static bool rt_crowd_make_room = true;
 
+// MODS "Tactical AI" (cfg tactical_ai). The realtime tactics on top of vanilla's rules: jumping clear
+// of a grenade, reloading in cover, searching the last known position, taking a much nearer foe,
+// minding allies in the line of fire. Default ON: his call, 2026-10-17. See the COMBAT AI blocks.
+static bool rt_tactical_ai = true;
+
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
 // prostě vypnout to s tou zbraní, ať se mě neptají při tom konfliktu? zabiju assassina a ještě se jim
 // nelíbí, že držím po činu zbraň"). JTGENGRD's critter_p_proc sees the dude's weapon in hand, asks
@@ -1544,6 +1549,7 @@ static void rt_inflight_init_blast(RtInFlight* f)
         ? f->ctd.defender->tile
         : f->ctd.tile;
 }
+
 
 // True if some in-flight attack already targets `d` (enforces one-reaction-per-defender).
 static bool rt_defender_in_flight(Object* d)
@@ -11173,6 +11179,11 @@ void combat_rt_init()
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CROWD_MAKE_ROOM_KEY, &crowdRoom);
     rt_crowd_make_room = crowdRoom != 0;
 
+    // The realtime tactics on top of vanilla's rules (MODS "Tactical AI"). Default ON: his call, 2026-10-17.
+    int tacticalAi = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TACTICAL_AI_KEY, &tacticalAi);
+    rt_tactical_ai = tacticalAi != 0;
+
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
     // Default ON since the release (his setting).
     int lookAround = 1;
@@ -13137,6 +13148,208 @@ float combat_rt_time_scale()
     return scale;
 }
 
+// ⚠️ A BLAST HURTS WHO IS IN IT WHEN IT GOES OFF, NOT WHEN IT WAS THROWN (2026-10-17). compute_attack
+// lists the blast's victims (compute_explosion_on_extras) the moment the grenade leaves the hand --
+// right for turn-based, where nobody moves while it flies, and wrong here, where it flies for a second
+// or more at half pace (RT_THROWN_SLOWDOWN). Anyone who has got outside the radius by the time it
+// lands -- jumping clear (rt_grenade_dodge_tick), or simply walking on -- is taken off the list. It
+// holds for the dude too: outrun an enemy grenade and it misses you. Someone who walks INTO the
+// radius mid-flight is not added: the list is vanilla's, this only shortens it.
+static void rt_blast_filter(RtInFlight* f)
+{
+    Attack* at = &f->ctd;
+    int centre = f->blastTile;
+    int radius = f->blastRadius;
+    if (centre < 0 || radius <= 0) {
+        return;
+    }
+
+    if ((at->attackerFlags & DAM_HIT) != 0 && at->defender != NULL && at->defender != at->attacker
+        && FID_TYPE(at->defender->fid) == OBJ_TYPE_CRITTER && tile_dist(at->defender->tile, centre) > radius) {
+        trace_event(TRACE_COMBAT, "blast-clear", "who=defender id=%d pid=%d dist=%d radius=%d dmg=%d t=%.2f",
+            at->defender->id, at->defender->pid, tile_dist(at->defender->tile, centre), radius,
+            at->defenderDamage, rt_clock);
+        at->attackerFlags &= ~DAM_HIT;
+        at->defenderDamage = 0;
+        at->defenderFlags = 0;
+        at->defenderKnockback = 0;
+    }
+
+    int kept = 0;
+    for (int i = 0; i < at->extrasLength; i++) {
+        Object* victim = at->extras[i];
+        if (victim != NULL && FID_TYPE(victim->fid) == OBJ_TYPE_CRITTER && tile_dist(victim->tile, centre) > radius) {
+            trace_event(TRACE_COMBAT, "blast-clear", "who=extra id=%d pid=%d dist=%d radius=%d dmg=%d t=%.2f",
+                victim->id, victim->pid, tile_dist(victim->tile, centre), radius, at->extrasDamage[i], rt_clock);
+            continue;
+        }
+        if (kept != i) {
+            at->extras[kept] = at->extras[i];
+            at->extrasHitLocation[kept] = at->extrasHitLocation[i];
+            at->extrasDamage[kept] = at->extrasDamage[i];
+            at->extrasFlags[kept] = at->extrasFlags[i];
+            at->extrasKnockback[kept] = at->extrasKnockback[i];
+        }
+        kept++;
+    }
+    at->extrasLength = kept;
+
+    // The thrower's own backwash, if it got clear of its own blast.
+    if ((at->attackerFlags & DAM_BACKWASH) != 0 && at->attacker != NULL
+        && tile_dist(at->attacker->tile, centre) > radius) {
+        trace_event(TRACE_COMBAT, "blast-clear", "who=thrower id=%d pid=%d dist=%d radius=%d dmg=%d t=%.2f",
+            at->attacker->id, at->attacker->pid, tile_dist(at->attacker->tile, centre), radius,
+            at->attackerDamage, rt_clock);
+        at->attackerFlags &= ~(DAM_BACKWASH | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_DEAD | DAM_ON_FIRE);
+        at->attackerDamage = 0;
+    }
+}
+
+// --- COMBAT AI: JUMPING CLEAR OF A GRENADE (2026-10-17, MODS "Tactical AI") ----------------------
+//
+// His design questions, answered before it was built: "zasáhl bych ho někdy?" -- yes, often. A fighter
+// inside a coming blast first has to NOTICE it (it sees the thrower, or the grenade comes within its
+// Perception in tiles), then wins a roll of (PE + AG) x 4 % capped at 75 (his pick: an average raider
+// about 40 %), then waits its reaction time (0.5 s less 0.03 per PE point) -- and only then, if the
+// grenade is STILL in the air, it is not swinging, falling or getting up, it has AP and somewhere to
+// go, it runs to the nearest tile outside the radius. A short throw lands before it moves; a ghoul
+// shuffles a tile a second and almost never makes it. Everyone in rt_actors does it, companions too
+// (they jump clear of YOUR grenades); the dude does his own dodging. What makes the jump count is
+// rt_blast_filter -- without it the victims compute_attack listed at the throw would be hurt anyway.
+#define RT_DODGE_PCT_PER_POINT 4
+#define RT_DODGE_PCT_CAP 75
+
+static bool rt_blast_in_air(int serial)
+{
+    for (int i = 0; i < rt_inflight_count; i++) {
+        RtInFlight* f = &rt_inflight[i];
+        if (f->serial == serial && f->blastRadius > 0) {
+            return f->projectile != NULL && f->projectile->fid != f->explosionFid;
+        }
+    }
+    return false;
+}
+
+static void rt_do_dodge(RtActor* a, Object* npc)
+{
+    const char* refused = NULL;
+    int anim = FID_ANIM_TYPE(npc->fid);
+    if (critter_is_prone(npc) || critter_is_dead(npc)) {
+        refused = "down";
+    } else if (!rt_can_walk(npc)) {
+        refused = "cannot-walk";
+    } else if (a->ap <= 0) {
+        refused = "no-ap"; // 0 AP stops the dude's feet too
+    } else if (anim_busy(npc) != 0 && anim != ANIM_WALK && anim != ANIM_RUNNING && anim != ANIM_STAND) {
+        refused = "busy"; // mid-swing, flinching, getting up
+    } else if (!rt_blast_in_air(a->dodge_serial)) {
+        refused = "too-late";
+    }
+    if (refused != NULL) {
+        trace_event(TRACE_FLOW, "grenade-dodge", "id=%d pid=%d refused=%s t=%.2f", npc->id, npc->pid, refused, rt_clock);
+        return;
+    }
+
+    int centre = a->dodge_tile;
+    int radius = a->dodge_radius;
+    int away = npc->tile == centre ? roll_random(0, ROTATION_COUNT - 1) : tile_dir(centre, npc->tile);
+    int need = radius + 1 - tile_dist(npc->tile, centre);
+    if (need < 1) {
+        need = 1;
+    }
+    static const int fan[5] = { 0, 1, -1, 2, -2 };
+
+    for (int n = need; n <= need + 1; n++) {
+        for (int k = 0; k < 5; k++) {
+            int rotation = (away + fan[k] + ROTATION_COUNT) % ROTATION_COUNT;
+            int dest = tile_num_in_direction(npc->tile, rotation, n);
+            if (dest == npc->tile || tile_dist(dest, centre) <= radius) {
+                continue;
+            }
+            if (obj_blocking_at(npc, dest, npc->elevation) != NULL) {
+                continue;
+            }
+            int steps = make_path(npc, npc->tile, dest, NULL, 1);
+            if (steps <= 0 || steps > n + 2) {
+                continue;
+            }
+
+            // Whatever it was doing on foot ends here; an idle STAND is cut like every mover cuts it.
+            anim_end_moves(npc);
+            anim_end_lone_stand(npc);
+            npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+            if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "dodge")) {
+                return;
+            }
+            anim_reset_last_path();
+            int rc = register_object_run_to_tile(npc, dest, npc->elevation, -1, 0);
+            register_end();
+            bool moved = rc == 0 && anim_last_path_steps(npc) != 0;
+            trace_event(TRACE_FLOW, "grenade-dodge", "id=%d pid=%d from=%d to=%d steps=%d moved=%d centre=%d t=%.2f",
+                npc->id, npc->pid, npc->tile, dest, steps, moved ? 1 : 0, centre, rt_clock);
+            return;
+        }
+    }
+
+    trace_event(TRACE_FLOW, "grenade-dodge", "id=%d pid=%d refused=nowhere t=%.2f", npc->id, npc->pid, rt_clock);
+}
+
+static void rt_grenade_dodge_tick()
+{
+    if (!rt_tactical_ai) {
+        return;
+    }
+
+    for (int k = 0; k < rt_inflight_count; k++) {
+        RtInFlight* f = &rt_inflight[k];
+        if (f->blastRadius <= 0 || f->projectile == NULL || f->projectile->fid == f->explosionFid) {
+            continue; // no blast, or it has gone off
+        }
+        for (int i = 0; i < rt_actor_count; i++) {
+            RtActor* a = &rt_actors[i];
+            Object* npc = a->obj;
+            if (a->dodge_serial == f->serial || !rt_is_combatant(npc)) {
+                continue;
+            }
+            if (npc->elevation != f->projectile->elevation || tile_dist(npc->tile, f->blastTile) > f->blastRadius) {
+                continue;
+            }
+            int pe = stat_level(npc, STAT_PERCEPTION);
+            bool notices = f->attacker == npc
+                || (f->attacker != NULL && is_within_perception(npc, f->attacker))
+                || obj_dist(npc, f->projectile) <= pe;
+            if (!notices) {
+                continue; // it may still notice the grenade coming closer on a later frame
+            }
+
+            a->dodge_serial = f->serial;
+            int chance = (pe + stat_level(npc, STAT_AGILITY)) * RT_DODGE_PCT_PER_POINT;
+            if (chance > RT_DODGE_PCT_CAP) {
+                chance = RT_DODGE_PCT_CAP;
+            }
+            int roll = roll_random(1, 100);
+            float delay = 0.5f - 0.03f * pe;
+            if (delay < 0.15f) {
+                delay = 0.15f;
+            }
+            bool jumps = roll <= chance;
+            a->dodge_at = jumps ? rt_clock + delay : -1.0f;
+            a->dodge_tile = f->blastTile;
+            a->dodge_radius = f->blastRadius;
+            trace_event(TRACE_FLOW, "grenade-notice", "id=%d pid=%d blast=%d dist=%d chance=%d roll=%d jumps=%d delay=%.2f t=%.2f",
+                npc->id, npc->pid, f->serial, tile_dist(npc->tile, f->blastTile), chance, roll, jumps ? 1 : 0, delay, rt_clock);
+        }
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (a->dodge_at >= 0.0f && rt_clock >= a->dodge_at) {
+            a->dodge_at = -1.0f;
+            rt_do_dodge(a, a->obj);
+        }
+    }
+}
+
 void combat_rt_update(float dt)
 {
     if (obj_dude == NULL) {
@@ -13470,6 +13683,12 @@ void combat_rt_update(float dt)
         bool ready = elapsed >= RT_MIN_SWING_SECONDS || gunFired;
         bool trigger = explosive ? landed : (swingDone || connected || actionReached || poseEnded);
         if ((trigger && ready) || capped) {
+            // A blast hurts who is in it NOW (rt_blast_filter). Before the reaction is chosen.
+            if (f->blastRadius > 0) {
+                rt_blast_filter(f);
+                heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
+            }
+
             // Settle lethality against the defender's hp as it is NOW, before anything downstream
             // reads the flags. Fire-time lethality is measured against the hp the defender had when
             // the trigger was pulled, so under focus-fire the blow that lands first can be one that
@@ -13607,6 +13826,10 @@ void combat_rt_update(float dt)
             i++;
         }
     }
+
+    // Grenades in the air first: a fighter that jumps clear registers its run before its own AI
+    // decides anything this frame (rt_grenade_dodge_tick).
+    rt_grenade_dodge_tick();
 
     for (int i = 0; i < rt_actor_count; i++) {
         rt_update_actor(&rt_actors[i], dt);
@@ -15149,6 +15372,16 @@ void combat_rt_set_crowd_make_room(bool enabled)
 bool combat_rt_get_crowd_make_room()
 {
     return rt_crowd_make_room;
+}
+
+void combat_rt_set_tactical_ai(bool enabled)
+{
+    rt_tactical_ai = enabled;
+}
+
+bool combat_rt_get_tactical_ai()
+{
+    return rt_tactical_ai;
 }
 
 // A critter that is IN the fight -- chasing, attacking, or pulled in as hostile -- while one is on.
