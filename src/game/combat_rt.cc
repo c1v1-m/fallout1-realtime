@@ -9617,6 +9617,60 @@ static void rt_search_tick(RtActor* a, Object* npc)
     }
 }
 
+// --- COMBAT AI: A MUCH NEARER FOE (2026-10-17, MODS "Tactical AI") -------------------------------
+//
+// A target is sticky until it dies, so a melee critter set on the dude walked the length of a map
+// after him with Dogmeat chewing on its leg. Once a second a chaser looks for a foe at least
+// RT_RETARGET_GAIN tiles nearer than its target and within RT_RETARGET_NEAR, that it can see (or is
+// touching) and reach, and turns on it. Not while its target is the one that hurt it since its last
+// turn (vanilla's ai_danger_source puts whoHitMe first), and not a shooter that can already hit its
+// target from where it stands. Hostiles pick from the dude's side, companions from the hostiles.
+#define RT_RETARGET_GAIN 3
+#define RT_RETARGET_NEAR 6
+
+static void rt_retarget_nearer(RtActor* a, Object* npc)
+{
+    Object* current = a->target;
+    if (current == NULL) {
+        return;
+    }
+    int currentDist = obj_dist(npc, current);
+    if (currentDist <= RT_RETARGET_GAIN) {
+        return;
+    }
+    if (npc->data.critter.combat.whoHitMe == current && npc->data.critter.combat.damageLastTurn > 0) {
+        return; // revenge holds
+    }
+    int mode = rt_hit_mode(npc);
+    int range = item_w_range(npc, mode);
+    if (range > 1 && currentDist <= range && !rt_shot_blocked(npc, current, mode)) {
+        return; // a shooter with a clear shot keeps it
+    }
+
+    Object* nearer = a->friendly ? rt_nearest_hostile(npc) : (a->hostile ? rt_nearest_player_side(npc) : NULL);
+    if (nearer == NULL || nearer == current) {
+        return;
+    }
+    int dist = obj_dist(npc, nearer);
+    if (dist > RT_RETARGET_NEAR || dist + RT_RETARGET_GAIN > currentDist) {
+        return;
+    }
+    if (dist > 1 && !is_within_perception(npc, nearer)) {
+        return;
+    }
+    if (!rt_can_reach_or_shoot(npc, nearer)) {
+        return;
+    }
+
+    trace_event(TRACE_FLOW, "retarget", "id=%d pid=%d was=%d now=%d nowPid=%d why=nearer wasDist=%d dist=%d t=%.2f",
+        npc->id, npc->pid, current->id, nearer->id, nearer->pid, currentDist, dist, rt_clock);
+    a->target = nearer;
+    a->plan_valid = false;
+    a->no_path_since = -1.0f;
+    a->unperceived_since = -1.0f;
+    a->route_plugged = false;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -10619,6 +10673,12 @@ static void rt_update_actor(RtActor* a, float dt)
         // starts a take-out animation the anim_busy guard holds movement until it
         // finishes, so the NPC visibly draws, then advances.
         rt_ensure_weapon_drawn(a);
+
+        // A much nearer foe than the one it is after (rt_retarget_nearer), looked for once a second.
+        if (rt_tactical_ai && rt_clock >= a->retarget_check_at) {
+            a->retarget_check_at = rt_clock + 1.0f;
+            rt_retarget_nearer(a, npc);
+        }
 
         {
             // Close to the PREFERRED engagement distance before opening fire (capped at the
