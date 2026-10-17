@@ -13062,6 +13062,11 @@ bool combat_rt_can_aim()
     return rt_window_target() != NULL;
 }
 
+bool combat_rt_weapon_can_aim()
+{
+    return obj_dude != NULL && rt_is_combatant(obj_dude) && item_w_called_shot(obj_dude, rt_player_hit_mode());
+}
+
 Object* combat_rt_aim_target()
 {
     if (obj_dude == NULL || !rt_is_combatant(obj_dude)) {

@@ -4762,7 +4762,12 @@ static int called_shot_index_for(int hitLocation)
 
 static int get_called_shot_location(Object* critter, int* hit_location, int hit_mode, int initialLocation)
 {
-    call_target = critter;
+    // ⚠️ NO TARGET IS ALLOWED (2026-10-17, "R3 by mělo fungovat i mimo, prostě si předpřipravit
+    // aim"): the window is then for BINDING a part ahead of the fight. The picture and the part names
+    // are the dude's own (a human figure, human names); the to-hit column stays empty, because there
+    // is nobody to have a chance against.
+    Object* shown = critter != NULL ? critter : obj_dude;
+    call_target = shown;
 
     // The gamepad's floating hand lives in an always-on-top window and showed straight through this
     // one ("ruka na loot byla skrz to vidět") -- take it down before the window paints, the same rule
@@ -4799,7 +4804,7 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
     buf_to_buf(data, CALLED_SHOT_WINDOW_WIDTH, CALLED_SHOT_WINDOW_HEIGHT, CALLED_SHOT_WINDOW_WIDTH, windowBuffer, CALLED_SHOT_WINDOW_WIDTH);
     art_ptr_unlock(handle);
 
-    fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_CALLED_SHOT_PIC, 0, 0);
+    fid = art_id(OBJ_TYPE_CRITTER, shown->fid & 0xFFF, ANIM_CALLED_SHOT_PIC, 0, 0);
     data = art_ptr_lock_data(fid, 0, 0, &handle);
     if (data != NULL) {
         buf_to_buf(data, 170, 225, 170, windowBuffer + CALLED_SHOT_WINDOW_WIDTH * 31 + 128, CALLED_SHOT_WINDOW_WIDTH);
@@ -4852,8 +4857,10 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         char* hit_location_name;
         int hit_location_name_width;
 
-        probability = determine_to_hit(obj_dude, critter, hit_loc_left[index], hit_mode);
-        print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 33, CALLED_SHOT_WINDOW_WIDTH, probability);
+        if (critter != NULL) {
+            probability = determine_to_hit(obj_dude, critter, hit_loc_left[index], hit_mode);
+            print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 33, CALLED_SHOT_WINDOW_WIDTH, probability);
+        }
 
         btn = win_register_button(call_win,
             33,
@@ -4871,10 +4878,12 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
         win_register_button_func(btn, draw_loc_on, draw_loc_off, NULL, NULL);
         draw_loc_off(btn, index);
 
-        probability = determine_to_hit(obj_dude, critter, hit_loc_right[index], hit_mode);
-        print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 373, CALLED_SHOT_WINDOW_WIDTH, probability);
+        if (critter != NULL) {
+            probability = determine_to_hit(obj_dude, critter, hit_loc_right[index], hit_mode);
+            print_tohit(windowBuffer + CALLED_SHOT_WINDOW_WIDTH * (call_ty[index] - 86) + 373, CALLED_SHOT_WINDOW_WIDTH, probability);
+        }
 
-        hit_location_name = combat_get_loc_name(critter, hit_loc_right[index]);
+        hit_location_name = combat_get_loc_name(shown, hit_loc_right[index]);
         if (hit_location_name != NULL) {
             hit_location_name_width = text_width(hit_location_name);
         } else {
@@ -4992,10 +5001,11 @@ static int get_called_shot_location(Object* critter, int* hit_location, int hit_
 // reason picking a limb has never cost the player a beating.
 int combat_called_shot_pick(Object* critter, int hitMode, int initialLocation)
 {
-    if (critter == NULL) {
+    if (obj_dude == NULL) {
         return -1;
     }
 
+    // critter may be NULL: the window then only binds a part ahead (see get_called_shot_location).
     int hitLocation = HIT_LOCATION_TORSO;
     if (get_called_shot_location(critter, &hitLocation, hitMode, initialLocation) == -1) {
         return -1;

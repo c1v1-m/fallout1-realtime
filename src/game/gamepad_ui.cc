@@ -7591,7 +7591,11 @@ static void gpui_aim_wheel(SDL_GameController* pad)
     // nothing else (its release, gpui_button_shortcuts), and the lock is LT's hold alone.
     // R3: open the called-shot window on the click, or refuse audibly.
     if (r3Edge) {
-        bool blocked = uiBlocked || !combat_rt_can_aim();
+        // ⚠️ A TARGET IS NOT NEEDED (2026-10-17, "R3 by mělo fungovat i mimo, prostě si
+        // předpřipravit aim"): with nobody in reach the window opens anyway, on a stand-in figure and
+        // without chances, and binds the part for the shots to come. What still refuses is the WEAPON
+        // -- Fast Shot, a burst, a flamer (combat_rt_aim_refusal names which).
+        bool blocked = uiBlocked || !combat_rt_weapon_can_aim();
         if (blocked) {
             // ⚠️ THE REFUSAL IS A SOUND, NOT A SENTENCE. It used to print the reason into the
             // message window, because refusing in silence is indistinguishable from a dead button.
@@ -7629,10 +7633,8 @@ static void gpui_aim_wheel(SDL_GameController* pad)
             // in the tree but is now unreachable -- ⚠️ DO NOT DELETE IT without asking him: those
             // masks are his own work, painted in Aseprite over several rounds, and "change it
             // completely" was about which UI opens, not about burning that.
-            Object* aimTarget = combat_rt_aim_target();
-            int part = aimTarget != NULL
-                ? combat_called_shot_pick(aimTarget, combat_rt_player_hit_mode(), gpui_aim_last_part)
-                : -1;
+            Object* aimTarget = combat_rt_aim_target(); // NULL = nobody in reach: bind ahead
+            int part = combat_called_shot_pick(aimTarget, combat_rt_player_hit_mode(), gpui_aim_last_part);
             trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d", part,
                 aimTarget != NULL ? aimTarget->pid : -1);
             if (part >= 0) {
@@ -8106,14 +8108,15 @@ static void gpui_drain_requests()
         if (target == NULL) {
             target = combat_rt_aim_target();
         }
-        bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_can_aim();
-        if (blocked || target == NULL) {
-            const char* why = blocked ? combat_rt_aim_refusal() : "no-target";
+        // No target is fine here too: the window then binds a part ahead (see the pad's R3).
+        bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled() || !combat_rt_weapon_can_aim();
+        if (blocked) {
+            const char* why = combat_rt_aim_refusal();
             gsound_play_sfx_file("iisxxxx1");
             trace_event(TRACE_INPUT, "aim-refused", "why=%s src=key", why != NULL ? why : "?");
         } else {
             int part = combat_called_shot_pick(target, combat_rt_player_hit_mode(), gpui_aim_last_part);
-            trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d src=key", part, target->pid);
+            trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d src=key", part, target != NULL ? target->pid : -1);
             if (part >= 0) {
                 gpui_aim_last_part = part;
                 bool aimed = intface_item_set_aiming();

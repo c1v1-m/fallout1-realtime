@@ -141,6 +141,9 @@ bool combat_rt_dude_rest_offset(int* x, int* y);
 // weapon supports called shots, and there is a target (the lock-on, else the nearest
 // hostile in range). The gamepad layer gates the body-part wheel on this.
 bool combat_rt_can_aim();
+// The weapon side of combat_rt_can_aim only: the dude can make a called shot with what he holds,
+// target or not. R3 / V open the called-shot window on this, to bind a part ahead of the fight.
+bool combat_rt_weapon_can_aim();
 
 // The critter an aimed shot would currently hit (the lock-on target, else the nearest
 // hostile in range), or NULL. The gamepad layer uses it to show the target's body in the
