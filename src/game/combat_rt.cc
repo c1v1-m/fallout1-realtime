@@ -542,6 +542,15 @@ typedef struct RtActor {
     bool fleeing;      // rt_flee_step owns it: it pays for its legs the way the DUDE pays (no reserve)
     bool flee_blocked; // ran its pool dry: stands, like the dude's rt_move_blocked, until resume_ap
     bool wipe_pending; // entered its breather mid-step: wipe its forehead once the body is free
+    // A CROWD MAKES ROOM (rt_room_wait / rt_room_make). Waiter side: whom it asked, since when, the
+    // last frame it asked, and how long it walks around instead after a refusal or a timeout.
+    // Fighter side: the waiter it owes room to, and how long it keeps off the spot it gave up.
+    Object* room_from;
+    float room_asked_at;
+    float room_last_ask;
+    float room_refused_until;
+    Object* room_for;
+    float room_yield_until;
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -1223,6 +1232,9 @@ static bool rt_mouse_hold_walk = true;
 // retaliation AND the script learning who fired (scr_set_objs source NULL), because a Junktown guard's
 // own damage_p_proc raises the town alarm (GVAR 247) and changes team when source_obj is the dude.
 static bool rt_forgive_stray = true;
+
+// MODS "Crowds make room" (cfg crowd_make_room). Default ON: his call, 2026-10-17. See rt_room_wait.
+static bool rt_crowd_make_room = true;
 
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
 // prostě vypnout to s tou zbraní, ať se mě neptají při tom konfliktu? zabiju assassina a ještě se jim
@@ -4955,6 +4967,11 @@ static void rt_step_toward(Object* mover, Object* target)
         return; // adjacent to target or immediately blocked -- nothing to move this frame
     }
 
+    // An idle STAND -- the breather's forehead wipe, a vanilla fidget -- is cut here: it owes
+    // nobody anything, and left running it makes check_registry refuse the leg (see
+    // rt_advance_to_target, where it cost a ghoul 0.9 s).
+    anim_end_lone_stand(mover);
+
     // ⚠️ DEFER_STAND: this leg is one of many, and the FSM registers the next one the frame this one
     // ends. Standing the body in between flashed the STAND pose and restarted the stride from frame 0
     // every four tiles (anim_defer_stand in anim.cc holds it in stride instead).
@@ -6009,6 +6026,15 @@ static bool rt_advance_to_target(Object* npc, Object* target)
     // Movement spends the engine combat.ap per tile while the warm bit is set; top it
     // up (movement is free in combat_rt's model) so the hop isn't truncated short.
     npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS);
+
+    // ⚠️ THE FOREHEAD WIPE OUTLASTED THE BREATHER (2026-10-17, ghouls in Necropolis). rt_wipe_forehead
+    // registers a lone ANIM_STAND, which anim_busy does not count -- so the FSM runs while it plays --
+    // but check_registry does: every move asked for during it was refused. The wipe is 1.8 s long and
+    // the breather that started it was over after 1.3 s, so id=1981 spent the rest asking for a route
+    // EVERY FRAME (55 `move-fail no-path` in trace_2026-10-17_154822 s=16.75-17.66), and each of them
+    // fed the unreachable give-up -- a wipe past RT_NO_PATH_GIVEUP_SECONDS would have dropped it out
+    // of the fight. The breather has decided it may go; the gesture ends here.
+    anim_end_lone_stand(npc);
 
     if (!rt_register_begin(ANIMATION_REQUEST_RESERVED | ANIMATION_REQUEST_DEFER_STAND, "reposition")) {
         return true; // table full, not a routing failure -- don't count it against the target
@@ -8674,6 +8700,12 @@ static void rt_refresh_registry()
             a->fleeing = prev->fleeing;
             a->flee_blocked = prev->flee_blocked;
             a->wipe_pending = prev->wipe_pending;
+            a->room_from = prev->room_from;
+            a->room_asked_at = prev->room_asked_at;
+            a->room_last_ask = prev->room_last_ask;
+            a->room_refused_until = prev->room_refused_until;
+            a->room_for = prev->room_for;
+            a->room_yield_until = prev->room_yield_until;
             prevHostile = prev->hostile;
         } else {
             a->state = RT_IDLE;
@@ -8704,6 +8736,12 @@ static void rt_refresh_registry()
             a->fleeing = false;
             a->flee_blocked = false;
             a->wipe_pending = false;
+            a->room_from = NULL;
+            a->room_asked_at = -1.0f;
+            a->room_last_ask = -1.0f;
+            a->room_refused_until = 0.0f;
+            a->room_for = NULL;
+            a->room_yield_until = 0.0f;
             a->run_winded = false;
             a->breather = false;
             a->breather_since = -1.0f;
@@ -8921,6 +8959,261 @@ static void rt_refresh_registry()
 }
 
 // Advances one NPC's state machine for this frame.
+// --- A CROWD MAKES ROOM -------------------------------------------------------------------------
+//
+// ⚠️ 2026-10-17, his request: *"když mě npc obklíčí, co kdyby si po útoku npc pohnulo, aby se ke mně
+// ostatní dostali rychleji"*. In trace_2026-10-17_154822 (Necropolis, five ghouls, open street) four
+// of them stood round him within five seconds and the fifth, id=1981, struck six seconds later than
+// the rest: the one spot it was making for went to another ghoul, and the way round the pack to the
+// two spots still open on the far side was four tiles at a ghoul's shuffle (plus a breather on the
+// way). He picked both halves and "for everyone" (companions too):
+//
+//   * SLIDE: the fighter in the waiter's way has a free spot beside the target next to it -> it
+//     moves there. It stays beside the target, so it loses no attack, and its old spot -- the one
+//     the waiter is standing behind -- opens.
+//   * STEP BACK: no such spot (a doorway, a wall, a full ring) -> a fighter with LESS AP than the
+//     waiter steps back one tile, and the fresher ally takes its place. The tired one then keeps off
+//     that spot for RT_ROOM_YIELD_SECONDS (or it walks straight back in) and goes round instead.
+//
+// ⚠️ THIS IS NOT THE RING-SLOT CHASE THAT WAS REVERTED. Two earlier crowd rules are on record in the
+// CHASE mover below: a "hold and wait" (id=1756 stood still six seconds) and "go for an open slot on
+// the ring, else orbit" (96% of hostile time spent NOT attacking). Both moved the CHASERS. Here a
+// chaser's movement is unchanged unless it asks, and the only one that moves is a fighter that has
+// just struck and CANNOT strike again this instant (its cooldown or its pool) -- it spends a beat it
+// would have spent standing. A waiter holds at most RT_ROOM_WAIT_SECONDS, then walks round the old
+// way; a waiter with an open spot right beside it (RT_ROOM_SHORT_DETOUR) never asks at all, and a
+// fighter that can do neither turns the ask down on its next beat, so the waiter walks round at once.
+//
+// Trace: `room-ask`, `room-timeout`, `room-make how=slide|step-back|none`.
+#define RT_ROOM_WAIT_SECONDS 3.0f
+#define RT_ROOM_SHORT_DETOUR 1
+#define RT_ROOM_YIELD_SECONDS 2.0f
+#define RT_ROOM_REFUSED_SECONDS 4.0f
+
+static RtActor* rt_actor_of(Object* obj)
+{
+    if (obj == NULL) {
+        return NULL;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == obj) {
+            return &rt_actors[i];
+        }
+    }
+    return NULL;
+}
+
+// The waiter stops asking (it got in, walked off, or gave up).
+static void rt_room_reset_wait(RtActor* w)
+{
+    w->room_from = NULL;
+    w->room_asked_at = -1.0f;
+    w->room_last_ask = -1.0f;
+}
+
+// The nearest free tile beside the target for the mover, as a hex distance from fromTile; -1 if the
+// ring is full. A tile_num_in_direction that hits the map edge comes back as the target's own tile,
+// which is skipped.
+static int rt_room_nearest_free(Object* mover, Object* target, int fromTile)
+{
+    int best = -1;
+    for (int d = 0; d < ROTATION_COUNT; d++) {
+        int t = tile_num_in_direction(target->tile, d, 1);
+        if (t == target->tile || t == mover->tile) {
+            continue;
+        }
+        if (obj_blocking_at(mover, t, target->elevation) != NULL) {
+            continue;
+        }
+        int dist = tile_dist(fromTile, t);
+        if (best == -1 || dist < best) {
+            best = dist;
+        }
+    }
+    return best;
+}
+
+// One walked tile, standing at the end (it attacks from there, or waits there).
+static bool rt_room_move(Object* npc, int dest, const char* why)
+{
+    anim_end_lone_stand(npc); // the wipe, a fidget -- see rt_advance_to_target
+    // The engine's per-tile combat.ap, as every other mover tops it up (combat_rt's own pool pays).
+    npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS);
+    if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, why)) {
+        return false;
+    }
+    anim_reset_last_path();
+    int rc = register_object_move_to_tile(npc, dest, npc->elevation, 1, 0);
+    register_end();
+    return rc == 0 && anim_last_path_steps(npc) != 0;
+}
+
+// WAITER side, from the CHASE mover when its straight step is blocked by a critter. True = hold
+// this frame: the fighter in the way has been asked and owes it room (rt_room_make).
+static bool rt_room_wait(RtActor* w, Object* npc, Object* blocker, int engage)
+{
+    if (!rt_crowd_make_room || engage != 1 || w->fleeing || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false; // a shooter fires from where it stands; nobody need move for it
+    }
+
+    Object* target = w->target;
+    if (target == NULL || obj_dist(npc, target) != 2 || rt_clock < w->room_refused_until) {
+        rt_room_reset_wait(w);
+        return false;
+    }
+
+    // An open spot right beside it: just step in, as before.
+    int near = rt_room_nearest_free(npc, target, npc->tile);
+    if (near != -1 && near <= RT_ROOM_SHORT_DETOUR) {
+        rt_room_reset_wait(w);
+        return false;
+    }
+
+    // The one in the way must be a teammate fighting the same target from beside it.
+    RtActor* a = rt_actor_of(blocker);
+    if (a == NULL || a->state != RT_ATTACK || a->target != target || a->fleeing
+        || (blocker->flags & OBJECT_MULTIHEX) != 0
+        || blocker->data.critter.combat.team != npc->data.critter.combat.team
+        || obj_dist(blocker, target) != 1) {
+        rt_room_reset_wait(w);
+        return false;
+    }
+
+    // Already walking off -- it made room a moment ago, and a fighter in RT_ATTACK walks for nothing
+    // else: hold quietly until its tile frees, without asking it again.
+    int blockerAnim = FID_ANIM_TYPE(blocker->fid);
+    bool onItsWay = anim_busy(blocker) != 0 && (blockerAnim == ANIM_WALK || blockerAnim == ANIM_RUNNING);
+
+    // A new ask -- another fighter, or the first frame after it stopped asking -- starts the clock.
+    if (w->room_from != blocker || w->room_last_ask < 0.0f || rt_clock - w->room_last_ask > 0.25f) {
+        w->room_from = blocker;
+        w->room_asked_at = rt_clock;
+        if (!onItsWay) {
+            trace_event(TRACE_FLOW, "room-ask", "id=%d pid=%d of=%d tile=%d tgt=%d free=%d ap=%d t=%.2f",
+                npc->id, npc->pid, blocker->id, npc->tile, target->tile, near, w->ap, rt_clock);
+        }
+    } else if (rt_clock - w->room_asked_at >= RT_ROOM_WAIT_SECONDS) {
+        trace_event(TRACE_FLOW, "room-timeout", "id=%d pid=%d of=%d held=%.2f t=%.2f",
+            npc->id, npc->pid, blocker->id, rt_clock - w->room_asked_at, rt_clock);
+        w->room_refused_until = rt_clock + RT_ROOM_REFUSED_SECONDS;
+        rt_room_reset_wait(w);
+        if (a->room_for == npc) {
+            a->room_for = NULL;
+        }
+        return false; // walk round after all
+    }
+
+    w->room_last_ask = rt_clock;
+    if (!onItsWay) {
+        a->room_for = npc;
+    }
+    return true;
+}
+
+// FIGHTER side, from RT_ATTACK on a free body. True = it moved (this beat is spent).
+static bool rt_room_make(RtActor* a, Object* npc, int hitMode)
+{
+    Object* waiter = a->room_for;
+    if (waiter == NULL) {
+        return false;
+    }
+    if (!rt_crowd_make_room || !rt_in_registry(waiter)) {
+        a->room_for = NULL;
+        return false;
+    }
+
+    // Still asking, still behind it, still for the same target? The waiter re-asks every frame it
+    // holds, so a stale ask is one it has stopped making.
+    RtActor* w = rt_actor_of(waiter);
+    Object* target = a->target;
+    if (w == NULL || w->room_from != npc || w->room_last_ask < 0.0f || rt_clock - w->room_last_ask > 0.25f
+        || w->state != RT_CHASE || w->target != target || target == NULL
+        || obj_dist(waiter, target) != 2 || obj_dist(npc, waiter) != 1 || obj_dist(npc, target) != 1) {
+        a->room_for = NULL;
+        return false;
+    }
+
+    // AFTER striking: a fighter that can strike right now strikes, and makes room on its next beat.
+    int cost = rt_ap_cost(npc, hitMode);
+    if (a->ap >= cost && !rt_attack_on_cooldown(npc)) {
+        return false;
+    }
+
+    const char* how = "none";
+    int dest = -1;
+
+    if (!rt_can_walk(npc) || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        how = "none";
+    } else {
+        // SLIDE: a free spot beside the target, next to this fighter -- the farther from the waiter
+        // the better, so the waiter is not left facing the new spot instead of the old one.
+        int bestDist = -1;
+        for (int d = 0; d < ROTATION_COUNT; d++) {
+            int t = tile_num_in_direction(target->tile, d, 1);
+            if (t == target->tile || t == npc->tile || tile_dist(npc->tile, t) != 1) {
+                continue;
+            }
+            if (obj_blocking_at(npc, t, npc->elevation) != NULL) {
+                continue;
+            }
+            int dw = tile_dist(waiter->tile, t);
+            if (dw > bestDist) {
+                bestDist = dw;
+                dest = t;
+            }
+        }
+        if (dest != -1) {
+            how = "slide";
+        } else {
+            // STEP BACK: only for a FRESHER ally -- swapping a tired fighter for a tired one gains
+            // nothing. One tile out, two from the target, never onto the waiter; toward the nearest
+            // open spot on the ring when there is one, so its own way round is the short one.
+            int waiterCost = rt_ap_cost(waiter, rt_hit_mode(waiter));
+            if (w->ap >= waiterCost && w->ap > a->ap) {
+                int bestScore = 0;
+                for (int d = 0; d < ROTATION_COUNT; d++) {
+                    int t = tile_num_in_direction(npc->tile, d, 1);
+                    if (t == npc->tile || t == waiter->tile || t == target->tile
+                        || tile_dist(t, target->tile) != 2) {
+                        continue;
+                    }
+                    if (obj_blocking_at(npc, t, npc->elevation) != NULL) {
+                        continue;
+                    }
+                    int toOpen = rt_room_nearest_free(npc, target, t);
+                    int score = (toOpen == -1 ? 50 : toOpen) * 10 - tile_dist(waiter->tile, t);
+                    if (dest == -1 || score < bestScore) {
+                        bestScore = score;
+                        dest = t;
+                    }
+                }
+                if (dest != -1) {
+                    how = "step-back";
+                }
+            } else {
+                how = "not-fresher"; // a tired one for a tired one gains nothing: it walks round now
+            }
+        }
+    }
+
+    int from = npc->tile;
+    bool moved = dest != -1 && rt_room_move(npc, dest, how);
+    trace_event(TRACE_FLOW, "room-make", "id=%d pid=%d for=%d how=%s from=%d to=%d moved=%d ap=%d wap=%d t=%.2f",
+        npc->id, npc->pid, waiter->id, how, from, dest, moved ? 1 : 0, a->ap, w->ap, rt_clock);
+
+    a->room_for = NULL;
+    rt_room_reset_wait(w);
+    if (!moved) {
+        // Nowhere to go: the waiter walks round now instead of holding out its full wait.
+        w->room_refused_until = rt_clock + RT_ROOM_REFUSED_SECONDS;
+        return false;
+    }
+    if (dest != -1 && tile_dist(dest, target->tile) > 1) {
+        a->room_yield_until = rt_clock + RT_ROOM_YIELD_SECONDS;
+    }
+    return true;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -9983,6 +10276,9 @@ static void rt_update_actor(RtActor* a, float dt)
                     a->follow_retry_at = rt_clock + 1.0f;
                 }
                 a->no_path_since = -1.0f;
+            } else if (rt_clock < a->room_yield_until) {
+                // It just stepped back to let a fresher ally in (rt_room_make). Walking now would
+                // take it straight back onto the spot it gave up, before the ally gets there.
             } else {
                 // While the in-combat bit is set, anim.cc deducts the mover's engine
                 // combat.ap per tile and truncates the move at ap <= 0. That field is
@@ -10057,6 +10353,13 @@ static void rt_update_actor(RtActor* a, float dt)
                     // Pathing around is at least a behaviour that ends in an attack, so it stands
                     // until the CHASE diagnostic below explains why actors sit in CHASE at all --
                     // guessing at the movement layer three times running is how this got worse.
+                    // A CROWD MAKES ROOM: a fellow fighter in the way, and no open spot close by --
+                    // ask it to move after its strike, and hold for that instead of a long way
+                    // round (rt_room_wait). Holding is not failing to route.
+                    if (FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER && rt_room_wait(a, npc, blocker, engage)) {
+                        a->no_path_since = -1.0f;
+                        break;
+                    }
                     rt_note_chase_move(a, npc, 3, blocker != NULL ? blocker->pid : -1, stepDest);
                     rt_note_path_result(a, rt_advance_to_target(npc, a->target));
                 } else {
@@ -10145,6 +10448,12 @@ static void rt_update_actor(RtActor* a, float dt)
         // (playerEligible) has no reaction gate and can freely hit a critter that's getting up.
         // rt_is_cancelable_reaction is true only for the flinch/dodge, so it draws the line where
         // the comment above always claimed it was.
+        //
+        // A CROWD MAKES ROOM first: a waiting teammate asked this fighter to move (rt_room_wait),
+        // and it does so only on a beat in which it could not strike anyway (rt_room_make).
+        if (rt_room_make(a, npc, hitMode)) {
+            break;
+        }
         if (rt_is_cancelable_reaction(a->target)) {
             break;
         }
@@ -10539,6 +10848,11 @@ void combat_rt_init()
     int forgiveStray = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FORGIVE_STRAY_KEY, &forgiveStray);
     rt_forgive_stray = forgiveStray != 0;
+
+    // A crowd makes room (MODS "Crowds make room"). Default ON: his call, 2026-10-17. See rt_room_wait.
+    int crowdRoom = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CROWD_MAKE_ROOM_KEY, &crowdRoom);
+    rt_crowd_make_room = crowdRoom != 0;
 
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
     // Default ON since the release (his setting).
@@ -14494,6 +14808,16 @@ void combat_rt_set_forgive_stray(bool enabled)
 bool combat_rt_get_forgive_stray()
 {
     return rt_forgive_stray;
+}
+
+void combat_rt_set_crowd_make_room(bool enabled)
+{
+    rt_crowd_make_room = enabled;
+}
+
+bool combat_rt_get_crowd_make_room()
+{
+    return rt_crowd_make_room;
 }
 
 // A critter that is IN the fight -- chasing, attacking, or pulled in as hostile -- while one is on.

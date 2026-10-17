@@ -84,6 +84,9 @@ namespace fallout {
 // attacks it, right holds a lock in a fight and uses things outside one. 0 = vanilla click-to-walk.
 #define GAME_CONFIG_MOUSE_HOLD_WALK_KEY "mouse_hold_walk"
 #define GAME_CONFIG_FORGIVE_STRAY_KEY "forgive_stray_hits"
+// A fighter that just struck slides aside or steps back for a waiting teammate (combat_rt.cc,
+// rt_room_wait). 1 = on (his call, 2026-10-17), 0 = whoever stands in front keeps the spot.
+#define GAME_CONFIG_CROWD_MAKE_ROOM_KEY "crowd_make_room"
 // FREE MOVEMENT: the body is integrated from a velocity and obj->tile is re-anchored to whichever
 // cell it has moved into, instead of the body following a chain of whole tile steps. The engine
 // goes on reading obj->tile, which never stops being a real walkable tile, so nothing else in the

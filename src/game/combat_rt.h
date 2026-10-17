@@ -111,6 +111,8 @@ void combat_rt_set_mouse_hold_walk(bool enabled);
 bool combat_rt_get_mouse_hold_walk();
 void combat_rt_set_forgive_stray(bool enabled);
 bool combat_rt_get_forgive_stray();
+void combat_rt_set_crowd_make_room(bool enabled);
+bool combat_rt_get_crowd_make_room();
 bool combat_rt_weapon_amnesty();
 bool combat_rt_critter_fighting(Object* critter);
 bool combat_rt_fm_foreign_touch();
