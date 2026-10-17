@@ -626,6 +626,7 @@ static const PipboyControl ctrl4_lines[] = {
     { "R", "Reload" },
     { "T", "Quick slot LB: throw the grenade" },
     { "H", "Quick slot RB: stimpack" },
+    { "P", "Set-timer window: set it and put it down" },
     { "B", "Swap active hand" },
     { NULL, NULL },
     { NULL, "AROUND YOU" },

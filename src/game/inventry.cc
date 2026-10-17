@@ -6887,6 +6887,38 @@ void draw_amount(int value, int inventoryWindowType)
 
 static bool mt_pad_arm = true;
 
+// ⚠️ A PRESSES WHAT THE CURSOR IS ON, once the cursor has been moved (2026-10-17, "neplacnulo se to").
+// A was hard-wired to DONE here, and that edge fires a frame BEFORE the button under the cursor gets
+// its click (the click's own frame returns that button's code or a mouse event, so this function is
+// not even asked then). All three of his tries in trace_2026-10-17_150325 ended "a down / a up": the
+// stick had walked the cursor onto PLACE and A still set the timer with DONE. With the cursor where it
+// was when the window opened, A stays the quick DONE it always was; once he has moved it onto a
+// button, A leaves the press to that button -- PLACE, DONE, CANCEL, + or -.
+static int mt_window_type = -1;
+static int mt_open_mx = -1;
+static int mt_open_my = -1;
+
+static bool mt_cursor_on_button()
+{
+    if (mt_wid == -1) {
+        return false;
+    }
+    bool timer = mt_window_type == INVENTORY_WINDOW_TYPE_SET_TIMER;
+    int px = timer ? 194 : 200;
+    int py = timer ? 64 : 46;
+    if (mouseHitTestInWindow(mt_wid, px, py, px + 16 - 1, py + 24 - 1)) {
+        return true; // + and - stacked
+    }
+    if (mouseHitTestInWindow(mt_wid, 98, 128, 98 + 15 - 1, 128 + 16 - 1)
+        || mouseHitTestInWindow(mt_wid, 148, 128, 148 + 15 - 1, 128 + 16 - 1)) {
+        return true; // DONE, CANCEL
+    }
+    if (timer) {
+        return mouseHitTestInWindow(mt_wid, 120, 86, 120 + MT_PLACE_W - 1, 86 + MT_PLACE_H - 1); // PLACE
+    }
+    return mouseHitTestInWindow(mt_wid, 120, 80, 120 + 94 - 1, 80 + 33 - 1); // ALL
+}
+
 // Re-arm the picker's gamepad edge detection so a button still held from whatever opened
 // the picker (e.g. LT+A in barter) doesn't instantly fire on the first frame.
 static void move_timer_gamepad_reset()
@@ -6934,13 +6966,19 @@ static int move_timer_gamepad_keycode()
         prevInc = incNow;
         prevDec = decNow;
         mt_pad_arm = false;
+        mouse_get_position(&mt_open_mx, &mt_open_my);
         return -1;
     }
 
     int keyCode = -1;
     Uint32 now = SDL_GetTicks();
     if (aNow && !prevA) {
-        keyCode = KEY_RETURN;
+        int mx;
+        int my;
+        mouse_get_position(&mx, &my);
+        bool moved = mx != mt_open_mx || my != mt_open_my;
+        // On a button the click itself presses it (see mt_open_mx); anywhere else A is DONE.
+        keyCode = moved && mt_cursor_on_button() ? -1 : KEY_RETURN;
     } else if (bNow && !prevB) {
         keyCode = KEY_ESCAPE;
     } else if (yNow && !prevY) {
@@ -6967,6 +7005,7 @@ static int move_timer_gamepad_keycode()
 // 0x469458
 static int do_move_timer(int inventoryWindowType, Object* item, int max)
 {
+    mt_window_type = inventoryWindowType;
     setup_move_timer_win(inventoryWindowType, item);
     move_timer_gamepad_reset();
     mt_place_requested = false;
@@ -7002,6 +7041,10 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
             return -1;
         }
 
+        // P = PLACE for the keyboard (the CONTROLS keyboard page lists it).
+        if (keyCode == KEY_LOWERCASE_P || keyCode == KEY_UPPERCASE_P) {
+            keyCode = MT_KEY_PLACE;
+        }
         bool place = keyCode == MT_KEY_PLACE && inventoryWindowType == INVENTORY_WINDOW_TYPE_SET_TIMER;
         if (keyCode == KEY_RETURN || place) {
             if (value >= min && value <= max) {
