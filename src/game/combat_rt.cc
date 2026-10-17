@@ -9564,6 +9564,59 @@ static bool rt_reload_cover(RtActor* a, Object* npc, int hitMode)
     return moved;
 }
 
+// --- COMBAT AI: THE LAST KNOWN POSITION (2026-10-17, MODS "Tactical AI") -------------------------
+//
+// A chaser that stops perceiving anyone to fight keeps after its target for RT_STOP_GRACE_SECONDS
+// and then disengages -- and used to forget the whole fight on the spot. Now a HOSTILE that
+// disengages that way walks (searching, not charging) to the tile where it last perceived its
+// target, then turns this way and that until RT_SEARCH_SECONDS are up. The IDLE branch's own
+// re-aggro runs every frame of it, so the moment it sees you again it is back in the chase.
+// Companions never search -- their IDLE is following the dude.
+#define RT_SEARCH_SECONDS 10.0f
+
+static void rt_search_tick(RtActor* a, Object* npc)
+{
+    if (a->search_tile < 0) {
+        return;
+    }
+    if (!rt_tactical_ai || rt_clock >= a->search_until || !rt_can_walk(npc)) {
+        trace_event(TRACE_FLOW, "search-end", "id=%d pid=%d tile=%d t=%.2f", npc->id, npc->pid, npc->tile, rt_clock);
+        a->search_tile = -1;
+        return;
+    }
+    if (anim_busy(npc) != 0) {
+        return;
+    }
+
+    if (tile_dist(npc->tile, a->search_tile) > 1) {
+        npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+        if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "search")) {
+            return;
+        }
+        anim_reset_last_path();
+        // Three tiles a leg: the AI does not run while a body animates, and a searcher that walked
+        // the whole way in one go would stroll straight past you before it could notice.
+        int rc = register_object_move_to_tile(npc, a->search_tile, npc->elevation, 3, 0);
+        register_end();
+        if (rc != 0 || anim_last_path_steps(npc) == 0) {
+            // No way there (bodies, a door it cannot open): it looks from where it stands.
+            trace_event(TRACE_FLOW, "search-blocked", "id=%d pid=%d tile=%d want=%d t=%.2f",
+                npc->id, npc->pid, npc->tile, a->search_tile, rt_clock);
+            a->search_tile = npc->tile;
+        }
+        return;
+    }
+
+    // There: look around.
+    a->search_tile = npc->tile;
+    if (rt_clock >= a->search_look_at) {
+        static const int steps[4] = { -2, -1, 1, 2 };
+        int rotation = (npc->rotation + steps[roll_random(0, 3)] + ROTATION_COUNT) % ROTATION_COUNT;
+        rt_look_set_rotation(npc, rotation);
+        a->search_look_at = rt_clock + 0.8f + roll_random(0, 6) * 0.1f;
+    }
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -9939,6 +9992,10 @@ static void rt_update_actor(RtActor* a, float dt)
                 }
             } else {
                 a->unperceived_since = -1.0f;
+                // Still in sight: this is where it would go and look if it lost it (rt_search_tick).
+                if (a->target != NULL && a->target->elevation == npc->elevation) {
+                    a->last_seen_tile = a->target->tile;
+                }
             }
         }
 
@@ -9948,6 +10005,15 @@ static void rt_update_actor(RtActor* a, float dt)
                 npc->id, npc->pid, npc->tile,
                 rt_is_combatant(a->target) ? obj_dist(npc, a->target) : -1, rt_clock);
             giveUp = true;
+            // Lost it, not beaten it: go and look where it was last seen (rt_search_tick).
+            if (rt_tactical_ai && a->hostile && !a->friendly && a->last_seen_tile >= 0
+                && tile_dist(npc->tile, a->last_seen_tile) > 1) {
+                a->search_tile = a->last_seen_tile;
+                a->search_until = rt_clock + RT_SEARCH_SECONDS;
+                a->search_look_at = 0.0f;
+                trace_event(TRACE_FLOW, "search-start", "id=%d pid=%d tile=%d to=%d t=%.2f",
+                    npc->id, npc->pid, npc->tile, a->search_tile, rt_clock);
+            }
         }
 
         if (giveUp) {
@@ -10449,6 +10515,13 @@ static void rt_update_actor(RtActor* a, float dt)
                     a->unreachable_tile = npc->tile;
                     a->unreachable_until = rt_clock + RT_UNREACHABLE_RETRY_SECONDS;
                 }
+            }
+
+            // Nobody in sight to take up again: look where the target was last seen (rt_search_tick).
+            if (a->state == RT_IDLE) {
+                rt_search_tick(a, npc);
+            } else {
+                a->search_tile = -1;
             }
         } else if (a->friendly) {
             // Follower: pick the nearest of the dude's enemies and engage it. The same
