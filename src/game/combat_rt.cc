@@ -9631,16 +9631,35 @@ static void rt_search_tick(RtActor* a, Object* npc)
     }
 
     if (tile_dist(npc->tile, a->search_tile) > 1) {
-        npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
-        if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "search")) {
-            return;
-        }
-        anim_reset_last_path();
         // Three tiles a leg: the AI does not run while a body animates, and a searcher that walked
         // the whole way in one go would stroll straight past you before it could notice.
-        int rc = register_object_move_to_tile(npc, a->search_tile, npc->elevation, 3, 0);
-        register_end();
-        if (rc != 0 || anim_last_path_steps(npc) == 0) {
+        //
+        // ⚠️ THE LEG IS CUT HERE, NOT BY THE MOVE'S AP ARGUMENT: anim_move_to_tile honours that only
+        // when the destination tile is blocked (vanilla), and out of combat no AP drain stops a
+        // walk either. trace_2026-10-17_234728: id=3263 searched along a 126-step route in one go,
+        // 12 s of walking with its eyes shut (the FSM waits out anim_busy), past RT_SEARCH_SECONDS.
+        // (a5 = 0: someone standing on the spot itself does not cancel the search.)
+        unsigned char rotations[800];
+        int steps = make_path(npc, npc->tile, a->search_tile, rotations, 0);
+        bool moved = false;
+        if (steps > 0) {
+            int leg = a->search_tile;
+            if (steps > 3) {
+                leg = npc->tile;
+                for (int i = 0; i < 3; i++) {
+                    leg = tile_num_in_direction(leg, rotations[i], 1);
+                }
+            }
+            npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+            if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "search")) {
+                return;
+            }
+            anim_reset_last_path();
+            int rc = register_object_move_to_tile(npc, leg, npc->elevation, -1, 0);
+            register_end();
+            moved = rc == 0 && anim_last_path_steps(npc) != 0;
+        }
+        if (!moved) {
             // No way there (bodies, a door it cannot open): it looks from where it stands.
             trace_event(TRACE_FLOW, "search-blocked", "id=%d pid=%d tile=%d want=%d t=%.2f",
                 npc->id, npc->pid, npc->tile, a->search_tile, rt_clock);
@@ -10423,6 +10442,16 @@ static void rt_update_actor(RtActor* a, float dt)
         // stepping behind a doorframe doesn't disengage half the map for one frame.
         if (!giveUp && rt_clock >= a->stop_check_at) {
             a->stop_check_at = rt_clock + RT_STOP_CHECK_SECONDS;
+            // ⚠️ ONE THAT NEVER SAW YOU STILL KNOWS WHERE THE FIGHT WAS (2026-10-17, "schoval jsem se
+            // za zeď a voni se deaggrovali"). Guards called in by an alarm (guard-join: saw-teammate)
+            // can chase without ever passing the sight test -- vanilla sight is a FACING cone, and a
+            // super mutant guard (PE 4) walking round a wall at 16-21 tiles has its back to you, so
+            // it gets PE*2 = 8 tiles. trace_2026-10-17_234728: three of them joined at s=105.2, never
+            // perceived the dude once, disengaged at 108.2, and with no last_seen_tile none of them
+            // searched. The first check of a chase takes the target's tile instead.
+            if (a->last_seen_tile < 0 && a->target != NULL && a->target->elevation == npc->elevation) {
+                a->last_seen_tile = a->target->tile;
+            }
             if (rt_wants_to_stop(npc, a->target)) {
                 if (a->unperceived_since < 0.0f) {
                     a->unperceived_since = rt_clock;
@@ -10458,6 +10487,7 @@ static void rt_update_actor(RtActor* a, float dt)
             a->target = NULL;
             a->no_path_since = -1.0f;
             a->unperceived_since = -1.0f;
+            a->last_seen_tile = -1; // the search above took its copy; the next chase starts fresh
         } else if (rt_target_unreachable(a)) {
             // UNREACHABLE TARGET -- the third de-aggro condition, added once the trace proved
             // this was the frozen chaser's cause (3277 no-path failures, id=687 rooted on one
