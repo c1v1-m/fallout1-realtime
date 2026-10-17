@@ -13136,7 +13136,18 @@ void combat_rt_update(float dt)
         // Don't let action-frame / swing-done / connect commit before the swing has had time to play
         // (and its SFX to sound) -- that produced "shadow attacks" (damage + AP, no visible swing)
         // when the defender was already reacting or the swing read as done instantly. Cap still wins.
-        bool ready = elapsed >= RT_MIN_SWING_SECONDS;
+        //
+        // ⚠️ EXCEPT A GUN THAT HAS VISIBLY FIRED (2026-10-17, "střelba z brokovnice -- přišlo mi, že
+        // tam byl delay zásahu"). The floor guards against a commit with nothing on screen; a gun
+        // whose action frame was SEEN (actionSeen needs a real fire pose at its action frame) has
+        // already shown the shot and played its bang. In trace_2026-10-17_163624 every follow-up
+        // shotgun round -- the gun still raised, no ANIM_POINT -- began its fire pose at +0.01 s,
+        // reached the action frame at ~+0.07 s (4 frames x 64 ms, unauthored -> frame 1) and then
+        // sat on this floor until +0.30 s: a quarter of a second between the bang and the hit, on
+        // ~60% of his shots. The opening shot of a burst (raise 0.52 s, then fire) was already in
+        // sync -- the floor had run out during the raise. Melee and thrown keep the floor.
+        bool gunFired = actionReached && attackType == ATTACK_TYPE_RANGED;
+        bool ready = elapsed >= RT_MIN_SWING_SECONDS || gunFired;
         bool trigger = explosive ? landed : (swingDone || connected || actionReached || poseEnded);
         if ((trigger && ready) || capped) {
             // Settle lethality against the defender's hp as it is NOW, before anything downstream
