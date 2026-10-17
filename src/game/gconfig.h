@@ -91,6 +91,9 @@ namespace fallout {
 // reloading in cover, searching the last known position, taking a much nearer foe, minding allies in
 // the line of fire (combat_rt.cc, rt_tactical_ai). 1 = on (his call, 2026-10-17), 0 = vanilla rules only.
 #define GAME_CONFIG_TACTICAL_AI_KEY "tactical_ai"
+// The body part the weapon slot's AIMED mode fires at (gamepad_ui, gpui_aim_last_part): written
+// whenever a part is bound in the called-shot window, read back at start. HIT_LOCATION_* (0-7).
+#define GAME_CONFIG_AIM_PART_KEY "aim_part"
 // FREE MOVEMENT: the body is integrated from a velocity and obj->tile is re-anchored to whichever
 // cell it has moved into, instead of the body following a chain of whole tile steps. The engine
 // goes on reading obj->tile, which never stops being a real walkable tile, so nothing else in the

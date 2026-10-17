@@ -5397,6 +5397,30 @@ static void gpui_ammo_load(int index)
 // (tile_refresh_rect), which is exactly how the engine erases its own transient drawing.
 static int gpui_aim_last_part = HIT_LOCATION_HEAD; // part the slot's AIMED mode fires at
 
+// ⚠️ THE BOUND PART IS REMEMBERED (2026-10-17, "po každým spuštění mám aimed shots head, já mám
+// neustále eyes, ať si to prostě pamatuje"). It lived only in this variable, so every launch started
+// over on the head. Now every bind writes it to fallout.cfg on the spot (a crash must not lose it)
+// and gamepad_ui_init reads it back -- one choice for the player, whichever save is loaded.
+static void gpui_aim_part_store(int part)
+{
+    gpui_aim_last_part = part;
+    int saved = -1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AIM_PART_KEY, &saved);
+    if (saved != part) {
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AIM_PART_KEY, part);
+        gconfig_save();
+    }
+}
+
+static void gpui_aim_part_load()
+{
+    int part = HIT_LOCATION_HEAD;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_AIM_PART_KEY, &part);
+    if (part >= HIT_LOCATION_HEAD && part < HIT_LOCATION_UNCALLED) {
+        gpui_aim_last_part = part;
+    }
+}
+
 // The part bound in the LB called-shot window. combat_rt reads it for every attack made while the
 // weapon slot is on its AIMED mode (rt_player_called_loc).
 int gamepad_ui_aim_part()
@@ -7638,7 +7662,7 @@ static void gpui_aim_wheel(SDL_GameController* pad)
             trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d", part,
                 aimTarget != NULL ? aimTarget->pid : -1);
             if (part >= 0) {
-                gpui_aim_last_part = part;
+                gpui_aim_part_store(part);
                 // ...AND THE SLOT GOES TO ITS AIMED MODE (2026-10-09): binding a part means "aim
                 // there", so the next RT does, at the aimed price the slot now prints beside its
                 // bullseye. LT+Y steps back out of it. Still nothing is fired here.
@@ -8122,7 +8146,7 @@ static void gpui_drain_requests()
             int part = combat_called_shot_pick(target, combat_rt_player_hit_mode(), gpui_aim_last_part);
             trace_event(TRACE_INPUT, "aim-picker", "vanilla part=%d tgt=%d src=key", part, target != NULL ? target->pid : -1);
             if (part >= 0) {
-                gpui_aim_last_part = part;
+                gpui_aim_part_store(part);
                 bool aimed = intface_item_set_aiming();
                 trace_event(TRACE_INPUT, "aim-bind", "part=%d slot-aimed=%d", part, aimed ? 1 : 0);
                 gsound_play_sfx_file("ib1p1xx1");
@@ -8409,6 +8433,7 @@ static bool gpui_hide_cursor_predicate()
 
 void gamepad_ui_init()
 {
+    gpui_aim_part_load(); // the remembered aimed part (gpui_aim_part_store)
     // Cursor feel. Clamped so a bad cfg can't make the cursor immovable or uncontrollable, and the
     // deadzone is capped well below 1 so there is always a usable band left above it.
     double cursorSpeed = GPUI_CURSOR_MAX_SPEED;
