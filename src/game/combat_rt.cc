@@ -9671,6 +9671,99 @@ static void rt_retarget_nearer(RtActor* a, Object* npc)
     a->route_plugged = false;
 }
 
+// --- COMBAT AI: AN ALLY IN THE LINE OF FIRE (2026-10-17, MODS "Tactical AI") ---------------------
+//
+// Vanilla shoots straight through a friend -- combat_is_shot_blocked lets critters pass, and the
+// bullet hits the first one in the way. Now a shooter with a teammate between it and its target rolls
+// INT x 10 % (his pick: "aby to nedělali pořád"): a bright one steps up to two tiles to a spot with a
+// clean line, a dim one fires anyway and may well hit its friend, as vanilla would. Either way it does
+// not ask again for RT_FF_PAUSE_SECONDS. Guns only: a melee blow has no line, a grenade its own rules.
+#define RT_FF_PAUSE_SECONDS 3.0f
+
+// The first live teammate of the shooter on the straight line from fromTile to the target, or NULL
+// (the same walk combat_is_shot_blocked makes; a wall ends it -- that shot is refused anyway).
+static Object* rt_ally_in_line(Object* shooter, int fromTile, Object* target)
+{
+    Object* obstacle = shooter;
+    int from = fromTile;
+    for (int guard = 0; guard < 16 && obstacle != NULL && from != target->tile; guard++) {
+        make_straight_path(shooter, from, target->tile, NULL, &obstacle, 32);
+        if (obstacle == NULL || obstacle == target || FID_TYPE(obstacle->fid) != OBJ_TYPE_CRITTER) {
+            return NULL;
+        }
+        if (obstacle != shooter && !critter_is_dead(obstacle)
+            && obstacle->data.critter.combat.team == shooter->data.critter.combat.team) {
+            return obstacle;
+        }
+        from = obstacle->tile;
+    }
+    return NULL;
+}
+
+// True when it stepped aside (this beat is spent).
+static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
+{
+    if (rt_clock < a->ff_check_until || a->target == NULL) {
+        return false;
+    }
+    Object* weapon = item_hit_with(npc, attackMode);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON
+        || item_w_subtype(weapon, attackMode) != ATTACK_TYPE_RANGED) {
+        return false;
+    }
+    Object* target = a->target;
+    Object* ally = rt_ally_in_line(npc, npc->tile, target);
+    if (ally == NULL) {
+        return false;
+    }
+
+    a->ff_check_until = rt_clock + RT_FF_PAUSE_SECONDS;
+    int intelligence = stat_level(npc, STAT_INTELLIGENCE);
+    int roll = roll_random(1, 10);
+    bool careful = roll <= intelligence;
+
+    int dest = -1;
+    int destSteps = 0;
+    if (careful && rt_can_walk(npc) && (npc->flags & OBJECT_MULTIHEX) == 0) {
+        int range = item_w_range(npc, attackMode);
+        int tiles[24];
+        int count = rt_tiles_around(npc->tile, 2, tiles, 24);
+        for (int i = 1; i < count; i++) {
+            int t = tiles[i];
+            int dist = tile_dist(t, target->tile);
+            if (dist < 2 || dist > range || obj_blocking_at(npc, t, npc->elevation) != NULL) {
+                continue;
+            }
+            if (combat_is_shot_blocked(npc, t, target->tile, target, NULL) || rt_ally_in_line(npc, t, target) != NULL) {
+                continue;
+            }
+            int steps = make_path(npc, npc->tile, t, NULL, 1);
+            if (steps <= 0 || steps > 3) {
+                continue;
+            }
+            if (dest == -1 || steps < destSteps) {
+                dest = t;
+                destSteps = steps;
+            }
+        }
+    }
+
+    bool moved = false;
+    if (dest != -1) {
+        anim_end_lone_stand(npc);
+        npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+        if (rt_register_begin(ANIMATION_REQUEST_RESERVED, "ff-step")) {
+            anim_reset_last_path();
+            int rc = register_object_move_to_tile(npc, dest, npc->elevation, -1, 0);
+            register_end();
+            moved = rc == 0 && anim_last_path_steps(npc) != 0;
+        }
+    }
+    trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d int=%d roll=%d careful=%d to=%d moved=%d t=%.2f",
+        npc->id, npc->pid, ally->id, intelligence, roll, careful ? 1 : 0, dest, moved ? 1 : 0, rt_clock);
+    return moved;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -11021,6 +11114,17 @@ static void rt_update_actor(RtActor* a, float dt)
         // (back to CHASE, whose verdict keeps it walking), hopeless even point blank -> run away.
         if (rt_can_walk(npc)) {
             int verdict = rt_min_to_hit_verdict(a, npc, a->target, attackMode);
+            // A planned burst can be a poorer shot than the plain one CHASE judges by; sent back to
+            // CHASE it would be judged "in range" again and bounce between the two every frame. The
+            // plain shot instead, if THAT one is good enough.
+            if (verdict != RT_HIT_OK && attackMode != hitMode
+                && rt_min_to_hit_verdict(a, npc, a->target, hitMode) == RT_HIT_OK) {
+                attackMode = hitMode;
+                attackLoc = HIT_LOCATION_UNCALLED;
+                a->plan_mode = hitMode;
+                a->plan_loc = HIT_LOCATION_UNCALLED;
+                verdict = RT_HIT_OK;
+            }
             if (verdict == RT_HIT_HOPELESS) {
                 rt_run_away_hopeless(a, npc);
                 break;
@@ -11029,6 +11133,11 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->state = RT_CHASE;
                 break;
             }
+        }
+
+        // A teammate between it and its target (rt_ff_care): a bright shooter steps aside first.
+        if (rt_tactical_ai && rt_ff_care(a, npc, attackMode)) {
+            break;
         }
 
         // Record an attack intent if the pool can afford it; the arbiter decides
