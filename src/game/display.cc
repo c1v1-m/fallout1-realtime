@@ -196,6 +196,16 @@ void display_print(char* str)
         return;
     }
 
+    // ⚠️ WORK ON A COPY (2026-10-17, crash in trace_2026-10-17_205745: "write 0x7ff7f0e6aa33" from
+    // gpui_run_to_exit). The word wrap below cuts the text by writing '\0' into it and patches the
+    // space back afterwards -- fine on vanilla's message buffers, an access violation on a string
+    // literal, which is read-only memory. The exit run printed "Heading for the exit." straight from
+    // one, and a line too wide for the window took the game down the moment it wrapped. Copying here
+    // makes every caller safe, the literal ones included.
+    char local[1024];
+    snprintf(local, sizeof(local), "%s", str != NULL ? str : "");
+    str = local;
+
     int oldFont = text_curr();
     text_font(DISPLAY_MONITOR_FONT);
 
