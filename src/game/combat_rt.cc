@@ -330,6 +330,35 @@ typedef enum RtState {
     RT_ATTACK, // In range; attack whenever the AP pool can afford it.
 } RtState;
 
+// WHAT A FIGHTER IS TRYING TO DO (2026-10-18) -- step one of the intent layer ("jsem pro to, jestli
+// nám to pomůže udělat combat víc taktický"). For now it is only READ off the actor's existing state
+// each frame (rt_intent_update) and traced when it changes, [FLOW/intent], so one line says what a
+// critter wanted and why instead of twenty lines to piece it together from. NOTHING DECIDES FROM IT
+// YET -- the three states and their special cases still drive everything.
+typedef enum RtIntent {
+    RT_INTENT_NONE, // a bystander; never traced
+    RT_INTENT_WATCH, // hostile, nobody to fight in sight
+    RT_INTENT_FOLLOW, // a companion with nothing to fight
+    RT_INTENT_APPROACH, // closing in on its target
+    RT_INTENT_ATTACK, // in range and attacking
+    RT_INTENT_HOLD, // deliberately not advancing (squad, defend, breather)
+    RT_INTENT_REPOSITION, // stepping somewhere for a reason (make room, back off, cover, a clean line)
+    RT_INTENT_RELOAD,
+    RT_INTENT_HEAL,
+    RT_INTENT_DODGE,
+    RT_INTENT_FLEE,
+    RT_INTENT_SEARCH,
+    RT_INTENT_SCRIPT, // its script has the turn
+    RT_INTENT_DOWN, // falling, on the ground, getting up
+    RT_INTENT_DEAD,
+    RT_INTENT_COUNT,
+} RtIntent;
+
+static const char* const rt_intent_names[RT_INTENT_COUNT] = {
+    "none", "watch", "follow", "approach", "attack", "hold", "reposition", "reload", "heal", "dodge",
+    "flee", "search", "script", "down", "dead",
+};
+
 typedef struct RtActor {
     Object* obj;
     RtState state;
@@ -588,6 +617,13 @@ typedef struct RtActor {
     bool defend_covered;      // looked for cover when it started holding
     float defend_since;       // when it started holding (the standoff cap, RT_DEFEND_MAX)
     float backoff_next_at;    // a shooter's next step back from a close dude (rt_back_off)
+    int intent;               // RtIntent read off the state each frame (rt_intent_update) -- trace only
+    const char* intent_why;   // always a string literal
+    float intent_since;
+    float intent_logged_at;
+    int hint_intent;          // a tactical step just taken (rt_intent_hint), shown while the body acts it out
+    const char* hint_why;
+    float hint_until;
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -8839,6 +8875,13 @@ static void rt_refresh_registry()
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
             a->backoff_next_at = prev->backoff_next_at;
+            a->intent = prev->intent;
+            a->intent_why = prev->intent_why;
+            a->intent_since = prev->intent_since;
+            a->intent_logged_at = prev->intent_logged_at;
+            a->hint_intent = prev->hint_intent;
+            a->hint_why = prev->hint_why;
+            a->hint_until = prev->hint_until;
             a->hit_verdict = prev->hit_verdict;
             a->hit_verdict_at = prev->hit_verdict_at;
             a->hit_verdict_tgt = prev->hit_verdict_tgt;
@@ -8904,6 +8947,13 @@ static void rt_refresh_registry()
             a->defend_covered = false;
             a->defend_since = 0.0f;
             a->backoff_next_at = 0.0f;
+            a->intent = RT_INTENT_NONE;
+            a->intent_why = "";
+            a->intent_since = rt_clock;
+            a->intent_logged_at = -1.0f;
+            a->hint_intent = RT_INTENT_NONE;
+            a->hint_why = "";
+            a->hint_until = 0.0f;
             a->hit_verdict = 0;
             a->hit_verdict_at = 0.0f;
             a->hit_verdict_tgt = NULL;
@@ -10073,6 +10123,117 @@ static bool rt_back_off(RtActor* a, Object* npc, int attackMode)
     return false;
 }
 
+// --- THE INTENT, READ OFF THE STATE (2026-10-18, step one of the intent layer) --------------------
+//
+// A tactical step just taken (make room, back off, reload in cover, a clean line, a grenade jump, a
+// stimpak): shown as the intent while the body acts it out, for `seconds` at most.
+static void rt_intent_hint(RtActor* a, int intent, const char* why, float seconds)
+{
+    a->hint_intent = intent;
+    a->hint_why = why;
+    a->hint_until = rt_clock + seconds;
+}
+
+// Once a frame per actor, after its update: what is it trying to do, and why. Read-only apart from
+// the intent fields and the trace -- nothing reads `intent` back to decide anything (yet). Ordered as
+// vanilla's turn is: whatever has the body first, then the script, flight, then the fight itself.
+//
+// [FLOW/intent] on every change of intent, and on a change of reason within one intent once the old
+// reason has had its second -- so a reason that flaps every frame is visible without flooding.
+static void rt_intent_update(RtActor* a)
+{
+    Object* npc = a->obj;
+    if (npc == NULL) {
+        return;
+    }
+
+    int intent = RT_INTENT_NONE;
+    const char* why = "";
+    bool busy = anim_busy(npc) != 0;
+    if (critter_is_dead(npc)) {
+        intent = RT_INTENT_DEAD;
+        why = "dead";
+    } else if (combat_rt_in_heavy_reaction(npc) || critter_is_prone(npc)) {
+        intent = RT_INTENT_DOWN;
+        why = critter_is_prone(npc) ? "on-the-ground" : "falling";
+    } else if (a->fleeing) {
+        intent = RT_INTENT_FLEE;
+        why = a->flee_blocked ? "out-of-ap" : "fleeing";
+    } else if (a->script_hold_until > rt_clock) {
+        intent = RT_INTENT_SCRIPT;
+        why = "script-turn";
+    } else if (a->dodge_at >= 0.0f) {
+        intent = RT_INTENT_DODGE;
+        why = "grenade-seen";
+    } else if (combat_rt_is_reloading(npc)) {
+        intent = RT_INTENT_RELOAD;
+        why = "reload";
+    } else if (rt_clock < a->hint_until && busy) {
+        intent = a->hint_intent;
+        why = a->hint_why;
+    } else if (a->state == RT_ATTACK) {
+        intent = RT_INTENT_ATTACK;
+        why = a->plan_valid && a->plan_loc != HIT_LOCATION_UNCALLED ? "called-shot" : "in-range";
+    } else if (a->state == RT_CHASE) {
+        if (a->squad_hold_start >= 0.0f) {
+            intent = RT_INTENT_HOLD;
+            why = "wait-for-squad";
+        } else if (a->defend_covered && !a->defend_provoked && rt_is_defensive(a, npc)) {
+            intent = RT_INTENT_HOLD;
+            why = "defend";
+        } else if (a->breather) {
+            intent = RT_INTENT_HOLD;
+            why = "winded";
+        } else if (rt_clock < a->room_yield_until) {
+            intent = RT_INTENT_REPOSITION;
+            why = "made-room";
+        } else {
+            intent = RT_INTENT_APPROACH;
+            if (a->route_plugged) {
+                why = "route-plugged";
+            } else if (rt_clock < a->detour_until) {
+                why = "detour";
+            } else if (a->hit_verdict == RT_HIT_CLOSER) {
+                why = "to-hit-too-low";
+            } else {
+                why = "closing";
+            }
+        }
+    } else if (a->search_tile >= 0) {
+        intent = RT_INTENT_SEARCH;
+        why = "last-seen";
+    } else if (a->friendly) {
+        intent = RT_INTENT_FOLLOW;
+        why = "party";
+    } else if (a->hostile) {
+        intent = RT_INTENT_WATCH;
+        if (rt_clock < a->unreachable_until) {
+            why = "unreachable";
+        } else if ((npc->data.critter.combat.maneuver & CRITTER_MANEUVER_DISENGAGING) != 0) {
+            why = "out-of-fight";
+        } else {
+            why = "no-one-seen";
+        }
+    }
+
+    bool changed = intent != a->intent;
+    bool reason = !changed && strcmp(why, a->intent_why) != 0 && rt_clock - a->intent_logged_at >= 1.0f;
+    if (!changed && !reason) {
+        return;
+    }
+    Object* tgt = a->target;
+    trace_event(TRACE_FLOW, "intent", "id=%d pid=%d %s->%s why=%s was=%s held=%.1f tgt=%d dist=%d ap=%d t=%.2f",
+        npc->id, npc->pid, rt_intent_names[a->intent], rt_intent_names[intent], why, a->intent_why,
+        rt_clock - a->intent_since, tgt != NULL ? tgt->id : 0, tgt != NULL ? obj_dist(npc, tgt) : -1,
+        a->ap, rt_clock);
+    if (changed) {
+        a->intent_since = rt_clock;
+    }
+    a->intent = intent;
+    a->intent_why = why;
+    a->intent_logged_at = rt_clock;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -10841,6 +11002,7 @@ static void rt_update_actor(RtActor* a, float dt)
     // Returning here consumes the beat, exactly like the reload branch inside RT_ATTACK: the
     // animation it just registered will hold anim_busy next frame anyway.
     if (a->state != RT_IDLE && rt_try_medic(a, npc)) {
+        rt_intent_hint(a, RT_INTENT_HEAL, "medic", 3.0f);
         return;
     }
 
@@ -11389,6 +11551,7 @@ static void rt_update_actor(RtActor* a, float dt)
             if (rt_tactical_ai && !a->reload_cover_tried && weapon != NULL && rt_npc_has_ammo_for(npc, weapon)) {
                 a->reload_cover_tried = true;
                 if (rt_reload_cover(a, npc, hitMode)) {
+                    rt_intent_hint(a, RT_INTENT_REPOSITION, "reload-cover", 3.0f);
                     break;
                 }
             }
@@ -11447,6 +11610,7 @@ static void rt_update_actor(RtActor* a, float dt)
         // A CROWD MAKES ROOM first: a waiting teammate asked this fighter to move (rt_room_wait),
         // and it does so only on a beat in which it could not strike anyway (rt_room_make).
         if (rt_room_make(a, npc, hitMode)) {
+            rt_intent_hint(a, RT_INTENT_REPOSITION, "make-room", 2.0f);
             break;
         }
         if (rt_is_cancelable_reaction(a->target)) {
@@ -11492,11 +11656,13 @@ static void rt_update_actor(RtActor* a, float dt)
 
         // A shooter the foe has walked up to steps back now and then (rt_back_off).
         if (rt_tactical_ai && rt_back_off(a, npc, attackMode)) {
+            rt_intent_hint(a, RT_INTENT_REPOSITION, "back-off", 2.0f);
             break;
         }
 
         // A teammate between it and its target (rt_ff_care): a bright shooter steps aside first.
         if (rt_tactical_ai && rt_ff_care(a, npc, attackMode)) {
+            rt_intent_hint(a, RT_INTENT_REPOSITION, "clean-line", 2.0f);
             break;
         }
 
@@ -14104,6 +14270,7 @@ static void rt_grenade_dodge_tick()
         if (a->dodge_at >= 0.0f && rt_clock >= a->dodge_at) {
             a->dodge_at = -1.0f;
             rt_do_dodge(a, a->obj);
+            rt_intent_hint(a, RT_INTENT_DODGE, "jump-clear", 2.0f);
         }
     }
 }
@@ -14591,6 +14758,9 @@ void combat_rt_update(float dt)
 
     for (int i = 0; i < rt_actor_count; i++) {
         rt_update_actor(&rt_actors[i], dt);
+        if (i < rt_actor_count) {
+            rt_intent_update(&rt_actors[i]); // trace only; see RtIntent
+        }
     }
 
     // The dude must NEVER be left unable to act. Unlike an NPC -- which stays unconscious until
@@ -16029,7 +16199,7 @@ void combat_rt_trace_snapshot()
         Object* tgt = a->target;
         trace_event(TRACE_STATE, "critter",
             "id=%d pid=%d tile=%d x=%d y=%d fid=%08x anim=%d frame=%d flat=%d hid=%d dead=%d prone=%d busy=%d rx=%s "
-            "st=%d host=%d frnd=%d tgt=%d dist=%d ap=%d",
+            "st=%d host=%d frnd=%d tgt=%d dist=%d ap=%d int=%s",
             o->id, o->pid, o->tile, o->x, o->y, o->fid,
             FID_ANIM_TYPE(o->fid), o->frame,
             (o->flags & OBJECT_FLAT) != 0 ? 1 : 0,
@@ -16038,7 +16208,7 @@ void combat_rt_trace_snapshot()
             rt_react_name(rt_reaction_kind(o)),
             a->state, a->hostile ? 1 : 0, a->friendly ? 1 : 0,
             tgt != NULL ? tgt->id : 0,
-            tgt != NULL ? obj_dist(o, tgt) : -1, a->ap);
+            tgt != NULL ? obj_dist(o, tgt) : -1, a->ap, rt_intent_names[a->intent]);
     }
 }
 
