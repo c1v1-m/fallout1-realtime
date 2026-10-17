@@ -578,6 +578,9 @@ typedef struct RtActor {
     float retarget_check_at; // next look for a much nearer enemy (rt_retarget_nearer)
     float ff_check_until; // friendly-fire care: no new roll before this (rt_ff_care)
     int attack_loc; // the intent's hit location (HIT_LOCATION_UNCALLED unless a called shot)
+    // It is following a route round a wall (or round what blocks its shot): until this, the straight
+    // step does not take it back. See RT_DETOUR_COMMIT_SECONDS.
+    float detour_until;
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -5171,6 +5174,16 @@ static void rt_reposition(Object* npc, Object* target)
 // toward the give-up above -- see route_plugged in the CHASE mover).
 #define RT_ROUTE_PLUGGED_RETRY_SECONDS 0.5f
 
+// ⚠️ A DETOUR ROUND A WALL IS FOLLOWED THROUGH (2026-10-17, "raiders mají problémy odejít ze stanu").
+// A shooter inside a tent stood in range of the dude with the tent wall between them: the blocked
+// shot sent it round by the pathfinder (mover 2), the route to the door led AWAY from him, out of
+// its engagement distance -- where the plain straight step (mover 1) took over and walked it right
+// back to the wall, in range and blocked again. trace_2026-10-17_205745: id=546 going 17097 <->
+// 17698 for half a minute, 14 FLOW/oscillate in one fight, never out of the tent. Once a route round
+// something STATIC is taken, the straight step stays off for this long after each leg of it, so the
+// route is walked to its end. Bodies in the way do not arm it (the crowd rules handle those).
+#define RT_DETOUR_COMMIT_SECONDS 2.5f
+
 // Records the outcome of a routing attempt on the actor. Success clears the timer; the first
 // failure stamps it. rt_target_unreachable() then decides when to let go.
 static void rt_note_path_result(RtActor* a, bool routed)
@@ -8812,6 +8825,7 @@ static void rt_refresh_registry()
             a->room_for = prev->room_for;
             a->room_yield_until = prev->room_yield_until;
             a->route_plugged = prev->route_plugged;
+            a->detour_until = prev->detour_until;
             a->hit_verdict = prev->hit_verdict;
             a->hit_verdict_at = prev->hit_verdict_at;
             a->hit_verdict_tgt = prev->hit_verdict_tgt;
@@ -8870,6 +8884,7 @@ static void rt_refresh_registry()
             a->room_for = NULL;
             a->room_yield_until = 0.0f;
             a->route_plugged = false;
+            a->detour_until = 0.0f;
             a->hit_verdict = 0;
             a->hit_verdict_at = 0.0f;
             a->hit_verdict_tgt = NULL;
@@ -10841,6 +10856,7 @@ static void rt_update_actor(RtActor* a, float dt)
 
             if (attackNow) {
                 a->state = RT_ATTACK;
+                a->detour_until = 0.0f;
             } else if (a->breather) {
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
                 // place it does anything, and what it suppresses is MOVEMENT ONLY.
@@ -10873,8 +10889,12 @@ static void rt_update_actor(RtActor* a, float dt)
                 //
                 // So: try to reposition at most once a second, never arm the give-up from here, and
                 // otherwise hold -- the RT_ATTACK test above re-checks the line every frame.
-                if (rt_clock >= a->follow_retry_at && !rt_advance_to_target(npc, a->target)) {
-                    a->follow_retry_at = rt_clock + 1.0f;
+                if (rt_clock >= a->follow_retry_at) {
+                    if (rt_advance_to_target(npc, a->target)) {
+                        a->detour_until = rt_clock + RT_DETOUR_COMMIT_SECONDS; // walk it through
+                    } else {
+                        a->follow_retry_at = rt_clock + 1.0f;
+                    }
                 }
                 a->no_path_since = -1.0f;
             } else if (rt_clock < a->room_yield_until) {
@@ -10922,7 +10942,9 @@ static void rt_update_actor(RtActor* a, float dt)
                     }
                 }
 
-                if (blocker != NULL) {
+                // A route round a wall taken a moment ago is walked through first (RT_DETOUR_COMMIT_SECONDS).
+                bool detouring = blocker == NULL && rt_clock < a->detour_until;
+                if (blocker != NULL || detouring) {
                     // WHAT is in the way decides what to do about it. A wall or a crate is
                     // permanent -- route around it. ANOTHER CRITTER pressing on the same target
                     // is not: routing around a body that is itself moving produced the crowd
@@ -10957,7 +10979,7 @@ static void rt_update_actor(RtActor* a, float dt)
                     // A CROWD MAKES ROOM: a fellow fighter in the way, and no open spot close by --
                     // ask it to move after its strike, and hold for that instead of a long way
                     // round (rt_room_wait). Holding is not failing to route.
-                    if (FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER && rt_room_wait(a, npc, blocker, engage)) {
+                    if (blocker != NULL && FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER && rt_room_wait(a, npc, blocker, engage)) {
                         a->no_path_since = -1.0f;
                         break;
                     }
@@ -10988,6 +11010,10 @@ static void rt_update_actor(RtActor* a, float dt)
                     } else {
                         a->route_plugged = false;
                         rt_note_path_result(a, routed);
+                    }
+                    // Round a wall or scenery (not a body): follow the route through.
+                    if (routed && (blocker == NULL || FID_TYPE(blocker->fid) != OBJ_TYPE_CRITTER)) {
+                        a->detour_until = rt_clock + RT_DETOUR_COMMIT_SECONDS;
                     }
                 } else {
                     a->route_plugged = false;
