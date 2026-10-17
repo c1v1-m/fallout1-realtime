@@ -74,6 +74,16 @@ static Object* ip_target = NULL;   // interactable currently highlighted (re-der
 #define IP_RECENT_LOOT_PENALTY 3
 static Object* ip_recent_loot = NULL;
 static unsigned int ip_recent_loot_at = 0;
+
+// ⚠️ A LOCKED DOOR IS USED FIRST, PICKED SECOND (2026-10-17, his pick, after the Mariposa entrance:
+// he had the code from the Mutant Transmissions tape, and A on the door kept rolling a -60 lockpick
+// instead of using it -- the door's use_p_proc is what enters the code). So the first A on a locked
+// door USES it, as a click always did in vanilla: a code, a password, any script gets its say, or the
+// door just says it is locked. If it is still locked after that try, the prompt turns to the pick
+// and the next A picks it. Doors only -- a locked chest has no script to ask and keeps the pick.
+#define IP_DOOR_TRIED_MS 120000
+static Object* ip_door_tried = NULL;
+static unsigned int ip_door_tried_at = 0;
 static Object* ip_pending = NULL;  // queued by the A hook, performed from the tick
 static int ip_pending_kind = IP_NONE;
 
@@ -410,7 +420,14 @@ static int ip_build_actions(Object* obj, int* out)
     // lock may already be open (a script, a key, someone else's pick) while obj_is_locked lags, and
     // rattling a locked door is at least honest feedback. Same for a locked chest.
     if (def == IP_LOCKPICK) {
-        out[n++] = FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY ? IP_USE : IP_LOOT_CONTAINER;
+        bool door = FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY;
+        bool tried = obj == ip_door_tried && get_time() - ip_door_tried_at < IP_DOOR_TRIED_MS;
+        if (door && !tried) {
+            out[0] = IP_USE; // used first (ip_door_tried); the pick one tap away
+            out[n++] = IP_LOCKPICK;
+        } else {
+            out[n++] = door ? IP_USE : IP_LOOT_CONTAINER;
+        }
     }
 
     // PUSH PAST YOUR OWN FOLLOWER -- the Fallout 2 move, which F1 only ever had through mods.
@@ -1304,6 +1321,11 @@ void interact_prompt_tick()
         if (kind == IP_LOOT_CORPSE || kind == IP_LOOT_CONTAINER) {
             ip_recent_loot = obj;
             ip_recent_loot_at = get_time();
+        }
+        // A locked door has been tried with USE: if it stays locked, the next A picks it.
+        if (kind == IP_USE && FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY && ip_classify(obj) == IP_LOCKPICK) {
+            ip_door_tried = obj;
+            ip_door_tried_at = get_time();
         }
         return;
     }
