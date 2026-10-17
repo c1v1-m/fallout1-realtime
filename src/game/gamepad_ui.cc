@@ -2027,7 +2027,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // is taken on the press as before; a throwable bound to it is drawn on the press and thrown on the
     // release, like LB's.
     if (rbPressed && !radial_wheel_is_open() && !inven_any_open()) {
-        trace_event(TRACE_INPUT, "heal-press", "src=rb");
+        trace_event(TRACE_INPUT, "quick-slot-press", "src=rb");
         gpui_qs_press(GPUI_QS_RB, false);
     }
     if (rbReleased) {
@@ -3758,7 +3758,12 @@ static Object* gpui_quick_slot_item(int slot, int* count)
             return bound;
         }
     }
-    if (slot == GPUI_QS_LB) {
+    // ⚠️ RB = GRENADES, LB = STIMPAK (2026-10-17, "lb a rb prohoď, rb bude pro granáty a lb stimpack").
+    // Swapped from the first layout (LB grenade, RB heal). Only the slots' OWN picks changed: the button
+    // mechanics already follow what is in the slot -- a throwable is drawn on the press (LB: on the
+    // hold) and thrown on the release, a drug is taken (RB: on the press, LB: on the release of a hold,
+    // since a tap of LB is still the reload). A binding made in the inventory overrides either pick.
+    if (slot == GPUI_QS_RB) {
         Object* item = gpui_best_throwable();
         if (item != NULL) {
             *count = inven_pid_quantity_carried(obj_dude, item->pid);
@@ -8180,21 +8185,22 @@ bool gamepad_ui_handle_key(int* keyCode)
     case KEY_LOWERCASE_H:
     case KEY_UPPERCASE_H:
     case KEY_ALT_H:
-        // The RB quick slot (its own pick is the best heal). A throwable bound to it is drawn and
-        // thrown in one go: the keyboard reports no release.
+        // H = the heal: the LB quick slot since the swap (its own pick is the best heal). A throwable
+        // bound to it is drawn and thrown in one go: the keyboard reports no release.
         if (!radial_wheel_is_open() && !inven_any_open()) {
             trace_event(TRACE_INPUT, "heal-press", "src=key");
-            gpui_qs_press(GPUI_QS_RB, true);
+            gpui_qs_press(GPUI_QS_LB, true);
         }
         return true;
     case KEY_LOWERCASE_T:
     case KEY_UPPERCASE_T:
     case KEY_CTRL_T:
     case KEY_ALT_T:
-        // The LB quick slot: draw and throw in one go (or take the drug bound to it).
+        // T = the grenade: the RB quick slot since the swap. Drawn and thrown in one go (or the drug
+        // bound to it taken).
         if (!radial_wheel_is_open() && !inven_any_open()) {
             trace_event(TRACE_INPUT, "kbm-key", "key=T");
-            gpui_qs_press(GPUI_QS_LB, true);
+            gpui_qs_press(GPUI_QS_RB, true);
         }
         return true;
     case KEY_LOWERCASE_R:
@@ -8245,7 +8251,7 @@ void gamepad_ui_inventory_tick()
     }
     int count;
     Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
-    intface_update_heal_slot(item, count);
+    intface_update_heal_slot(item, count, gpui_qs_drawn(GPUI_QS_RB));
     item = gpui_quick_slot_item(GPUI_QS_LB, &count);
     intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
 }
@@ -8267,7 +8273,7 @@ void gamepad_ui_tick()
         {
             int count;
             Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
-            intface_update_heal_slot(item, count);
+            intface_update_heal_slot(item, count, gpui_qs_drawn(GPUI_QS_RB));
             item = gpui_quick_slot_item(GPUI_QS_LB, &count);
             intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
         }
@@ -8305,7 +8311,7 @@ void gamepad_ui_tick()
     {
         int count;
         Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
-        intface_update_heal_slot(item, count);
+        intface_update_heal_slot(item, count, gpui_qs_drawn(GPUI_QS_RB));
         item = gpui_quick_slot_item(GPUI_QS_LB, &count);
         intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
     }

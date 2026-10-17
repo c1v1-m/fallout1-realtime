@@ -55,7 +55,7 @@ void intface_update_ac(bool animate);
 void intface_update_move_points(int actionPoints, int bonusMove);
 
 // Realtime heal slot (the RB stimpak indicator) -- see the block above intface_redraw.
-void intface_update_heal_slot(Object* item, int count);
+void intface_update_heal_slot(Object* item, int count, bool armed = false);
 void intface_invalidate_heal_slot();
 // The LB quick slot, in the strip LEFT of the bar (gamepad_ui "QUICK SLOTS"); armed = the item is
 // drawn and waiting for the release. No strip (a 640-wide screen) = nothing is drawn.

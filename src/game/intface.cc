@@ -1390,7 +1390,7 @@ void intface_update_quick_slot_lb(Object* item, int count, bool armed)
         scale_art(item_inv_fid(item), base + pitch * 4 + 4, HEAL_SLOT_W - 8, iconH, pitch);
     }
 
-    const char* label = pad ? "LB" : "T";
+    const char* label = pad ? "LB" : "H"; // the heal since the LB/RB swap (2026-10-17)
     int labelY = 4 + iconH;
     int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
     text_to_buf(base + pitch * labelY + labelX, (char*)label, pitch, pitch,
@@ -1408,7 +1408,7 @@ void intface_update_quick_slot_lb(Object* item, int count, bool armed)
     win_draw_rect(sideArtLeftWindow, &rect);
 }
 
-void intface_update_heal_slot(Object* item, int count)
+void intface_update_heal_slot(Object* item, int count, bool armed)
 {
     // Turn-based still owns the end-turn box (it is where END TURN / END COMBAT appear), so stay off.
     if (interfaceWindow == -1 || !combat_rt_enabled()) {
@@ -1419,6 +1419,9 @@ void intface_update_heal_slot(Object* item, int count)
     // change test, so plugging a pad in or out repaints it.
     static int heal_slot_pad = -1;
     int pad = gamepad_ui_get_controller() != NULL ? 1 : 0;
+    // ...and whether its grenade is drawn: red label, as the LB slot does (RB holds the grenades since
+    // the 2026-10-17 swap). Folded into the same change key.
+    pad += armed ? 2 : 0;
     int pid = item != NULL ? item->pid : -1;
     if (pid == heal_slot_pid && count == heal_slot_count && pad == heal_slot_pad) {
         return;
@@ -1461,10 +1464,11 @@ void intface_update_heal_slot(Object* item, int count)
     // The binding, then the count -- same reading order as the weapon slot's mode label above
     // its ammo counter. Yellow for the label, green for a usable count, red for empty, matching
     // the colours the rest of the bar already uses for those three meanings.
-    const char* label = pad ? "RB" : "H";
+    const char* label = (pad & 1) ? "RB" : "T"; // the grenade since the LB/RB swap (2026-10-17)
     int labelY = 4 + iconH;
     int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
-    text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch, colorTable[32747]);
+    text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch,
+        armed ? colorTable[31744] : colorTable[32747]);
 
     char countText[8];
     snprintf(countText, sizeof(countText), "%d", count);
