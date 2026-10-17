@@ -3843,6 +3843,14 @@ static RtReaction* rt_reaction_find(Object* obj)
     return NULL;
 }
 
+bool combat_rt_in_heavy_reaction(Object* critter)
+{
+    RtReaction* r = rt_reaction_find(critter);
+    return r != NULL
+        && (r->kind == RT_REACT_FALLING || r->kind == RT_REACT_PRONE
+            || r->kind == RT_REACT_STANDING || r->kind == RT_REACT_DYING);
+}
+
 // Find, or take a free slot. Returns NULL only when the table is genuinely full, which is traced --
 // silently dropping a reaction is how a body gets forgotten on the ground.
 static RtReaction* rt_reaction_slot(Object* obj)

@@ -336,6 +336,9 @@ bool combat_rt_is_reloading(Object* critter);
 void combat_rt_inject_begin(Object* critter);
 void combat_rt_inject_end(Object* critter);
 bool combat_rt_is_injecting(Object* critter);
+// A body in a knockdown or a death -- falling, lying, getting up, dying (the reaction layer's view).
+// An enemy's trigger pull must not cut it (action_attack); only the commit decides what a new hit does.
+bool combat_rt_in_heavy_reaction(Object* critter);
 
 // Empty a critter's realtime pool. The realtime stand-in for vanilla's "lose your turn" critical
 // failure: there are no turns, so the cost is paid as points plus the wait for them to come back.

@@ -799,8 +799,16 @@ int action_attack(Attack* attack)
     // rule since: only a hit that makes you FLINCH (through-damage >= flinch_dt_factor x DT) or a
     // knockdown ends a reload, and both are decided at the commit, where the damage is known.
     // ...and so does a stimpak jab (2026-10-16): the stagger, not the trigger pull, ends it.
+    // ⚠️ ...AND A KNOCKED-DOWN DEFENDER KEEPS GETTING UP (2026-10-17, "deathclaw spadl k zemi a
+    // zaútočil na mě"). The standup is not a prioritized sequence, so this clear ended it at the
+    // trigger pull: trace_2026-10-17_203334, the deathclaw shot down (s=13.43) began its standup at
+    // s=15.37, his next shot went off at 15.90 -- and at 15.92, its body suddenly free, its AI sent it
+    // running at him straight from the ground pose. The same holds for the fall and a death. Which of
+    // them a new hit may cut is the reaction layer's call at the commit (rt_reaction_heavy), never
+    // the trigger pull's.
     bool keepDefenderReload = combat_rt_enabled()
-        && (combat_rt_is_reloading(attack->defender) || combat_rt_is_injecting(attack->defender));
+        && (combat_rt_is_reloading(attack->defender) || combat_rt_is_injecting(attack->defender)
+            || combat_rt_in_heavy_reaction(attack->defender));
     if (!keepDefenderReload && register_clear(attack->defender) == -2) {
         // The defender is in a PRIORITIZED sequence -- almost always its OWN attack swing.
         // Turn-based can't reach here (you can't be attacked mid-swing), but realtime can, and
@@ -836,7 +844,8 @@ int action_attack(Attack* attack)
     for (int index = 0; index < attack->extrasLength; index++) {
         // Same rule for a body caught in the burst: its reload is only a hit's to end, at the commit.
         if (combat_rt_enabled()
-            && (combat_rt_is_reloading(attack->extras[index]) || combat_rt_is_injecting(attack->extras[index]))) {
+            && (combat_rt_is_reloading(attack->extras[index]) || combat_rt_is_injecting(attack->extras[index])
+                || combat_rt_in_heavy_reaction(attack->extras[index]))) {
             continue;
         }
         if (register_clear(attack->extras[index]) == -2) {
