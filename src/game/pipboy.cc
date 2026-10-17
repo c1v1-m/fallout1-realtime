@@ -455,6 +455,7 @@ static PipboyRenderProc* PipFnctn[5] = {
 static const PipboyControl ctrl_lines[] = {
     { NULL, "MOVEMENT" },
     { "Left stick", "Walk" },
+    { "X", "Reload" },
     { "X (hold)", "Run" },
     { "Right stick", "Cursor, pick a target" },
     { "LT (hold)", "Aim: lock the nearest enemy" },
@@ -465,8 +466,7 @@ static const PipboyControl ctrl_lines[] = {
     // fires it; RB is the heal, LT + Y the firing mode. LB + B still heals but is not listed -- one row, one gesture.
     { "R3", "Called shot: pick a body part" },
     { "In that window", "A or R3: slot goes AIMED there" },
-    { "LB", "Reload" },
-    { "LB (hold)", "Quick slot: stimpack, taken as you let go" },
+    { "LB", "Quick slot: stimpack, or the tool / drug you put there" },
     { "RB", "Quick slot: grenade - hold to draw, let go = throw" },
     { "LT + Y", "Firing mode: single / aimed / burst" },
     { NULL, NULL },
@@ -489,7 +489,7 @@ static const PipboyControl ctrl_lines[] = {
     { NULL, "WHEELS - hold the button (L3: press), aim, release to pick" },
     // Since 2026-10-04 the drugs are this ring's LAST page too, and the paging wraps -- so from the
     // first page they are a single LB away. That is the whole reason the entry spells LB out.
-    { "Y", "Weapons + ammo; LB = drugs, items, armour" },
+    { "Y", "Weapons + ammo; LB = drugs and items" },
     { "B", "Drugs and quick items - aim LEFT" },
     { "L3 (press)", "Skills: tilt the SAME stick at one, let go or A picks" },
     { "A", "Take what is highlighted" },

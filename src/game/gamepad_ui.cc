@@ -1276,8 +1276,8 @@ static bool gpui_consumed_rb = false; // RB: a press already spent (paging a whe
 // lock); a slot picks its item by itself but can be bound in the inventory; drawing costs 2 AP, 1 with
 // Quick Pockets, and putting the old weapon back is free.
 //
-//   LB  tap = reload (as always). Held past GPUI_QS_HOLD_MS = the LB slot: a THROWABLE is drawn into
-//       the active hand and thrown on the release; a DRUG is taken on the release.
+//   LB  ⚠️ since 2026-10-17 exactly like RB: the slot is used on the PRESS (a drug or a tool), a
+//       throwable drawn on the press and thrown on the release. The reload went to X's tap.
 //   RB  the RB slot: a drug (the default, a stimpak) is taken on the press, as the heal always was; a
 //       throwable is drawn on the press and thrown on the release.
 //   B   while one is drawn: put it away, nothing thrown (costs the draw, like any swap).
@@ -1291,6 +1291,7 @@ static int gpui_qs_bound[GPUI_QS_COUNT] = { -1, -1 };
 
 static Object* gpui_quick_slot_item(int slot, int* count);
 static bool gpui_item_is_throwable(Object* item);
+static bool gpui_item_is_tool(Object* item);
 static void gpui_qs_press(int slot, bool throwOnDraw);
 static void gpui_qs_release(int slot);
 static bool gpui_qs_cancel();
@@ -1580,10 +1581,8 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     bool lbReleased = !lbNow && prevLb; // tap = the reload, on its release; a hold = the LB quick slot
     prevLb = lbNow;
     static unsigned int lbDownTime = 0;
-    static bool lbSlotHeld = false; // this hold has become the LB quick slot
     if (lbPressed) {
         lbDownTime = get_time();
-        lbSlotHeld = false;
     }
     bool rbPressed = rbNow && !prevRb;
     bool rbReleased = !rbNow && prevRb;
@@ -1950,8 +1949,13 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         gpui_cycle_fire_mode("lt+y");
     }
     if (xReleased) {
-        // Nothing to do on a plain release any more -- just clear the spent flag so the next press
-        // starts clean.
+        // ⚠️ X TAP = RELOAD (2026-10-17, his pick; off LB, which is a plain quick slot now -- "nech mě
+        // používat tools ... na LB to není dobré"). The hold is the run (gamepad_ui_run_on reads X
+        // live), so only a press shorter than the hold line reloads -- the same tap/hold split as B
+        // and Y. The reload itself is unchanged: gpui_request_reload, its AP, its buzz, its trace.
+        if (!gpui_consumed_x && get_time() - xDownTime < GPUI_QUICK_HOLD_MS) {
+            gpui_request_reload();
+        }
         gpui_consumed_x = false;
     }
 
@@ -1963,51 +1967,21 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // THE LB QUICK SLOT (2026-10-15, see gpui_consumed_lb): held past the tap line, LB stops being the
     // reload and becomes the slot -- a throwable is drawn now and thrown on the release, a drug is
     // taken on the release.
-    if (lbNow && !lbSlotHeld && !gpui_consumed_lb && elapsed_time(lbDownTime) >= GPUI_QS_HOLD_MS
-        && !radial_wheel_is_open() && !inven_any_open()) {
-        lbSlotHeld = true;
-        int count;
-        Object* item = gpui_quick_slot_item(GPUI_QS_LB, &count);
-        if (gpui_item_is_throwable(item)) {
-            gpui_qs_press(GPUI_QS_LB, false);
-        }
+    // ⚠️ LB IS A PLAIN QUICK SLOT NOW, PRESS AND RELEASE EXACTLY LIKE RB (2026-10-17, "nech mě používat
+    // tools jako ten přístroj, který ukazuje živý na mapě ... chci prostě kliknout LB nebo RB"). The
+    // reload it used to carry on a tap went to X's tap; what is in the slot -- a stimpak by default,
+    // a drug, a TOOL (motion sensor, Geiger counter, Stealth Boy, flare...) or a throwable -- is used
+    // on the press, a throwable drawn on the press and thrown on the release.
+    if (lbPressed && !gpui_consumed_lb && !radial_wheel_is_open() && !inven_any_open()) {
+        trace_event(TRACE_INPUT, "quick-slot-press", "src=lb");
+        gpui_qs_press(GPUI_QS_LB, false);
     }
-
     if (lbReleased) {
         if (gpui_consumed_lb) {
-            // This press was spent: an LB+B heal, a weapon-wheel page, or a
-            // screen that closed on it.
+            // This press was spent: a weapon-wheel page, or a screen that closed on it.
             gpui_consumed_lb = false;
-        } else if (lbSlotHeld) {
-            lbSlotHeld = false;
-            int count;
-            Object* item = gpui_quick_slot_item(GPUI_QS_LB, &count);
-            if (gpui_qs_drawn(GPUI_QS_LB)) {
-                gpui_qs_release(GPUI_QS_LB);
-            } else if (item == NULL || !gpui_item_is_throwable(item)) {
-                gpui_qs_press(GPUI_QS_LB, false); // a drug in the slot: taken now (or the empty buzz)
-            }
-            // (a throwable whose draw was refused stays put: its buzz already answered the hold)
         } else {
-            // ⚠️ ANY RELEASE RELOADS, HOWEVER LONG THE PRESS (2026-10-09). The 220 ms tap limit was
-            // there to tell the reload from the hold (the called-shot window, then for a moment a
-            // lock); "LB bude jen reload" took the hold away, and a limit with nothing on the other
-            // side of it would only turn a slow press into a dead button.
-            // Reload the active-hand weapon from inventory ammo. In realtime combat this costs AP
-            // (vanilla reload = 2) from combat_rt's pool -- you cannot reload on an empty pool; out
-            // of combat the pool is full so it is effectively free. Charge only when a reload
-            // actually happened (had ammo, was not already full).
-            //
-            // ⚠️ THIS USED TO FAIL SILENTLY IN THREE DIFFERENT WAYS and leave no trace of any of
-            // them: not enough AP, nothing to reload with, or already full. You pressed LB, nothing
-            // happened, and there was no way to tell which -- not on screen, not in the log ("Jak
-            // je reload?"). The whole point of the empty-gun lesson is that a refusal has to be
-            // audible; and the log has to be able to answer the question afterwards, which it
-            // could not: a whole session showed ZERO player reloads because none were recorded.
-            //
-            // The sound is the vanilla refusal buzz, the same one every other refused gamepad
-            // action uses. No console line -- the buzz already says it (see the console rule).
-            gpui_request_reload();
+            gpui_qs_release(GPUI_QS_LB);
         }
     }
 
@@ -2108,13 +2082,9 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
             gpui_consumed_lb = true;
         }
         gpui_qs_cancel();
-    } else if (bPressed && lbNow) {
-        gpui_consumed_b = true;
-        gpui_consumed_lb = true;
-        gpui_heal_pending = true;
-        gpui_heal_pending_since = get_time();
-        trace_event(TRACE_INPUT, "heal-press", "src=lb+b");
     }
+    // (The LB+B heal alias is gone, 2026-10-17: LB's own press takes the slot's stimpak now, and the
+    // B under it would have taken a second one.)
 }
 
 // --- L3 skill wheel (a radial_wheel instance). ---
@@ -3727,6 +3697,16 @@ static bool gpui_item_is_throwable(Object* item)
         && item_w_subtype(item, HIT_MODE_RIGHT_WEAPON_PRIMARY) == ATTACK_TYPE_THROW;
 }
 
+// A TOOL for a quick slot (2026-10-17): a miscellaneous item the game lets you USE -- the motion
+// sensor (the automap with the living on it), the Geiger counter and the Stealth Boy (on/off), a
+// flare, an explosive (its timer) -- or use ON something (the crosshair, like the rope). Exactly the
+// set the item pages of the Y wheel list (gpui_collect_usable_items), used the same way.
+static bool gpui_item_is_tool(Object* item)
+{
+    return item != NULL && item_get_type(item) == ITEM_TYPE_MISC
+        && (proto_action_can_use(item->pid) || proto_action_can_use_on(item->pid));
+}
+
 // The LB slot's own pick: the hardest-hitting throwable carried (grenades before knives and rocks).
 static Object* gpui_best_throwable()
 {
@@ -3900,9 +3880,9 @@ static void gpui_qs_bind_under_cursor(int slot)
         return;
     }
     char msg[120];
-    if (!gpui_item_is_throwable(item) && item_get_type(item) != ITEM_TYPE_DRUG) {
+    if (!gpui_item_is_throwable(item) && item_get_type(item) != ITEM_TYPE_DRUG && !gpui_item_is_tool(item)) {
         gsound_play_sfx_file("iisxxxx1");
-        snprintf(msg, sizeof(msg), "%s: only something to throw or take.", slot == GPUI_QS_LB ? "LB" : "RB");
+        snprintf(msg, sizeof(msg), "%s: only something to throw, take or use.", slot == GPUI_QS_LB ? "LB" : "RB");
         inven_display_msg(msg);
         return;
     }
@@ -4373,12 +4353,11 @@ static int gpui_collect_usable_items(int* pids, int* counts, int count, int max)
         if (item == NULL) {
             continue;
         }
-        // ...and ARMOUR (2026-10-17, "Quick inventory i pro armour by se hodil"): picking it puts it on,
-        // picking the one he wears takes it off (gpui_quick_wear).
+        // ⚠️ NO ARMOUR (2026-10-17, "quick menu dej pryč brnění, docela tam překáží"). It was added the
+        // same day ("Quick inventory i pro armour by se hodil") and taken out again; gpui_quick_wear and
+        // its dispatch stay, unreachable, should it come back.
         int type = item_get_type(item);
-        if (type == ITEM_TYPE_ARMOR) {
-            // counted below like any other kind
-        } else if (type != ITEM_TYPE_MISC) {
+        if (type != ITEM_TYPE_MISC) {
             continue;
         } else if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
             continue;
@@ -8073,6 +8052,13 @@ static void gpui_drain_requests()
             trace_event(TRACE_INPUT, "quick-slot-stale", "slot=%d", slot);
         } else if (item == NULL || gpui_item_is_throwable(item)) {
             gsound_play_sfx_file("iisxxxx1");
+        } else if (gpui_item_is_tool(item)) {
+            // A tool goes the Y wheel's way: used outright, or its crosshair armed.
+            if (proto_action_can_use(item->pid)) {
+                gpui_quick_use_item(item->pid);
+            } else {
+                gpui_quick_use_on_item(item->pid);
+            }
         } else {
             gpui_quick_use(item->pid);
         }
