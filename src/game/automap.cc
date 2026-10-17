@@ -7,6 +7,7 @@
 
 #include "game/bmpdlog.h"
 #include "game/config.h"
+#include "game/gamepad_ui.h"
 #include "game/game.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
@@ -271,6 +272,24 @@ void automap(bool isInGame, bool isUsingScanner)
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
     bool done = false;
+
+    // A SHOULDER BUTTON CLOSES IT AGAIN (2026-10-17, "když mám na quickslotu tu mapku, tak opětovné
+    // tlačítko by to mělo i schovat"): the motion sensor in an LB / RB quick slot opens this map, and
+    // the same button is where the thumb is to put it away. Latched to the state at opening, so the
+    // press that opened it does not close it on the first frame. The pad is read directly -- no
+    // gamepad_ui tick runs inside this loop.
+    bool padPrevLb = true;
+    bool padPrevRb = true;
+    {
+        SDL_GameController* pad = gamepad_ui_get_controller();
+        if (pad != NULL) {
+            SDL_GameControllerUpdate();
+            padPrevLb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+            padPrevRb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+        }
+    }
+    bool closedByPad = false;
+
     while (!done) {
         sharedFpsLimiter.mark();
 
@@ -279,6 +298,20 @@ void automap(bool isInGame, bool isUsingScanner)
         // FIXME: There is minor bug in the interface - pressing H/L to toggle
         // high/low details does not update switch state.
         int keyCode = get_input();
+
+        SDL_GameController* pad = gamepad_ui_get_controller();
+        if (pad != NULL) {
+            SDL_GameControllerUpdate();
+            bool lb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
+            bool rb = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) != 0;
+            if ((lb && !padPrevLb) || (rb && !padPrevRb)) {
+                keyCode = KEY_ESCAPE;
+                closedByPad = true;
+            }
+            padPrevLb = lb;
+            padPrevRb = rb;
+        }
+
         switch (keyCode) {
         case KEY_TAB:
         case KEY_ESCAPE:
@@ -368,6 +401,13 @@ void automap(bool isInGame, bool isUsingScanner)
 
     for (int index = 0; index < AUTOMAP_FRM_COUNT; index++) {
         art_ptr_unlock(frmHandle[index]);
+    }
+
+    // The shoulder press that closed it is still down, and it is the very button of the quick slot
+    // that opened it: without a new epoch the game loop would read it as a fresh press and open
+    // the map straight back up. See gamepad_ui_bump_input_epoch.
+    if (closedByPad) {
+        gamepad_ui_bump_input_epoch();
     }
 }
 
