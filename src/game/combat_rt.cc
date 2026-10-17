@@ -9453,6 +9453,117 @@ static void rt_plan_attack(RtActor* a, Object* npc, int baseMode)
     }
 }
 
+// --- COMBAT AI: TILES AROUND A CRITTER ------------------------------------------------------------
+// Every tile within radius of centre (radius 4 is 61 tiles), nearest rings first. Fills out up to
+// cap and returns the count.
+static int rt_tiles_around(int centre, int radius, int* out, int cap)
+{
+    int count = 0;
+    if (cap <= 0) {
+        return 0;
+    }
+    out[count++] = centre;
+    int ringStart = 0;
+    for (int r = 1; r <= radius; r++) {
+        int ringEnd = count;
+        for (int i = ringStart; i < ringEnd; i++) {
+            for (int d = 0; d < ROTATION_COUNT; d++) {
+                int t = tile_num_in_direction(out[i], d, 1);
+                if (tile_dist(t, centre) != r) {
+                    continue; // inward, sideways, or held at the map edge
+                }
+                bool seen = false;
+                for (int k = ringEnd; k < count; k++) {
+                    if (out[k] == t) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen && count < cap) {
+                    out[count++] = t;
+                }
+            }
+        }
+        ringStart = ringEnd;
+    }
+    return count;
+}
+
+// --- COMBAT AI: RELOAD IN COVER (2026-10-17, MODS "Tactical AI") ---------------------------------
+//
+// A shooter whose magazine runs dry used to reload where it stood, in the open, in your sights.
+// Now, once per reload, it looks within RT_COVER_TILES for a free tile its target has NO LINE OF FIRE
+// to (a wall or scenery in between -- the same straight-path test combat_check_bad_shot uses), no
+// nearer to the target and still within its own weapon's reach, and runs there first; the reload
+// itself is the one RT_ATTACK already does, now behind the corner. In a melee (target beside it),
+// already out of the target's line, or with no cover in reach, it reloads in place as before.
+#define RT_COVER_TILES 4
+
+static bool rt_reload_cover(RtActor* a, Object* npc, int hitMode)
+{
+    Object* target = a->target;
+    if (target == NULL || !rt_can_walk(npc) || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    int targetDist = obj_dist(npc, target);
+    if (targetDist <= 1) {
+        return false;
+    }
+    if (combat_is_shot_blocked(target, target->tile, npc->tile, npc, NULL)) {
+        return false; // already out of its line of fire
+    }
+
+    int range = item_w_range(npc, hitMode);
+    int tiles[96];
+    int count = rt_tiles_around(npc->tile, RT_COVER_TILES, tiles, 96);
+    int best = -1;
+    int bestSteps = 0;
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        int dist = tile_dist(t, target->tile);
+        if (dist < targetDist || dist > range) {
+            continue;
+        }
+        if (obj_blocking_at(npc, t, npc->elevation) != NULL) {
+            continue;
+        }
+        if (!combat_is_shot_blocked(target, target->tile, t, NULL, NULL)) {
+            continue; // it could still shoot there
+        }
+        // Rings are nearest-first, so the first reachable tile is close to the best; a route that
+        // swings far round is no cover worth running for.
+        int steps = make_path(npc, npc->tile, t, NULL, 1);
+        if (steps <= 0 || steps > tile_dist(npc->tile, t) + 2) {
+            continue;
+        }
+        if (best == -1 || steps < bestSteps) {
+            best = t;
+            bestSteps = steps;
+            if (steps <= 1) {
+                break;
+            }
+        }
+    }
+
+    if (best == -1) {
+        trace_event(TRACE_FLOW, "reload-cover", "id=%d pid=%d none tile=%d t=%.2f", npc->id, npc->pid, npc->tile, rt_clock);
+        return false;
+    }
+
+    anim_end_lone_stand(npc);
+    npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+    if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "reload-cover")) {
+        return false;
+    }
+    anim_reset_last_path();
+    int rc = register_object_run_to_tile(npc, best, npc->elevation, -1, 0);
+    register_end();
+    bool moved = rc == 0 && anim_last_path_steps(npc) != 0;
+    trace_event(TRACE_FLOW, "reload-cover", "id=%d pid=%d from=%d to=%d steps=%d moved=%d t=%.2f",
+        npc->id, npc->pid, npc->tile, best, bestSteps, moved ? 1 : 0, rt_clock);
+    return moved;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -10686,8 +10797,20 @@ static void rt_update_actor(RtActor* a, float dt)
         // If the reload FAILS there is no ammo anywhere in the pack, and the critter must not be
         // left holding a weapon it can never fire -- see rt_swap_dry_weapon for what that looked
         // like in the trace. Swapping costs the same beat and the same AP as reloading would have.
-        if (a->ap >= RT_RELOAD_AP_COST && rt_needs_reload(npc, hitMode)) {
+        bool needsReload = rt_needs_reload(npc, hitMode);
+        if (!needsReload) {
+            a->reload_cover_tried = false; // loaded again: the next empty magazine may look for cover
+        }
+        if (a->ap >= RT_RELOAD_AP_COST && needsReload) {
             Object* weapon = item_hit_with(npc, hitMode);
+            // Cover first (rt_reload_cover), once per reload -- then the reload below, wherever it
+            // stands. Only when there is ammo to load: a dry critter with nothing left swaps weapons.
+            if (rt_tactical_ai && !a->reload_cover_tried && weapon != NULL && rt_npc_has_ammo_for(npc, weapon)) {
+                a->reload_cover_tried = true;
+                if (rt_reload_cover(a, npc, hitMode)) {
+                    break;
+                }
+            }
             // MODS "Reload animation": the loop first, the load and the AP at its end (see
             // rt_npc_start_reload_anim). The beat is the reload either way -- started now, or asked
             // again next frame because the body was not free yet; the gun is empty regardless.
