@@ -581,6 +581,13 @@ typedef struct RtActor {
     // It is following a route round a wall (or round what blocks its shot): until this, the straight
     // step does not take it back. See RT_DETOUR_COMMIT_SECONDS.
     float detour_until;
+    // --- GROUP TACTICS (2026-10-17): squad advance, shooters backing off, defenders holding. ---
+    float squad_hold_start;   // < 0 = not holding for the squad (rt_squad_holds)
+    bool squad_hold_done;     // held once this engagement; reset in IDLE
+    bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
+    bool defend_covered;      // looked for cover when it started holding
+    float defend_since;       // when it started holding (the standoff cap, RT_DEFEND_MAX)
+    float backoff_next_at;    // a shooter's next step back from a close dude (rt_back_off)
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -8826,6 +8833,12 @@ static void rt_refresh_registry()
             a->room_yield_until = prev->room_yield_until;
             a->route_plugged = prev->route_plugged;
             a->detour_until = prev->detour_until;
+            a->squad_hold_start = prev->squad_hold_start;
+            a->squad_hold_done = prev->squad_hold_done;
+            a->defend_provoked = prev->defend_provoked;
+            a->defend_covered = prev->defend_covered;
+            a->defend_since = prev->defend_since;
+            a->backoff_next_at = prev->backoff_next_at;
             a->hit_verdict = prev->hit_verdict;
             a->hit_verdict_at = prev->hit_verdict_at;
             a->hit_verdict_tgt = prev->hit_verdict_tgt;
@@ -8885,6 +8898,12 @@ static void rt_refresh_registry()
             a->room_yield_until = 0.0f;
             a->route_plugged = false;
             a->detour_until = 0.0f;
+            a->squad_hold_start = -1.0f;
+            a->squad_hold_done = false;
+            a->defend_provoked = false;
+            a->defend_covered = false;
+            a->defend_since = 0.0f;
+            a->backoff_next_at = 0.0f;
             a->hit_verdict = 0;
             a->hit_verdict_at = 0.0f;
             a->hit_verdict_tgt = NULL;
@@ -9787,6 +9806,254 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
     return moved;
 }
 
+// --- COMBAT AI: GROUP TACTICS (2026-10-17, MODS "Tactical AI") ---------------------------------
+//
+// His three picks, all of them: "aby si nepřátelé někdy počkali na hráče", "chodili spolu na mě a ne
+// postupně", "někteří přiběhli ke mně a zbytek střílel z dálky". Each is a narrow rule on top of the
+// chase; none of them moves a critter that would otherwise be attacking.
+//
+//   * SQUAD ADVANCE (rt_squad_holds): a chaser well AHEAD of a teammate on the same side -- by
+//     RT_SQUAD_GAP tiles of distance to the foe -- and still RT_SQUAD_MIN_DIST or more from it, waits
+//     for the laggard, once per engagement and for at most RT_SQUAD_HOLD_MAX. They arrive together
+//     instead of one at a time. Being hit ends the wait.
+//   * SHOOTERS KEEP THEIR DISTANCE (rt_back_off): a gunman the dude has walked up to (2 tiles or
+//     less) steps back two tiles to a spot it can still shoot from -- only on a beat it could not fire
+//     anyway, with a chance of (100 - aggression) % and then not again for RT_BACKOFF_PAUSE. A raider
+//     (aggression 80) rarely gives ground, a guard (20) usually does. The melee ones charge as before.
+//   * DEFENDERS HOLD (rt_defend_holds): a critter whose AI packet is cautious (aggression up to
+//     RT_DEFENSIVE_AGGRESSION -- guards, peasants, merchants, scribes) does not run out at you. It
+//     holds its ground, stepping into cover first if you could shoot it, and fires once you are in
+//     its range; it comes for you only when you get within RT_DEFEND_RADIUS or hurt it.
+// The history that makes these narrow: crowd rules that moved CHASERS ("hold and wait", "orbit")
+// were reverted twice for cutting attacks. A wait here is capped and once-only, a defender in range
+// still shoots, and the back-off spends only a beat the shooter could not fire in.
+#define RT_SQUAD_GAP 4
+#define RT_SQUAD_MIN_DIST 5
+#define RT_SQUAD_RADIUS 15
+#define RT_SQUAD_HOLD_MAX 3.0f
+#define RT_BACKOFF_PAUSE 5.0f
+#define RT_DEFENSIVE_AGGRESSION 30
+#define RT_DEFEND_RADIUS 5
+// A standoff ends: a defender left alone this long stands down to IDLE, latched on its tile the way an
+// unreachable chaser is -- it takes the fight up again only once you are in its weapon's reach and
+// sight (the IDLE latch's canShootNow), or you come close or hurt it. Without this a guard holding
+// out of your range kept the fight -- and its AP economy and no travel speed -- alive for ever.
+#define RT_DEFEND_MAX 12.0f
+
+static bool rt_is_defensive(RtActor* a, Object* npc)
+{
+    return a->hostile && !a->friendly && !isPartyMember(npc) && combatai_aggression(npc) <= RT_DEFENSIVE_AGGRESSION;
+}
+
+// True = wait this frame for the squad.
+static bool rt_squad_holds(RtActor* a, Object* npc)
+{
+    if (a->squad_hold_done || a->target == NULL || !rt_can_walk(npc)) {
+        return false;
+    }
+    if (npc->data.critter.combat.damageLastTurn > 0) {
+        if (a->squad_hold_start >= 0.0f) {
+            trace_event(TRACE_FLOW, "squad-hold", "id=%d pid=%d end=hit held=%.2f t=%.2f",
+                npc->id, npc->pid, rt_clock - a->squad_hold_start, rt_clock);
+        }
+        a->squad_hold_done = true;
+        a->squad_hold_start = -1.0f;
+        return false;
+    }
+
+    int myDist = obj_dist(npc, a->target);
+    if (myDist < RT_SQUAD_MIN_DIST) {
+        if (a->squad_hold_start >= 0.0f) {
+            a->squad_hold_done = true;
+            a->squad_hold_start = -1.0f;
+        }
+        return false;
+    }
+
+    // The laggard: a teammate still on its way, near me, much further from its foe than I am.
+    Object* laggard = NULL;
+    int laggardDist = 0;
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* t = &rt_actors[i];
+        Object* mate = t->obj;
+        if (mate == npc || t->state != RT_CHASE || t->fleeing || t->target == NULL || !rt_is_combatant(mate)) {
+            continue;
+        }
+        if (mate->data.critter.combat.team != npc->data.critter.combat.team || tile_dist(mate->tile, npc->tile) > RT_SQUAD_RADIUS) {
+            continue;
+        }
+        int dist = obj_dist(mate, t->target);
+        if (dist >= myDist + RT_SQUAD_GAP && dist > laggardDist) {
+            laggard = mate;
+            laggardDist = dist;
+        }
+    }
+
+    if (laggard == NULL) {
+        if (a->squad_hold_start >= 0.0f) {
+            trace_event(TRACE_FLOW, "squad-hold", "id=%d pid=%d end=together held=%.2f t=%.2f",
+                npc->id, npc->pid, rt_clock - a->squad_hold_start, rt_clock);
+            a->squad_hold_done = true;
+            a->squad_hold_start = -1.0f;
+        }
+        return false;
+    }
+
+    if (a->squad_hold_start < 0.0f) {
+        a->squad_hold_start = rt_clock;
+        trace_event(TRACE_FLOW, "squad-hold", "id=%d pid=%d start dist=%d laggard=%d laggardDist=%d t=%.2f",
+            npc->id, npc->pid, myDist, laggard->id, laggardDist, rt_clock);
+    } else if (rt_clock - a->squad_hold_start >= RT_SQUAD_HOLD_MAX) {
+        trace_event(TRACE_FLOW, "squad-hold", "id=%d pid=%d end=timeout held=%.2f t=%.2f",
+            npc->id, npc->pid, rt_clock - a->squad_hold_start, rt_clock);
+        a->squad_hold_done = true;
+        a->squad_hold_start = -1.0f;
+        return false;
+    }
+    return true;
+}
+
+// A free tile within radius of the critter, out of the target's line of fire, reachable in a few
+// steps; -1 if none. Nearest rings first (rt_tiles_around).
+static int rt_cover_tile(Object* npc, Object* target, int radius)
+{
+    int tiles[48];
+    int count = rt_tiles_around(npc->tile, radius, tiles, 48);
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        if (obj_blocking_at(npc, t, npc->elevation) != NULL) {
+            continue;
+        }
+        if (tile_dist(t, target->tile) < tile_dist(npc->tile, target->tile)) {
+            continue; // not towards it
+        }
+        if (!combat_is_shot_blocked(target, target->tile, t, NULL, NULL)) {
+            continue;
+        }
+        int steps = make_path(npc, npc->tile, t, NULL, 1);
+        if (steps > 0 && steps <= tile_dist(npc->tile, t) + 2) {
+            return t;
+        }
+    }
+    return -1;
+}
+
+static bool rt_walk_to(Object* npc, int dest, const char* why, bool run)
+{
+    anim_end_lone_stand(npc);
+    npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+    if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, why)) {
+        return false;
+    }
+    anim_reset_last_path();
+    int rc = run
+        ? register_object_run_to_tile(npc, dest, npc->elevation, -1, 0)
+        : register_object_move_to_tile(npc, dest, npc->elevation, -1, 0);
+    register_end();
+    return rc == 0 && anim_last_path_steps(npc) != 0;
+}
+
+// True = hold this frame (out of range of its foe, not provoked).
+static bool rt_defend_holds(RtActor* a, Object* npc)
+{
+    if (a->defend_provoked || a->target == NULL || !rt_is_defensive(a, npc)) {
+        return false;
+    }
+    int dist = obj_dist(npc, a->target);
+    const char* why = NULL;
+    if (npc->data.critter.combat.damageLastTurn > 0) {
+        why = "hit";
+    } else if (dist <= RT_DEFEND_RADIUS) {
+        why = "close";
+    }
+    if (why != NULL) {
+        a->defend_provoked = true;
+        trace_event(TRACE_FLOW, "defend-hold", "id=%d pid=%d end=%s dist=%d t=%.2f", npc->id, npc->pid, why, dist, rt_clock);
+        return false;
+    }
+
+    if (a->defend_covered && rt_clock - a->defend_since >= RT_DEFEND_MAX) {
+        trace_event(TRACE_FLOW, "defend-hold", "id=%d pid=%d end=standoff dist=%d t=%.2f", npc->id, npc->pid, dist, rt_clock);
+        a->state = RT_IDLE;
+        a->target = NULL;
+        a->unreachable_tile = npc->tile;
+        a->unreachable_until = rt_clock + RT_UNREACHABLE_RETRY_SECONDS;
+        return true;
+    }
+
+    // Into cover first, once, if the foe could shoot it where it stands.
+    if (!a->defend_covered) {
+        a->defend_covered = true;
+        a->defend_since = rt_clock;
+        Object* foeWeapon = item_hit_with(a->target, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+        bool foeShoots = foeWeapon != NULL && item_get_type(foeWeapon) == ITEM_TYPE_WEAPON
+            && item_w_subtype(foeWeapon, HIT_MODE_RIGHT_WEAPON_PRIMARY) == ATTACK_TYPE_RANGED
+            && dist <= item_w_range(a->target, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+        int cover = -1;
+        if (foeShoots && rt_can_walk(npc) && !combat_is_shot_blocked(a->target, a->target->tile, npc->tile, npc, NULL)) {
+            cover = rt_cover_tile(npc, a->target, 3);
+        }
+        bool moved = cover != -1 && rt_walk_to(npc, cover, "defend-cover", true);
+        trace_event(TRACE_FLOW, "defend-hold", "id=%d pid=%d start dist=%d aggr=%d cover=%d moved=%d t=%.2f",
+            npc->id, npc->pid, dist, combatai_aggression(npc), cover, moved ? 1 : 0, rt_clock);
+    }
+    return true;
+}
+
+// A shooter the foe has walked up to steps back, now and then. True = it moved (beat spent).
+static bool rt_back_off(RtActor* a, Object* npc, int attackMode)
+{
+    if (rt_clock < a->backoff_next_at || a->target == NULL || !rt_can_walk(npc) || a->ap <= 0
+        || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    Object* weapon = item_hit_with(npc, attackMode);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON
+        || item_w_subtype(weapon, attackMode) != ATTACK_TYPE_RANGED) {
+        return false;
+    }
+    int range = item_w_range(npc, attackMode);
+    int dist = obj_dist(npc, a->target);
+    if (range < 4 || dist > 2) {
+        return false;
+    }
+    // Only on a beat it could not fire in anyway.
+    if (a->ap >= rt_ap_cost(npc, attackMode) && !rt_attack_on_cooldown(npc)) {
+        return false;
+    }
+
+    a->backoff_next_at = rt_clock + RT_BACKOFF_PAUSE;
+    int aggression = combatai_aggression(npc);
+    int roll = roll_random(1, 100);
+    if (roll > 100 - aggression) {
+        return false; // stands its ground this time
+    }
+
+    int away = tile_dir(a->target->tile, npc->tile);
+    static const int fan[5] = { 0, 1, -1, 2, -2 };
+    for (int k = 0; k < 5; k++) {
+        int rotation = (away + fan[k] + ROTATION_COUNT) % ROTATION_COUNT;
+        int dest = tile_num_in_direction(npc->tile, rotation, 2);
+        int destDist = tile_dist(dest, a->target->tile);
+        if (dest == npc->tile || destDist <= dist || destDist > range) {
+            continue;
+        }
+        if (obj_blocking_at(npc, dest, npc->elevation) != NULL
+            || combat_is_shot_blocked(npc, dest, a->target->tile, a->target, NULL)) {
+            continue;
+        }
+        int steps = make_path(npc, npc->tile, dest, NULL, 1);
+        if (steps <= 0 || steps > 3) {
+            continue;
+        }
+        bool moved = rt_walk_to(npc, dest, "back-off", false);
+        trace_event(TRACE_FLOW, "back-off", "id=%d pid=%d from=%d to=%d dist=%d aggr=%d roll=%d moved=%d t=%.2f",
+            npc->id, npc->pid, npc->tile, dest, dist, aggression, roll, moved ? 1 : 0, rt_clock);
+        return moved;
+    }
+    return false;
+}
+
 static void rt_update_actor(RtActor* a, float dt)
 {
     Object* npc = a->obj;
@@ -10176,7 +10443,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 rt_is_combatant(a->target) ? obj_dist(npc, a->target) : -1, rt_clock);
             giveUp = true;
             // Lost it, not beaten it: go and look where it was last seen (rt_search_tick).
-            if (rt_tactical_ai && a->hostile && !a->friendly && a->last_seen_tile >= 0
+            if (rt_tactical_ai && a->hostile && !a->friendly && !rt_is_defensive(a, npc) && a->last_seen_tile >= 0
                 && tile_dist(npc->tile, a->last_seen_tile) > 1) {
                 a->search_tile = a->last_seen_tile;
                 a->search_until = rt_clock + RT_SEARCH_SECONDS;
@@ -10560,6 +10827,11 @@ static void rt_update_actor(RtActor* a, float dt)
 
     switch (a->state) {
     case RT_IDLE: {
+        // A new engagement may wait for its squad again, and a defender holds again (group tactics).
+        a->squad_hold_done = false;
+        a->squad_hold_start = -1.0f;
+        a->defend_provoked = false;
+        a->defend_covered = false;
         // RE-AGGRO IS GATED ON PERCEPTION, and it has to be: the stop rule above drops a chase
         // once the critter perceives nobody, and if this branch could re-acquire on distance
         // alone (rt_nearest_player_side reaches the 50-tile leash) it would re-engage on the very
@@ -10586,6 +10858,13 @@ static void rt_update_actor(RtActor* a, float dt)
                 && obj_dist(npc, near) <= item_w_range(npc, nearMode)
                 && !rt_shot_blocked(npc, near, nearMode)
                 && is_within_perception(npc, near);
+            // A defender that stood down from a standoff (rt_defend_holds) also wakes when you come
+            // close or hurt it -- the two things that would have ended its hold.
+            if (!canShootNow && rt_tactical_ai && rt_is_defensive(a, npc)
+                && (npc->data.critter.combat.damageLastTurn > 0
+                    || (near != NULL && obj_dist(npc, near) <= RT_DEFEND_RADIUS && is_within_perception(npc, near)))) {
+                canShootNow = true;
+            }
             if (!canShootNow) {
                 break;
             }
@@ -10897,6 +11176,10 @@ static void rt_update_actor(RtActor* a, float dt)
                     }
                 }
                 a->no_path_since = -1.0f;
+            } else if (rt_tactical_ai && (rt_defend_holds(a, npc) || rt_squad_holds(a, npc))) {
+                // Holding: a defender out of reach keeps its ground, a chaser ahead waits for its squad
+                // (group tactics above). Holding is not failing to route.
+                a->no_path_since = -1.0f;
             } else if (rt_clock < a->room_yield_until) {
                 // It just stepped back to let a fresher ally in (rt_room_make). Walking now would
                 // take it straight back onto the spot it gave up, before the ally gets there.
@@ -11167,6 +11450,11 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->state = RT_CHASE;
                 break;
             }
+        }
+
+        // A shooter the foe has walked up to steps back now and then (rt_back_off).
+        if (rt_tactical_ai && rt_back_off(a, npc, attackMode)) {
+            break;
         }
 
         // A teammate between it and its target (rt_ff_care): a bright shooter steps aside first.
