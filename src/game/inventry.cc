@@ -631,6 +631,7 @@ void handle_inventory()
         if (gamepad_ui_take_quick_normal()) {
             inven_gamepad_quick_normal();
         }
+        gamepad_ui_inventory_tick(); // the LB / RB slots beside the bar, kept in step
 
         display_body(-1, INVENTORY_WINDOW_TYPE_NORMAL);
 

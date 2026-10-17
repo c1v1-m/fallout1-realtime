@@ -317,8 +317,9 @@ const char* perk_realtime_note(int perk)
 {
     switch (perk) {
     case PERK_QUICK_POCKETS:
-        // gpui_quick_use: the RB / H heal and the item wheel's drugs.
-        return "Realtime: drugs used with RB, H or the item wheel cost 1 AP, not 2.";
+        // gpui_quick_use (the RB / H heal and the item wheel's drugs) and, since 2026-10-15, the
+        // quick slots' draw (LB / RB / T): "Jsou quick pockets zmíněné, že LB a RB stojí míň?"
+        return "Realtime: quick slots (LB/RB, T, H) and wheel drugs cost 1 AP, not 2.";
     case PERK_AWARENESS:
         // gmouse_3d_awareness_hp: the second line of the to-hit cursor, lock-on or mouse.
         return "Realtime: aim at someone to see their hit points.";

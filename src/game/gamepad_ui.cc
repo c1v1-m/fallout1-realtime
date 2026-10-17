@@ -997,11 +997,13 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
             } else if (deferForUseOn) {
                 gpui_a_interact_deferred = true;
             } else if (gpui_a_interacting && !gamepad_ui_menu_active() && !dialog_active()) {
-                if (interact_prompt_target() != NULL && !interact_prompt_offering_corpse()) {
-                    interactNow = interact_prompt_request();
-                } else if (!postKillCooldown) {
-                    interactNow = interact_prompt_request() || combat_rt_try_world_loot();
-                }
+                // ⚠️ A CORPSE LOOTS ON ONE A, MID-FIGHT TOO (2026-10-17, "áčko na mrtvolu při boji je
+                // loot. teď hráč musí klikat double A pro loot"). The post-kill cooldown used to hold a
+                // corpse back while anything hostile was in range -- a drawn gun makes that the whole
+                // fight -- leaving only the double tap below. Both dated from when A ALSO FIRED: mashing
+                // it to kill would pop the fresh body. RT has been the only attack since 2026-09-16, so
+                // nothing mashes A any more and a corpse is one press like a door.
+                interactNow = interact_prompt_request() || combat_rt_try_world_loot();
             }
             // A deferred press must not drop through as a world walk-click either.
             interactNow = interactNow || deferForUseOn;
@@ -8119,6 +8121,25 @@ bool gamepad_ui_handle_key(int* keyCode)
     }
 
     return false;
+}
+
+// ⚠️ THE QUICK SLOTS ANSWER INSIDE THE INVENTORY (2026-10-17, "když dám LB nebo RB na item v inventory,
+// tak se to neprojeví hned, až po vypnutí inventory"). The slots beside the bar are only kept in step
+// by gamepad_ui_tick, and the inventory runs its own loop, so a binding (or a stimpak used from the
+// list) showed only once the screen closed. The binding itself happens in the input hook, which must
+// not read protos (gpui_quick_slot_item does -- see gpui_hostile_in_range_cached), so the redraw
+// lives here, called by that loop where the quick-action poll already runs. Both draws are no-ops
+// unless the item or the count changed.
+void gamepad_ui_inventory_tick()
+{
+    if (obj_dude == NULL) {
+        return;
+    }
+    int count;
+    Object* item = gpui_quick_slot_item(GPUI_QS_RB, &count);
+    intface_update_heal_slot(item, count);
+    item = gpui_quick_slot_item(GPUI_QS_LB, &count);
+    intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
 }
 
 void gamepad_ui_tick()

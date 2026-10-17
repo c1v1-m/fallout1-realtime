@@ -118,6 +118,9 @@ int gamepad_ui_take_loot_quick();
 // input hook, where the use/equip pipeline's map/monitor redraw would re-enter
 // the windowing system and crash.
 bool gamepad_ui_take_quick_normal();
+// Per frame from the inventory's own loop (outside the input hook): keeps the LB / RB quick slots
+// beside the bar in step while the inventory is open -- see gamepad_ui.cc.
+void gamepad_ui_inventory_tick();
 
 // One discrete D-pad step for navigating an action popup: -1 for up (previous
 // option), +1 for down (next option), 0 for no step this frame. Edge-triggered
