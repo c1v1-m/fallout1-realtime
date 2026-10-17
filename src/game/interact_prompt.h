@@ -53,7 +53,10 @@ int interact_prompt_use_targets(Object** out, int max);
 // (a unit vector, y positive down). Returns false when nothing lies that way, so the caller can
 // refuse audibly. The choice overrides the automatic nearest-target pick until it goes out of reach,
 // stops being interactable, or times out.
-bool interact_prompt_pick_direction(float dirX, float dirY);
+// fresh = the first frame of a new flick (the stick was back under the threshold before): a flick
+// the same way as the current selection then steps to the NEXT thing that way, so two objects in a
+// line are both reachable.
+bool interact_prompt_pick_direction(float dirX, float dirY, bool fresh);
 
 // True only when the current prompt target is a CORPSE (the one interaction the post-kill loot
 // cooldown gates). A door/scenery/item/talk target returns false so A performs it immediately even

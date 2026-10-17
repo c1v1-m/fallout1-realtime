@@ -64,6 +64,16 @@ enum {
 };
 
 static Object* ip_target = NULL;   // interactable currently highlighted (re-derived each tick)
+
+// ⚠️ THE CORPSE YOU JUST LOOTED STEPS ASIDE (2026-10-17, "mám dvě mrtvoly na lootování vedle sebe a
+// nemůžu vybrat tu druhou"). trace_2026-10-17_213818: two raiders on 26088 and 26089, the dude on
+// 26087 -- A always took the nearer one, and the farther lay in the same direction, where the
+// stick's aim chose the nearer one again. So for IP_RECENT_LOOT_MS after a loot, the automatic pick
+// ranks that body as if it lay IP_RECENT_LOOT_PENALTY tiles further: the next A opens the other one.
+#define IP_RECENT_LOOT_MS 30000
+#define IP_RECENT_LOOT_PENALTY 3
+static Object* ip_recent_loot = NULL;
+static unsigned int ip_recent_loot_at = 0;
 static Object* ip_pending = NULL;  // queued by the A hook, performed from the tick
 static int ip_pending_kind = IP_NONE;
 
@@ -627,6 +637,12 @@ static Object* ip_find_nearest(int* kindOut)
             continue;
         }
         int prio = ip_priority(kind);
+        // Just looted (see ip_recent_loot): ranked as if further off, so another body of the same
+        // kind in reach goes first.
+        if (obj == ip_recent_loot && (kind == IP_LOOT_CORPSE || kind == IP_LOOT_CONTAINER)
+            && get_time() - ip_recent_loot_at < IP_RECENT_LOOT_MS) {
+            d += IP_RECENT_LOOT_PENALTY;
+        }
         // A following party member is almost always the closest talkable critter, so it would
         // hog the prompt and block talking to the NPC you actually walked up to. Drop companions
         // BELOW everything else so any other interactable in range wins; you can still talk to a
@@ -893,7 +909,7 @@ static void ip_screen_pos(Object* obj, int* x, int* y)
 //
 // Returns true only when the selection actually CHANGED, so the caller can blip once per change
 // rather than once per frame.
-bool interact_prompt_pick_direction(float dirX, float dirY)
+bool interact_prompt_pick_direction(float dirX, float dirY, bool fresh)
 {
     if (obj_dude == NULL) {
         return false;
@@ -945,6 +961,51 @@ bool interact_prompt_pick_direction(float dirX, float dirY)
             best = cand[i];
             bestScore = score;
         }
+    }
+
+    // ⚠️ A SECOND FLICK THE SAME WAY STEPS ON (2026-10-17, the two raiders in a line: the farther one
+    // could never win, the nearer always scored higher in the same direction). On a FRESH flick whose
+    // best answer is what is already selected, take the next candidate that way instead -- ordered by
+    // score, wrapping round -- so pushing the stick twice reaches the second thing in a line.
+    if (fresh && best != NULL && best == ip_target) {
+        Object* next = NULL;
+        float nextScore = 0.0f;
+        Object* top = NULL;
+        float topScore = 0.0f;
+        for (int i = 0; i < count; i++) {
+            if (cand[i] == ip_target) {
+                continue;
+            }
+            int tx;
+            int ty;
+            ip_screen_pos(cand[i], &tx, &ty);
+            float vx = (float)(tx - fromX);
+            float vy = (float)(ty - fromY);
+            float len = sqrtf(vx * vx + vy * vy);
+            if (len < 1.0f) {
+                continue;
+            }
+            float dot = (vx * dirX + vy * dirY) / len;
+            if (dot < IP_PICK_CONE_COS) {
+                continue;
+            }
+            float score = dot - IP_PICK_DIST_WEIGHT * ((float)obj_dist(obj_dude, cand[i]) / (float)ip_pick_range_tiles);
+            if (score <= bestScore && (next == NULL || score > nextScore)) {
+                next = cand[i]; // the best one ranked below the current
+                nextScore = score;
+            }
+            if (top == NULL || score > topScore) {
+                top = cand[i];
+                topScore = score;
+            }
+        }
+        Object* chosen = next != NULL ? next : top;
+        if (chosen != NULL) {
+            ip_manual_target = chosen;
+            ip_manual_since = get_time();
+            return true;
+        }
+        return false;
     }
 
     if (best == NULL || best == ip_target) {
@@ -1240,6 +1301,10 @@ void interact_prompt_tick()
         }
         trace_event(TRACE_ACTION, "interact-do", "kind=%d pid=%d objType=%d rc=%d",
             kind, obj->pid, FID_TYPE(obj->fid), rc);
+        if (kind == IP_LOOT_CORPSE || kind == IP_LOOT_CONTAINER) {
+            ip_recent_loot = obj;
+            ip_recent_loot_at = get_time();
+        }
         return;
     }
 

@@ -7762,8 +7762,12 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         // nudged constantly while moving and looking around, and buzzing at every one of those is
         // noise. The blip fires only when the selection actually changes (interact_prompt_pick_-
         // direction returns true only then), so a sweep ticks once per object it passes over.
+        // fresh = a new flick: the same direction again steps to the next thing that way.
+        static bool ipPickOut = false;
+        bool ipPickFresh = mag > GPUI_IP_PICK_THRESHOLD && !ipPickOut;
+        ipPickOut = mag > GPUI_IP_PICK_THRESHOLD;
         if (mag > GPUI_IP_PICK_THRESHOLD) {
-            if (interact_prompt_pick_direction(x / mag, y / mag)) {
+            if (interact_prompt_pick_direction(x / mag, y / mag, ipPickFresh)) {
                 gsound_play_sfx_file("ib1p1xx1");
             }
         }
