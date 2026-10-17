@@ -551,6 +551,9 @@ typedef struct RtActor {
     float room_refused_until;
     Object* room_for;
     float room_yield_until;
+    // Its last route failed only because of BODIES (a static route exists): it holds and retries at
+    // follow_retry_at instead of counting toward the unreachable give-up. See the CHASE mover.
+    bool route_plugged;
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -3895,6 +3898,18 @@ static void rt_reaction_enter(RtReaction* r, int kind, const char* why)
         r->keepTile = o->tile;
     }
 
+    // ⚠️ A BODY THAT STARTS TO DIE STOPS BLOCKING (2026-10-17, "teď jen stáli ve dveřích"). Vanilla
+    // clears the tile in show_death, at the END of the death animation -- harmless in turn-based,
+    // where nobody moves while it plays. In realtime a ghoul killed IN A DOORWAY of the Hall of the
+    // Dead kept the only way through shut for its whole 2.3 s fall (trace_2026-10-17_185823 id=3490,
+    // dying s=116.45, flat s=118.75): the three behind it found no route for 2 s, were written off as
+    // unreachable at s=118.35 and stood there, latched, while he shot them. The flatten itself still
+    // waits for the fall (draw order, see rt_settle_corpse_flat) -- only the blocking goes now. Same
+    // three protos exempt as show_death, whose corpses vanilla keeps standing.
+    if (kind == RT_REACT_DYING && o->pid != 16777266 && o->pid != 16777265 && o->pid != 16777224) {
+        o->flags |= OBJECT_NO_BLOCK;
+    }
+
     // A body that starts to die stops walking: a walk left running animates the death art as steps
     // (anim_end_moves has the Skulz in the club). The commit pass already clears a defender it kills;
     // this is for every death that came from somewhere else -- a script, an explosion, undead-kill.
@@ -5069,6 +5084,10 @@ static void rt_reposition(Object* npc, Object* target)
 // UNREACHABLE. Generous on purpose: a path can fail transiently while a doorway is briefly
 // plugged by other critters, and de-aggroing on one bad frame would make packs give up.
 #define RT_NO_PATH_GIVEUP_SECONDS 2.0f
+
+// How often a critter whose way is plugged only by BODIES asks for a route again (it is not counted
+// toward the give-up above -- see route_plugged in the CHASE mover).
+#define RT_ROUTE_PLUGGED_RETRY_SECONDS 0.5f
 
 // Records the outcome of a routing attempt on the actor. Success clears the timer; the first
 // failure stamps it. rt_target_unreachable() then decides when to let go.
@@ -8706,6 +8725,7 @@ static void rt_refresh_registry()
             a->room_refused_until = prev->room_refused_until;
             a->room_for = prev->room_for;
             a->room_yield_until = prev->room_yield_until;
+            a->route_plugged = prev->route_plugged;
             prevHostile = prev->hostile;
         } else {
             a->state = RT_IDLE;
@@ -8742,6 +8762,7 @@ static void rt_refresh_registry()
             a->room_refused_until = 0.0f;
             a->room_for = NULL;
             a->room_yield_until = 0.0f;
+            a->route_plugged = false;
             a->run_winded = false;
             a->breather = false;
             a->breather_since = -1.0f;
@@ -10360,9 +10381,36 @@ static void rt_update_actor(RtActor* a, float dt)
                         a->no_path_since = -1.0f;
                         break;
                     }
+                    // A body plugs the only way (see below): hold until the retry.
+                    if (a->route_plugged && rt_clock < a->follow_retry_at) {
+                        a->no_path_since = -1.0f;
+                        break;
+                    }
                     rt_note_chase_move(a, npc, 3, blocker != NULL ? blocker->pid : -1, stepDest);
-                    rt_note_path_result(a, rt_advance_to_target(npc, a->target));
+                    bool routed = rt_advance_to_target(npc, a->target);
+                    // ⚠️ BODIES IN THE WAY ARE NOT "UNREACHABLE" (2026-10-17, "teď jen stáli ve
+                    // dveřích"). The route search counts every critter as a wall, so a doorway held
+                    // by a teammate fighting in it -- or by one dying there -- reads as "no route",
+                    // and two seconds of that dropped the whole queue behind it to IDLE and latched
+                    // it on its tile (trace_2026-10-17_185823: ids 3403/3405/3452 at the Hall of the
+                    // Dead, 2-3 tiles from him). Asked again against walls and scenery only
+                    // (rt_static_blocking_at): if THAT route exists, only bodies stand in it, and
+                    // they move or die -- so the critter holds and tries again shortly instead of
+                    // counting it toward the give-up. A wall, a locked door, a sealed pen still do.
+                    if (!routed && make_path_func(npc, npc->tile, a->target->tile, NULL, 0, rt_static_blocking_at) > 0) {
+                        if (!a->route_plugged) {
+                            trace_event(TRACE_FLOW, "route-plugged", "id=%d pid=%d tile=%d tgt=%d dist=%d t=%.2f",
+                                npc->id, npc->pid, npc->tile, a->target->tile, obj_dist(npc, a->target), rt_clock);
+                        }
+                        a->route_plugged = true;
+                        a->follow_retry_at = rt_clock + RT_ROUTE_PLUGGED_RETRY_SECONDS;
+                        a->no_path_since = -1.0f;
+                    } else {
+                        a->route_plugged = false;
+                        rt_note_path_result(a, routed);
+                    }
                 } else {
+                    a->route_plugged = false;
                     rt_note_chase_move(a, npc, 1, -1, stepDest);
                     rt_step_toward(npc, a->target);
                 }
