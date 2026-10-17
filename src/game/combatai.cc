@@ -541,6 +541,26 @@ int combatai_max_dist(Object* critter)
     return ai_cap(critter)->max_dist;
 }
 
+// REALTIME (combat_rt): the per-attack choices ai_try_attack makes, exported so realtime makes the
+// SAME ones without running a turn (2026-10-17). min_to_hit gates the shot (attack / move closer /
+// run away), ai_pick_hit_mode rolls the packet's secondary_freq, ai_called_shot its called_freq.
+// ai_called_shot tests the ENGINE AP field for the aimed cost -- the caller tops it up first and
+// checks its own pool.
+int combatai_min_to_hit(Object* critter)
+{
+    return ai_cap(critter)->min_to_hit;
+}
+
+int combatai_pick_hit_mode(Object* critter, Object* weapon)
+{
+    return ai_pick_hit_mode(critter, weapon);
+}
+
+int combatai_called_shot(Object* critter, Object* target, int hitMode)
+{
+    return ai_called_shot(critter, target, hitMode);
+}
+
 // Compare objects by distance to origin.
 //
 // 0x424E30

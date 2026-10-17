@@ -554,6 +554,30 @@ typedef struct RtActor {
     // Its last route failed only because of BODIES (a static route exists): it holds and retries at
     // follow_retry_at instead of counting toward the unreachable give-up. See the CHASE mover.
     bool route_plugged;
+    // --- COMBAT AI, 2026-10-17 ("jdeme implementovat vše"): vanilla's per-attack choices and the
+    // realtime tactics built on them. See the COMBAT AI block above rt_update_actor.
+    int hit_verdict; // vanilla min_to_hit verdict (rt_min_to_hit_verdict): 0 attack, 1 closer, 2 hopeless
+    float hit_verdict_at; // the cached verdict is recomputed after this
+    Object* hit_verdict_tgt;
+    int hit_verdict_mode;
+    bool plan_valid; // this attack's vanilla choices are made (rt_plan_attack)
+    int plan_mode;
+    int plan_loc;
+    Object* plan_target;
+    Object* plan_weapon;
+    Object* checked_hand; // what the hand held when weapon_checked latched (rt_ensure_weapon_drawn)
+    int dodge_serial; // the blast it has decided about (rt_grenade_dodge_tick)
+    float dodge_at; // when it jumps; < 0 = not jumping
+    int dodge_tile; // the blast centre it jumps away from
+    int dodge_radius;
+    bool reload_cover_tried; // looked for cover for the reload it is about to do (rt_reload_cover)
+    int last_seen_tile; // where it last perceived its target (rt_search_*)
+    int search_tile;
+    float search_until;
+    float search_look_at;
+    float retarget_check_at; // next look for a much nearer enemy (rt_retarget_nearer)
+    float ff_check_until; // friendly-fire care: no new roll before this (rt_ff_care)
+    int attack_loc; // the intent's hit location (HIT_LOCATION_UNCALLED unless a called shot)
 } RtActor;
 
 static RtActor rt_actors[RT_MAX_ACTORS];
@@ -1484,10 +1508,42 @@ struct RtInFlight {
     // erase hook if the projectile is freed first; explosionFid stays, so that still reads as landed.
     Object* projectile;
     int explosionFid;    // -1 = not an explosive attack
+
+    // A BLAST (grenade radius 2, rocket 3) and where it goes off, fixed when the attack is computed;
+    // 0 = no blast (a bullet, a thrown knife). Who it catches is re-checked when it lands
+    // (rt_blast_filter) -- see rt_grenade_dodge_tick. serial tells one blast from the next.
+    int blastTile;
+    int blastRadius;
+    int serial;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
 static int rt_inflight_count = 0;
+static int rt_inflight_serial_next = 1;
+
+// Where this attack's blast goes off and how far it reaches, as compute_attack decided it: a grenade
+// (thrown, explosion / plasma / EMP damage) reaches 2, any other explosion 3 (compute_explosion_on_
+// extras); centred on the defender when it hit, on the tile it fell to when it missed.
+static void rt_inflight_init_blast(RtInFlight* f)
+{
+    f->serial = rt_inflight_serial_next++;
+    f->blastTile = -1;
+    f->blastRadius = 0;
+    if (f->explosionFid == -1 || f->ctd.attacker == NULL || f->ctd.weapon == NULL) {
+        return;
+    }
+    int damageType = item_w_damage_type(f->ctd.weapon);
+    bool thrown = item_w_anim(f->ctd.attacker, f->ctd.hitMode) == ANIM_THROW_ANIM;
+    bool grenade = thrown
+        && (damageType == DAMAGE_TYPE_EXPLOSION || damageType == DAMAGE_TYPE_PLASMA || damageType == DAMAGE_TYPE_EMP);
+    if (!grenade && damageType != DAMAGE_TYPE_EXPLOSION) {
+        return; // a thrown knife or rock: it lands, it does not go off
+    }
+    f->blastRadius = grenade ? 2 : 3;
+    f->blastTile = (f->ctd.attackerFlags & DAM_HIT) != 0 && f->ctd.defender != NULL
+        ? f->ctd.defender->tile
+        : f->ctd.tile;
+}
 
 // True if some in-flight attack already targets `d` (enforces one-reaction-per-defender).
 static bool rt_defender_in_flight(Object* d)
@@ -2092,11 +2148,22 @@ static bool rt_sync_weapon_fid(Object* npc)
 
 static void rt_ensure_weapon_drawn(RtActor* a)
 {
-    if (a->weapon_checked) {
-        return;
-    }
-
     Object* npc = a->obj;
+
+    if (a->weapon_checked) {
+        if (inven_right_hand(npc) == a->checked_hand) {
+            return;
+        }
+        // ⚠️ THE HAND EMPTIED UNDER THE LATCH (2026-10-17). A critter whose best weapon was a stack
+        // of grenades throws the last one -- or throws its spear, a secondary attack since
+        // rt_plan_attack -- and is left bare-handed with the latch still set, so it punched for the
+        // rest of the fight with a knife in its pack. Vanilla's next turn would run
+        // ai_switch_weapons; this is that turn.
+        trace_event(TRACE_FLOW, "hand-changed", "id=%d pid=%d was=%d now=%d t=%.2f",
+            npc->id, npc->pid, a->checked_hand != NULL ? a->checked_hand->pid : -1,
+            inven_right_hand(npc) != NULL ? inven_right_hand(npc)->pid : -1, rt_clock);
+        a->weapon_checked = false;
+    }
 
     // Already holding a weapon in the right hand -- nothing to draw. Uses the TYPE-checked test:
     // with a plain non-NULL check a critter holding a non-weapon (Morbid's First Aid Kit) latched
@@ -2142,6 +2209,7 @@ static void rt_ensure_weapon_drawn(RtActor* a)
     // carries its own weapon code and a stale one asks for art nobody drew. Latch only once that
     // is settled.
     a->weapon_checked = rt_sync_weapon_fid(npc);
+    a->checked_hand = inven_right_hand(npc);
 }
 
 // The AP an actor must pay to attack in the given hit mode (its original Fallout
@@ -5227,6 +5295,7 @@ static bool rt_swap_dry_weapon(RtActor* a, Object* npc, Object* dry)
     if (replacement != NULL) {
         inven_wield(npc, replacement, 1);
         a->weapon_checked = true;
+        a->checked_hand = inven_right_hand(npc);
         trace_event(TRACE_FLOW, "npc-swap-weapon", "id=%d pid=%d from=%d to=%d t=%.2f",
             npc->id, npc->pid, dry != NULL ? dry->pid : -1, replacement->pid, rt_clock);
         return true;
@@ -5235,6 +5304,7 @@ static bool rt_swap_dry_weapon(RtActor* a, Object* npc, Object* dry)
     if (dry != NULL) {
         inven_unwield(npc, 1);
         a->weapon_checked = true;
+        a->checked_hand = inven_right_hand(npc);
         trace_event(TRACE_FLOW, "npc-unarmed", "id=%d pid=%d dropped=%d t=%.2f",
             npc->id, npc->pid, dry->pid, rt_clock);
         return true;
@@ -6782,6 +6852,7 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     f->actionSeen = false;
     f->tAnimEnd = -1.0f;
     f->projectile = action_take_explosive_projectile(&f->explosionFid);
+    rt_inflight_init_blast(f);
     combat_clear_pending_attack();
 
     // TEMP DIAG (phantom-attack hunt): combat_attack returned success but the attacker's swing
@@ -8643,6 +8714,7 @@ static void rt_refresh_registry()
         RtActor* a = &fresh[freshCount++];
         a->obj = obj;
         a->wants_attack = false;
+        a->attack_loc = HIT_LOCATION_UNCALLED;
         a->engine_target = NULL;
         bool prevHostile = false;
         if (prev != NULL) {
@@ -8726,6 +8798,27 @@ static void rt_refresh_registry()
             a->room_for = prev->room_for;
             a->room_yield_until = prev->room_yield_until;
             a->route_plugged = prev->route_plugged;
+            a->hit_verdict = prev->hit_verdict;
+            a->hit_verdict_at = prev->hit_verdict_at;
+            a->hit_verdict_tgt = prev->hit_verdict_tgt;
+            a->hit_verdict_mode = prev->hit_verdict_mode;
+            a->plan_valid = prev->plan_valid;
+            a->plan_mode = prev->plan_mode;
+            a->plan_loc = prev->plan_loc;
+            a->plan_target = prev->plan_target;
+            a->plan_weapon = prev->plan_weapon;
+            a->checked_hand = prev->checked_hand;
+            a->dodge_serial = prev->dodge_serial;
+            a->dodge_at = prev->dodge_at;
+            a->dodge_tile = prev->dodge_tile;
+            a->dodge_radius = prev->dodge_radius;
+            a->reload_cover_tried = prev->reload_cover_tried;
+            a->last_seen_tile = prev->last_seen_tile;
+            a->search_tile = prev->search_tile;
+            a->search_until = prev->search_until;
+            a->search_look_at = prev->search_look_at;
+            a->retarget_check_at = prev->retarget_check_at;
+            a->ff_check_until = prev->ff_check_until;
             prevHostile = prev->hostile;
         } else {
             a->state = RT_IDLE;
@@ -8763,6 +8856,27 @@ static void rt_refresh_registry()
             a->room_for = NULL;
             a->room_yield_until = 0.0f;
             a->route_plugged = false;
+            a->hit_verdict = 0;
+            a->hit_verdict_at = 0.0f;
+            a->hit_verdict_tgt = NULL;
+            a->hit_verdict_mode = -1;
+            a->plan_valid = false;
+            a->plan_mode = HIT_MODE_PUNCH;
+            a->plan_loc = HIT_LOCATION_UNCALLED;
+            a->plan_target = NULL;
+            a->plan_weapon = NULL;
+            a->checked_hand = NULL;
+            a->dodge_serial = -1;
+            a->dodge_at = -1.0f;
+            a->dodge_tile = -1;
+            a->dodge_radius = 0;
+            a->reload_cover_tried = false;
+            a->last_seen_tile = -1;
+            a->search_tile = -1;
+            a->search_until = 0.0f;
+            a->search_look_at = 0.0f;
+            a->retarget_check_at = 0.0f;
+            a->ff_check_until = 0.0f;
             a->run_winded = false;
             a->breather = false;
             a->breather_since = -1.0f;
@@ -9233,6 +9347,104 @@ static bool rt_room_make(RtActor* a, Object* npc, int hitMode)
         a->room_yield_until = rt_clock + RT_ROOM_YIELD_SECONDS;
     }
     return true;
+}
+
+// --- COMBAT AI: VANILLA'S PER-ATTACK CHOICES (2026-10-17) -----------------------------------------
+//
+// ⚠️ THREE OF THE AI PACKET'S NUMBERS WERE NEVER READ IN REALTIME: min_to_hit, secondary_freq and
+// called_freq (AI.TXT). Vanilla's ai_try_attack uses all three on every attack:
+//   * min_to_hit -- below it the critter does not shoot: it moves closer, and if even point blank
+//     would not reach it (determine_to_hit_no_range) it RUNS AWAY (ai_run_away sets FLEEING, which
+//     rt_flee_step already ports). His call: "jako vanilla, uteče". A raider no longer pops off 5%
+//     shots from across the map.
+//   * secondary_freq -- 1 in N attacks use the weapon's second mode: an SMG's burst, a spear's
+//     throw. Realtime only ever fired primary.
+//   * called_freq -- 1 in N attacks aimed at a random body part, if the critter is bright enough for
+//     the difficulty (ai_called_shot). Realtime never aimed.
+// The roll is made ONCE per attack (rt_plan_attack) and held until that attack is fired, its target
+// or its weapon changes -- re-rolling every frame would turn a 1-in-30 burst into a near-certainty.
+#define RT_HIT_OK 0
+#define RT_HIT_CLOSER 1
+#define RT_HIT_HOPELESS 2
+#define RT_HIT_VERDICT_SECONDS 0.25f
+
+static int rt_min_to_hit_verdict(RtActor* a, Object* npc, Object* target, int hitMode)
+{
+    if (a->hit_verdict_tgt == target && a->hit_verdict_mode == hitMode && rt_clock < a->hit_verdict_at) {
+        return a->hit_verdict;
+    }
+
+    int minToHit = combatai_min_to_hit(npc);
+    int toHit = determine_to_hit(npc, target, HIT_LOCATION_UNCALLED, hitMode);
+    int noRange = toHit;
+    int verdict = RT_HIT_OK;
+    if (toHit < minToHit) {
+        noRange = determine_to_hit_no_range(npc, target, HIT_LOCATION_UNCALLED, hitMode);
+        verdict = noRange < minToHit ? RT_HIT_HOPELESS : RT_HIT_CLOSER;
+    }
+
+    if (verdict != a->hit_verdict || target != a->hit_verdict_tgt) {
+        static const char* names[] = { "ok", "closer", "hopeless" };
+        trace_event(TRACE_FLOW, "min-to-hit", "id=%d pid=%d verdict=%s toHit=%d noRange=%d min=%d hm=%d dist=%d t=%.2f",
+            npc->id, npc->pid, names[verdict], toHit, noRange, minToHit, hitMode, obj_dist(npc, target), rt_clock);
+    }
+    a->hit_verdict = verdict;
+    a->hit_verdict_tgt = target;
+    a->hit_verdict_mode = hitMode;
+    a->hit_verdict_at = rt_clock + RT_HIT_VERDICT_SECONDS;
+    return verdict;
+}
+
+// Vanilla's answer to a hopeless shot: ai_run_away, i.e. FLEEING -- rt_flee_step takes it from the
+// next frame (it runs from the dude to max_dist and leaves the fight, as vanilla's does).
+static void rt_run_away_hopeless(RtActor* a, Object* npc)
+{
+    npc->data.critter.combat.maneuver |= CRITTER_MANUEVER_FLEEING;
+    a->plan_valid = false;
+    trace_event(TRACE_FLOW, "hopeless-flee", "id=%d pid=%d tgt=%d t=%.2f",
+        npc->id, npc->pid, a->target != NULL ? a->target->id : -1, rt_clock);
+}
+
+// The attack's vanilla choices: which mode (secondary_freq) and where (called_freq). baseMode is
+// rt_hit_mode's answer -- primary with a weapon, punch without (vanilla's ai_pick_hit_mode gives a
+// bare-handed critter nothing else either).
+static void rt_plan_attack(RtActor* a, Object* npc, int baseMode)
+{
+    Object* weapon = rt_hand_holds_weapon(npc) ? inven_right_hand(npc) : NULL;
+    if (a->plan_valid && a->plan_target == a->target && a->plan_weapon == weapon) {
+        return;
+    }
+
+    int maxAp = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS);
+    int mode = baseMode;
+    if (baseMode == HIT_MODE_RIGHT_WEAPON_PRIMARY && weapon != NULL
+        && combatai_pick_hit_mode(npc, weapon) == HIT_MODE_RIGHT_WEAPON_SECONDARY
+        && rt_attack_art_ok(npc, HIT_MODE_RIGHT_WEAPON_SECONDARY)
+        && obj_dist(npc, a->target) <= item_w_range(npc, HIT_MODE_RIGHT_WEAPON_SECONDARY)
+        && rt_ap_cost(npc, HIT_MODE_RIGHT_WEAPON_SECONDARY) <= maxAp) {
+        mode = HIT_MODE_RIGHT_WEAPON_SECONDARY;
+    }
+
+    // ai_called_shot answers TORSO for "not aimed" (vanilla charges no aim for it); realtime spells
+    // that UNCALLED, which is what its AP and bad-shot checks read as "not aiming".
+    int loc = HIT_LOCATION_UNCALLED;
+    if (rt_ap_cost(npc, mode, true) <= maxAp) {
+        npc->data.critter.combat.ap = maxAp;
+        int called = combatai_called_shot(npc, a->target, mode);
+        if (called != HIT_LOCATION_TORSO && called != HIT_LOCATION_UNCALLED) {
+            loc = called;
+        }
+    }
+
+    a->plan_valid = true;
+    a->plan_mode = mode;
+    a->plan_loc = loc;
+    a->plan_target = a->target;
+    a->plan_weapon = weapon;
+    if (mode != baseMode || loc != HIT_LOCATION_UNCALLED) {
+        trace_event(TRACE_FLOW, "attack-plan", "id=%d pid=%d hm=%d loc=%d wpn=%d t=%.2f",
+            npc->id, npc->pid, mode, loc, weapon != NULL ? weapon->pid : -1, rt_clock);
+    }
 }
 
 static void rt_update_actor(RtActor* a, float dt)
@@ -10259,7 +10471,24 @@ static void rt_update_actor(RtActor* a, float dt)
                 }
             }
 
-            if (inRange && !rt_shot_blocked(npc, a->target, mode)) {
+            // VANILLA'S min_to_hit (rt_min_to_hit_verdict): in range is not enough if the shot is
+            // below the packet's minimum -- close in instead, or give up if even point blank would
+            // not do. A critter that cannot walk fires from where it is (rt_can_walk).
+            bool attackNow = inRange && !rt_shot_blocked(npc, a->target, mode);
+            bool closeForHit = false;
+            if (attackNow && rt_can_walk(npc)) {
+                int verdict = rt_min_to_hit_verdict(a, npc, a->target, mode);
+                if (verdict == RT_HIT_HOPELESS) {
+                    rt_run_away_hopeless(a, npc);
+                    break;
+                }
+                if (verdict == RT_HIT_CLOSER && obj_dist(npc, a->target) > 1) {
+                    attackNow = false;
+                    closeForHit = true;
+                }
+            }
+
+            if (attackNow) {
                 a->state = RT_ATTACK;
             } else if (a->breather) {
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
@@ -10275,7 +10504,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 // An in-flight walk segment is left alone rather than force-cleared: it finishes
                 // its current tile and then nothing new is issued, so the stop reads as slowing to
                 // a halt instead of snapping mid-stride.
-            } else if (inRange) {
+            } else if (inRange && !closeForHit) {
                 // In range but no LINE OF FIRE (target behind a wall/building): don't
                 // just stand -- path AROUND the obstacle to get an angle. A plain step
                 // toward can't route around a building, so a ranged NPC would otherwise
@@ -10426,6 +10655,14 @@ static void rt_update_actor(RtActor* a, float dt)
             break;
         }
 
+        // The hand changed under the latch (a last grenade, a thrown spear): CHASE draws the next
+        // weapon (rt_ensure_weapon_drawn) before anything else is decided.
+        if (a->weapon_checked && inven_right_hand(npc) != a->checked_hand) {
+            a->state = RT_CHASE;
+            a->plan_valid = false;
+            break;
+        }
+
         int hitMode = rt_hit_mode(npc);
         if (obj_dist(npc, a->target) > item_w_range(npc, hitMode)) {
             a->state = RT_CHASE;
@@ -10506,16 +10743,43 @@ static void rt_update_actor(RtActor* a, float dt)
             break;
         }
 
+        // VANILLA'S CHOICES FOR THIS ATTACK (rt_plan_attack): its mode -- a burst, a spear's throw
+        // -- and a called shot, rolled once and held until it is fired. A planned mode that the
+        // target has since stepped out of falls back to the primary.
+        rt_plan_attack(a, npc, hitMode);
+        int attackMode = a->plan_mode;
+        int attackLoc = a->plan_loc;
+        if (obj_dist(npc, a->target) > item_w_range(npc, attackMode)) {
+            a->plan_valid = false;
+            attackMode = hitMode;
+            attackLoc = HIT_LOCATION_UNCALLED;
+        }
+
+        // ...and min_to_hit on that mode, as ai_try_attack checks it: too poor a shot -> close in
+        // (back to CHASE, whose verdict keeps it walking), hopeless even point blank -> run away.
+        if (rt_can_walk(npc)) {
+            int verdict = rt_min_to_hit_verdict(a, npc, a->target, attackMode);
+            if (verdict == RT_HIT_HOPELESS) {
+                rt_run_away_hopeless(a, npc);
+                break;
+            }
+            if (verdict == RT_HIT_CLOSER && obj_dist(npc, a->target) > 1) {
+                a->state = RT_CHASE;
+                break;
+            }
+        }
+
         // Record an attack intent if the pool can afford it; the arbiter decides
         // (by Sequence) who actually gets the single free hit-resolution slot this
         // frame and spends the AP. Can't afford -> stay in RT_ATTACK and wait for
         // AP to refill (no queueing). The anim_busy(npc) guard above already kept
-        // an actor that's mid-swing from getting here.
-        int cost = rt_ap_cost(npc, hitMode);
+        // an actor that's mid-swing from getting here. A called shot costs its aim.
+        int cost = rt_ap_cost(npc, attackMode, attackLoc != HIT_LOCATION_UNCALLED);
         if (a->ap >= cost) {
             a->wants_attack = true;
             a->attack_target = a->target;
-            a->attack_mode = hitMode;
+            a->attack_mode = attackMode;
+            a->attack_loc = attackLoc;
         }
         break;
     }
@@ -10610,6 +10874,7 @@ static void rt_resolve_attacks(float dt)
         Object* attacker;
         Object* target;
         int mode;
+        int loc;
         int cost;
         int seq;
         int* ap;
@@ -10639,7 +10904,7 @@ static void rt_resolve_attacks(float dt)
             continue;
         }
 
-        int cost = rt_ap_cost(npc, a->attack_mode);
+        int cost = rt_ap_cost(npc, a->attack_mode, a->attack_loc != HIT_LOCATION_UNCALLED);
         if (a->ap < cost
             || obj_dist(npc, a->attack_target) > item_w_range(npc, a->attack_mode)) {
             continue;
@@ -10649,6 +10914,7 @@ static void rt_resolve_attacks(float dt)
         c->attacker = npc;
         c->target = a->attack_target;
         c->mode = a->attack_mode;
+        c->loc = a->attack_loc;
         c->cost = cost;
         c->seq = stat_level(npc, STAT_SEQUENCE);
         c->ap = &a->ap;
@@ -10745,10 +11011,15 @@ static void rt_resolve_attacks(float dt)
 
     // Charge AP only if the attack actually started (rt_do_attack false = engine couldn't
     // register, e.g. the in-flight list is full or the table was busy; keep the AP and retry).
-    bool fired = rt_do_attack(win->attacker, win->target, win->mode, HIT_LOCATION_UNCALLED);
+    bool fired = rt_do_attack(win->attacker, win->target, win->mode, win->loc);
     if (fired) {
         *win->ap -= win->cost;
         rt_note_attack_fired(win->attacker, win->mode);
+        // This attack's vanilla choices are spent; the next one rolls its own (rt_plan_attack).
+        RtActor* wa = rt_actor_of(win->attacker);
+        if (wa != NULL) {
+            wa->plan_valid = false;
+        }
     }
 }
 
@@ -13030,6 +13301,7 @@ void combat_rt_update(float dt)
         f->actionSeen = false;
         f->tAnimEnd = -1.0f;
         f->projectile = action_take_explosive_projectile(&f->explosionFid);
+        rt_inflight_init_blast(f);
         combat_clear_pending_attack();
         trace_event(TRACE_COMBAT, "inflight-adopt", "t=%.2f", rt_clock);
     }
