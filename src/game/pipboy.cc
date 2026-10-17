@@ -478,9 +478,9 @@ static const PipboyControl ctrl_lines[] = {
     { "Y", "Swap active hand" },
     { NULL, NULL },
     // ⚠️ THE STICK EACH WHEEL READS IS PART OF ITS ENTRY. A wheel is aimed with the thumb that is
-    // NOT holding it open, so the face-button wheels (Y, B) read the LEFT stick and L3 reads the
-    // RIGHT one. Naming the wrong stick is worse than naming none: it sends the player to the walk
-    // stick, which is the input the wheels arm against.
+    // NOT holding it open, so the face-button wheels (Y, B) read the LEFT stick -- and since
+    // 2026-10-17 so does L3: click the stick, tilt that same stick at the skill (his pick, one thumb).
+    // Naming the wrong stick is worse than naming none.
     //
     // ⚠️ AMMUNITION LOST ITS OWN ROW (2026-09-17) because it lost its own button -- RB had to be
     // freed to become a held fire button. Since 2026-09-20 it is not a page you have to go looking
@@ -491,7 +491,7 @@ static const PipboyControl ctrl_lines[] = {
     // first page they are a single LB away. That is the whole reason the entry spells LB out.
     { "Y", "Weapons + ammo; LB = drugs, items, armour" },
     { "B", "Drugs and quick items - aim LEFT" },
-    { "L3 (press)", "Skills: stays open, RIGHT stick, let go or A picks" },
+    { "L3 (press)", "Skills: tilt the SAME stick at one, let go or A picks" },
     { "A", "Take what is highlighted" },
     { NULL, NULL },
     { NULL, "D-PAD - HOLD each of these; a TAP cycles the action" },

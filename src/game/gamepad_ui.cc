@@ -2891,6 +2891,14 @@ static void gpui_skill_wheel(SDL_GameController* pad)
     // it went -- confirmed only after the stick has stayed centred for GPUI_SKILL_RELEASE_MS, so
     // swinging from one side of the ring to the other through the middle does not pick on the way.
     // A, L3 and B keep their jobs.
+    //
+    // ⚠️ AIMED WITH THE LEFT STICK, THE ONE YOU JUST CLICKED (2026-10-17, "L3 se musí vymyslet jiné
+    // vybírání na skills"; his pick of three: one thumb). Click L3 and tilt that same stick at the
+    // skill; letting it spring back picks it, as before. The right thumb is free. Two things make the
+    // walk stick safe to aim with, both already in place for the Y and B wheels: the wheel opens
+    // DISARMED (radial_wheel_update ignores the stick until it has been back in the centre once, so a
+    // click made while running does not pick the skill you were running towards -- see
+    // [[wheel-aim-arming]]), and combat_rt stops the dude's feet while any wheel is open.
     static bool prevL3 = false;
     static bool prevB = false;
     static int releasedOn = -1;                // skill highlighted when the stick went to centre
@@ -2931,8 +2939,8 @@ static void gpui_skill_wheel(SDL_GameController* pad)
                 gpui_use_skill(skill);
             }
         } else {
-            float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / GPUI_AXIS_MAX;
-            float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / GPUI_AXIS_MAX;
+            float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) / GPUI_AXIS_MAX;
+            float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) / GPUI_AXIS_MAX;
             int before = radial_wheel_highlight_id();
             radial_wheel_update(x, y);
             int now = radial_wheel_highlight_id();
