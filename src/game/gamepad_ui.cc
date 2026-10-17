@@ -3691,7 +3691,21 @@ void gamepad_ui_quick_slot_set(int slot, int pid)
     }
 }
 
+// Can a quick slot THROW it? ⚠️ Either mode counts (2026-10-17, "i oštěp k hodu na LB nebo RB?"): a
+// spear thrusts on its primary and throws on its secondary, and the quick throw fires the THROW mode
+// whichever it is (combat_rt_quick_throw_mode). Grenades, rocks and throwing knives throw on the
+// primary.
 static bool gpui_item_is_throwable(Object* item)
+{
+    return item != NULL && item_get_type(item) == ITEM_TYPE_WEAPON
+        && (item_w_subtype(item, HIT_MODE_RIGHT_WEAPON_PRIMARY) == ATTACK_TYPE_THROW
+            || item_w_subtype(item, HIT_MODE_RIGHT_WEAPON_SECONDARY) == ATTACK_TYPE_THROW);
+}
+
+// ...but only something made to be thrown is a slot's OWN pick: a spear in the pack is a melee
+// weapon first, and RB's automatic choice must never throw away the one you fight with. A spear goes
+// in a slot when you bind it there.
+static bool gpui_item_throws_first(Object* item)
 {
     return item != NULL && item_get_type(item) == ITEM_TYPE_WEAPON
         && item_w_subtype(item, HIT_MODE_RIGHT_WEAPON_PRIMARY) == ATTACK_TYPE_THROW;
@@ -3715,7 +3729,7 @@ static Object* gpui_best_throwable()
     Inventory* inventory = &(obj_dude->data.inventory);
     for (int i = 0; i < inventory->length; i++) {
         Object* item = inventory->items[i].item;
-        if (!gpui_item_is_throwable(item)) {
+        if (!gpui_item_throws_first(item)) {
             continue;
         }
         int minDamage = 0;

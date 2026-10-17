@@ -12550,12 +12550,40 @@ static void rt_mouse_update()
 // The LB / RB quick slots (gamepad_ui, "QUICK SLOTS") draw a throwable into the active hand and, when
 // the button is let go, throw it here. His pick for the target: the lock while LT holds one, else the
 // nearest enemy the way RT without a lock finds it; nobody in range = the throwable is put away.
+// The THROW mode of what the active hand holds -- its primary for a grenade or a throwing knife, its
+// SECONDARY for a spear (2026-10-17: a spear drawn by a quick slot would otherwise have been thrust,
+// on the weapon slot's primary). Anything that does not throw keeps the slot's own mode.
+static int rt_quick_throw_mode()
+{
+    int hitMode = rt_player_hit_mode();
+    int primary;
+    if (hitMode == HIT_MODE_LEFT_WEAPON_PRIMARY || hitMode == HIT_MODE_LEFT_WEAPON_SECONDARY) {
+        primary = HIT_MODE_LEFT_WEAPON_PRIMARY;
+    } else if (hitMode == HIT_MODE_RIGHT_WEAPON_PRIMARY || hitMode == HIT_MODE_RIGHT_WEAPON_SECONDARY) {
+        primary = HIT_MODE_RIGHT_WEAPON_PRIMARY;
+    } else {
+        return hitMode;
+    }
+    int secondary = primary == HIT_MODE_LEFT_WEAPON_PRIMARY ? HIT_MODE_LEFT_WEAPON_SECONDARY : HIT_MODE_RIGHT_WEAPON_SECONDARY;
+    Object* weapon = item_hit_with(obj_dude, primary);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON) {
+        return hitMode;
+    }
+    if (item_w_subtype(weapon, primary) == ATTACK_TYPE_THROW) {
+        return primary;
+    }
+    if (item_w_subtype(weapon, secondary) == ATTACK_TYPE_THROW) {
+        return secondary;
+    }
+    return hitMode;
+}
+
 Object* combat_rt_quick_throw_target()
 {
     if (!rt_enabled || obj_dude == NULL) {
         return NULL;
     }
-    int hitMode = rt_player_hit_mode();
+    int hitMode = rt_quick_throw_mode();
     if (rt_lock_target != NULL) {
         if (rt_is_combatant(rt_lock_target)
             && obj_dist(obj_dude, rt_lock_target) <= item_w_range(obj_dude, hitMode)) {
@@ -12571,7 +12599,7 @@ bool combat_rt_request_throw(Object* target)
     if (!rt_enabled || obj_dude == NULL || target == NULL) {
         return false;
     }
-    int hitMode = rt_player_hit_mode();
+    int hitMode = rt_quick_throw_mode();
     rt_set_player_intent(target, hitMode);
     trace_event(TRACE_ACTION, "quick-throw", "target=%d id=%d hm=%d dist=%d range=%d t=%.2f",
         target->pid, target->id, hitMode, obj_dist(obj_dude, target), item_w_range(obj_dude, hitMode), rt_clock);
