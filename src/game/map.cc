@@ -1067,6 +1067,12 @@ int map_load_file(DB_FILE* stream)
         error = NULL;
     } while (0);
 
+    // STAGES (2026-10-17, "infinite loading"): a map load that never finished left nothing to say
+    // how far it got. One line here and one at the end; the hang watchdog (game_trace.cc) names
+    // the frame if it stops in between.
+    trace_event(TRACE_FLOW, "map-load-stage", "body name=%s error=%s script=%d", map_data.name,
+        error != NULL ? error : "-", map_data.scriptIndex);
+
     if (error != NULL) {
         char message[100]; // TODO: Size is probably wrong.
         snprintf(message, sizeof(message), "%s while loading map, version = %d", error, map_data.version);
@@ -1101,6 +1107,7 @@ int map_load_file(DB_FILE* stream)
     }
 
     gtime_q_add();
+    trace_event(TRACE_FLOW, "map-load-stage", "done name=%s rc=%d", map_data.name, rc);
     map_loading = false;
     db_register_callback(NULL, 0);
     svga_vsync_suspend(false);

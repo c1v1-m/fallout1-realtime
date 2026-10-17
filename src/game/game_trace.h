@@ -52,6 +52,11 @@ void trace_set_snapshot_fn(TraceSnapshotFn fn);
 // Set the realtime combat clock shown by combat heartbeats / digest (0 out of combat).
 void trace_set_clock(float seconds);
 
+// The game is still drawing frames (called from renderPresent, which every loop -- the map, the
+// world map, dialogue, inventory, menus -- goes through). The hang watchdog reads it: a main thread
+// that has not presented a frame for several seconds gets its call stack written to the log.
+void trace_alive();
+
 // Record one structured event. `sub` is a short coalescing key ("A.press", "rc-1",
 // "attack", ...); a rapid run of the same (cat, sub) collapses into one xN line.
 void trace_event(TraceCat cat, const char* sub, const char* fmt, ...);

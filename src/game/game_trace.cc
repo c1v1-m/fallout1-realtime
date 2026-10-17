@@ -165,6 +165,18 @@ static int g_crash_digests = 0;
 // mixer, an SDL worker -- means a completely different suspect list, so the digest says which.
 static unsigned long g_main_tid = 0;
 
+// --- HANG WATCHDOG (2026-10-17, "infinite loading, crash") ----------------------------------------
+// A hang leaves no crash and no digest -- the log simply stops, and the last line says where the
+// game WAS, not where it is stuck. trace_2026-10-17_194839 ended mid map load with nothing after it.
+// So a background thread watches the frame pulse (trace_alive, from renderPresent) and, once the
+// main thread has drawn nothing for TRACE_HANG_MS, suspends it for an instant, records its return
+// addresses, lets it go, and writes them symbolized under "=== HANG ===". Up to three dumps per stall
+// (8, 16, 24 s): the same top frame each time is a loop, different ones are slow progress.
+#define TRACE_HANG_MS 8000
+static volatile long g_alive = 0;
+static void* g_main_thread = NULL; // HANDLE, opened in trace_start_watchdog
+static unsigned long g_watchdog_tid = 0;
+
 static void trace_write_digest_body()
 {
     if (g_file == NULL) {
@@ -412,6 +424,9 @@ static void trace_write_crash(const char* kind, EXCEPTION_POINTERS* ep)
 // the normal crash path (and any real handler) still runs.
 static LONG WINAPI trace_veh(EXCEPTION_POINTERS* ep)
 {
+    if (g_watchdog_tid != 0 && GetCurrentThreadId() == g_watchdog_tid) {
+        return EXCEPTION_CONTINUE_SEARCH; // the watchdog probing a stack; its own __except handles it
+    }
     if (ep != NULL && ep->ExceptionRecord != NULL && trace_seh_is_fatal(ep->ExceptionRecord->ExceptionCode)) {
         trace_write_crash("first-chance", ep);
     }
@@ -451,6 +466,135 @@ static void trace_install_crash_handlers()
     signal(SIGABRT, trace_posix_handler);
     signal(SIGFPE, trace_posix_handler);
     signal(SIGILL, trace_posix_handler);
+#endif
+}
+
+#ifdef _WIN32
+// Return addresses of a SUSPENDED thread. Nothing in here may allocate: the thread may be frozen
+// holding the heap lock. RtlLookupFunctionEntry / RtlVirtualUnwind only read the image's unwind
+// tables, and a bad stack read is caught rather than taking the game down.
+static int trace_capture_pcs(HANDLE thread, DWORD64* pcs, int cap)
+{
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_FULL;
+    if (!GetThreadContext(thread, &ctx)) {
+        return 0;
+    }
+    int n = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+    __try {
+        while (n < cap && ctx.Rip != 0) {
+            pcs[n++] = ctx.Rip;
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, NULL);
+            if (fn == NULL) {
+                ctx.Rip = *(DWORD64*)ctx.Rsp; // a leaf: the return address sits on top
+                ctx.Rsp += 8;
+            } else {
+                PVOID handlerData = NULL;
+                DWORD64 establisher = 0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, NULL);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+#else
+    pcs[n++] = ctx.Eip;
+#endif
+    return n;
+}
+
+static void trace_write_hang(unsigned long stuckMs)
+{
+    DWORD64 pcs[40];
+    int n = 0;
+    if (SuspendThread((HANDLE)g_main_thread) != (DWORD)-1) {
+        n = trace_capture_pcs((HANDLE)g_main_thread, pcs, 40);
+        ResumeThread((HANDLE)g_main_thread);
+    }
+
+    fprintf(g_file, "=== HANG (main thread drew no frame for %.1f s) ===\n", stuckMs / 1000.0);
+    if (g_last_state[0] != '\0') {
+        fprintf(g_file, "last state: %s\n", g_last_state);
+    }
+
+    HANDLE process = GetCurrentProcess();
+    char symbolBuf[sizeof(SYMBOL_INFO) + 256] = { 0 };
+    SYMBOL_INFO* symbol = (SYMBOL_INFO*)symbolBuf;
+    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+    symbol->MaxNameLen = 255;
+    fputs("main stack:\n", g_file);
+    for (int i = 0; i < n; i++) {
+        DWORD64 disp = 0;
+        const char* name = "???";
+        if (SymFromAddr(process, pcs[i], &disp, symbol)) {
+            name = symbol->Name;
+        }
+        IMAGEHLP_LINE64 lineInfo;
+        memset(&lineInfo, 0, sizeof(lineInfo));
+        lineInfo.SizeOfStruct = sizeof(lineInfo);
+        DWORD lineDisp = 0;
+        if (SymGetLineFromAddr64(process, pcs[i], &lineDisp, &lineInfo)) {
+            fprintf(g_file, "  %s (%s:%lu)\n", name, lineInfo.FileName, lineInfo.LineNumber);
+        } else {
+            fprintf(g_file, "  %s+0x%llx\n", name, (unsigned long long)disp);
+        }
+    }
+    fflush(g_file);
+}
+
+static DWORD WINAPI trace_watchdog(LPVOID)
+{
+    long seen = g_alive;
+    DWORD since = GetTickCount();
+    int dumps = 0;
+    for (;;) {
+        Sleep(1000);
+        if (g_file == NULL || !g_enabled) {
+            return 0;
+        }
+        long now = g_alive;
+        if (now != seen) {
+            seen = now;
+            since = GetTickCount();
+            dumps = 0;
+            continue;
+        }
+        DWORD stuck = GetTickCount() - since;
+        if (dumps < 3 && stuck >= (DWORD)TRACE_HANG_MS * (DWORD)(dumps + 1)) {
+            dumps++;
+            trace_write_hang(stuck);
+        }
+    }
+}
+
+static void trace_start_watchdog()
+{
+    g_main_thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+        FALSE, GetCurrentThreadId());
+    if (g_main_thread == NULL) {
+        return;
+    }
+    // Symbols up front, from the main thread: DbgHelp is single-threaded, and the first lookup is
+    // the slow one.
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(GetCurrentProcess(), NULL, TRUE);
+    DWORD tid = 0;
+    HANDLE thread = CreateThread(NULL, 64 * 1024, trace_watchdog, NULL, 0, &tid);
+    if (thread != NULL) {
+        g_watchdog_tid = tid;
+        CloseHandle(thread);
+    }
+}
+#endif
+
+void trace_alive()
+{
+#ifdef _WIN32
+    InterlockedIncrement(&g_alive);
+#else
+    g_alive++;
 #endif
 }
 
@@ -539,6 +683,9 @@ void trace_init()
     fflush(g_file);
 
     trace_install_crash_handlers();
+#ifdef _WIN32
+    trace_start_watchdog();
+#endif
 }
 
 void trace_shutdown()

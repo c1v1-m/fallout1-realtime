@@ -5,6 +5,7 @@
 #include <SDL_opengl.h>
 
 #include "game/gconfig.h"
+#include "game/game_trace.h"
 #include "plib/gnw/crt_shader.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
@@ -435,6 +436,8 @@ void svga_toggle_fullscreen()
 
 void renderPresent()
 {
+    trace_alive(); // the hang watchdog's pulse (game_trace.cc)
+
     SDL_UpdateTexture(gSdlTexture, NULL, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);
 
     // With the CRT filter on the frame goes up through our own GL pass instead of SDL's
