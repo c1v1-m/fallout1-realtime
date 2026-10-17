@@ -3345,6 +3345,10 @@ static bool gpui_inject_pending = false; // a jab is playing and has not reached
 static int gpui_inject_pid = -1;
 static int gpui_inject_ap = 0;
 static unsigned int gpui_inject_at = 0;
+// The explosive put-down (gpui_place_explosive).
+static bool gpui_place_pending = false;
+static Object* gpui_place_item = NULL; // compared against the pack's pointers only, until dropped
+static unsigned int gpui_place_at = 0;
 
 static Object* gpui_carried_drug(int pid)
 {
@@ -3785,6 +3789,9 @@ void gamepad_ui_quick_slots_reset()
     // A jab from before a load never reaches its frame; its AP belonged to the old pool.
     gpui_inject_pending = false;
     combat_rt_inject_end(obj_dude);
+    // Nor does a put-down: the explosive it pointed at belonged to the old world.
+    gpui_place_pending = false;
+    gpui_place_item = NULL;
 }
 
 static void gpui_qt_set(int state)
@@ -4359,6 +4366,122 @@ static int gpui_collect_usable_items(int* pids, int* counts, int count, int max)
     return count;
 }
 
+// ⚠️ AN ARMED EXPLOSIVE GOES ON THE GROUND (2026-10-16, "je možné znovu najet na dynamit za účelem ho
+// položit?" and "nebo do artu přidat tlačítko nastavit čas a položit?"). Arming one from the wheel
+// left it ticking in the pack: picking it again only said "The timer is already ticking"
+// (trace_2026-10-16_014510 s=226.32), and the only way to put it down was the inventory's Drop. Now
+// both of his ideas work: the timer window's PLACE (X) arms and puts it down in one go, and picking
+// the armed one on the wheel puts it down later. The dude bends to the ground (ANIM_MAGIC_HANDS_
+// GROUND, frame 4 of 9 is the hand at the floor) and it lands there -- the animation first, as he
+// wanted the stimpak. A body taken off that animation drops it anyway, on the spot: a man who gets
+// hit while putting a bomb down lets go of it. Then vanilla's "they saw that"
+// (inven_explosive_dropped_notice), exactly as the inventory's Drop answers.
+//
+// Price: picking the armed one again is a new reach into the pack, 2 AP like every wheel item; the
+// timer window's PLACE rides on the arming's 2 AP, one action.
+// (gpui_place_pending / _item / _at: declared up with the jab state, the load reset clears them.)
+
+static bool gpui_is_armed_explosive(int pid)
+{
+    return pid == PROTO_ID_DYNAMITE_II || pid == PROTO_ID_PLASTIC_EXPLOSIVES_II;
+}
+
+static void gpui_place_now()
+{
+    gpui_place_pending = false;
+    Object* item = gpui_place_item;
+    gpui_place_item = NULL;
+    if (item == NULL || obj_dude == NULL) {
+        return;
+    }
+
+    bool carried = false;
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        if (inventory->items[i].item == item) {
+            carried = true;
+            break;
+        }
+    }
+    if (!carried) {
+        return; // gone already (it went off, or was dropped some other way)
+    }
+
+    obj_drop(obj_dude, item);
+    intface_update_items(true);
+    trace_event(TRACE_ACTION, "explosive-placed", "pid=%d tile=%d after=%ums", item->pid, obj_dude->tile,
+        elapsed_time(gpui_place_at));
+    inven_explosive_dropped_notice();
+}
+
+// The bend's frame at the floor (a register_object_call: a cut bend is caught by gpui_place_tick).
+static int gpui_place_done(void* a1, void* a2)
+{
+    (void)a1;
+    (void)a2;
+    if (gpui_place_pending) {
+        gpui_place_now();
+    }
+    return 0;
+}
+
+static void gpui_place_explosive(Object* item, bool chargeAp)
+{
+    if (gpui_place_pending) {
+        gsound_play_sfx_file("iisxxxx1");
+        return;
+    }
+    if (chargeAp && combat_rt_player_ap() < 2) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "explosive-place-refused", "why=ap ap=%d", combat_rt_player_ap());
+        return;
+    }
+    if (chargeAp) {
+        combat_rt_spend_ap(2);
+    }
+
+    gpui_place_item = item;
+    gpui_place_pending = true;
+    gpui_place_at = get_time();
+
+    if (!critter_is_prone(obj_dude)) {
+        int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_MAGIC_HANDS_GROUND,
+            (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+        int actionFrame = 0;
+        CacheEntry* handle;
+        Art* art = art_ptr_lock(fid, &handle);
+        if (art != NULL) {
+            actionFrame = art_frame_action_frame(art);
+            art_ptr_unlock(handle);
+        }
+
+        if (register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
+            register_object_animate(obj_dude, ANIM_MAGIC_HANDS_GROUND, 0);
+            register_object_call(obj_dude, NULL, gpui_place_done, actionFrame);
+            if (register_end() == 0) {
+                trace_event(TRACE_ACTION, "explosive-place-start", "pid=%d frame=%d ap=%d", item->pid, actionFrame,
+                    combat_rt_player_ap());
+                return;
+            }
+        }
+    }
+
+    gpui_place_now(); // on the floor already, or the bend could not register: put it down at once
+}
+
+// From the safe tick: a bend taken off before its frame drops the explosive where he stands.
+static void gpui_place_tick()
+{
+    if (!gpui_place_pending || obj_dude == NULL) {
+        return;
+    }
+    if (elapsed_time(gpui_place_at) < 200 || FID_ANIM_TYPE(obj_dude->fid) == ANIM_MAGIC_HANDS_GROUND) {
+        return;
+    }
+    trace_event(TRACE_ACTION, "explosive-place-cut", "anim=%d", FID_ANIM_TYPE(obj_dude->fid));
+    gpui_place_now();
+}
+
 // USE an item on yourself, exactly the inventory's Use (inventry.cc, GAME_MOUSE_ACTION_MENU_ITEM_USE):
 // take one out of the stack, protinst_use_item it, destroy it if that consumed it, otherwise put it
 // back. 2 AP in a fight, refused when the pool cannot pay -- the same price the drugs have.
@@ -4382,6 +4505,12 @@ static void gpui_quick_use_item(int pid)
         return;
     }
 
+    // Already armed: put it down (see gpui_place_pending).
+    if (gpui_is_armed_explosive(pid) && (item->flags & OBJECT_USED) != 0) {
+        gpui_place_explosive(item, true);
+        return;
+    }
+
     if (item_remove_mult(obj_dude, item, 1) != 0) {
         return;
     }
@@ -4392,6 +4521,10 @@ static void gpui_quick_use_item(int pid)
         obj_destroy(item);
     } else {
         item_add_force(obj_dude, item, 1);
+        // The timer window's PLACE: armed and put down in one action (its AP is the arming's).
+        if (inven_set_timer_place_requested() && gpui_is_armed_explosive(item->pid)) {
+            gpui_place_explosive(item, false);
+        }
     }
 
     if (rc != -1) {
@@ -7774,6 +7907,8 @@ static void gpui_drain_requests()
 {
     // A jab cut before its frame gives its AP back -- before any new press is judged.
     gpui_inject_tick();
+    // ...and an explosive whose put-down was cut still lands.
+    gpui_place_tick();
 
     // A quick slot's drug (RB's stimpak, or whatever is bound), then the throw's state machine.
     if (gpui_qs_use_pending_slot != -1) {

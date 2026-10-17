@@ -223,6 +223,7 @@ static void barter_move_inventory(Object* a1, int quantity, int a3, int a4, Obje
 static void barter_move_from_table_inventory(Object* a1, int quantity, int a3, Object* a4, Object* a5, bool a6);
 static void display_table_inventories(int win, Object* a2, Object* a3, int a4);
 static int do_move_timer(int inventoryWindowType, Object* item, int a3);
+static void inven_place_if_requested(Object* item, Object* owner, Object** handSlot);
 static int setup_move_timer_win(int inventoryWindowType, Object* item);
 static int exit_move_timer_win(int inventoryWindowType);
 
@@ -257,6 +258,22 @@ static InventoryWindowDescription iscr_data[INVENTORY_WINDOW_TYPE_COUNT] = {
 
 // 0x5056C8
 static bool dropped_explosive = false;
+
+// ⚠️ THE TIMER WINDOW CAN PUT THE EXPLOSIVE DOWN TOO (2026-10-16, "nebo do artu přidat tlačítko nastavit
+// čas a položit?"). Arming dynamite left it ticking in the pack, and putting it down meant opening
+// the inventory again and finding Drop -- on a pad, with the fuse running. The window's PLACE (the
+// plate under the clock, X on the pad) sets the timer exactly as DONE does and also asks for the
+// explosive to go on the ground; the one who armed it reads the request back
+// (inven_set_timer_place_requested) and drops it. The plate is vanilla's own ALL button from the
+// move-items mode of this same window, with the label drawn into a COPY (mt_place_up/down):
+// vanilla draws "ALL" straight into the cached art, and drawing PLACE there would leave it under
+// every later ALL.
+#define MT_KEY_PLACE 5001
+#define MT_PLACE_W 94
+#define MT_PLACE_H 33
+static bool mt_place_requested = false;
+static unsigned char mt_place_up[MT_PLACE_W * MT_PLACE_H];
+static unsigned char mt_place_down[MT_PLACE_W * MT_PLACE_H];
 
 // 0x59CD2C
 static CacheEntry* mt_key[8];
@@ -1467,41 +1484,7 @@ void exit_inventory(bool shouldEnableIso)
     gmouse_enable();
 
     if (dropped_explosive) {
-        Attack v1;
-        combat_ctd_init(&v1, obj_dude, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
-        v1.attackerFlags = DAM_HIT;
-        v1.tile = obj_dude->tile;
-        compute_explosion_on_extras(&v1, 0, 0, 1);
-
-        Object* v2 = NULL;
-        for (int index = 0; index < v1.extrasLength; index++) {
-            Object* critter = v1.extras[index];
-            if (critter != obj_dude
-                && critter->data.critter.combat.team != obj_dude->data.critter.combat.team
-                && stat_result(critter, STAT_PERCEPTION, 0, NULL) >= ROLL_SUCCESS) {
-                critter_set_who_hit_me(critter, obj_dude);
-
-                if (v2 == NULL) {
-                    v2 = critter;
-                }
-            }
-        }
-
-        if (v2 != NULL) {
-            if (!isInCombat()) {
-                STRUCT_664980 v3;
-                v3.attacker = v2;
-                v3.defender = obj_dude;
-                v3.actionPointsBonus = 0;
-                v3.accuracyBonus = 0;
-                v3.damageBonus = 0;
-                v3.minDamage = 0;
-                v3.maxDamage = INT_MAX;
-                v3.field_1C = 0;
-                scripts_request_combat(&v3);
-            }
-        }
-
+        inven_explosive_dropped_notice();
         dropped_explosive = false;
     }
 
@@ -2710,6 +2693,7 @@ bool inven_gamepad_quick_normal()
             if (v43 == NULL) {
                 item_add_force(v41, item, 1);
             }
+            inven_place_if_requested(item, v41, v43);
         }
     }
 
@@ -3397,6 +3381,49 @@ Object* inven_find_id(Object* obj, int id)
 }
 
 // 0x465B98
+// Vanilla's answer to an armed explosive put down in front of people -- it ran as the inventory
+// closed after one was dropped: everyone of another team inside the blast who notices it (a
+// Perception roll) takes it as an attack by the dude, and the first of them starts the fight. Out
+// here so the quick menu's "put it down" (gamepad_ui, 2026-10-16) answers the same way.
+void inven_explosive_dropped_notice()
+{
+    Attack v1;
+    combat_ctd_init(&v1, obj_dude, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+    v1.attackerFlags = DAM_HIT;
+    v1.tile = obj_dude->tile;
+    compute_explosion_on_extras(&v1, 0, 0, 1);
+
+    Object* v2 = NULL;
+    for (int index = 0; index < v1.extrasLength; index++) {
+        Object* critter = v1.extras[index];
+        if (critter != obj_dude
+            && critter->data.critter.combat.team != obj_dude->data.critter.combat.team
+            && stat_result(critter, STAT_PERCEPTION, 0, NULL) >= ROLL_SUCCESS) {
+            critter_set_who_hit_me(critter, obj_dude);
+
+            if (v2 == NULL) {
+                v2 = critter;
+            }
+        }
+    }
+
+    if (v2 != NULL) {
+        if (!isInCombat()) {
+            STRUCT_664980 v3;
+            v3.attacker = v2;
+            v3.defender = obj_dude;
+            v3.actionPointsBonus = 0;
+            v3.accuracyBonus = 0;
+            v3.damageBonus = 0;
+            v3.minDamage = 0;
+            v3.maxDamage = INT_MAX;
+            v3.field_1C = 0;
+            scripts_request_combat(&v3);
+        }
+    }
+
+}
+
 static int inven_wield_func(Object* critter, Object* item, int a3, bool animate);
 
 int inven_wield(Object* critter, Object* item, int a3)
@@ -4177,6 +4204,7 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
                 if (v43 == NULL) {
                     item_add_force(v41, item, 1);
                 }
+                inven_place_if_requested(item, v41, v43);
             }
         }
         break;
@@ -6874,13 +6902,14 @@ static int move_timer_gamepad_keycode()
     static bool prevA = false;
     static bool prevB = false;
     static bool prevY = false;
+    static bool prevX = false;
     static bool prevInc = false;
     static bool prevDec = false;
     static Uint32 lastStep = 0;
 
     SDL_GameController* pad = gamepad_ui_get_controller();
     if (pad == NULL) {
-        prevA = prevB = prevY = prevInc = prevDec = false;
+        prevA = prevB = prevY = prevX = prevInc = prevDec = false;
         return -1;
     }
 
@@ -6888,6 +6917,7 @@ static int move_timer_gamepad_keycode()
     bool aNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_A) != 0;
     bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
     bool yNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y) != 0;
+    bool xNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X) != 0;
     bool incNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0
         || SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
     bool decNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0
@@ -6899,6 +6929,7 @@ static int move_timer_gamepad_keycode()
         prevA = aNow;
         prevB = bNow;
         prevY = yNow;
+        prevX = xNow;
         prevInc = incNow;
         prevDec = decNow;
         mt_pad_arm = false;
@@ -6913,6 +6944,8 @@ static int move_timer_gamepad_keycode()
         keyCode = KEY_ESCAPE;
     } else if (yNow && !prevY) {
         keyCode = 5000; // set to max
+    } else if (xNow && !prevX) {
+        keyCode = MT_KEY_PLACE; // set the timer and put it down (SET TIMER only)
     } else if (incNow && (!prevInc || now - lastStep >= 120)) {
         keyCode = 6000; // +1
         lastStep = now;
@@ -6924,6 +6957,7 @@ static int move_timer_gamepad_keycode()
     prevA = aNow;
     prevB = bNow;
     prevY = yNow;
+    prevX = xNow;
     prevInc = incNow;
     prevDec = decNow;
     return keyCode;
@@ -6934,6 +6968,7 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
 {
     setup_move_timer_win(inventoryWindowType, item);
     move_timer_gamepad_reset();
+    mt_place_requested = false;
 
     int value;
     int min;
@@ -6966,10 +7001,12 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
             return -1;
         }
 
-        if (keyCode == KEY_RETURN) {
+        bool place = keyCode == MT_KEY_PLACE && inventoryWindowType == INVENTORY_WINDOW_TYPE_SET_TIMER;
+        if (keyCode == KEY_RETURN || place) {
             if (value >= min && value <= max) {
                 if (inventoryWindowType != INVENTORY_WINDOW_TYPE_SET_TIMER || value % 10 == 0) {
                     gsound_play_sfx_file("ib1p1xx1");
+                    mt_place_requested = place;
                     break;
                 }
             }
@@ -7095,6 +7132,35 @@ static int setup_move_timer_win(int inventoryWindowType, Object* item)
             buf_to_buf(overlayFrmData, 105, 81, 105, windowBuffer + 34 * windowDescription->width + 113, windowDescription->width);
             art_ptr_unlock(overlayFrmHandle);
         }
+
+        // PLACE -- the ALL plate, 6 px lower than ALL sits in the move-items mode: the clock reaches
+        // further down than the counter, and at y 80 the plate covered its bottom edge and the minus
+        // button (looked at side by side, 2026-10-16). At 86 its shadow lands on the panel border.
+        CacheEntry* plateUpHandle;
+        CacheEntry* plateDownHandle;
+        unsigned char* plateUp = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 307, 0, 0, 0), 0, 0, &plateUpHandle);
+        unsigned char* plateDown = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 308, 0, 0, 0), 0, 0, &plateDownHandle);
+        if (plateUp != NULL && plateDown != NULL) {
+            memcpy(mt_place_up, plateUp, sizeof(mt_place_up));
+            memcpy(mt_place_down, plateDown, sizeof(mt_place_down));
+
+            const char* label = "PLACE";
+            int length = text_width(label);
+            text_to_buf(mt_place_up + (MT_PLACE_W - length) / 2 + 4 * MT_PLACE_W, label, 200, MT_PLACE_W, colorTable[21091]);
+            text_to_buf(mt_place_down + (MT_PLACE_W - length) / 2 + 4 * MT_PLACE_W, label, 200, MT_PLACE_W, colorTable[18977]);
+
+            int btn = win_register_button(mt_wid, 120, 86, MT_PLACE_W, MT_PLACE_H, -1, -1, -1, MT_KEY_PLACE,
+                mt_place_up, mt_place_down, NULL, BUTTON_FLAG_TRANSPARENT);
+            if (btn != -1) {
+                win_register_button_sound_func(btn, gsound_red_butt_press, gsound_red_butt_release);
+            }
+        }
+        if (plateUp != NULL) {
+            art_ptr_unlock(plateUpHandle);
+        }
+        if (plateDown != NULL) {
+            art_ptr_unlock(plateDownHandle);
+        }
     }
 
     int inventoryFid = item_inv_fid(item);
@@ -7207,6 +7273,33 @@ static int exit_move_timer_win(int inventoryWindowType)
     win_delete(mt_wid);
 
     return 0;
+}
+
+// Did the last timer window end on PLACE? Read once -- the answer is cleared.
+bool inven_set_timer_place_requested()
+{
+    bool requested = mt_place_requested;
+    mt_place_requested = false;
+    return requested;
+}
+
+// PLACE from the inventory's own Use (both paths): the freshly armed explosive goes on the ground the
+// way the Drop action puts it there -- back from a hand box into the pack first -- and the screen's
+// close runs vanilla's "they saw that" (dropped_explosive).
+static void inven_place_if_requested(Object* item, Object* owner, Object** handSlot)
+{
+    if (!inven_set_timer_place_requested()) {
+        return;
+    }
+    if (item->pid != PROTO_ID_DYNAMITE_II && item->pid != PROTO_ID_PLASTIC_EXPLOSIVES_II) {
+        return;
+    }
+    if (handSlot != NULL) {
+        item_add_force(owner, item, 1);
+        *handSlot = NULL;
+    }
+    obj_drop(owner, item);
+    dropped_explosive = true;
 }
 
 // 0x469BA0

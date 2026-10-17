@@ -590,6 +590,16 @@ static const PipboyControl ctrl3_lines[] = {
     { "A", "Press the button" },
     { "Y", "Done" },
     { "B", "Cancel" },
+    // 2026-10-16: PLACE on the timer window, and an armed explosive picked again on a wheel goes on
+    // the ground (gpui_place_explosive). Eight rows tip this page into its tight layout (37 of 40).
+    { NULL, NULL },
+    { NULL, "SET TIMER (dynamite, plastic explosive)" },
+    { "D-pad", "Longer / shorter" },
+    { "Y", "Longest" },
+    { "A", "Set it" },
+    { "X", "Set it and put it down" },
+    { "B", "Cancel" },
+    { "Armed, on a wheel", "Pick it again: put it down" },
     { NULL, NULL },
     { NULL, "ANYWHERE ELSE" },
     { "Stick / D-pad", "Move the highlight" },

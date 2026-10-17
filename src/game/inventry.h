@@ -100,6 +100,10 @@ Object* inven_index_ptr(Object* obj, int a2);
 int inven_wield(Object* critter, Object* item, int a3);
 // The same at once: no put-away, no take-out (the quick slots, see inventry.cc).
 int inven_wield_instant(Object* critter, Object* item, int a3);
+// Vanilla's "they saw you put a bomb down" (see inventry.cc).
+void inven_explosive_dropped_notice();
+// Did the last timer window end on PLACE (set and put down)? Read once.
+bool inven_set_timer_place_requested();
 int inven_unwield(Object* critter, int a2);
 int inven_from_button(int input, Object** a2, Object*** a3, Object** a4);
 void inven_display_msg(char* string);
