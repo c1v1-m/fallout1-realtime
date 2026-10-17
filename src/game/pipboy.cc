@@ -489,7 +489,7 @@ static const PipboyControl ctrl_lines[] = {
     { NULL, "WHEELS - hold the button (L3: press), aim, release to pick" },
     // Since 2026-10-04 the drugs are this ring's LAST page too, and the paging wraps -- so from the
     // first page they are a single LB away. That is the whole reason the entry spells LB out.
-    { "Y", "Weapons + ammo; LB = drugs, items (Stealth Boy...)" },
+    { "Y", "Weapons + ammo; LB = drugs, items, armour" },
     { "B", "Drugs and quick items - aim LEFT" },
     { "L3 (press)", "Skills: stays open, RIGHT stick, let go or A picks" },
     { "A", "Take what is highlighted" },

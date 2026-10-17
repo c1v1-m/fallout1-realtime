@@ -3043,7 +3043,21 @@ static void gpui_drug_detail(int pid, char* out, size_t size)
     out[0] = '\0';
 
     Proto* proto;
-    if (proto_ptr(pid, &proto) != 0 || proto->item.type != ITEM_TYPE_DRUG) {
+    if (proto_ptr(pid, &proto) != 0) {
+        return;
+    }
+
+    // Armour: what it gives, and whether it is the one on him -- picking that one takes it off.
+    if (proto->item.type == ITEM_TYPE_ARMOR) {
+        Object* worn = obj_dude != NULL ? inven_worn(obj_dude) : NULL;
+        snprintf(out, size, "AC %d  DR %d%%  DT %d%s", proto->item.data.armor.armorClass,
+            proto->item.data.armor.damageResistance[DAMAGE_TYPE_NORMAL],
+            proto->item.data.armor.damageThreshold[DAMAGE_TYPE_NORMAL],
+            worn != NULL && worn->pid == pid ? "  - worn, pick to take off" : "");
+        return;
+    }
+
+    if (proto->item.type != ITEM_TYPE_DRUG) {
         return;
     }
 
@@ -4343,10 +4357,17 @@ static int gpui_collect_usable_items(int* pids, int* counts, int count, int max)
     Inventory* inventory = &(obj_dude->data.inventory);
     for (int i = 0; i < inventory->length; i++) {
         Object* item = inventory->items[i].item;
-        if (item == NULL || item_get_type(item) != ITEM_TYPE_MISC) {
+        if (item == NULL) {
             continue;
         }
-        if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
+        // ...and ARMOUR (2026-10-17, "Quick inventory i pro armour by se hodil"): picking it puts it on,
+        // picking the one he wears takes it off (gpui_quick_wear).
+        int type = item_get_type(item);
+        if (type == ITEM_TYPE_ARMOR) {
+            // counted below like any other kind
+        } else if (type != ITEM_TYPE_MISC) {
+            continue;
+        } else if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
             continue;
         }
 
@@ -4482,6 +4503,82 @@ static void gpui_place_tick()
     }
     trace_event(TRACE_ACTION, "explosive-place-cut", "anim=%d", FID_ANIM_TYPE(obj_dude->fid));
     gpui_place_now();
+}
+
+// ⚠️ ARMOUR FROM THE WHEEL (2026-10-17, "Quick inventory i pro armour by se hodil"; his price "4 AP jako
+// vanilla"). Picking an armour puts it on, picking the one he wears takes it off. The price is vanilla's
+// for changing armour in a fight -- opening the inventory, 4 AP, one less per Quick Pockets rank -- and
+// out of a fight the pool sits full, so it costs nothing there in effect.
+//
+// Done the way vanilla changes a critter's armour outside the inventory screen (item_remove_mult's worn
+// branch): the WORN flags, adjust_ac (inven_wield skips it for the dude -- the inventory screen does
+// it), then the body art. obj_change_fid keeps the pose and frame he is in, so a free-movement stride
+// carries on in the new suit; a body owned by another animation is refused rather than repainted
+// under it.
+static void gpui_quick_wear(int pid)
+{
+    int apCost = 4 - perk_level(PERK_QUICK_POCKETS);
+    if (apCost < 0) {
+        apCost = 0;
+    }
+    if (combat_rt_player_ap() < apCost) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "quick-wear-refused", "pid=%d why=ap ap=%d cost=%d", pid, combat_rt_player_ap(), apCost);
+        return;
+    }
+    if (critter_is_prone(obj_dude) || anim_busy_blocking(obj_dude) != 0) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_ACTION, "quick-wear-refused", "pid=%d why=busy anim=%d", pid, FID_ANIM_TYPE(obj_dude->fid));
+        return;
+    }
+
+    Proto* dudeProto;
+    if (proto_ptr(obj_dude->pid, &dudeProto) == -1) {
+        return;
+    }
+    int baseFid = dudeProto->fid & 0xFFF; // the suit he wears under everything
+
+    Object* worn = inven_worn(obj_dude);
+    Object* item = NULL;
+    if (worn != NULL && worn->pid == pid) {
+        worn->flags &= ~OBJECT_WORN; // taking it off: back in the pack
+        adjust_ac(obj_dude, worn, NULL);
+    } else {
+        Inventory* inventory = &(obj_dude->data.inventory);
+        for (int i = 0; i < inventory->length; i++) {
+            Object* candidate = inventory->items[i].item;
+            if (candidate != NULL && candidate->pid == pid && (candidate->flags & OBJECT_WORN) == 0) {
+                item = candidate;
+                break;
+            }
+        }
+        if (item == NULL) {
+            gsound_play_sfx_file("iisxxxx1");
+            return;
+        }
+        if (worn != NULL) {
+            worn->flags &= ~OBJECT_WORN;
+        }
+        item->flags |= OBJECT_WORN;
+        adjust_ac(obj_dude, worn, item);
+
+        int armorFid = stat_level(obj_dude, STAT_GENDER) == GENDER_FEMALE ? item_ar_female_fid(item) : item_ar_male_fid(item);
+        if (armorFid != -1) {
+            baseFid = armorFid;
+        }
+    }
+
+    Rect rect;
+    int fid = art_id(OBJ_TYPE_CRITTER, baseFid, FID_ANIM_TYPE(obj_dude->fid), (obj_dude->fid & 0xF000) >> 12,
+        (obj_dude->fid & 0x70000000) >> 28);
+    obj_change_fid(obj_dude, fid, &rect);
+    tile_refresh_rect(&rect, obj_dude->elevation);
+
+    combat_rt_spend_ap(apCost);
+    intface_update_ac(false); // the bar's AC box; false = no blocking roll (see intface_update_hit_points)
+    gsound_play_sfx_file("iputdown");
+    trace_event(TRACE_ACTION, "quick-wear", "pid=%d %s cost=%d ap=%d", pid, item != NULL ? "on" : "off", apCost,
+        combat_rt_player_ap());
 }
 
 // USE an item on yourself, exactly the inventory's Use (inventry.cc, GAME_MOUSE_ACTION_MENU_ITEM_USE):
@@ -4958,7 +5055,10 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
                     Proto* proto = NULL;
                     bool isDrug = proto_ptr(pid, &proto) != -1 && proto != NULL
                         && proto->item.type == ITEM_TYPE_DRUG;
-                    if (isDrug) {
+                    bool isArmor = proto != NULL && proto->item.type == ITEM_TYPE_ARMOR;
+                    if (isArmor) {
+                        gpui_quick_wear(pid);
+                    } else if (isDrug) {
                         gpui_quick_use(pid);
                     } else if (proto_action_can_use(pid)) {
                         gpui_quick_use_item(pid);
@@ -7616,6 +7716,14 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
         tpickTook = gpui_tpick_stick(x, y, mag);
     } else if (!gpui_targeting_cursor_armed()) {
         gpui_tpick_reset();
+    }
+
+    // Pointing with the stick lights the prompt's target yellow for a moment, one candidate or several
+    // (interact_prompt_note_stick, his call 2026-10-17).
+    if (mag > gpui_stick_deadzone && !lockedGameplay && !radial_wheel_is_open() && !gpui_aim_body_on
+        && !gpui_aim_gesture && !gpui_self_nav && !gamepad_ui_menu_active() && !dialog_active()
+        && !inven_any_open() && !gpui_targeting_cursor_armed()) {
+        interact_prompt_note_stick();
     }
 
     bool ipPickTook = false;

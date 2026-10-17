@@ -976,17 +976,46 @@ static void ip_clear_outline()
     tile_refresh_rect(&r, o->elevation);
 }
 
+// ⚠️ ...EXCEPT WHILE THE RIGHT STICK IS POINTING (2026-10-17, "když hýbu pravým joystickem, že highlight
+// na co mířím by byl fajn"; asked how, he said "ať jsou žluté jak byly"). The original yellow outline
+// is back, but only as the answer to a gesture: from the push until IP_STICK_HIGHLIGHT_MS after the
+// stick comes home. What he threw out on 2026-10-04 was the outline that never went away.
+#define IP_STICK_HIGHLIGHT_MS 1500
+static unsigned int ip_stick_last = 0;
+
+void interact_prompt_note_stick()
+{
+    ip_stick_last = get_time();
+    if (ip_stick_last == 0) {
+        ip_stick_last = 1; // 0 means "never"
+    }
+}
+
 static void ip_set_outline(Object* obj)
 {
-    // ⚠️ THE PROMPT NO LONGER OUTLINES ANYTHING (2026-10-04): "highlighty žluté u výtahů dej pryč i
-    // u pipbye když čekám, celkově je nechci". The floating action icon is the prompt; the yellow
-    // outline sat on every elevator panel and stayed lit over the Pip-Boy while he waited. Outlines on
-    // CRITTERS now mean one thing only -- friend / neutral / foe while aiming (combat_rt) -- and a
-    // yellow item outline here would read as "neutral". ip_clear_outline still undoes whatever an
-    // older state left behind, so nothing can stay stuck lit.
-    (void)obj;
-    if (ip_outlined != NULL) {
-        ip_clear_outline();
+    // ⚠️ THE PROMPT NO LONGER OUTLINES ANYTHING ON ITS OWN (2026-10-04): "highlighty žluté u výtahů dej
+    // pryč i u pipbye když čekám, celkově je nechci". The floating action icon is the prompt; the yellow
+    // outline sat on every elevator panel and stayed lit over the Pip-Boy while he waited. Only the
+    // stick's pointing (above) lights one now, and ip_clear_outline puts back whatever was there.
+    bool pointing = obj != NULL && ip_stick_last != 0 && elapsed_time(ip_stick_last) < IP_STICK_HIGHLIGHT_MS;
+    if (!pointing) {
+        if (ip_outlined != NULL) {
+            ip_clear_outline();
+        }
+        return;
+    }
+    if (ip_outlined == obj) {
+        return;
+    }
+    ip_clear_outline();
+    ip_outline_saved = obj->outline;
+    ip_outlined = obj;
+    obj_outline_object(obj, OUTLINE_TYPE_ITEM, NULL); // refuses if it already wears one (an aim outline)
+    Rect r;
+    if (obj_turn_on_outline(obj, &r) == 0) {
+        tile_refresh_rect(&r, obj->elevation);
+    } else {
+        tile_refresh_display();
     }
 }
 
