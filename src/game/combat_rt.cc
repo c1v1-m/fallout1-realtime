@@ -604,6 +604,10 @@ typedef struct RtActor {
     float dodge_at; // when it jumps; < 0 = not jumping
     int dodge_tile; // the blast centre it jumps away from
     int dodge_radius;
+    int shot_serial; // the dude's shot at it it has decided about (rt_shot_dodge_tick)
+    float shot_dodge_at; // when it sidesteps; < 0 = not
+    int shot_from; // the line it sidesteps off: where the shot comes from and where it is aimed
+    int shot_aim;
     bool reload_cover_tried; // looked for cover for the reload it is about to do (rt_reload_cover)
     int last_seen_tile; // where it last perceived its target (rt_search_*)
     int search_tile;
@@ -9183,6 +9187,10 @@ static void rt_refresh_registry()
             a->dodge_at = prev->dodge_at;
             a->dodge_tile = prev->dodge_tile;
             a->dodge_radius = prev->dodge_radius;
+            a->shot_serial = prev->shot_serial;
+            a->shot_dodge_at = prev->shot_dodge_at;
+            a->shot_from = prev->shot_from;
+            a->shot_aim = prev->shot_aim;
             a->reload_cover_tried = prev->reload_cover_tried;
             a->last_seen_tile = prev->last_seen_tile;
             a->search_tile = prev->search_tile;
@@ -9262,6 +9270,10 @@ static void rt_refresh_registry()
             a->dodge_at = -1.0f;
             a->dodge_tile = -1;
             a->dodge_radius = 0;
+            a->shot_serial = -1;
+            a->shot_dodge_at = -1.0f;
+            a->shot_from = -1;
+            a->shot_aim = -1;
             a->reload_cover_tried = false;
             a->last_seen_tile = -1;
             a->search_tile = -1;
@@ -10879,6 +10891,9 @@ static void rt_intent_update(RtActor* a)
     } else if (a->dodge_at >= 0.0f) {
         intent = RT_INTENT_DODGE;
         why = "grenade-seen";
+    } else if (a->shot_dodge_at >= 0.0f) {
+        intent = RT_INTENT_DODGE;
+        why = "shot-seen";
     } else if (combat_rt_is_reloading(npc)) {
         intent = RT_INTENT_RELOAD;
         why = "reload";
@@ -15523,6 +15538,142 @@ static void rt_grenade_dodge_tick()
     }
 }
 
+// --- COMBAT AI: SIDESTEPPING HIS SHOT (2026-10-18, his pick "uskočit tvé ráně") --------------------
+//
+// His observation: "když na někoho zamířím a vystřelím, tak enemy může jen přijmout kulku a nehýbe se".
+// In trace_2026-10-18_212427, 9 of his 11 shots hit a target that had started its own attack the same
+// instant (both saw each other as he stepped out) and stood raising its gun while his bullet flew -- he
+// can step out of an enemy's shot (the projectiles), nobody could step out of his. Now a critter that
+// SEES him aim at it (is_within_perception, from the moment his attack registers -- the raise is the
+// tell) and is not already committed to an attack of its own rolls (PE + AG) x 4 %, capped at 75, as
+// for a grenade, waits its reaction time and sidesteps off the line. Whether it got clear is the
+// projectiles' own test at the arrival (rt_projectile_dodge): more than 0.6 hex off the line misses.
+// Bullets, bolts and balls only (a blast has the grenade dodge); MODS "Tactical AI" and "Projectiles".
+#define RT_SHOT_DODGE_CLEAR 1.0f // hexes off the line a sidestep aims for (the corridor is 0.6)
+
+static bool rt_shot_in_air(int serial)
+{
+    for (int i = 0; i < rt_inflight_count; i++) {
+        if (rt_inflight[i].serial == serial) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void rt_do_shot_dodge(RtActor* a, Object* npc)
+{
+    const char* refused = NULL;
+    int anim = FID_ANIM_TYPE(npc->fid);
+    if (critter_is_prone(npc) || critter_is_dead(npc)) {
+        refused = "down";
+    } else if (!rt_can_walk(npc)) {
+        refused = "cannot-walk";
+    } else if (a->ap <= 0) {
+        refused = "no-ap";
+    } else if (anim_busy(npc) != 0 && anim != ANIM_WALK && anim != ANIM_RUNNING && anim != ANIM_STAND) {
+        refused = "busy"; // it began an attack, a reload or a reaction meanwhile
+    } else if (!rt_shot_in_air(a->shot_serial)) {
+        refused = "too-late";
+    }
+    if (refused != NULL) {
+        trace_event(TRACE_FLOW, "shot-dodge", "id=%d pid=%d refused=%s t=%.2f", npc->id, npc->pid, refused, rt_clock);
+        return;
+    }
+
+    // Square to the line: the two directions either side of it, nearest step first.
+    int toward = tile_dir(npc->tile, a->shot_from);
+    static const int side[4] = { 2, -2, 1, -1 };
+    int first = roll_random(0, 1); // which side first: no fixed habit to read
+    for (int n = 1; n <= 2; n++) {
+        for (int k = 0; k < 4; k++) {
+            int idx = (k & ~1) | ((k & 1) ^ first);
+            int rotation = (toward + side[idx] + ROTATION_COUNT) % ROTATION_COUNT;
+            int dest = tile_num_in_direction(npc->tile, rotation, n);
+            if (dest == npc->tile || obj_blocking_at(npc, dest, npc->elevation) != NULL) {
+                continue;
+            }
+            float off = rt_off_line(a->shot_from, a->shot_aim, dest);
+            if (off < RT_SHOT_DODGE_CLEAR) {
+                continue;
+            }
+            int steps = make_path(npc, npc->tile, dest, NULL, 1);
+            if (steps <= 0 || steps > n + 1) {
+                continue;
+            }
+
+            anim_end_moves(npc);
+            anim_end_lone_stand(npc);
+            npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+            if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "shot-dodge")) {
+                return;
+            }
+            anim_reset_last_path();
+            int rc = register_object_run_to_tile(npc, dest, npc->elevation, -1, 0);
+            register_end();
+            bool moved = rc == 0 && anim_last_path_steps(npc) != 0;
+            trace_event(TRACE_FLOW, "shot-dodge", "id=%d pid=%d from=%d to=%d off=%.2f steps=%d moved=%d t=%.2f",
+                npc->id, npc->pid, npc->tile, dest, off, steps, moved ? 1 : 0, rt_clock);
+            return;
+        }
+    }
+
+    trace_event(TRACE_FLOW, "shot-dodge", "id=%d pid=%d refused=nowhere t=%.2f", npc->id, npc->pid, rt_clock);
+}
+
+static void rt_shot_dodge_tick()
+{
+    if (!rt_tactical_ai || !rt_projectiles) {
+        return;
+    }
+
+    for (int k = 0; k < rt_inflight_count; k++) {
+        RtInFlight* f = &rt_inflight[k];
+        if (f->attacker != obj_dude || f->defender == NULL || f->blastRadius > 0 || f->flame
+            || (!f->bullet && f->explosionFid == -1) || f->originTile < 0 || f->aimTile < 0) {
+            continue; // not his, a blast, a flame, or nothing that flies
+        }
+        RtActor* a = rt_actor_of(f->defender);
+        Object* npc = f->defender;
+        if (a == NULL || a->shot_serial == f->serial || !rt_is_combatant(npc) || isPartyMember(npc)) {
+            continue;
+        }
+        if (!is_within_perception(npc, obj_dude)) {
+            continue; // it may still look round while the shot is being raised
+        }
+
+        a->shot_serial = f->serial;
+        int anim = FID_ANIM_TYPE(npc->fid);
+        bool committed = anim_busy(npc) != 0 && anim != ANIM_WALK && anim != ANIM_RUNNING && anim != ANIM_STAND;
+        int pe = stat_level(npc, STAT_PERCEPTION);
+        int chance = (pe + stat_level(npc, STAT_AGILITY)) * RT_DODGE_PCT_PER_POINT;
+        if (chance > RT_DODGE_PCT_CAP) {
+            chance = RT_DODGE_PCT_CAP;
+        }
+        int roll = roll_random(1, 100);
+        float delay = 0.5f - 0.03f * pe;
+        if (delay < 0.15f) {
+            delay = 0.15f;
+        }
+        bool steps = !committed && roll <= chance;
+        a->shot_dodge_at = steps ? rt_clock + delay : -1.0f;
+        a->shot_from = f->originTile;
+        a->shot_aim = f->aimTile;
+        trace_event(TRACE_FLOW, "shot-notice", "id=%d pid=%d dist=%d chance=%d roll=%d committed=%d dodges=%d delay=%.2f t=%.2f",
+            npc->id, npc->pid, tile_dist(f->originTile, npc->tile), chance, roll, committed ? 1 : 0,
+            steps ? 1 : 0, delay, rt_clock);
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (a->shot_dodge_at >= 0.0f && rt_clock >= a->shot_dodge_at) {
+            a->shot_dodge_at = -1.0f;
+            rt_do_shot_dodge(a, a->obj);
+            rt_intent_hint(a, RT_INTENT_DODGE, "shot-seen", 1.5f);
+        }
+    }
+}
+
 void combat_rt_update(float dt)
 {
     if (obj_dude == NULL) {
@@ -16098,6 +16249,7 @@ void combat_rt_update(float dt)
     // Grenades in the air first: a fighter that jumps clear registers its run before its own AI
     // decides anything this frame (rt_grenade_dodge_tick).
     rt_grenade_dodge_tick();
+    rt_shot_dodge_tick();
 
     // Bullets in the air: repaint their streaks (rt_tracers_tick).
     rt_tracers_tick();
