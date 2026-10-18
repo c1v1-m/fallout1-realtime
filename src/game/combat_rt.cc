@@ -7796,6 +7796,21 @@ static void rt_fm_drive(float angle, bool run, float dt)
             anim_clear_pending(obj_dude);
         }
 
+        // ⚠️ ...AND THE MISS DODGE (2026-10-18). It is pure decoration -- no damage, no state -- and
+        // rt_cancel_flinch_for_move was always meant to let a move cut it, but that call sits BELOW this
+        // gate, so free movement never reached it: a rocket that missed held him ~0.9 s with the stick
+        // pushed ("rakety mě stunou"). Only the dodge: a hit's stagger is a stop by design (MODS "Hits
+        // stagger"). anim_cut_pending: the dodge is a prioritized sequence of his own.
+        if (FID_ANIM_TYPE(obj_dude->fid) == ANIM_DODGE_ANIM && !rt_dude_incapacitated()) {
+            int dodgeFrame = obj_dude->frame;
+            for (int guard = 0; guard < 4 && FID_ANIM_TYPE(obj_dude->fid) == ANIM_DODGE_ANIM
+                 && anim_busy_blocking(obj_dude) != 0 && anim_cut_pending(obj_dude) == 0;
+                 guard++) {
+            }
+            trace_event(TRACE_COMBAT, "dodge-cut", "frame=%d free=%d t=%.2f",
+                dodgeFrame, anim_busy_blocking(obj_dude) == 0 ? 1 : 0, rt_clock);
+        }
+
         if (anim_busy_blocking(obj_dude) != 0 || rt_dude_incapacitated()) {
             if (rt_fm_active) {
                 rt_fm_active = false;
@@ -14918,6 +14933,31 @@ static float rt_off_line(int origin, int aim, int tile)
     return sqrtf(cx * cx + cy * cy);
 }
 
+// ⚠️ A MISS IS DODGED ONLY WHEN IT CAME CLOSE (2026-10-18, his play: "rakety mě stunou, i když jsem od
+// nich dál"). Vanilla plays the defender's dodge on every miss, wherever it went -- harmless in turns,
+// but in realtime the dodge owns the body for ~0.9 s: a rocket landing 4-6 tiles off (outside its
+// radius-3 blast, no damage) stopped him twice in trace_2026-10-18_193242, and a gatling burst from
+// 25 tiles once. His pick: the dodge plays only for a near miss -- a shot whose line passes within
+// RT_DODGE_NEAR_HEXES of where the defender stands now, a blast that goes off at most one tile past
+// its edge -- and the stick cuts it at once (rt_fm_drive). Everyone, the enemies too: where the shot
+// went is the same question for any body. Melee misses are always close.
+#define RT_DODGE_NEAR_HEXES 1.0f
+
+static bool rt_miss_came_close(const RtInFlight* f)
+{
+    Object* d = f->ctd.defender;
+    if (d == NULL || d->tile < 0) {
+        return true;
+    }
+    if (f->blastRadius > 0 && f->blastTile >= 0) {
+        return tile_dist(d->tile, f->blastTile) <= f->blastRadius + 1;
+    }
+    if (f->originTile < 0 || f->aimTile < 0) {
+        return true;
+    }
+    return rt_off_line(f->originTile, f->aimTile, d->tile) <= RT_DODGE_NEAR_HEXES;
+}
+
 static void rt_tracers_fly_on(int serial);
 
 static void rt_projectile_dodge(RtInFlight* f)
@@ -15814,7 +15854,14 @@ void combat_rt_update(float dt)
             // Called for EVERY hit, not just heavy ones: with the split on, the whole defender
             // block is skipped at fire time, so this is also what registers the weapon
             // drop/destroy callbacks and the show_death corpse settle.
-            bool reactionRegistered = action_defender_reaction(&f->ctd);
+            // A miss far from the defender plays no dodge at all (rt_miss_came_close).
+            bool farMiss = projectileAttack && (f->ctd.attackerFlags & DAM_HIT) == 0 && !rt_miss_came_close(f);
+            if (farMiss && f->ctd.defender != NULL) {
+                trace_event(TRACE_COMBAT, "dodge-skip", "id=%d pid=%d att=%d blast=%d t=%.2f",
+                    f->ctd.defender->id, f->ctd.defender->pid, f->attacker != NULL ? f->attacker->id : -1,
+                    f->blastRadius, rt_clock);
+            }
+            bool reactionRegistered = farMiss ? false : action_defender_reaction(&f->ctd);
 
             // ...and every critter the blow caught beside it (a burst's cone, a blast's ring), on
             // the same beat. They used to be registered at FIRE time, before anything was decided,
