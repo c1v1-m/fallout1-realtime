@@ -1,0 +1,20 @@
+# Shoot and move with a slow projectile and a throw: a rocket launcher, then grenades from the RB slot.
+name rocket-move
+map DESERT1.MAP
+seed 1
+duration 30
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude stat ST 8
+dude hp 400
+dude skill big_guns 120
+dude armor 2
+dude wield 13
+dude item 14 8
+
+spawn 16777291 22500 rot 5 wield 8 item 29 6 hostile
+spawn 16777291 23304 rot 5 wield 4 hostile
+
+at 0 shootmove

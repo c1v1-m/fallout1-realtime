@@ -391,6 +391,7 @@ Object* combat_rt_quick_throw_target();
 bool combat_rt_request_throw(Object* target);
 bool combat_rt_player_attack_pending();
 bool combat_rt_dude_targeted();
+bool combat_rt_dude_attacking();
 
 } // namespace fallout
 

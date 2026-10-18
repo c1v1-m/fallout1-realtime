@@ -1,0 +1,20 @@
+# Shoot and move with a throw: frag grenades in hand, the stick pushed sideways as soon as he throws.
+# The grenade's flight is launched at the throw's release frame; cutting the throw must not lose it.
+name throw-move
+map DESERT1.MAP
+seed 1
+duration 25
+
+dude tile 20100 rot 2
+dude stat ST 8
+dude stat AG 8
+dude hp 400
+dude skill throwing 120
+dude armor 2
+dude wield 25
+dude item 25 6
+
+spawn 16777291 21700 rot 5 wield 8 item 29 6 hostile
+spawn 16777291 21704 rot 5 wield 8 item 29 6 hostile
+
+at 0 shootmove

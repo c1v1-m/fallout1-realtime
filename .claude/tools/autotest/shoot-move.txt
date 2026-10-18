@@ -1,0 +1,23 @@
+# Shoot and move (2026-10-18): the dude fires and pushes the stick sideways the moment his attack is
+# under way; two raiders with pistols do the same to him (their tactics move them after a shot too).
+# What it shows: shot-tail-cut lines (DUDE and NPC), the stick taking the body right after the action
+# frame, and every hit still landing (bullet commits survive the cut).
+name shoot-move
+map DESERT1.MAP
+seed 1
+duration 40
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude stat EN 8
+dude hp 400
+dude skill small_guns 110
+dude armor 2
+dude wield 8
+dude item 29 10
+
+spawn 16777291 22500 rot 5 wield 8 item 29 6 hostile
+spawn 16777291 22504 rot 5 wield 8 item 29 6 hostile
+
+at 0 shootmove

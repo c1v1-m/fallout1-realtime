@@ -1593,6 +1593,10 @@ struct RtInFlight {
     bool bullet;
     float tDischarge;
     float bulletFlight;
+
+    // The shot or the throw has LEFT THE WEAPON (shoot and move, 2026-10-18): from here on the rest of
+    // the shooter's sequence is only his own follow-through, which a move may cut (rt_shot_tail_note).
+    bool released;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1615,6 +1619,7 @@ static void rt_inflight_init_blast(RtInFlight* f)
         && f->originTile >= 0 && f->aimTile >= 0;
     f->tDischarge = -1.0f;
     f->bulletFlight = 0.0f;
+    f->released = false;
     if (f->explosionFid == -1 || f->ctd.attacker == NULL || f->ctd.weapon == NULL) {
         return;
     }
@@ -2187,6 +2192,7 @@ static int rt_hit_mode(Object* critter)
 // to fists rather than trade a broken attack for an invisible critter.
 // Defined further down (next to the other animation helpers); needed here for the wield.
 static bool rt_register_begin(int requestOptions, const char* where);
+static void rt_shot_tail_owner_cut(const char* where);
 
 // Returns TRUE once the pose is settled -- either it already matched, or it was just
 // re-stamped. FALSE means "ask again next frame": the critter was mid-animation, which is most
@@ -3195,6 +3201,9 @@ static bool rt_npc_sprint_ok(Object* npc)
 // register_object_*/register_end on this returning true.
 static bool rt_register_begin(int requestOptions, const char* where)
 {
+    // A critter deciding during the tail of its own shot moves now (rt_shot_tail_cut).
+    rt_shot_tail_owner_cut(where);
+
     if (register_begin(requestOptions) == -1) {
         trace_event(TRACE_ANIM, "register-full", "at=%s t=%.2f", where, rt_clock);
         return false;
@@ -4584,6 +4593,179 @@ static bool rt_swing_keep_live()
     }
 
     return false;
+}
+
+// --- SHOOT AND MOVE --------------------------------------------------------------------------------
+//
+// ⚠️ 2026-10-18, his question after a Mariposa fight: "Můžu vystřelit a hned se hýbat? nejen já ale i
+// teoreticky enemy?" -- and his pick, for everyone: once the bullet has left the barrel, the shooter
+// may move at once and the rest of the animation is cut. The trace had his stick ignored for ~1.1 s
+// after every shot (swing-keep "done why=walking held=1.10"): the raise, the fire pose AND the
+// lowering all owned the body, and free movement stands off any art that is not its own.
+//
+// What stays: the RAISE before the shot (ANIM_POINT) -- it is the tell an enemy is about to fire, the
+// thing a dodge reads -- and the fire pose up to its ACTION FRAME, where the shot leaves the gun (the
+// flight launch and the bullet's tracer hang on that frame). A burst keeps its whole fire pose, since
+// its rounds leave all through it; only its lowering is cut. Rate of fire is untouched: the attack
+// cooldown and rt_attacker_in_flight still decide when the next shot may go.
+//
+// The latch is set by the resolve loop the frame the shot is released, and only means anything while
+// the body is still in that attack's own poses (fire / throw / lowering / the next weapon's take-out
+// after a throw). It is cut only when something actually wants to MOVE the body: the dude's stick or
+// arrows, an NPC's walk registered through rt_register_begin (rt_shot_tail_owner) or its flee. A body
+// that stays put plays its follow-through to the end, as before.
+#define RT_SHOT_TAIL_MAX 16
+
+struct RtShotTail {
+    Object* obj;
+    float since; // rt_clock when the shot left the weapon
+};
+
+static RtShotTail rt_shot_tail[RT_SHOT_TAIL_MAX];
+
+// The NPC whose decision is running during the tail of its own shot (rt_update_actor); its next walk
+// registration cuts that tail first. NULL outside that one call.
+static Object* rt_shot_tail_owner = NULL;
+
+static void rt_shot_tail_clear_all()
+{
+    for (int i = 0; i < RT_SHOT_TAIL_MAX; i++) {
+        rt_shot_tail[i].obj = NULL;
+    }
+    rt_shot_tail_owner = NULL;
+}
+
+// A body being freed, or one starting a new attack: forget its tail.
+static void rt_shot_tail_drop(Object* o)
+{
+    for (int i = 0; i < RT_SHOT_TAIL_MAX; i++) {
+        if (rt_shot_tail[i].obj == o) {
+            rt_shot_tail[i].obj = NULL;
+        }
+    }
+    if (rt_shot_tail_owner == o) {
+        rt_shot_tail_owner = NULL;
+    }
+}
+
+static void rt_shot_tail_note(Object* o)
+{
+    if (o == NULL) {
+        return;
+    }
+
+    RtShotTail* slot = NULL;
+    for (int i = 0; i < RT_SHOT_TAIL_MAX && slot == NULL; i++) {
+        if (rt_shot_tail[i].obj == o) {
+            slot = &rt_shot_tail[i];
+        }
+    }
+    for (int i = 0; i < RT_SHOT_TAIL_MAX && slot == NULL; i++) {
+        if (rt_shot_tail[i].obj == NULL) {
+            slot = &rt_shot_tail[i];
+        }
+    }
+    if (slot == NULL) {
+        return; // table full: this shot plays out the old way
+    }
+
+    slot->obj = o;
+    slot->since = rt_clock;
+}
+
+// The poses of a ranged attack's own sequence once the shot is out.
+static bool rt_shot_tail_pose(int anim)
+{
+    return anim == ANIM_FIRE_SINGLE || anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS
+        || anim == ANIM_THROW_ANIM || anim == ANIM_UNPOINT || anim == ANIM_TAKE_OUT;
+}
+
+// Is this body busy ONLY with the follow-through of a shot that has already left the weapon?
+static bool rt_in_shot_tail(Object* o)
+{
+    if (o == NULL) {
+        return false;
+    }
+
+    RtShotTail* slot = NULL;
+    for (int i = 0; i < RT_SHOT_TAIL_MAX; i++) {
+        if (rt_shot_tail[i].obj == o) {
+            slot = &rt_shot_tail[i];
+            break;
+        }
+    }
+    if (slot == NULL) {
+        return false;
+    }
+
+    if (!rt_is_critter(o) || critter_is_dead(o) || critter_is_prone(o)
+        || rt_reaction_kind(o) != RT_REACT_NONE
+        || anim_busy_blocking(o) == 0
+        || !rt_shot_tail_pose(FID_ANIM_TYPE(o->fid))) {
+        return false;
+    }
+
+    return true;
+}
+
+// Ends the follow-through so the body can move this frame. True when it is free now.
+static bool rt_shot_tail_cut(Object* o, const char* why)
+{
+    if (!rt_in_shot_tail(o)) {
+        return false;
+    }
+
+    float since = -1.0f;
+    for (int i = 0; i < RT_SHOT_TAIL_MAX; i++) {
+        if (rt_shot_tail[i].obj == o) {
+            since = rt_shot_tail[i].since;
+            break;
+        }
+    }
+
+    int pose = FID_ANIM_TYPE(o->fid);
+    int frame = o->frame;
+
+    // anim_cut_pending: the attack is a PRIORITIZED sequence, and only one where the body still has
+    // work left may end -- never an older one only dropping somebody's corpse.
+    int ended = 0;
+    for (int guard = 0; guard < 4 && anim_busy_blocking(o) != 0 && anim_cut_pending(o) == 0; guard++) {
+        ended++;
+    }
+    rt_shot_tail_drop(o);
+
+    trace_event(TRACE_COMBAT, "shot-tail-cut", "%s id=%d pid=%d pose=%d frame=%d after=%.2f seqs=%d free=%d why=%s t=%.2f",
+        o == obj_dude ? "DUDE" : "NPC", o->id, o->pid, pose, frame,
+        since >= 0.0f ? rt_clock - since : -1.0f, ended, anim_busy_blocking(o) == 0 ? 1 : 0,
+        why != NULL ? why : "-", rt_clock);
+
+    return anim_busy_blocking(o) == 0;
+}
+
+static void rt_shot_tail_owner_cut(const char* where)
+{
+    if (rt_shot_tail_owner == NULL) {
+        return;
+    }
+
+    Object* o = rt_shot_tail_owner;
+    rt_shot_tail_owner = NULL;
+    rt_shot_tail_cut(o, where);
+}
+
+// Once a frame: a latch whose body has finished (or left) its follow-through means nothing any more.
+static void rt_shot_tail_tick()
+{
+    for (int i = 0; i < RT_SHOT_TAIL_MAX; i++) {
+        Object* o = rt_shot_tail[i].obj;
+        if (o == NULL) {
+            continue;
+        }
+        if (!rt_is_critter(o) || critter_is_dead(o) || anim_busy_blocking(o) == 0
+            || !rt_shot_tail_pose(FID_ANIM_TYPE(o->fid))) {
+            rt_shot_tail[i].obj = NULL;
+        }
+    }
 }
 
 // --- A POSE NOBODY OWNS ANY MORE ----------------------------------------------------------------
@@ -6763,6 +6945,7 @@ static bool rt_flee_step(RtActor* a, Object* npc)
     // candidate searches at a time.
     // DEFER_STAND: legs follow legs, and a body stood between two of them flashed its STAND pose
     // (anim_defer_stand in anim.cc).
+    rt_shot_tail_owner_cut("flee");
     register_begin(ANIMATION_REQUEST_RESERVED | ANIMATION_REQUEST_DEFER_STAND);
     combatai_msg(npc, NULL, AI_MESSAGE_TYPE_RUN, 0);
     register_object_run_to_tile(npc, dest, npc->elevation, ap, 0);
@@ -6975,6 +7158,8 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     // Snapshot the computed attack into the in-flight list and free the global pending slot
     // immediately, so the next attacker (incl. the player vs an enemy) can compute this very
     // frame. The snapshot commits later, from its own copy, at swing-connect / the cap.
+    rt_shot_tail_drop(attacker);
+
     RtInFlight* f = &rt_inflight[rt_inflight_count++];
     combat_take_pending_snapshot(&f->ctd, &f->callDisplay);
     f->attacker = attacker;
@@ -7120,6 +7305,9 @@ static void rt_player_move(int rotation)
     // A movement input cancels an in-progress flinch so the player isn't frozen
     // for its full duration (the hit already committed, so the tail is cosmetic).
     rt_cancel_flinch_for_move(obj_dude);
+
+    // ...and the follow-through of a shot that is already out (shoot and move, rt_shot_tail_cut).
+    rt_shot_tail_cut(obj_dude, "key-step");
 
     // anim_busy_blocking, not anim_busy: once the dude's own swing has played out he is free,
     // even though the sequence he fired from is still animating his victim's death. See
@@ -11475,9 +11663,18 @@ static void rt_update_actor(RtActor* a, float dt)
     // pending standup (rt_stand_up runs from the standup pass above) -- the critter snapped straight
     // from the fall into shooting with no getting-up animation. Prone clears once rt_stand_up
     // registers the standup (flag dropped, anim moves to 36/37), so the FSM resumes right after.
-    if (anim_busy(npc) != 0 || critter_is_prone(npc)) {
+    //
+    // ⚠️ ...EXCEPT THE FOLLOW-THROUGH OF ITS OWN SHOT (shoot and move, rt_shot_tail_cut): the bullet is
+    // out, so it decides now, and a walk it registers cuts the rest of the animation. A decision that
+    // does not move it leaves the follow-through playing; attacking still waits for a free body.
+    bool shotTail = anim_busy(npc) != 0 && !critter_is_prone(npc) && rt_in_shot_tail(npc);
+    if ((anim_busy(npc) != 0 && !shotTail) || critter_is_prone(npc)) {
         return;
     }
+    struct ShotTailOwner {
+        ShotTailOwner(Object* o) { rt_shot_tail_owner = o; }
+        ~ShotTailOwner() { rt_shot_tail_owner = NULL; }
+    } shotTailOwner(shotTail ? npc : NULL);
 
     // VANILLA'S ORDER FOR A TURN, top to bottom: the script's combat_p_proc first -- if it takes the
     // turn (script_overrides) combat_ai never runs -- then combat_ai, which flees before anything
@@ -12505,6 +12702,7 @@ static void rt_abandon_encounter()
 
     // The held attacker offsets point at objects the caller is about to free.
     rt_swing_keep_clear_all();
+    rt_shot_tail_clear_all();
 }
 
 // Full per-session state reset, shared by init / exit / game-reset so every teardown path
@@ -13395,6 +13593,18 @@ bool combat_rt_dude_targeted()
     return false;
 }
 
+// One of the dude's own attacks is under way (registered, not yet committed) -- the self-played runs
+// watch for it to move him the moment he has fired (autotest "shootmove").
+bool combat_rt_dude_attacking()
+{
+    for (int i = 0; i < rt_inflight_count; i++) {
+        if (rt_inflight[i].attacker == obj_dude) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool combat_rt_player_attack_pending()
 {
     if (rt_player_intent_target != NULL) {
@@ -13751,6 +13961,12 @@ void combat_rt_poll_gamepad()
             rt_traced_stick_ang = angle;
             rt_traced_stick_run = run;
             rt_traced_stick_on = true;
+        }
+
+        // SHOOT AND MOVE: a shot that has left the gun gives the body back to the stick at once
+        // (rt_shot_tail_cut) -- only when the stick may actually move him, so 0 AP still stops him.
+        if (!rt_move_blocked || rt_ap_empty_walks) {
+            rt_shot_tail_cut(obj_dude, "stick");
         }
 
         // Out of AP (walked/ran the pool dry): stop until it regenerates to the resume
@@ -15267,6 +15483,7 @@ void combat_rt_update(float dt)
     // Put back any sub-tile offset an attack's registration or its end-of-sequence re-centre threw
     // away -- BEFORE the movement handlers below read obj->x/y. See rt_swing_keep_tick.
     rt_swing_keep_tick();
+    rt_shot_tail_tick();
 
     // ...and put a body back on its feet when an animation left it standing in a pose nothing owns
     // any more (a ladder, a flight of stairs). See rt_dude_pose_reconcile.
@@ -15456,6 +15673,26 @@ void combat_rt_update(float dt)
             }
         }
         bool actionReached = !thrown && !explosive && f->actionSeen;
+
+        // SHOOT AND MOVE: the shot or the throw has left the weapon -- at the action frame, or for a
+        // burst (whose rounds leave all through its pose) when the pose ends. From here a move may cut
+        // the rest of the shooter's sequence (rt_shot_tail_cut). Not when the attack hurt the shooter
+        // (a critical miss, a backwash, a dud): that reaction rides the same sequence.
+        if (projectileAttack && !f->released && f->attacker != NULL) {
+            int af = f->ctd.attackerFlags;
+            bool hurtsSelf = ((af & DAM_HIT) == 0 && (af & (DAM_CRITICAL | DAM_BACKWASH)) != 0) || (af & DAM_DUD) != 0;
+            int pose = FID_ANIM_TYPE(f->attacker->fid);
+            bool burst = pose == ANIM_FIRE_BURST || pose == ANIM_FIRE_CONTINUOUS;
+            // A gun's action frame is already latched above (actionSeen); a rocket, a bolt or a throw asks.
+            bool out = (!burst && (f->actionSeen || ((thrown || explosive) && rt_attack_action_frame_reached(f->attacker))))
+                || (f->tAnimStart >= 0.0f && f->tAnimEnd >= 0.0f);
+            if (out) {
+                f->released = true;
+                if (!hurtsSelf) {
+                    rt_shot_tail_note(f->attacker);
+                }
+            }
+        }
 
         // For a projectile attack, commit when the FIRING POSE ENDS rather than when the whole
         // sequence does. The sequence also carries the projectile's flight and, since 2026-08-10,
@@ -16766,6 +17003,7 @@ void combat_rt_notify_critter_removed(Object* removed)
 
     // ...and any held attack offset (rt_swing_keep_tick dereferences it every frame).
     rt_swing_keep_drop(removed);
+    rt_shot_tail_drop(removed);
 
     // Drop combat_rt's own cached pointers.
     if (rt_lock_target == removed) {

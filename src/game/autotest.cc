@@ -71,6 +71,8 @@ namespace fallout {
 //                                      never attacking -- for measuring what can be dodged
 //        dodge                         stand (saving AP) and, the moment an attack at him is under way,
 //                                      run sideways for 1.2 s -- a player who sees the shot coming
+//        shootmove                     fight, and the moment his own attack is under way push the stick
+//                                      sideways for 0.8 s (turning each time) -- shoot and move
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
@@ -99,9 +101,10 @@ enum {
     AT_THROW_FREE,
     AT_STRAFE,
     AT_DODGE,
+    AT_SHOOT_MOVE,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove" };
 
 typedef struct AtItem {
     int pid;
@@ -185,6 +188,8 @@ static bool at_was_targeted = false;
 static float at_dodge_until = 0.0f;
 static float at_dodge_from = 0.0f;
 static float at_reaction = 0.3f; // a player notices the wind-up this late (scenario "reaction")
+static bool at_was_attacking = false;
+static float at_move_until = 0.0f;
 
 static void at_trim(char* s)
 {
@@ -917,6 +922,32 @@ void autotest_tick(float dt)
             at_axis(SDL_CONTROLLER_AXIS_LEFTX, (Sint16)(-32000.0f * dy / len * at_strafe_dir));
             at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
             at_button(SDL_CONTROLLER_BUTTON_X, true);
+            break;
+        }
+        case AT_SHOOT_MOVE: {
+            bool attacking = combat_rt_dude_attacking();
+            if (attacking && !at_was_attacking) {
+                at_move_until = at_elapsed + 0.8f;
+                at_strafe_dir = -at_strafe_dir;
+                trace_event(TRACE_FLOW, "autotest", "shootmove at=%.1f dir=%d ap=%d", at_elapsed, at_strafe_dir, combat_rt_player_ap());
+            }
+            at_was_attacking = attacking;
+            if (enemy == NULL || at_elapsed >= at_move_until) {
+                at_fight(enemy, dist);
+                break;
+            }
+            // Keep the lock (LT held) while the stick walks him sideways.
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, 32767);
+            int x1, y1, x2, y2;
+            tile_coord(obj_dude->tile, &x1, &y1, obj_dude->elevation);
+            tile_coord(enemy->tile, &x2, &y2, obj_dude->elevation);
+            float dx = (float)(x2 - x1), dy = (float)(y2 - y1);
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len < 1.0f) {
+                len = 1.0f;
+            }
+            at_axis(SDL_CONTROLLER_AXIS_LEFTX, (Sint16)(-32000.0f * dy / len * at_strafe_dir));
+            at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
             break;
         }
         case AT_SHOOT:

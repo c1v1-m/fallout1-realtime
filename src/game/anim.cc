@@ -766,7 +766,24 @@ int register_clear(Object* a1)
 //
 // So this variant applies the same already-played skip as anim_busy_blocking and only ever
 // ends a sequence where a1 genuinely still has something left to animate.
+static int anim_clear_pending_ex(Object* a1, bool evenPrioritized);
+
 int anim_clear_pending(Object* a1)
+{
+    return anim_clear_pending_ex(a1, false);
+}
+
+// anim_clear_pending that also ends a PRIORITIZED sequence -- every attack is one. For combat_rt's
+// shoot-and-move (rt_shot_tail_cut): once the shot has left the gun, the rest of the shooter's own
+// attack sequence (the fire pose's last frames, the lowering) is cut so the body can move. Same
+// already-played skip as anim_clear_pending, so it can only ever end a sequence where a1 still has
+// something left to animate -- never one that is only dropping somebody else's corpse.
+int anim_cut_pending(Object* a1)
+{
+    return anim_clear_pending_ex(a1, true);
+}
+
+static int anim_clear_pending_ex(Object* a1, bool evenPrioritized)
 {
     for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
         AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
@@ -792,7 +809,7 @@ int anim_clear_pending(Object* a1)
             continue;
         }
 
-        if ((animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0) {
+        if ((animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0 && !evenPrioritized) {
             return -2;
         }
 
