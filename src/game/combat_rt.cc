@@ -623,6 +623,8 @@ typedef struct RtActor {
     // --- GROUP TACTICS (2026-10-17): squad advance, shooters backing off, defenders holding. ---
     float squad_hold_start;   // < 0 = not holding for the squad (rt_squad_holds)
     bool squad_hold_done;     // held once this engagement; reset in IDLE
+    float corner_hold_start;  // < 0 = not gathering at a corner (rt_corner_holds)
+    bool corner_done;         // decided about this blocked approach; reset when the line opens
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
     bool defend_covered;      // looked for cover when it started holding
     float defend_since;       // when it started holding (the standoff cap, RT_DEFEND_MAX)
@@ -9184,6 +9186,8 @@ static void rt_refresh_registry()
             a->detour_until = prev->detour_until;
             a->squad_hold_start = prev->squad_hold_start;
             a->squad_hold_done = prev->squad_hold_done;
+            a->corner_hold_start = prev->corner_hold_start;
+            a->corner_done = prev->corner_done;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9267,6 +9271,8 @@ static void rt_refresh_registry()
             a->detour_until = 0.0f;
             a->squad_hold_start = -1.0f;
             a->squad_hold_done = false;
+            a->corner_hold_start = -1.0f;
+            a->corner_done = false;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;
@@ -10383,6 +10389,90 @@ static bool rt_squad_holds(RtActor* a, Object* npc)
             npc->id, npc->pid, rt_clock - a->squad_hold_start, rt_clock);
         a->squad_hold_done = true;
         a->squad_hold_start = -1.0f;
+        return false;
+    }
+    return true;
+}
+
+// ⚠️ GATHER AT THE CORNER (2026-10-19, his "stačilo být za rohem a vyhrál jsem easily", his pick "sejdou
+// se a vyjdou spolu"). In trace_2026-10-19_003354 he held a corner and eight mutants came round it one
+// at a time over 23 s, six of them killed at 1-5 tiles by one aimed shot each: a chaser that cannot see
+// its foe walks the corridor to it, rounds the corner alone and starts its second-long raise next to
+// him. Now a chaser close to a foe it has no line of fire to (RT_CORNER_DIST), with teammates on their
+// way behind it, stops and waits until RT_CORNER_GROUP of them stand beside it -- or RT_CORNER_HOLD_MAX,
+// or it is hurt, or the foe comes within two tiles -- and then they go round together. Whether it
+// thinks of it is a roll of INT x 10 % per approach, like the rest of the tactics: a dim mutant often
+// does not. It decides again once it has had the foe in its line of fire.
+#define RT_CORNER_DIST 10
+#define RT_CORNER_NEAR 3
+#define RT_CORNER_GROUP 2
+#define RT_CORNER_HOLD_MAX 4.0f
+
+static bool rt_corner_holds(RtActor* a, Object* npc)
+{
+    if (a->corner_done || a->target == NULL || !rt_can_walk(npc) || a->fleeing) {
+        return false;
+    }
+    const char* end = NULL;
+    int myDist = obj_dist(npc, a->target);
+    int near = 0;
+    int coming = 0;
+    if (npc->data.critter.combat.damageLastTurn > 0) {
+        end = "hit";
+    } else if (myDist > RT_CORNER_DIST) {
+        return false; // still on its way: nothing to decide yet
+    } else if (myDist <= 2) {
+        end = "close";
+    } else {
+        for (int i = 0; i < rt_actor_count; i++) {
+            RtActor* t = &rt_actors[i];
+            Object* mate = t->obj;
+            if (mate == npc || t->fleeing || t->target != a->target || !rt_is_combatant(mate)
+                || (t->state != RT_CHASE && t->state != RT_ATTACK)
+                || mate->data.critter.combat.team != npc->data.critter.combat.team) {
+                continue;
+            }
+            int d = tile_dist(mate->tile, npc->tile);
+            if (d <= RT_CORNER_NEAR) {
+                near++;
+            } else if (d <= RT_SQUAD_RADIUS && t->state == RT_CHASE && obj_dist(mate, a->target) > myDist) {
+                coming++;
+            }
+        }
+        if (near >= RT_CORNER_GROUP) {
+            end = "together";
+        } else if (coming == 0) {
+            end = "alone";
+        }
+    }
+
+    if (end != NULL) {
+        if (a->corner_hold_start >= 0.0f) {
+            trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d end=%s near=%d held=%.2f t=%.2f",
+                npc->id, npc->pid, end, near, rt_clock - a->corner_hold_start, rt_clock);
+        }
+        a->corner_done = true;
+        a->corner_hold_start = -1.0f;
+        return false;
+    }
+
+    if (a->corner_hold_start < 0.0f) {
+        int intelligence = stat_level(npc, STAT_INTELLIGENCE);
+        int roll = roll_random(1, 100);
+        if (roll > intelligence * 10) {
+            trace_event(TRACE_FLOW, "corner-skip", "id=%d pid=%d int=%d roll=%d dist=%d coming=%d t=%.2f",
+                npc->id, npc->pid, intelligence, roll, myDist, coming, rt_clock);
+            a->corner_done = true;
+            return false;
+        }
+        a->corner_hold_start = rt_clock;
+        trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d start dist=%d near=%d coming=%d int=%d roll=%d t=%.2f",
+            npc->id, npc->pid, myDist, near, coming, intelligence, roll, rt_clock);
+    } else if (rt_clock - a->corner_hold_start >= RT_CORNER_HOLD_MAX) {
+        trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d end=timeout near=%d held=%.2f t=%.2f",
+            npc->id, npc->pid, near, rt_clock - a->corner_hold_start, rt_clock);
+        a->corner_done = true;
+        a->corner_hold_start = -1.0f;
         return false;
     }
     return true;
@@ -12131,6 +12221,8 @@ static void rt_update_actor(RtActor* a, float dt)
             if (attackNow) {
                 a->state = RT_ATTACK;
                 a->detour_until = 0.0f;
+                a->corner_done = false; // it has the foe in its line: the next corner is a new decision
+                a->corner_hold_start = -1.0f;
             } else if (a->breather) {
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
                 // place it does anything, and what it suppresses is MOVEMENT ONLY.
@@ -12145,6 +12237,11 @@ static void rt_update_actor(RtActor* a, float dt)
                 // An in-flight walk segment is left alone rather than force-cleared: it finishes
                 // its current tile and then nothing new is issued, so the stop reads as slowing to
                 // a halt instead of snapping mid-stride.
+            } else if (inRange && !closeForHit && rt_tactical_ai && rt_corner_holds(a, npc)) {
+                // Gathering at the corner before going round it (rt_corner_holds). Holding is not
+                // failing to route.
+                a->no_path_since = -1.0f;
+                rt_intent_hint(a, RT_INTENT_HOLD, "gather-corner", 0.5f);
             } else if (inRange && !closeForHit) {
                 // In range but no LINE OF FIRE (target behind a wall/building): don't
                 // just stand -- path AROUND the obstacle to get an angle. A plain step
