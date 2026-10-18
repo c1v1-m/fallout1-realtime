@@ -32,6 +32,20 @@ function tileDist(a, b) {
     const dq = q2 - q1, dr = r2 - r1;
     return (Math.abs(dq) + Math.abs(dr) + Math.abs(dq + dr)) / 2;
 }
+// Bearing (degrees) of tile b seen from tile a, in the hex grid's own geometry.
+function bearing(a, b) {
+    const c = t => { const [q, r] = cube(t); return [0.8660254 * q, r + q * 0.5]; };
+    const [ax, ay] = c(a), [bx, by] = c(b);
+    return Math.atan2(by - ay, bx - ax) * 180 / Math.PI;
+}
+// The widest gap-free arc that holds every angle: 360 minus the largest empty gap between them.
+function angleSpread(list) {
+    if (list.length < 2) return 0;
+    const a = list.map(x => ((x % 360) + 360) % 360).sort((p, q) => p - q);
+    let gap = 360 - a[a.length - 1] + a[0];
+    for (let i = 1; i < a.length; i++) gap = Math.max(gap, a[i] - a[i - 1]);
+    return Math.round(360 - gap);
+}
 function kv(rest) {
     const o = {};
     for (const m of rest.matchAll(/(\w+)=(\S+)/g)) o[m[1]] = m[2];
@@ -298,6 +312,20 @@ for (const fight of fights) {
     const hpMin = fhb.length ? Math.min(...fhb.map(h => h.hp)) : NaN;
     const hpEnd = fhb.length ? fhb[fhb.length - 1].hp : NaN;
 
+    // the angles they came from: each attacker's bearing from the dude at its first attack
+    const arrivals = [];
+    for (const n of npcs.values()) {
+        if (!Number.isFinite(n.firstAttack)) continue;
+        const sn = fsnaps.find(x => x.s >= n.firstAttack) || fsnaps[fsnaps.length - 1];
+        if (!sn || sn.dudeTile < 0) continue;
+        const f = sn.npcs.get(n.id);
+        if (!f) continue;
+        arrivals.push(Math.round(bearing(sn.dudeTile, num(f.tile))));
+    }
+    const arc = angleSpread(arrivals);
+    if (arrivals.length >= 3 && arc >= 90) good(fs_, -1, `attackers came from ${arc} deg around the dude (not one column)`);
+    if (arrivals.length >= 3 && arc < 45) issue(1, fs_, -1, `all ${arrivals.length} attackers came from one side (${arc} deg arc)`);
+
     // arrival spread
     const firsts = [...npcs.values()].map(n => n.firstAttack).filter(Number.isFinite).sort((a, b) => a - b);
     const spread = firsts.length >= 2 ? firsts[firsts.length - 1] - firsts[0] : NaN;
@@ -331,7 +359,7 @@ for (const fight of fights) {
     }
     rows.sort((a, b) => b.attacks - a.attacks);
     report.fights.push({
-        start: fs_, end: fe, dur, flickers: fight.flickers, hpStart, hpMin, hpEnd, spread, dude, npcs: rows,
+        start: fs_, end: fe, dur, flickers: fight.flickers, hpStart, hpMin, hpEnd, spread, dude, npcs: rows, arrivals, arc,
         dudeDied: fight.dudeDied ?? null,
     });
 }
@@ -420,6 +448,7 @@ for (const f of report.fights) {
     out.push(`== fight s=${fmt(f.start)}..${fmt(f.end)}  (${fmt(f.dur)} s)  dude HP ${f.hpStart}->${f.hpEnd} (min ${f.hpMin})  kills ${f.dude.kills}${f.dudeDied !== null ? '  DUDE DIED s=' + fmt(f.dudeDied) : ''}`);
     out.push(`   dude: ${f.dude.attacks} attacks` + (hasHit ? `, hit ${f.dude.hits}/${f.dude.shots} (${pct(f.dude.hits, f.dude.shots)}), dealt ${f.dude.dmg}, took ${f.dude.taken}` : ''));
     if (Number.isFinite(f.spread)) out.push(`   first-attack spread: ${fmt(f.spread)} s`);
+    if (f.arrivals.length) out.push(`   came from: ${f.arrivals.map(x => x + '°').join(' ')}  (arc ${f.arc}°)`);
     for (const r of f.npcs) {
         let line = `   ${r.name.padEnd(30)} in ${fmt(r.life).padStart(5)} s  atk ${String(r.attacks).padStart(2)}`;
         line += `  1st after ${fmt(r.tta).padStart(4)} s`;

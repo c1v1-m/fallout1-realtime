@@ -1,0 +1,19 @@
+# His Mariposa fight (trace_2026-10-18_180650): the barracks floor of MBSTRG12 with the map's own
+# super mutants (their scripts run; only the map script is off). The dude stands where he stood and
+# takes it -- what we watch is how they come at him: one column, or round and spread out.
+name mariposa
+map MBSTRG12.MAP
+seed 1
+duration 30
+
+dude elevation 1
+provoke
+dude tile 16892 rot 3
+dude stat PE 8
+dude stat AG 8
+dude hp 2000
+dude armor 17
+dude wield 8
+dude item 29 6
+
+at 0 shoot

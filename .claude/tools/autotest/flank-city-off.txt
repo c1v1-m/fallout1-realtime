@@ -1,0 +1,23 @@
+# Do they go round? Four knife raiders bunched at the east end of the ruined wall in CITY1
+# (tiles 24305-24311 / 24505-24511), the dude north of it. The shortest way in is round the east
+# end for all four (a column); a bright one (INT roll) should take the west end ([FLOW/flank-start]).
+# airep prints "came from: ..." -- the arc of bearings they attacked from.
+name flank-city-off
+map CITY1.MAP
+seed 1
+duration 40
+tactical off
+
+dude tile 23908 rot 3
+dude stat PE 8
+dude hp 600
+dude armor 17
+dude wield 8
+dude item 29 4
+
+spawn 16777291 26511 rot 0 wield 4 hostile
+spawn 16777291 26711 rot 0 wield 4 hostile
+spawn 16777291 26512 rot 0 wield 4 hostile
+spawn 16777291 26911 rot 0 wield 4 hostile
+
+at 0 shoot

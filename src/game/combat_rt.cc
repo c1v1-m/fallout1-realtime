@@ -621,6 +621,10 @@ typedef struct RtActor {
     bool defend_covered;      // looked for cover when it started holding
     float defend_since;       // when it started holding (the standoff cap, RT_DEFEND_MAX)
     float backoff_next_at;    // a shooter's next step back from a close dude (rt_back_off)
+    int flank_tile;           // the side of its target it is going round to (rt_flank_step); -1 = none
+    float flank_until;        // gives the way round up after this
+    bool flank_decided;       // asked once an engagement; reset in IDLE
+    float spread_check_at;    // a shooter's next look for a spot of its own (rt_spread_step)
     int intent;               // RtIntent read off the state each frame (rt_intent_update) -- trace only
     const char* intent_why;   // always a string literal
     float intent_since;
@@ -1320,6 +1324,7 @@ static bool rt_tactical_ai = true;
 // MODS "Projectiles" (cfg projectiles): bullets fly as tracers and commit on arrival, and every shot that
 // flies checks its line on arrival (rt_projectile_dodge). Default ON, his design (2026-10-18).
 static bool rt_projectiles = true;
+static RtActor* rt_actor_of(Object* obj);
 static void rt_tracers_render(Rect* rect, int elevation);
 static void rt_tracers_reset();
 
@@ -6918,6 +6923,11 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
         rt_swing_keep_arm(attacker, swingKeepTile, swingKeepX, swingKeepY);
         if (attacker == obj_dude) {
             rt_dude_last_attack = rt_clock; // the fight is his now (rt_dude_in_fight)
+        } else {
+            RtActor* shooter = rt_actor_of(attacker);
+            if (shooter != NULL) {
+                shooter->hint_until = 0.0f; // the step it took is over: this is an attack ([FLOW/intent])
+            }
         }
 
         trace_event(TRACE_COMBAT, "attack", "%s aid=%d ->pid=%d did=%d hm=%d t=%.2f",
@@ -8931,6 +8941,10 @@ static void rt_refresh_registry()
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
             a->backoff_next_at = prev->backoff_next_at;
+            a->flank_tile = prev->flank_tile;
+            a->flank_until = prev->flank_until;
+            a->flank_decided = prev->flank_decided;
+            a->spread_check_at = prev->spread_check_at;
             a->intent = prev->intent;
             a->intent_why = prev->intent_why;
             a->intent_since = prev->intent_since;
@@ -9006,6 +9020,10 @@ static void rt_refresh_registry()
             a->defend_covered = false;
             a->defend_since = 0.0f;
             a->backoff_next_at = 0.0f;
+            a->flank_tile = -1;
+            a->flank_until = 0.0f;
+            a->flank_decided = false;
+            a->spread_check_at = 0.0f;
             a->intent = RT_INTENT_NONE;
             a->intent_why = "";
             a->intent_since = rt_clock;
@@ -10155,6 +10173,352 @@ static bool rt_walk_to(Object* npc, int dest, const char* why, bool run)
     return rc == 0 && anim_last_path_steps(npc) != 0;
 }
 
+// --- COMBAT AI: GOING ROUND, AND SPREADING OUT (2026-10-18, MODS "Tactical AI") -------------------
+//
+// His report from Mariposa: "šli za sebou a žádný flankování" -- ten super mutants came down one
+// corridor in single file, though the rooms had corridors all round them. Each one walks its own
+// shortest way, and all their shortest ways are the same. His picks: go round AND spread out, and
+// let intelligence decide who thinks of it (INT x 10 %, the roll the friendly-fire care uses).
+//
+//   * GOING ROUND (rt_flank_step): a close fighter (weapon reach <= RT_FLANK_MAX_RANGE: fists, blades,
+//     a shotgun, a flamer) still RT_FLANK_MIN_DIST or more from its target, with a teammate ahead of
+//     it on its own way in, rolls once an engagement; a bright one looks for a tile beside the target
+//     at least RT_FLANK_ANGLE degrees round from the way the column comes in, whose route is at most
+//     RT_FLANK_DETOUR times the direct one and keeps clear of the column, and walks there in legs of
+//     RT_FLANK_LEG tiles. Close enough, arrived, or out of time, and it fights as before.
+//   * SPREADING OUT (rt_spread_step): a shooter with a teammate at its elbow (2 tiles), or in front of it
+//     (up to 8 tiles) on nearly the same line to the target (RT_SPREAD_ANGLE), rolls, on a beat it
+//     could not fire anyway; a bright one steps up to 3 tiles to a spot with a clean line from a
+//     different angle.
+#define RT_FLANK_MAX_RANGE 6
+#define RT_FLANK_MIN_DIST 6
+#define RT_FLANK_ANGLE 60.0f
+#define RT_FLANK_DETOUR 1.5f
+#define RT_FLANK_LEG 4
+#define RT_FLANK_CANDIDATES 6
+#define RT_SPREAD_PAUSE 4.0f
+#define RT_SPREAD_MIN_RANGE 7
+#define RT_SPREAD_ANGLE 25.0f
+
+static void rt_hex_centre(int tile, float* x, float* y);
+static float rt_off_line(int origin, int aim, int tile);
+#define RT_SPREAD_OFF_LINE 1.5f // hexes off the line a teammate in front fires along
+
+// The angle at centre between centre->a and centre->b, in degrees (hex geometry).
+static float rt_angle_at(int centre, int a, int b)
+{
+    float cx, cy, ax, ay, bx, by;
+    rt_hex_centre(centre, &cx, &cy);
+    rt_hex_centre(a, &ax, &ay);
+    rt_hex_centre(b, &bx, &by);
+    float d = fabsf(atan2f(ay - cy, ax - cx) - atan2f(by - cy, bx - cx));
+    if (d > 3.14159265f) {
+        d = 6.2831853f - d;
+    }
+    return d * 57.29578f;
+}
+
+// The route's tiles from -> to (make_path's own walk), up to max; returns how many.
+static int rt_route_tiles(Object* npc, int from, int to, int* tiles, int max)
+{
+    unsigned char rotations[800];
+    int steps = make_path(npc, from, to, rotations, 0);
+    int t = from;
+    int n = 0;
+    for (int i = 0; i < steps && n < max; i++) {
+        t = tile_num_in_direction(t, rotations[i], 1);
+        tiles[n++] = t;
+    }
+    return n;
+}
+
+// A live teammate after the same target, nearer to it than npc, standing within a tile of the first
+// part of route (its last tiles, beside the target, everyone shares).
+static Object* rt_column_ahead(RtActor* a, Object* npc, const int* route, int n)
+{
+    int myDist = obj_dist(npc, a->target);
+    int upto = n - 2;
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* o = &rt_actors[i];
+        Object* c = o->obj;
+        if (c == NULL || c == npc || o->target != a->target || o->state == RT_IDLE || critter_is_dead(c)
+            || c->data.critter.combat.team != npc->data.critter.combat.team || obj_dist(c, a->target) >= myDist) {
+            continue;
+        }
+        // Not the first tiles: a pack starts out side by side, and that is not a column ahead.
+        for (int k = 3; k < upto; k++) {
+            if (tile_dist(c->tile, route[k]) <= 1) {
+                return c;
+            }
+        }
+    }
+    return NULL;
+}
+
+// The longest reach of any gun it carries, in hand or in the pack: a super mutant whose minigun is
+// still holstered when the chase starts is no close fighter (the hit mode then reads "punch").
+static int rt_longest_gun_reach(Object* npc)
+{
+    int best = 0;
+    Inventory* inventory = &(npc->data.inventory);
+    for (int i = 0; i < inventory->length; i++) {
+        Object* item = inventory->items[i].item;
+        if (item == NULL || item_get_type(item) != ITEM_TYPE_WEAPON) {
+            continue;
+        }
+        Proto* proto;
+        if (proto_ptr(item->pid, &proto) == -1 || proto == NULL) {
+            continue;
+        }
+        int reach = proto->item.data.weapon.maxRange1 > proto->item.data.weapon.maxRange2
+            ? proto->item.data.weapon.maxRange1
+            : proto->item.data.weapon.maxRange2;
+        if (reach > best) {
+            best = reach;
+        }
+    }
+    return best;
+}
+
+// True = it is going round this frame (a leg registered); false = chase as before.
+static bool rt_flank_step(RtActor* a, Object* npc, int range)
+{
+    if (rt_longest_gun_reach(npc) > range) {
+        range = rt_longest_gun_reach(npc);
+    }
+    if (!rt_tactical_ai || range > RT_FLANK_MAX_RANGE || a->target == NULL || !rt_can_walk(npc)
+        || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        a->flank_tile = -1;
+        return false;
+    }
+    Object* target = a->target;
+    int dist = obj_dist(npc, target);
+
+    if (a->flank_tile >= 0) {
+        const char* end = NULL;
+        if (dist <= 3) {
+            end = "close";
+        } else if (tile_dist(npc->tile, a->flank_tile) <= 1) {
+            end = "arrived";
+        } else if (rt_clock >= a->flank_until) {
+            end = "timeout";
+        }
+        if (end == NULL) {
+            int leg[RT_FLANK_LEG];
+            int n = rt_route_tiles(npc, npc->tile, a->flank_tile, leg, RT_FLANK_LEG);
+            if (n > 0 && rt_walk_to(npc, leg[n - 1], "flank", true)) {
+                return true;
+            }
+            end = "blocked";
+        }
+        trace_event(TRACE_FLOW, "flank-end", "id=%d pid=%d why=%s tile=%d dist=%d t=%.2f",
+            npc->id, npc->pid, end, npc->tile, dist, rt_clock);
+        a->flank_tile = -1;
+        return false;
+    }
+
+    if (a->flank_decided || dist < RT_FLANK_MIN_DIST) {
+        return false;
+    }
+    a->flank_decided = true;
+
+    static int route[800];
+    int n = rt_route_tiles(npc, npc->tile, target->tile, route, 800);
+    if (n < RT_FLANK_MIN_DIST) {
+        return false;
+    }
+    Object* column = rt_column_ahead(a, npc, route, n);
+    if (column == NULL) {
+        return false;
+    }
+    int intelligence = stat_level(npc, STAT_INTELLIGENCE);
+    int roll = roll_random(1, 10);
+    if (roll > intelligence) {
+        trace_event(TRACE_FLOW, "flank-skip", "id=%d pid=%d why=dim int=%d roll=%d column=%d t=%.2f",
+            npc->id, npc->pid, intelligence, roll, column->id, rt_clock);
+        return false;
+    }
+
+    // The way the column comes in: the direct route three tiles out from the target.
+    int entry = route[n > 3 ? n - 4 : 0];
+    int ring[40];
+    int count = rt_tiles_around(target->tile, 3, ring, 40);
+    int cand[40];
+    float candAngle[40];
+    int candCount = 0;
+    for (int i = 1; i < count; i++) {
+        int t = ring[i];
+        int d = tile_dist(t, target->tile);
+        if (d < 2 || obj_blocking_at(npc, t, npc->elevation) != NULL) {
+            continue;
+        }
+        float ang = rt_angle_at(target->tile, entry, t);
+        if (ang < RT_FLANK_ANGLE) {
+            continue;
+        }
+        cand[candCount] = t;
+        candAngle[candCount] = ang;
+        candCount++;
+    }
+    // Widest first; only the first few are routed (each is a full path search).
+    for (int i = 0; i < candCount; i++) {
+        for (int j = i + 1; j < candCount; j++) {
+            if (candAngle[j] > candAngle[i]) {
+                float fa = candAngle[i];
+                candAngle[i] = candAngle[j];
+                candAngle[j] = fa;
+                int ft = cand[i];
+                cand[i] = cand[j];
+                cand[j] = ft;
+            }
+        }
+    }
+    int best = -1;
+    int bestSteps = 0;
+    float bestAngle = 0.0f;
+    int maxSteps = (int)(n * RT_FLANK_DETOUR);
+    static int alt[800];
+    for (int i = 0; i < candCount && i < RT_FLANK_CANDIDATES; i++) {
+        int m = rt_route_tiles(npc, npc->tile, cand[i], alt, 800);
+        if (m <= 0 || m > maxSteps) {
+            continue;
+        }
+        // It must keep clear of the column, or it is the same way in with a different last step.
+        // Only teammates AHEAD of it count, and not on the first tiles (the pack it starts out in).
+        bool clear = true;
+        int myDist = obj_dist(npc, target);
+        for (int r = 0; r < rt_actor_count && clear; r++) {
+            RtActor* o = &rt_actors[r];
+            Object* c = o->obj;
+            if (c == NULL || c == npc || o->target != target || o->state == RT_IDLE
+                || c->data.critter.combat.team != npc->data.critter.combat.team || obj_dist(c, target) >= myDist) {
+                continue;
+            }
+            for (int k = 3; k < (m * 7) / 10; k++) {
+                if (tile_dist(c->tile, alt[k]) <= 1) {
+                    clear = false;
+                    break;
+                }
+            }
+        }
+        if (!clear) {
+            continue;
+        }
+        best = cand[i];
+        bestSteps = m;
+        bestAngle = candAngle[i];
+        break;
+    }
+    if (best < 0) {
+        trace_event(TRACE_FLOW, "flank-skip", "id=%d pid=%d why=no-way-round direct=%d candidates=%d t=%.2f",
+            npc->id, npc->pid, n, candCount, rt_clock);
+        return false;
+    }
+    a->flank_tile = best;
+    a->flank_until = rt_clock + bestSteps * 0.7f + 3.0f;
+    trace_event(TRACE_FLOW, "flank-start", "id=%d pid=%d to=%d angle=%.0f direct=%d round=%d column=%d int=%d roll=%d t=%.2f",
+        npc->id, npc->pid, best, bestAngle, n, bestSteps, column->id, intelligence, roll, rt_clock);
+    int leg[RT_FLANK_LEG];
+    int legN = rt_route_tiles(npc, npc->tile, best, leg, RT_FLANK_LEG);
+    if (legN > 0 && rt_walk_to(npc, leg[legN - 1], "flank", true)) {
+        return true;
+    }
+    a->flank_tile = -1;
+    return false;
+}
+
+// True when it stepped to a spot of its own (this beat is spent).
+static bool rt_spread_step(RtActor* a, Object* npc, int attackMode)
+{
+    if (!rt_tactical_ai || rt_clock < a->spread_check_at || a->target == NULL || !rt_can_walk(npc) || a->ap <= 0
+        || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    Object* weapon = item_hit_with(npc, attackMode);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON
+        || item_w_subtype(weapon, attackMode) != ATTACK_TYPE_RANGED) {
+        return false;
+    }
+    int range = item_w_range(npc, attackMode);
+    if (range < RT_SPREAD_MIN_RANGE) {
+        return false;
+    }
+    if (a->ap >= rt_ap_cost(npc, attackMode) && !rt_attack_on_cooldown(npc)) {
+        return false; // it can fire: it fires
+    }
+    a->spread_check_at = rt_clock + RT_SPREAD_PAUSE;
+
+    Object* target = a->target;
+    Object* crowd[8];
+    int crowdCount = 0;
+    for (int i = 0; i < rt_actor_count && crowdCount < 8; i++) {
+        RtActor* o = &rt_actors[i];
+        Object* c = o->obj;
+        if (c == NULL || c == npc || o->target != target || o->state == RT_IDLE || critter_is_dead(c)
+            || c->data.critter.combat.team != npc->data.critter.combat.team) {
+            continue;
+        }
+        // At its elbow, or IN FRONT of it on nearly the same line (a column down a corridor: they
+        // stand three or four tiles apart, one behind the other, all shooting past each other).
+        bool sameLine = rt_angle_at(target->tile, npc->tile, c->tile) < RT_SPREAD_ANGLE;
+        bool infront = obj_dist(c, target) < obj_dist(npc, target) && obj_dist(npc, c) <= 8;
+        if (sameLine && (obj_dist(npc, c) <= 2 || infront)) {
+            crowd[crowdCount++] = c;
+        }
+    }
+    if (crowdCount == 0) {
+        return false;
+    }
+    int intelligence = stat_level(npc, STAT_INTELLIGENCE);
+    int roll = roll_random(1, 10);
+    if (roll > intelligence) {
+        trace_event(TRACE_FLOW, "spread-skip", "id=%d pid=%d why=dim crowd=%d int=%d roll=%d t=%.2f", npc->id, npc->pid, crowd[0]->id, intelligence, roll, rt_clock);
+        return false;
+    }
+
+    int tiles[40];
+    int count = rt_tiles_around(npc->tile, 3, tiles, 40);
+    int dest = -1;
+    int destSteps = 0;
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        int d = tile_dist(t, target->tile);
+        if (d < 2 || d > range || obj_blocking_at(npc, t, npc->elevation) != NULL) {
+            continue;
+        }
+        bool apart = true;
+        for (int k = 0; k < crowdCount; k++) {
+            // A different angle up close; far off, out of the line its teammate stands in (25 degrees at
+            // 25 tiles would be a 10-tile walk -- a step of 2 out of the line is what a column needs).
+            bool outOfLine = rt_angle_at(target->tile, t, crowd[k]->tile) >= RT_SPREAD_ANGLE
+                || rt_off_line(target->tile, crowd[k]->tile, t) >= RT_SPREAD_OFF_LINE;
+            if (!outOfLine || tile_dist(t, crowd[k]->tile) <= 1) {
+                apart = false;
+                break;
+            }
+        }
+        if (!apart || combat_is_shot_blocked(npc, t, target->tile, target, NULL) || rt_ally_in_line(npc, t, target) != NULL) {
+            continue;
+        }
+        int steps = make_path(npc, npc->tile, t, NULL, 1);
+        if (steps <= 0 || steps > 3) {
+            continue;
+        }
+        if (dest == -1 || steps < destSteps) {
+            dest = t;
+            destSteps = steps;
+        }
+    }
+    if (dest == -1) {
+        trace_event(TRACE_FLOW, "spread-skip", "id=%d pid=%d why=no-spot crowd=%d t=%.2f", npc->id, npc->pid, crowd[0]->id, rt_clock);
+        return false;
+    }
+    bool moved = rt_walk_to(npc, dest, "spread", false);
+    trace_event(TRACE_FLOW, "spread-step", "id=%d pid=%d from=%d to=%d crowd=%d int=%d roll=%d moved=%d t=%.2f",
+        npc->id, npc->pid, npc->tile, dest, crowd[0]->id, intelligence, roll, moved ? 1 : 0, rt_clock);
+    return moved;
+}
+
 // True = hold this frame (out of range of its foe, not provoked).
 static bool rt_defend_holds(RtActor* a, Object* npc)
 {
@@ -11157,10 +11521,16 @@ static void rt_update_actor(RtActor* a, float dt)
     switch (a->state) {
     case RT_IDLE: {
         // A new engagement may wait for its squad again, and a defender holds again (group tactics).
-        a->squad_hold_done = false;
+        // ...but not while it is SEARCHING for the one it just lost (self-played Mariposa: back from a
+        // one-second search it waited for its squad all over again, 0.05 s, and the intents flapped).
+        if (a->search_tile < 0) {
+            a->squad_hold_done = false;
+            a->defend_provoked = false;
+            a->flank_decided = false;
+        }
         a->squad_hold_start = -1.0f;
-        a->defend_provoked = false;
         a->defend_covered = false;
+        a->flank_tile = -1;
         // RE-AGGRO IS GATED ON PERCEPTION, and it has to be: the stop rule above drops a chase
         // once the critter perceives nobody, and if this branch could re-acquire on distance
         // alone (rt_nearest_player_side reaches the 50-tile leash) it would re-engage on the very
@@ -11539,6 +11909,9 @@ static void rt_update_actor(RtActor* a, float dt)
             } else if (rt_clock < a->room_yield_until) {
                 // It just stepped back to let a fresher ally in (rt_room_make). Walking now would
                 // take it straight back onto the spot it gave up, before the ally gets there.
+            } else if (rt_flank_step(a, npc, range)) {
+                rt_intent_hint(a, RT_INTENT_REPOSITION, "flank", 2.0f);
+                a->no_path_since = -1.0f;
             } else {
                 // While the in-combat bit is set, anim.cc deducts the mover's engine
                 // combat.ap per tile and truncates the move at ap <= 0. That field is
@@ -11813,6 +12186,11 @@ static void rt_update_actor(RtActor* a, float dt)
         // A shooter the foe has walked up to steps back now and then (rt_back_off).
         if (rt_tactical_ai && rt_back_off(a, npc, attackMode)) {
             rt_intent_hint(a, RT_INTENT_REPOSITION, "back-off", 2.0f);
+            break;
+        }
+
+        if (rt_spread_step(a, npc, attackMode)) {
+            rt_intent_hint(a, RT_INTENT_REPOSITION, "spread", 2.0f);
             break;
         }
 

@@ -45,6 +45,8 @@ namespace fallout {
 //                                      script spawns its own critters into the arena)
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
+//   dude elevation <0-2>               the floor of the map (default: the map's entrance floor); the
+//                                      enemies are spawned on the same floor
 //   dude stat <ST|PE|EN|CH|IN|AG|LK> <value>
 //   dude hp <n>                        maximum HP, as a higher-level character would have
 //   dude skill <small_guns|big_guns|energy|unarmed|melee|throwing|first_aid|sneak> <level>
@@ -70,6 +72,10 @@ namespace fallout {
 //        dodge                         stand (saving AP) and, the moment an attack at him is under way,
 //                                      run sideways for 1.2 s -- a player who sees the shot coming
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
+//   provoke                            every critter already on the dude's floor turns hostile (as a
+//                                      base alarm does) -- it still has to see him before it comes
+//   tactical on|off                    MODS "Tactical AI" for this run (default: as the cfg says)
+//   projectiles on|off                 MODS "Projectiles" for this run
 //   shots <n>                          up to n screenshots (screenshots/scrNNNNN.bmp beside the exe),
 //                                      each taken while a bullet tracer is in the air, 1 s apart
 //   projectile_speedup <x>             how much faster than its art a rocket / plasma / laser flies
@@ -126,6 +132,8 @@ static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
 static float at_projectile_speedup = -1.0f;
+static int at_tactical = -1;
+static int at_projectiles = -1;
 static int at_shots_wanted = 0;
 static int at_shots_taken = 0;
 static float at_shot_next = 0.0f;
@@ -133,6 +141,8 @@ static float at_shot_due = -1.0f;
 static float at_duration = 60.0f;
 static int at_dude_tile = -1;
 static int at_dude_rotation = -1;
+static int at_dude_elevation = -1;
+static bool at_provoke = false;
 static int at_dude_stats[7] = { -1, -1, -1, -1, -1, -1, -1 };
 static int at_dude_skills[SKILL_COUNT];
 static AtItem at_dude_items[AT_MAX_ITEMS];
@@ -261,6 +271,12 @@ static bool at_parse(const char* path)
             at_team = atoi(tok[1]);
         } else if (strcmp(tok[0], "reaction") == 0 && n >= 2) {
             at_reaction = (float)atof(tok[1]);
+        } else if (strcmp(tok[0], "provoke") == 0) {
+            at_provoke = true;
+        } else if (strcmp(tok[0], "tactical") == 0 && n >= 2) {
+            at_tactical = strcmp(tok[1], "off") == 0 ? 0 : 1;
+        } else if (strcmp(tok[0], "projectiles") == 0 && n >= 2) {
+            at_projectiles = strcmp(tok[1], "off") == 0 ? 0 : 1;
         } else if (strcmp(tok[0], "shots") == 0 && n >= 2) {
             at_shots_wanted = atoi(tok[1]);
         } else if (strcmp(tok[0], "projectile_speedup") == 0 && n >= 2) {
@@ -272,7 +288,9 @@ static bool at_parse(const char* path)
         } else if (strcmp(tok[0], "duration") == 0 && n >= 2) {
             at_duration = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "dude") == 0 && n >= 3) {
-            if (strcmp(tok[1], "tile") == 0) {
+            if (strcmp(tok[1], "elevation") == 0) {
+                at_dude_elevation = atoi(tok[2]);
+            } else if (strcmp(tok[1], "tile") == 0) {
                 at_dude_tile = atoi(tok[2]);
                 if (n >= 5 && strcmp(tok[3], "rot") == 0) {
                     at_dude_rotation = atoi(tok[4]);
@@ -440,10 +458,19 @@ void autotest_setup_world()
         trace_event(TRACE_ERR, "autotest", "virtual pad failed: %s", SDL_GetError());
     }
 
-    int elevation = map_elevation;
+    if (at_dude_elevation >= 0 && at_dude_elevation != map_elevation) {
+        map_set_elevation(at_dude_elevation);
+    }
+    int elevation = at_dude_elevation >= 0 ? at_dude_elevation : map_elevation;
 
     if (at_projectile_speedup > 0.0f) {
         anim_set_projectile_speedup(at_projectile_speedup);
+    }
+    if (at_tactical >= 0) {
+        combat_rt_set_tactical_ai(at_tactical != 0);
+    }
+    if (at_projectiles >= 0) {
+        combat_rt_set_projectiles(at_projectiles != 0);
     }
 
     // The dude.
@@ -532,6 +559,24 @@ void autotest_setup_world()
         trace_event(TRACE_FLOW, "autotest-spawn", "id=%d pid=%d tile=%d wield=%d hostile=%d team=%d hp=%d",
             critter->id, critter->pid, critter->tile, sp->wield, sp->hostile ? 1 : 0, critter->data.critter.combat.team,
             critter->data.critter.hp);
+    }
+
+    if (at_provoke) {
+        Object** list = NULL;
+        int count = obj_create_list(-1, elevation, OBJ_TYPE_CRITTER, &list);
+        int provoked = 0;
+        for (int i = 0; i < count; i++) {
+            Object* c = list[i];
+            if (c == obj_dude || critter_is_dead(c)) {
+                continue;
+            }
+            combat_rt_notify_attack(c, obj_dude);
+            provoked++;
+        }
+        if (list != NULL) {
+            obj_delete_list(list);
+        }
+        trace_event(TRACE_FLOW, "autotest", "provoked %d critters", provoked);
     }
 
     trace_event(TRACE_FLOW, "autotest", "start scenario=%s file=%s map=%s seed=%d duration=%.0f dude=%d spawns=%d pad=%d",
