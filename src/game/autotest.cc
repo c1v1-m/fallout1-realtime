@@ -144,7 +144,6 @@ static int at_shots_wanted = 0;
 static float at_ipdump_at = -1.0f; // scenario "ipdump": when to list the interact candidates
 static int at_shots_taken = 0;
 static float at_shot_next = 0.0f;
-static float at_shot_due = -1.0f;
 static float at_duration = 60.0f;
 static int at_dude_tile = -1;
 static int at_dude_rotation = -1;
@@ -973,17 +972,23 @@ void autotest_tick(float dt)
         at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
     }
 
-    // A photograph of the bullets (scenario "shots").
-    // A bullet is first drawn inside the shooter's own sprite; 0.12 s on it is a third of the way there.
-    if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && combat_rt_tracers_in_air() > 0 && at_shot_due < 0.0f) {
-        at_shot_due = at_elapsed + 0.02f; // a real-speed bullet is on screen 0.05 s
-    }
-    if (at_shot_due >= 0.0f && at_elapsed >= at_shot_due) {
-        at_shot_due = -1.0f;
+    // A photograph of the bullets (scenario "shots"): EVERY frame a tracer is in the air, up to six, so
+    // a real-speed bullet (on screen ~0.05 s) is caught all the way across -- a single photo missed the
+    // .223 and the buckshot (2026-10-19).
+    static int at_seq_frames = 0;
+    if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && combat_rt_tracers_in_air() > 0) {
         dump_screen();
+        at_seq_frames++;
+        trace_event(TRACE_FLOW, "autotest", "shot n=%d frame=%d at=%.3f tracers=%d", at_shots_taken, at_seq_frames, at_elapsed, combat_rt_tracers_in_air());
+        if (at_seq_frames >= 6) {
+            at_shots_taken++;
+            at_shot_next = at_elapsed + 1.0f;
+            at_seq_frames = 0;
+        }
+    } else if (at_seq_frames > 0) {
         at_shots_taken++;
         at_shot_next = at_elapsed + 1.0f;
-        trace_event(TRACE_FLOW, "autotest", "shot n=%d at=%.2f tracers=%d", at_shots_taken, at_elapsed, combat_rt_tracers_in_air());
+        at_seq_frames = 0;
     }
 
     // The end.

@@ -15223,7 +15223,7 @@ static RtBulletLook rt_bullet_look(Object* weapon)
     }
     switch (item_w_caliber(weapon)) {
     case 0: // BB's: the Red Ryder, ~90 m/s
-        return rt_look(90.0f, 0.0f, 2, RT_RGB(22, 17, 9), 1);
+        return rt_look(90.0f, 0.0f, 2, RT_RGB(31, 24, 12), 1); // shiny copper: the dull one vanished on the sand
     case 12: // 9mm ball
         return rt_look(360.0f, 0.25f, 1, RT_BRASS, 1);
     case 8: // 10mm
@@ -15237,7 +15237,7 @@ static RtBulletLook rt_bullet_look(Object* weapon)
     case 6: // 5mm (minigun, assault rifle)
         return rt_look(900.0f, 0.45f, 1, RT_BRASS, 1);
     case 11: // 12 ga. buckshot
-        return rt_look(400.0f, 0.0f, 1, RT_RGB(24, 24, 22), 6);
+        return rt_look(400.0f, 0.0f, 2, RT_RGB(29, 29, 27), 6); // 2x2 and light: 1-px grey shot vanished on the sand
     }
     return fallback;
 }

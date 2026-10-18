@@ -2,7 +2,7 @@
 name cal-223
 map DESERT1.MAP
 seed 1
-shots 2
+shots 3
 duration 10
 
 dude tile 20100 rot 2
