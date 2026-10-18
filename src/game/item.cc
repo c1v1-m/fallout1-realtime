@@ -20,6 +20,7 @@
 #include "game/proto.h"
 #include "game/queue.h"
 #include "game/roll.h"
+#include "game/combat_rt.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -1366,6 +1367,17 @@ int item_w_range(Object* critter, int hit_mode)
             max_range = 3 * (stat_level(critter, STAT_STRENGTH) + 2 * perk_level(PERK_HEAVE_HO));
         } else {
             max_range = 3 * stat_level(critter, STAT_STRENGTH);
+        }
+
+        // ⚠️ THROWING ADDS REACH (2026-10-18, his pick: "když mám větší throwing, můžu házet dál? přijde mi,
+        // že moc nikam nedohodím"). Vanilla: the skill is accuracy only, the reach is the weapon's own
+        // (a grenade 15) under 3 x ST. Realtime: a tile more for every 25 % of Throwing above 75 % (100 %
+        // = +1, 150 % = +3, 200 % = +5), still under the strength cap. Everyone, the enemies too.
+        if (combat_rt_enabled() && critter != NULL && FID_TYPE(critter->fid) == OBJ_TYPE_CRITTER) {
+            int throwing = skill_level(critter, SKILL_THROWING);
+            if (throwing > 75) {
+                range += (throwing - 75) / 25;
+            }
         }
 
         if (range > max_range) {
