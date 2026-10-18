@@ -3580,8 +3580,35 @@ void death_checks(Attack* attack)
 }
 
 // 0x422418
+// [COMBAT/hit]: what one attack actually did to one victim, at the moment it lands (2026-10-18). Until
+// now the trace said who attacked whom but never whether it hit or for how much, so nothing could judge
+// the AI from a trace alone (.claude/tools/trace/airep.js). hp= is the victim's HP before this damage.
+static void trace_hit(Attack* attack, Object* victim, int damage, bool hit, bool crit, int loc, bool extra)
+{
+    if (victim == NULL || FID_TYPE(victim->fid) != OBJ_TYPE_CRITTER) {
+        return;
+    }
+    Object* attacker = attack->attacker;
+    bool attackerIsCritter = attacker != NULL && FID_TYPE(attacker->fid) == OBJ_TYPE_CRITTER;
+    trace_event(TRACE_COMBAT, "hit", "att=%d attPid=%d def=%d defPid=%d hit=%d crit=%d dmg=%d hp=%d dist=%d mode=%d loc=%d extra=%d oops=%d",
+        attackerIsCritter ? attacker->id : -1, attacker != NULL ? attacker->pid : -1,
+        victim->id, victim->pid,
+        hit || damage > 0 ? 1 : 0, crit ? 1 : 0, damage,
+        stat_level(victim, STAT_CURRENT_HIT_POINTS),
+        attacker != NULL ? obj_dist(attacker, victim) : -1, attack->hitMode, loc, extra ? 1 : 0,
+        attack->oops == victim && attack->oops != attack->defender ? 1 : 0);
+}
+
 void apply_damage(Attack* attack, bool animated)
 {
+    // The main victim's hit/critical bits live in attackerFlags (compute_attack); an extra was hit if it was hurt.
+    trace_hit(attack, attack->defender, attack->defenderDamage, (attack->attackerFlags & DAM_HIT) != 0,
+        (attack->attackerFlags & DAM_CRITICAL) != 0, attack->defenderHitLocation, false);
+    for (int index = 0; index < attack->extrasLength; index++) {
+        trace_hit(attack, attack->extras[index], attack->extrasDamage[index], (attack->extrasFlags[index] & DAM_HIT) != 0,
+            (attack->extrasFlags[index] & DAM_CRITICAL) != 0, attack->extrasHitLocation[index], true);
+    }
+
     Object* attacker = attack->attacker;
     bool attackerIsCritter = attacker != NULL && FID_TYPE(attacker->fid) == OBJ_TYPE_CRITTER;
 
