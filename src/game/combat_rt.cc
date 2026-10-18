@@ -6889,6 +6889,15 @@ static bool rt_flee_step(RtActor* a, Object* npc)
         return true; // cornered, or the last leg would not route: holds, and never attacks
     }
 
+    // A BODY WITH NO WALK ART CANNOT RUN (2026-10-18). Shady Sands' children (art NACHLD: his data
+    // carries only a few of their death frames, some releases cut the kids) failed the run
+    // registration every 0.5 s for 100 s of a fight (trace_2026-10-18_221747, ids 1424/1425, rc=-1 x 20
+    // each). It cowers where it stands and asks again once a turn.
+    if (!rt_can_walk(npc)) {
+        a->flee_retry_at = rt_clock + rt_script_turn_period(npc);
+        return true;
+    }
+
     static const char* reasons[] = { "none", "fleeing", "hurt", "min-hp" };
     int from = npc->tile;
     int dist = obj_dist(npc, obj_dude);
