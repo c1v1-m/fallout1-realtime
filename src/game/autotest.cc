@@ -54,6 +54,7 @@ namespace fallout {
 //   dude item <pid> [qty]
 //   dude wield <pid>                   added and put in the active hand, loaded
 //   dude armor <pid>
+//   dude curhp <n>                     start with n hit points (after the maximum is set)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
 //   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
@@ -74,6 +75,7 @@ namespace fallout {
 //                                      run sideways for 1.2 s -- a player who sees the shot coming
 //        shootmove                     fight, and the moment his own attack is under way push the stick
 //                                      sideways for 0.8 s (turning each time) -- shoot and move
+//        heal                          press LB (the heal slot) once, then stand
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
@@ -104,9 +106,10 @@ enum {
     AT_STRAFE,
     AT_DODGE,
     AT_SHOOT_MOVE,
+    AT_HEAL,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal" };
 
 typedef struct AtItem {
     int pid;
@@ -155,6 +158,7 @@ static AtItem at_dude_items[AT_MAX_ITEMS];
 static int at_dude_item_count = 0;
 static int at_dude_wield = -1;
 static int at_dude_hp = -1;
+static int at_dude_curhp = -1; // "dude curhp": start wounded
 static int at_dude_armor = -1;
 static AtSpawn at_spawns[AT_MAX_SPAWNS];
 static int at_spawn_count = 0;
@@ -323,6 +327,8 @@ static bool at_parse(const char* path)
                 at_dude_item_count++;
             } else if (strcmp(tok[1], "hp") == 0) {
                 at_dude_hp = atoi(tok[2]);
+            } else if (strcmp(tok[1], "curhp") == 0) {
+                at_dude_curhp = atoi(tok[2]);
             } else if (strcmp(tok[1], "wield") == 0) {
                 at_dude_wield = atoi(tok[2]);
             } else if (strcmp(tok[1], "armor") == 0) {
@@ -522,6 +528,9 @@ void autotest_setup_world()
         stat_set_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS) + at_dude_hp - now);
     }
     obj_dude->data.critter.hp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+    if (at_dude_curhp > 0 && at_dude_curhp < obj_dude->data.critter.hp) {
+        obj_dude->data.critter.hp = at_dude_curhp;
+    }
     if (at_dude_tile >= 0) {
         obj_move_to_tile(obj_dude, at_dude_tile, elevation, NULL);
     }
@@ -958,6 +967,16 @@ void autotest_tick(float dt)
             at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
             break;
         }
+        case AT_HEAL:
+            // One press of LB (the heal slot), then stand.
+            at_stick_still();
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+            if (at_shots == 0) {
+                at_tap(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+                at_shots = 1;
+                trace_event(TRACE_FLOW, "autotest", "heal-tap at=%.2f hp=%d", at_elapsed, critter_get_hits(obj_dude));
+            }
+            break;
         case AT_SHOOT:
             if (at_shots == 0) {
                 at_fight(enemy, dist);

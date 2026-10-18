@@ -1611,6 +1611,12 @@ struct RtInFlight {
 
     // aimTile / blastTile re-pointed at where the target stands when the shot is released (rt_reaim).
     bool reaimed;
+
+    // Hit points of the defender and of each extra when the attack was computed: a DAM_DEAD set
+    // because the damage reached THOSE is withdrawn if a heal lifted them meanwhile (rt_late_survive).
+    // -1 = not a critter.
+    int defHpAtFire;
+    int extrasHpAtFire[EXPLOSION_TARGET_COUNT];
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1635,6 +1641,13 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->bulletFlight = 0.0f;
     f->released = false;
     f->reaimed = false;
+    f->defHpAtFire = f->ctd.defender != NULL && FID_TYPE(f->ctd.defender->fid) == OBJ_TYPE_CRITTER
+        ? critter_get_hits(f->ctd.defender)
+        : -1;
+    for (int x = 0; x < EXPLOSION_TARGET_COUNT; x++) {
+        Object* extra = x < f->ctd.extrasLength ? f->ctd.extras[x] : NULL;
+        f->extrasHpAtFire[x] = extra != NULL && FID_TYPE(extra->fid) == OBJ_TYPE_CRITTER ? critter_get_hits(extra) : -1;
+    }
     f->flame = f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
         && item_w_subtype(f->ctd.weapon, f->ctd.hitMode) == ATTACK_TYPE_RANGED
         && item_w_damage_type(f->ctd.weapon) == DAMAGE_TYPE_FIRE;
@@ -15408,6 +15421,37 @@ static void rt_tracers_tick()
 // through the target, check_ranged_miss). Sidestepping is the shot you see coming, Isaac-style. The
 // physical flights do the same at their launch (action_rt_launch_flight); a thrown or fired miss keeps
 // its spot. Both sides, his shots included.
+// ⚠️ A HEAL IN THE MEANTIME UNDOES A DEATH SENTENCE (2026-10-19, "dal jsem si superstimpak a zabila
+// mě raketa za 24, přitom jsem měl 53 živů"). compute_attack decides lethality against the hit points
+// the target has when the trigger is pulled: the rocket that killed him was fired at 1 HP (DAM_DEAD:
+// 19 >= 1), he took a Super Stimpak in its flight (1 -> 71), it landed for 19 and he died anyway, at
+// 52 HP (trace_2026-10-19_002535 s=143.90 / 145.16 / 146.18). combat_late_lethal_upgrade covers the
+// opposite case only. A DAM_DEAD that came from the HIT POINTS (the damage reached the hp at the fire)
+// is withdrawn when the hp now exceed the damage; one a critical dealt outright (the damage was below
+// the hp even then -- an instant-death critical) stands.
+static void rt_late_survive(RtInFlight* f)
+{
+    Attack* at = &f->ctd;
+    Object* d = at->defender;
+    if ((at->defenderFlags & DAM_DEAD) != 0 && d != NULL && FID_TYPE(d->fid) == OBJ_TYPE_CRITTER
+        && !critter_is_dead(d) && f->defHpAtFire >= 0 && at->defenderDamage >= f->defHpAtFire
+        && critter_get_hits(d) > at->defenderDamage) {
+        at->defenderFlags &= ~DAM_DEAD;
+        trace_event(TRACE_COMBAT, "late-survive", "who=defender id=%d pid=%d dmg=%d hpAtFire=%d hp=%d t=%.2f",
+            d->id, d->pid, at->defenderDamage, f->defHpAtFire, critter_get_hits(d), rt_clock);
+    }
+    for (int x = 0; x < at->extrasLength && x < EXPLOSION_TARGET_COUNT; x++) {
+        Object* e = at->extras[x];
+        if ((at->extrasFlags[x] & DAM_DEAD) != 0 && e != NULL && FID_TYPE(e->fid) == OBJ_TYPE_CRITTER
+            && !critter_is_dead(e) && f->extrasHpAtFire[x] >= 0 && at->extrasDamage[x] >= f->extrasHpAtFire[x]
+            && critter_get_hits(e) > at->extrasDamage[x]) {
+            at->extrasFlags[x] &= ~DAM_DEAD;
+            trace_event(TRACE_COMBAT, "late-survive", "who=extra id=%d pid=%d dmg=%d hpAtFire=%d hp=%d t=%.2f",
+                e->id, e->pid, at->extrasDamage[x], f->extrasHpAtFire[x], critter_get_hits(e), rt_clock);
+        }
+    }
+}
+
 static void rt_reaim(RtInFlight* f)
 {
     if (f->reaimed) {
@@ -16243,6 +16287,8 @@ void combat_rt_update(float dt)
             // then snaps it flat in the same frame ("he died without falling"; traced on Ian
             // 2026-08-10 under three attackers). heavyReaction has to be re-read after this, since
             // it is what selects the fall AND shields it from the stray-anim tests.
+            rt_late_survive(f);
+            heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             if (combat_late_lethal_upgrade(&f->ctd)) {
                 heavyReaction = true;
             }

@@ -1,0 +1,17 @@
+# A heal in the meantime undoes a death sentence (2026-10-19): the dude at 1 HP, a rocket mutant fires
+# from 20 tiles (a ~2 s flight), the dude takes a Super Stimpak in its flight -- he must survive the hit
+# (late-survive), not die at 50+ HP as in trace_2026-10-19_002535.
+name heal-midflight
+map DESERT1.MAP
+seed 4
+duration 8
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 1
+dude item 144 3
+
+spawn 16777225 24100 rot 5 wield 13 item 14 10 hostile
+
+at 0 idle
+at 1.3 heal
