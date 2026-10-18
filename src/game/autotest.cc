@@ -76,6 +76,7 @@ namespace fallout {
 //                                      base alarm does) -- it still has to see him before it comes
 //   tactical on|off                    MODS "Tactical AI" for this run (default: as the cfg says)
 //   projectiles on|off                 MODS "Projectiles" for this run
+//   tracer <hexes> <r> <g> <b> [underline]   how a bullet looks (r g b 0-31) -- to photograph variants
 //   shots <n>                          up to n screenshots (screenshots/scrNNNNN.bmp beside the exe),
 //                                      each taken while a bullet tracer is in the air, 1 s apart
 //   projectile_speedup <x>             how much faster than its art a rocket / plasma / laser flies
@@ -277,6 +278,8 @@ static bool at_parse(const char* path)
             at_tactical = strcmp(tok[1], "off") == 0 ? 0 : 1;
         } else if (strcmp(tok[0], "projectiles") == 0 && n >= 2) {
             at_projectiles = strcmp(tok[1], "off") == 0 ? 0 : 1;
+        } else if (strcmp(tok[0], "tracer") == 0 && n >= 5) {
+            combat_rt_set_tracer_look((float)atof(tok[1]), atoi(tok[2]), atoi(tok[3]), atoi(tok[4]), n >= 6 && strcmp(tok[5], "underline") == 0);
         } else if (strcmp(tok[0], "shots") == 0 && n >= 2) {
             at_shots_wanted = atoi(tok[1]);
         } else if (strcmp(tok[0], "projectile_speedup") == 0 && n >= 2) {

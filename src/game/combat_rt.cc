@@ -10672,10 +10672,12 @@ static void rt_intent_update(RtActor* a)
         intent = RT_INTENT_ATTACK;
         why = a->plan_valid && a->plan_loc != HIT_LOCATION_UNCALLED ? "called-shot" : "in-range";
     } else if (a->state == RT_CHASE) {
-        if (a->squad_hold_start >= 0.0f) {
+        // Holding means standing: a body that walks is approaching, whatever flag another branch
+        // left set (self-played/his trace: "held (wait-for-squad) 9.1 s" while it closed from 28 to 9).
+        if (a->squad_hold_start >= 0.0f && !busy) {
             intent = RT_INTENT_HOLD;
             why = "wait-for-squad";
-        } else if (a->defend_covered && !a->defend_provoked && rt_is_defensive(a, npc)) {
+        } else if (a->defend_covered && !a->defend_provoked && rt_is_defensive(a, npc) && !busy) {
             intent = RT_INTENT_HOLD;
             why = "defend";
         } else if (a->breather) {
@@ -14733,7 +14735,6 @@ static void rt_projectile_dodge(RtInFlight* f)
 #define RT_BULLET_SPEED 40.0f        // hexes a second
 #define RT_LASER_BULLET_SPEED 150.0f
 #define RT_ENERGY_BULLET_SPEED 60.0f // electrical, EMP and anything else that is not a bullet or a laser
-#define RT_TRACER_LENGTH 1.2f        // hexes
 #define RT_TRACER_STAGGER 0.05f      // seconds between the rounds of a burst
 #define RT_TRACER_LIFT 30            // pixels: from the feet to the gun
 #define RT_TRACER_FLY_ON 8.0f        // hexes a dodged bullet flies on past where its target stood
@@ -14756,6 +14757,13 @@ typedef struct RtTracer {
 } RtTracer;
 
 static RtTracer rt_tracers[RT_MAX_TRACERS];
+
+// HOW A BULLET LOOKS. His first look at them (2026-10-18): "moc dlouhé a vypadají lehce jako laserové
+// střely z nějaké videohry s loďkou" -- a 1.2-hex neon streak. Shorter and duller now; the look is a
+// lever so the self-played runs can photograph variants (combat_rt_set_tracer_look, scenario "tracer").
+static float rt_tracer_length = 0.35f; // hexes
+static int rt_tracer_rgb = (28 << 10) | (26 << 5) | 18; // 15-bit colour of the streak
+static bool rt_tracer_underline = false; // a darker line under it (the first look had one)
 
 static void rt_tracers_reset()
 {
@@ -14797,6 +14805,13 @@ static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation,
     }
 }
 
+void combat_rt_set_tracer_look(float lengthHexes, int r, int g, int b, bool underline)
+{
+    rt_tracer_length = lengthHexes > 0.05f ? lengthHexes : 0.05f;
+    rt_tracer_rgb = ((r & 31) << 10) | ((g & 31) << 5) | (b & 31);
+    rt_tracer_underline = underline;
+}
+
 // How many bullet tracers are on screen right now (the self-played runs photograph them).
 int combat_rt_tracers_in_air()
 {
@@ -14827,7 +14842,7 @@ static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, 
         return false;
     }
     float end = tr->dist + tr->past;
-    float tail = travelled - RT_TRACER_LENGTH;
+    float tail = travelled - rt_tracer_length;
     if (tail >= end) {
         *gone = true;
         return false;
@@ -14857,8 +14872,8 @@ static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, 
 // The overlay (tile.cc refresh_game): every tracer in the air, clipped to what is being repainted.
 static void rt_tracers_render(Rect* rect, int elevation)
 {
-    int core = colorTable[(31 << 10) | (31 << 5) | 22];
-    int edge = colorTable[(26 << 10) | (20 << 5) | 6];
+    int core = colorTable[rt_tracer_rgb];
+    int edge = colorTable[(((rt_tracer_rgb >> 10) & 31) * 2 / 3 << 10) | (((rt_tracer_rgb >> 5) & 31) * 2 / 3 << 5) | ((rt_tracer_rgb & 31) * 2 / 3)];
     for (int i = 0; i < RT_MAX_TRACERS; i++) {
         RtTracer* tr = &rt_tracers[i];
         if (!tr->used || tr->elevation != elevation) {
@@ -14869,7 +14884,9 @@ static void rt_tracers_render(Rect* rect, int elevation)
         if (!rt_tracer_segment(tr, &x0, &y0, &x1, &y1, &gone)) {
             continue;
         }
-        tile_overlay_line(rect, x0, y0 + 1, x1, y1 + 1, edge);
+        if (rt_tracer_underline) {
+            tile_overlay_line(rect, x0, y0 + 1, x1, y1 + 1, edge);
+        }
         tile_overlay_line(rect, x0, y0, x1, y1, core);
     }
 }

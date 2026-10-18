@@ -118,6 +118,7 @@ bool combat_rt_get_tactical_ai();
 void combat_rt_set_projectiles(bool enabled);
 bool combat_rt_get_projectiles();
 int combat_rt_tracers_in_air();
+void combat_rt_set_tracer_look(float lengthHexes, int r, int g, int b, bool underline);
 bool combat_rt_weapon_amnesty();
 bool combat_rt_critter_fighting(Object* critter);
 bool combat_rt_fm_foreign_touch();
