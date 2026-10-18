@@ -200,6 +200,7 @@ int check_move(int* a1);
 float anim_get_travel_speed();
 float anim_travel_speed_in_effect();
 void anim_set_travel_speed(float scale);
+void anim_set_projectile_speedup(float speedup);
 // MODS "Reload animation" (cfg reload_anim): a reload plays the weapon's STAND loop (dude and NPCs)
 // and the dude stops idling. anim_set_reload_timing brackets the register_end that starts one.
 bool anim_get_reload_anim();

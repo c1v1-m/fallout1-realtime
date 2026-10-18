@@ -1,0 +1,18 @@
+# A plasma ball is a projectile without a blast: does a sidestep make it miss? (rt_projectile_dodge,
+# step one of the projectiles.) A super mutant with a plasma rifle 12 tiles off; the dude dodges as a
+# player who sees the aim (reaction 0.3 s). Count with dodgecount.js: hit / dodged / missed on the roll.
+name plasma-stand
+map DESERT1.MAP
+seed 1
+duration 40
+reaction 0.3
+
+dude tile 20100 rot 2
+dude stat AG 8
+dude stat EN 8
+dude hp 3000
+dude armor 17
+
+spawn 16777241 22500 rot 5 wield 15 item 39 6 hostile
+
+at 0 idle

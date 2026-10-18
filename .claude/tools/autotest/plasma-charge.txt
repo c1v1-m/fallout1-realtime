@@ -1,0 +1,21 @@
+# The dude's plasma rifle against three raiders charging him with knives: they walk ALONG the line of
+# fire, so a plasma ball must still find them (no false dodges from rt_projectile_dodge).
+name plasma-charge
+map DESERT1.MAP
+seed 1
+duration 40
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude hp 500
+dude skill energy 120
+dude armor 17
+dude wield 15
+dude item 39 6
+
+spawn 16777291 23300 rot 5 wield 4 hostile
+spawn 16777291 23296 rot 5 wield 4 hostile
+spawn 16777291 23304 rot 5 wield 4 hostile
+
+at 0 fight

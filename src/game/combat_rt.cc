@@ -1560,7 +1560,7 @@ struct RtInFlight {
     // goes off, not when the trigger is pulled -- see `landed` in the resolve loop. NULLed by the
     // erase hook if the projectile is freed first; explosionFid stays, so that still reads as landed.
     Object* projectile;
-    int explosionFid;    // -1 = not an explosive attack
+    int explosionFid;    // -1 = not an explosive attack; ACTION_RT_LANDS_ON_ERASE = a bolt / ball: lands when erased
 
     // A BLAST (grenade radius 2, rocket 3) and where it goes off, fixed when the attack is computed;
     // 0 = no blast (a bullet, a thrown knife). Who it catches is re-checked when it lands
@@ -1568,6 +1568,12 @@ struct RtInFlight {
     int blastTile;
     int blastRadius;
     int serial;
+
+    // Where it was fired from and at: the shooter's tile and the target's (or, for a miss, the tile it
+    // falls to) when the attack was computed. A projectile you can watch fly hits whoever is still on
+    // that line when it arrives (rt_projectile_dodge).
+    int originTile;
+    int aimTile;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1582,6 +1588,8 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->serial = rt_inflight_serial_next++;
     f->blastTile = -1;
     f->blastRadius = 0;
+    f->originTile = f->ctd.attacker != NULL ? f->ctd.attacker->tile : -1;
+    f->aimTile = (f->ctd.attackerFlags & DAM_HIT) != 0 && f->ctd.defender != NULL ? f->ctd.defender->tile : f->ctd.tile;
     if (f->explosionFid == -1 || f->ctd.attacker == NULL || f->ctd.weapon == NULL) {
         return;
     }
@@ -12956,6 +12964,18 @@ bool combat_rt_request_throw(Object* target)
     return true;
 }
 
+// True while some attack at the dude is under way (from the attacker's wind-up to the commit) --
+// what a player sees coming. The self-played dodger reacts to it (autotest.cc).
+bool combat_rt_dude_targeted()
+{
+    for (int i = 0; i < rt_inflight_count; i++) {
+        if (rt_inflight[i].defender == obj_dude && rt_inflight[i].attacker != obj_dude) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool combat_rt_player_attack_pending()
 {
     if (rt_player_intent_target != NULL) {
@@ -14218,6 +14238,71 @@ float combat_rt_time_scale()
     return scale;
 }
 
+// --- PROJECTILES YOU CAN STEP OUT OF (2026-10-18, step one) --------------------------------------
+//
+// His words: "líbí se mi když rakety letí, je možné od nich utéci jako kdybych hrál Binding of Isaac?
+// ... mít prostě projektily" -- and his pick: everything, bullets too, at speeds by kind. Step one
+// covers what already flies on screen without a blast: a laser bolt, a plasma ball, a thrown knife
+// or spear (a rocket's and a grenade's blast has rt_blast_filter). compute_attack decided the hit
+// when the trigger was pulled; when the projectile ARRIVES, the target must still be on the line it
+// was fired along, within RT_PROJECTILE_HALF_WIDTH of it. Walking along that line -- straight at the
+// shooter or away -- still meets it; a sidestep does not. The geometry is the hex grid's own
+// (even-q offset -> cube -> flat-top centres, one hex = 1.0), so the corridor is the same width in
+// every direction.
+#define RT_PROJECTILE_HALF_WIDTH 0.6f
+
+static void rt_hex_centre(int tile, float* x, float* y)
+{
+    int col = tile % 200;
+    int row = tile / 200;
+    int q = col;
+    int r = row - (col + (col & 1)) / 2;
+    *x = 0.8660254f * q; // sqrt(3)/2: flat-top centres, neighbours exactly 1.0 apart
+    *y = r + q * 0.5f;
+}
+
+// How far the tile is from the shot's line (origin through aim, carried on past the aim -- a projectile
+// does not stop where the target used to be), in hexes. Behind the shooter counts from the shooter.
+static float rt_off_line(int origin, int aim, int tile)
+{
+    float ox, oy, ax, ay, tx, ty;
+    rt_hex_centre(origin, &ox, &oy);
+    rt_hex_centre(aim, &ax, &ay);
+    rt_hex_centre(tile, &tx, &ty);
+    float dx = ax - ox, dy = ay - oy;
+    float len2 = dx * dx + dy * dy;
+    float px = tx - ox, py = ty - oy;
+    if (len2 < 0.0001f) {
+        return sqrtf(px * px + py * py);
+    }
+    float t = (px * dx + py * dy) / len2;
+    if (t < 0.0f) {
+        return sqrtf(px * px + py * py);
+    }
+    float cx = px - t * dx, cy = py - t * dy;
+    return sqrtf(cx * cx + cy * cy);
+}
+
+static void rt_projectile_dodge(RtInFlight* f)
+{
+    Attack* at = &f->ctd;
+    if ((at->attackerFlags & DAM_HIT) == 0 || at->defender == NULL || at->defender == at->attacker
+        || FID_TYPE(at->defender->fid) != OBJ_TYPE_CRITTER || f->originTile < 0 || f->aimTile < 0) {
+        return;
+    }
+    float off = rt_off_line(f->originTile, f->aimTile, at->defender->tile);
+    if (off <= RT_PROJECTILE_HALF_WIDTH) {
+        return;
+    }
+    trace_event(TRACE_COMBAT, "proj-dodged", "id=%d pid=%d att=%d off=%.2f from=%d aim=%d now=%d dmg=%d t=%.2f",
+        at->defender->id, at->defender->pid, at->attacker != NULL ? at->attacker->id : -1, off,
+        f->originTile, f->aimTile, at->defender->tile, at->defenderDamage, rt_clock);
+    at->attackerFlags &= ~(DAM_HIT | DAM_CRITICAL);
+    at->defenderDamage = 0;
+    at->defenderFlags = 0;
+    at->defenderKnockback = 0;
+}
+
 // ⚠️ A BLAST HURTS WHO IS IN IT WHEN IT GOES OFF, NOT WHEN IT WAS THROWN (2026-10-17). compute_attack
 // lists the blast's victims (compute_explosion_on_extras) the moment the grenade leaves the hand --
 // right for turn-based, where nobody moves while it flies, and wrong here, where it flies for a second
@@ -14754,9 +14839,13 @@ void combat_rt_update(float dt)
         bool ready = elapsed >= RT_MIN_SWING_SECONDS || gunFired;
         bool trigger = explosive ? landed : (swingDone || connected || actionReached || poseEnded);
         if ((trigger && ready) || capped) {
-            // A blast hurts who is in it NOW (rt_blast_filter). Before the reaction is chosen.
+            // A blast hurts who is in it NOW (rt_blast_filter); a bolt, a ball or a thrown blade, who
+            // is still on its line (rt_projectile_dodge). Before the reaction is chosen.
             if (f->blastRadius > 0) {
                 rt_blast_filter(f);
+                heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
+            } else if (explosive) {
+                rt_projectile_dodge(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             }
 

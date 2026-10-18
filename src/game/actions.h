@@ -27,6 +27,10 @@ void action_extras_reaction(Attack* attack);
 // Realtime: take the explosive projectile the last ranged attack launched (NULL = none) and the
 // explosion art it becomes on arrival; combat_rt commits the blast then.
 Object* action_take_explosive_projectile(int* explosionFid);
+
+// The "explosion fid" handed over for a projectile that has no blast and is simply erased when it
+// arrives (a laser bolt, a plasma ball): combat_rt reads the erase as the landing.
+#define ACTION_RT_LANDS_ON_ERASE (-2)
 // obj_erase_object, just before the free: a realtime flight waiting for its launch drops `obj`.
 void action_notify_object_freed(Object* obj);
 int action_attack(Attack* attack);

@@ -1,0 +1,20 @@
+# How many rockets can a running dude dodge? A super mutant with a rocket launcher 12 tiles off, the
+# dude runs sideways (turning every 1.5 s) and never fires back. Count, per rocket: hit him, cleared
+# him (outran the blast: [COMBAT/blast-clear] who=defender), or missed on the roll.
+# Run it with different projectile_speedup values (the game's own is 4).
+name rocket-dodge
+map DESERT1.MAP
+seed 1
+duration 45
+reaction 0.3
+projectile_speedup 4
+
+dude tile 20100 rot 2
+dude stat AG 8
+dude stat EN 8
+dude hp 3000
+dude armor 17
+
+spawn 16777225 22500 rot 5 wield 13 item 14 30 hostile
+
+at 0 dodge

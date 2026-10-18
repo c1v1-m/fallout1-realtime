@@ -413,6 +413,7 @@ static float anim_attack_stat_factor = 0.09f;
 // ...and how much SLOWER a thrown weapon flies (a grenade: 10 -> 5 tiles a second), 2026-10-16.
 #define RT_THROWN_SLOWDOWN 2.0f
 static float anim_attack_stat_high_bias = ANIM_ATTACK_STAT_HIGH_BIAS;
+static float anim_projectile_speedup = RT_PROJECTILE_SPEEDUP; // anim_set_projectile_speedup (autotest)
 
 void anim_init()
 {
@@ -4776,6 +4777,13 @@ float anim_get_travel_speed()
 
 // MODS page: change the travel speed while the game runs. Same clamp as the loader, so the screen
 // cannot feed in a value the cfg path would have rejected.
+// How much faster than its art a shot's own projectile (rocket, plasma, laser) flies. Only the
+// self-played tests change it so far (scenario "projectile_speedup"), to measure what can be dodged.
+void anim_set_projectile_speedup(float speedup)
+{
+    anim_projectile_speedup = speedup > 0.1f ? speedup : 0.1f;
+}
+
 void anim_set_travel_speed(float scale)
 {
     anim_travel_speed = scale < 0.35f ? 0.35f : (scale > 1.0f ? 1.0f : scale);
@@ -5466,7 +5474,7 @@ unsigned int compute_tpf(Object* object, int fid)
     bool projectileFlight = combat_rt_enabled() && object != NULL && animType == ANIM_WALK
         && FID_TYPE(object->fid) == OBJ_TYPE_MISC;
     if (projectileFlight && object->pid == -1) {
-        tpf = (unsigned int)(tpf / RT_PROJECTILE_SPEEDUP + 0.5f);
+        tpf = (unsigned int)(tpf / anim_projectile_speedup + 0.5f);
         if (tpf < 1) {
             tpf = 1;
         }

@@ -1450,6 +1450,15 @@ static int action_ranged(Attack* attack, int anim)
                     // fid is its "explosion" for combat_rt's landing test.
                     action_rt_explosive_projectile = projectile;
                     action_rt_explosion_fid = weaponFid;
+                } else if (!fl->thrown && !fl->eraseAtEnd && combat_rt_enabled()) {
+                    // ⚠️ A LASER BOLT OR A PLASMA BALL HITS WHEN IT ARRIVES TOO (2026-10-18, the
+                    // projectiles he asked for: "mít prostě projektily"). It used to commit on the
+                    // gun's action frame like a bullet, a tenth of a second after the trigger, with
+                    // the ball still crossing the gap -- the self-played plasma-dodge run had every
+                    // hit land before the ball did, so no sidestep could ever count. It is erased at
+                    // the end of its flight (action_register_flight), and that erase is its landing.
+                    action_rt_explosive_projectile = projectile;
+                    action_rt_explosion_fid = ACTION_RT_LANDS_ON_ERASE;
                 }
 
                 if (fl == &inlineFlight) {

@@ -1,5 +1,7 @@
 #include "game/autotest.h"
 
+#include "game/anim.h"
+
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -62,6 +64,13 @@ namespace fallout {
 //        throw                         hold LT for a lock, then press and let go of RB once (the RB
 //                                      quick slot: a grenade by default)
 //        throwfree                     press and let go of RB once with no lock
+//        strafe                        run (X held) sideways to the nearest enemy, turning every 1.5 s,
+//                                      never attacking -- for measuring what can be dodged
+//        dodge                         stand (saving AP) and, the moment an attack at him is under way,
+//                                      run sideways for 1.2 s -- a player who sees the shot coming
+//   reaction <seconds>                 the dodger's reaction time (default 0.3)
+//   projectile_speedup <x>             how much faster than its art a rocket / plasma / laser flies
+//                                      (the game's own is 4)
 //
 // The run ends at `duration`, 2 s after the dude dies, or 3 s after the last spawned enemy does.
 
@@ -78,9 +87,11 @@ enum {
     AT_SHOOT,
     AT_THROW,
     AT_THROW_FREE,
+    AT_STRAFE,
+    AT_DODGE,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge" };
 
 typedef struct AtItem {
     int pid;
@@ -111,6 +122,7 @@ static char at_map_name[64] = "";
 static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
+static float at_projectile_speedup = -1.0f;
 static float at_duration = 60.0f;
 static int at_dude_tile = -1;
 static int at_dude_rotation = -1;
@@ -149,6 +161,12 @@ static int at_goto_best = 9999;
 static float at_goto_since = 0.0f;
 static bool at_goto_done = false;
 static float at_throw_at = -1.0f;
+static float at_strafe_flip = 0.0f;
+static int at_strafe_dir = 1;
+static bool at_was_targeted = false;
+static float at_dodge_until = 0.0f;
+static float at_dodge_from = 0.0f;
+static float at_reaction = 0.3f; // a player notices the wind-up this late (scenario "reaction")
 
 static void at_trim(char* s)
 {
@@ -234,6 +252,10 @@ static bool at_parse(const char* path)
             SDL_strlcpy(at_map_name, tok[1], sizeof(at_map_name));
         } else if (strcmp(tok[0], "team") == 0 && n >= 2) {
             at_team = atoi(tok[1]);
+        } else if (strcmp(tok[0], "reaction") == 0 && n >= 2) {
+            at_reaction = (float)atof(tok[1]);
+        } else if (strcmp(tok[0], "projectile_speedup") == 0 && n >= 2) {
+            at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "seed") == 0 && n >= 2) {
@@ -410,6 +432,10 @@ void autotest_setup_world()
     }
 
     int elevation = map_elevation;
+
+    if (at_projectile_speedup > 0.0f) {
+        anim_set_projectile_speedup(at_projectile_speedup);
+    }
 
     // The dude.
     for (int s = 0; s < 7; s++) {
@@ -781,6 +807,61 @@ void autotest_tick(float dt)
                 trace_event(TRACE_FLOW, "autotest", "rb-tap at=%.1f lock=%d", at_elapsed, combat_rt_has_lock() ? 1 : 0);
             }
             break;
+        case AT_STRAFE:
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+            if (enemy == NULL) {
+                at_stick_still();
+                at_button(SDL_CONTROLLER_BUTTON_X, false);
+                break;
+            }
+            if (at_elapsed >= at_strafe_flip) {
+                at_strafe_dir = -at_strafe_dir;
+                at_strafe_flip = at_elapsed + 1.5f;
+            }
+            {
+                // Perpendicular to the line to the enemy, in screen space (what a thumb does).
+                int x1, y1, x2, y2;
+                tile_coord(obj_dude->tile, &x1, &y1, obj_dude->elevation);
+                tile_coord(enemy->tile, &x2, &y2, obj_dude->elevation);
+                float dx = (float)(x2 - x1), dy = (float)(y2 - y1);
+                float len = sqrtf(dx * dx + dy * dy);
+                if (len < 1.0f) {
+                    len = 1.0f;
+                }
+                float px = -dy / len * at_strafe_dir, py = dx / len * at_strafe_dir;
+                at_axis(SDL_CONTROLLER_AXIS_LEFTX, (Sint16)(32000.0f * px));
+                at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * py));
+                at_button(SDL_CONTROLLER_BUTTON_X, true); // run
+            }
+            break;
+        case AT_DODGE: {
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+            bool targeted = combat_rt_dude_targeted();
+            if (targeted && !at_was_targeted) {
+                at_dodge_from = at_elapsed + at_reaction;
+                at_dodge_until = at_dodge_from + 1.2f;
+                at_strafe_dir = -at_strafe_dir;
+                trace_event(TRACE_FLOW, "autotest", "dodge at=%.1f dir=%d ap=%d", at_elapsed, at_strafe_dir, combat_rt_player_ap());
+            }
+            at_was_targeted = targeted;
+            if (enemy == NULL || at_elapsed < at_dodge_from || at_elapsed >= at_dodge_until) {
+                at_stick_still();
+                at_button(SDL_CONTROLLER_BUTTON_X, false);
+                break;
+            }
+            int x1, y1, x2, y2;
+            tile_coord(obj_dude->tile, &x1, &y1, obj_dude->elevation);
+            tile_coord(enemy->tile, &x2, &y2, obj_dude->elevation);
+            float dx = (float)(x2 - x1), dy = (float)(y2 - y1);
+            float len = sqrtf(dx * dx + dy * dy);
+            if (len < 1.0f) {
+                len = 1.0f;
+            }
+            at_axis(SDL_CONTROLLER_AXIS_LEFTX, (Sint16)(-32000.0f * dy / len * at_strafe_dir));
+            at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
+            at_button(SDL_CONTROLLER_BUTTON_X, true);
+            break;
+        }
         case AT_SHOOT:
             if (at_shots == 0) {
                 at_fight(enemy, dist);
