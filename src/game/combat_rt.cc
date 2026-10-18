@@ -570,6 +570,7 @@ typedef struct RtActor {
     float flee_retry_at;
     bool fleeing;      // rt_flee_step owns it: it pays for its legs the way the DUDE pays (no reserve)
     bool flee_blocked; // ran its pool dry: stands, like the dude's rt_move_blocked, until resume_ap
+    int flee_done_hp;  // its HP when it ran out to max_dist and left the fight; -1 = not left (rt_flee_step)
     bool wipe_pending; // entered its breather mid-step: wipe its forehead once the body is free
     // A CROWD MAKES ROOM (rt_room_wait / rt_room_make). Waiter side: whom it asked, since when, the
     // last frame it asked, and how long it walks around instead after a refusal or a timeout.
@@ -6689,6 +6690,7 @@ static bool rt_flee_step(RtActor* a, Object* npc)
     if (dest == -2) {
         trace_event(TRACE_FLOW, "flee-done", "id=%d pid=%d dist=%d maxDist=%d t=%.2f",
             npc->id, npc->pid, dist, combatai_max_dist(npc), rt_clock);
+        a->flee_done_hp = critter_get_hits(npc);
         a->state = RT_IDLE;
         a->target = NULL;
         a->no_path_since = -1.0f;
@@ -8860,6 +8862,7 @@ static void rt_refresh_registry()
             a->flee_retry_at = prev->flee_retry_at;
             a->fleeing = prev->fleeing;
             a->flee_blocked = prev->flee_blocked;
+            a->flee_done_hp = prev->flee_done_hp;
             a->wipe_pending = prev->wipe_pending;
             a->room_from = prev->room_from;
             a->room_asked_at = prev->room_asked_at;
@@ -8932,6 +8935,7 @@ static void rt_refresh_registry()
             a->flee_retry_at = 0.0f;
             a->fleeing = false;
             a->flee_blocked = false;
+            a->flee_done_hp = -1;
             a->wipe_pending = false;
             a->room_from = NULL;
             a->room_asked_at = -1.0f;
@@ -9671,7 +9675,7 @@ static void rt_search_tick(RtActor* a, Object* npc)
     if (a->search_tile < 0) {
         return;
     }
-    if (!rt_tactical_ai || rt_clock >= a->search_until || !rt_can_walk(npc)) {
+    if (!rt_tactical_ai || rt_clock >= a->search_until || !rt_can_walk(npc) || combatai_flee_reason(npc) != 0) {
         trace_event(TRACE_FLOW, "search-end", "id=%d pid=%d tile=%d t=%.2f", npc->id, npc->pid, npc->tile, rt_clock);
         a->search_tile = -1;
         return;
@@ -10633,7 +10637,11 @@ static void rt_update_actor(RtActor* a, float dt)
                 rt_is_combatant(a->target) ? obj_dist(npc, a->target) : -1, rt_clock);
             giveUp = true;
             // Lost it, not beaten it: go and look where it was last seen (rt_search_tick).
+            // ⚠️ NOT ONE THAT IS RUNNING AWAY (2026-10-18, self-played open-raiders: a knife raider at 3 HP
+            // fled, ran dry at 12 tiles, lost sight of the dude -- and walked back to where it had last
+            // seen him, saw him, fled again: a loop). Vanilla's flee reasons win over looking for him.
             if (rt_tactical_ai && a->hostile && !a->friendly && !rt_is_defensive(a, npc) && a->last_seen_tile >= 0
+                && !a->fleeing && combatai_flee_reason(npc) == 0
                 && tile_dist(npc->tile, a->last_seen_tile) > 1) {
                 a->search_tile = a->last_seen_tile;
                 a->search_until = rt_clock + RT_SEARCH_SECONDS;
@@ -11130,6 +11138,16 @@ static void rt_update_actor(RtActor* a, float dt)
             // set long after the hit.) Without this, rt_wants_to_stop dropped it out of the chase and
             // the next frame picked it straight back up, round and round.
             bool hurtSinceItsTurn = npc->data.critter.combat.damageLastTurn > 0;
+
+            // ⚠️ ONLY A NEW HIT BRINGS BACK ONE THAT RAN OUT TO ITS max_dist (2026-10-18, found by the
+            // self-played run open-raiders_2: a raider shot to 10 HP stood on its max_dist of 12 and left
+            // and rejoined the fight 97 times in 3 s -- flee-done, the hit it fled from still counting as
+            // "hurt since its turn", re-engage, flee-done...). Vanilla asks once a round, so there the
+            // same critter rejoins and leaves once per round and simply stands; here the hit it ran from
+            // no longer counts, and the next one does.
+            if (hurtSinceItsTurn && a->flee_done_hp >= 0 && critter_get_hits(npc) >= a->flee_done_hp) {
+                hurtSinceItsTurn = false;
+            }
             bool toldToStop = (npc->data.critter.combat.maneuver & CRITTER_MANEUVER_DISENGAGING) != 0
                 && !hurtSinceItsTurn;
 
