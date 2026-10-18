@@ -100,6 +100,8 @@ namespace fallout {
 // mouse click sets it once and it survives this many seconds of locked/flinch
 // frames -- so the click isn't lost just because the frame it landed on was busy.
 #define RT_INTENT_TTL 0.4f
+// A quick throw released short of AP waits this long with the grenade in hand (combat_rt_request_throw).
+#define RT_THROW_AP_WAIT 2.0f
 
 // Hard cap (seconds) on how long the hit-resolution slot stays leased to one
 // attack. Normally the slot frees the instant the attacker's swing animation
@@ -1731,6 +1733,9 @@ static float rt_move_input_age = 1000.0f;
 static Object* rt_player_intent_target = NULL;
 static int rt_player_intent_mode = 0;
 static float rt_player_intent_ttl = 0.0f;
+// The quick throw is waiting for AP (combat_rt_request_throw): a move cancels it, the throw or the
+// end of its wait clears it. Read only while rt_player_intent_target is set.
+static bool rt_throw_waiting = false;
 // The called-shot body part for the latched intent, or HIT_LOCATION_UNCALLED for a
 // normal (non-aimed) attack. Set by the LT aimed-shot picker (and its RB repeat) via combat_rt_aimed_attack.
 static int rt_player_intent_loc = HIT_LOCATION_UNCALLED;
@@ -12459,6 +12464,10 @@ static void rt_resolve_attacks(float dt)
     if (rt_player_intent_ttl > 0.0f) {
         rt_player_intent_ttl -= dt;
         if (rt_player_intent_ttl <= 0.0f) {
+            if (rt_throw_waiting && rt_player_intent_target != NULL) {
+                trace_event(TRACE_ACTION, "quick-throw-expired", "ap=%d t=%.2f", rt_player_ap, rt_clock);
+            }
+            rt_throw_waiting = false;
             rt_player_intent_ttl = 0.0f;
             rt_player_intent_target = NULL;
             rt_player_intent_loc = HIT_LOCATION_UNCALLED;
@@ -12612,6 +12621,10 @@ static void rt_resolve_attacks(float dt)
             bool fired = rt_do_attack(obj_dude, rt_player_intent_target,
                 rt_player_intent_mode, rt_player_intent_loc);
             if (fired) {
+                if (rt_throw_waiting) {
+                    trace_event(TRACE_ACTION, "quick-throw-waited", "ap=%d t=%.2f", rt_player_ap, rt_clock);
+                }
+                rt_throw_waiting = false;
                 rt_note_attack_fired(obj_dude, rt_player_intent_mode);
                 // Defer the AP charge to swing-connect (the commit pass) rather than debiting
                 // it the instant the button is pressed: the pool visibly drops when the swing
@@ -13596,6 +13609,24 @@ bool combat_rt_request_throw(Object* target)
     }
     int hitMode = rt_quick_throw_mode();
     rt_set_player_intent(target, hitMode);
+
+    // ⚠️ SHORT OF AP, THE GRENADE WAITS IN THE HAND (2026-10-18, "někdy hodím granát, někdy ne"). A
+    // throw costs 4 AP; every failed one in trace_2026-10-18_195510 was released with 0-2, and the
+    // 0.4 s intent latch ran out before the pool refilled, so the grenade went back to the pack
+    // without a sound. His pick: a beep and a note now, the throw the moment the AP is there (up to
+    // RT_THROW_AP_WAIT), and a move of the stick cancels the wait (gamepad_ui then puts it away).
+    int cost = rt_ap_cost(obj_dude, hitMode);
+    rt_throw_waiting = false;
+    if (rt_player_ap < cost) {
+        rt_player_intent_ttl = RT_THROW_AP_WAIT;
+        rt_throw_waiting = true;
+        gsound_play_sfx_file("iisxxxx1");
+        char note[64];
+        snprintf(note, sizeof(note), "Not enough AP to throw (%d).", cost);
+        display_print(note);
+        trace_event(TRACE_ACTION, "quick-throw-wait", "ap=%d cost=%d t=%.2f", rt_player_ap, cost, rt_clock);
+    }
+
     bool far = obj_dist(obj_dude, target) > item_w_range(obj_dude, hitMode);
     if (far) {
         rt_player_far_target = target;
@@ -13985,6 +14016,16 @@ void combat_rt_poll_gamepad()
             rt_traced_stick_ang = angle;
             rt_traced_stick_run = run;
             rt_traced_stick_on = true;
+        }
+
+        // A grenade waiting for AP (combat_rt_request_throw): the stick says "never mind".
+        if (rt_throw_waiting && rt_player_intent_target != NULL) {
+            trace_event(TRACE_ACTION, "quick-throw-cancel", "why=move ap=%d t=%.2f", rt_player_ap, rt_clock);
+            rt_throw_waiting = false;
+            rt_player_intent_target = NULL;
+            rt_player_intent_ttl = 0.0f;
+            rt_player_intent_loc = HIT_LOCATION_UNCALLED;
+            rt_player_far_target = NULL;
         }
 
         // SHOOT AND MOVE: a shot that has left the gun gives the body back to the stick at once

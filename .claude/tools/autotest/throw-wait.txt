@@ -1,0 +1,16 @@
+# A quick throw short of AP (2026-10-18): Agility 1 = 5 AP, the draw takes 2, the throw costs 4 -- the
+# grenade must wait in the hand and go the moment the pool reaches 4 (quick-throw-wait, -waited).
+name throw-wait
+map DESERT1.MAP
+seed 1
+duration 12
+
+dude tile 20100 rot 2
+dude stat AG 1
+dude stat ST 8
+dude hp 400
+dude item 25 3
+
+spawn 16777291 21700 rot 5 wield 8 item 29 6 hostile
+
+at 0 throw
