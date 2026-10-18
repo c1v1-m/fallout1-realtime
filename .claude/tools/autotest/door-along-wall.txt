@@ -1,0 +1,13 @@
+# A door seen along its own wall (2026-10-18): Mariposa barracks door 26880 (row 134, col 80) in a wall
+# along col 80. Standing a few tiles from it beside that wall, it must stay pickable (ip_sees lets the
+# wall tiles next to a door pass).
+name door-along-wall
+map MBSTRG12.MAP
+seed 1
+duration 2
+
+dude tile 26478 rot 2
+dude elevation 1
+dude hp 400
+
+ipdump 1

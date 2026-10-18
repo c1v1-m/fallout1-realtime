@@ -1,0 +1,13 @@
+# Nothing behind a wall (2026-10-18): Mariposa's barracks (MBSTRG12, elevation 1), three lockers per
+# alcove with 4-tile partitions between. Standing at his tile 28072 by the lockers 27871/28071/28271,
+# the picker must not offer the lockers of the next alcove (26671/26871/27071) behind the partition.
+name lockers-wall
+map MBSTRG12.MAP
+seed 1
+duration 3
+
+dude tile 28072 rot 2
+dude elevation 1
+dude hp 400
+
+ipdump 1

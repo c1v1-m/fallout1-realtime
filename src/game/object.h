@@ -73,6 +73,7 @@ bool obj_occupied(int tile_num, int elev);
 Object* obj_blocking_at(Object* a1, int tile_num, int elev);
 int obj_scroll_blocking_at(int tile_num, int elev);
 Object* obj_sight_blocking_at(Object* a1, int tile_num, int elev);
+Object* obj_wall_blocking_at(Object* a1, int tile, int elevation);
 int obj_dist(Object* object1, Object* object2);
 int obj_create_list(int tile, int elevation, int objectType, Object*** objectsPtr);
 void obj_delete_list(Object** objects);

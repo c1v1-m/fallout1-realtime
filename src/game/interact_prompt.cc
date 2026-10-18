@@ -597,17 +597,88 @@ static bool ip_reachable_within(Object* obj, int maxSteps)
     return false;
 }
 
+// ⚠️ AND NOTHING BEHIND A WALL, LITERALLY (2026-10-18, "byl jsem u skříněk a mohl jsem zaměřit i další
+// za zdí. Ne! To se nesmí stávat"). The reach test alone let the stick pick a locker in the NEXT
+// alcove of Mariposa's barracks (MBSTRG12, elevation 1: three lockers per alcove, 4-tile partitions
+// between them): round the partition is ~10 steps for a locker 6 tiles off, inside the picker's
+// budget of dist x 2 + 2. So the straight line from him to the thing -- the engine's own, the one a
+// projectile flies (make_straight_path_func) -- must not cross a WALL or a CLOSED DOOR
+// (obj_wall_blocking_at; furniture does not hide anything). The line stops at the thing itself, so
+// the wall a locker stands against never counts. A door, or anything set into a wall, is not hidden
+// by the wall tiles beside it: walking along a wall towards a door, the line clips them -- the very
+// reason this was not a sight test the first time (2026-10-13).
+static Object* ip_sight_goal = NULL;
+static bool ip_sight_goal_in_wall = false;
+
+static Object* ip_sight_blocking_at(Object* self, int tile, int elevation)
+{
+    Object* blocker = obj_wall_blocking_at(self, tile, elevation);
+    if (blocker == NULL || blocker == ip_sight_goal) {
+        return NULL;
+    }
+    if (ip_sight_goal_in_wall && ip_sight_goal != NULL && tile_dist(tile, ip_sight_goal->tile) <= 1) {
+        return NULL;
+    }
+    return blocker;
+}
+
+static bool ip_sees(Object* obj)
+{
+    if (obj_dude == NULL || obj == NULL || obj == obj_dude) {
+        return true;
+    }
+    if (obj->elevation != obj_dude->elevation || tile_dist(obj_dude->tile, obj->tile) <= 1) {
+        return true;
+    }
+
+    ip_sight_goal = obj;
+    ip_sight_goal_in_wall = FID_TYPE(obj->fid) == OBJ_TYPE_WALL;
+    if (FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY) {
+        Proto* proto;
+        if (proto_ptr(obj->pid, &proto) != -1 && proto->scenery.type == SCENERY_TYPE_DOOR) {
+            ip_sight_goal_in_wall = true;
+        }
+    }
+    Object* blocker = NULL;
+    make_straight_path_func(obj_dude, obj_dude->tile, obj->tile, NULL, &blocker, 0, ip_sight_blocking_at);
+    bool seen = blocker == NULL;
+
+    // A DOOR IS SEEN WHEN THE FLOOR IN FRONT OF IT IS. Seen along its own wall the line to the door
+    // runs down that wall and clips wall tiles well past the ones beside it (self-played at the
+    // barracks door 26880: hidden from 4 of 5 spots beside its wall). So for a door, or anything set
+    // into a wall, any free tile next to it that he can see counts.
+    if (!seen && ip_sight_goal_in_wall) {
+        for (int rotation = 0; rotation < ROTATION_COUNT && !seen; rotation++) {
+            int front = tile_num_in_direction(obj->tile, rotation, 1);
+            if (front < 0 || front >= HEX_GRID_SIZE || obj_wall_blocking_at(NULL, front, obj->elevation) != NULL) {
+                continue;
+            }
+            if (front == obj_dude->tile) {
+                seen = true;
+                break;
+            }
+            blocker = NULL;
+            make_straight_path_func(obj_dude, obj_dude->tile, front, NULL, &blocker, 0, ip_sight_blocking_at);
+            seen = blocker == NULL;
+        }
+    }
+
+    ip_sight_goal = NULL;
+    ip_sight_goal_in_wall = false;
+    return seen;
+}
+
 // The automatic prompt guesses, so it only takes what is right there: a detour of two steps at most.
 // Pointing the stick (the picker, a skill cursor) is a decision and may cost a short walk round
 // something, but never the trip into another room that a wall between you would mean.
 static bool ip_auto_reach(Object* obj)
 {
-    return ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) + 2);
+    return ip_sees(obj) && ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) + 2);
 }
 
 static bool ip_pick_reach(Object* obj)
 {
-    return ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) * 2 + 2);
+    return ip_sees(obj) && ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) * 2 + 2);
 }
 
 // Best interactable within range, or NULL. Sets *kindOut to its interaction kind.
@@ -725,6 +796,29 @@ static int ip_collect(Object** out, int max)
         out[n++] = obj;
     }
     return n;
+}
+
+// Every interactable within the picker's range, and which test lets it through or keeps it out -- for
+// the self-played runs (autotest "ipdump") and any "I could pick that through a wall" report.
+void interact_prompt_trace_candidates()
+{
+    if (obj_dude == NULL) {
+        return;
+    }
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+        if (ip_classify(obj) == IP_NONE) {
+            continue;
+        }
+        int d = obj_dist(obj_dude, obj);
+        if (d > ip_pick_range_tiles) {
+            continue;
+        }
+        trace_event(TRACE_FLOW, "ip-candidate", "pid=%d tile=%d dist=%d sees=%d reach=%d onScreen=%d pick=%d auto=%d dude=%d",
+            obj->pid, obj->tile, d, ip_sees(obj) ? 1 : 0,
+            ip_reachable_within(obj, tile_dist(obj_dude->tile, obj->tile) * 2 + 2) ? 1 : 0,
+            ip_on_screen(obj) ? 1 : 0, ip_pick_reach(obj) ? 1 : 0,
+            d <= ip_range_tiles && ip_auto_reach(obj) ? 1 : 0, obj_dude->tile);
+    }
 }
 
 int interact_prompt_candidate_count()
@@ -899,6 +993,9 @@ int interact_prompt_use_targets(Object** out, int max)
         }
         if (!ip_on_screen(obj)) {
             continue;
+        }
+        if (!ip_sees(obj)) {
+            continue; // nothing behind a wall (ip_sees)
         }
         out[n++] = obj;
     }

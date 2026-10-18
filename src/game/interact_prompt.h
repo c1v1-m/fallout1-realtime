@@ -36,6 +36,7 @@ void interact_prompt_note_stick();
 // How many interactables are in reach. The right-stick picker only takes the stick when this is 2 or
 // more -- with a single candidate there is nothing to choose and the stick must stay a cursor.
 int interact_prompt_candidate_count();
+void interact_prompt_trace_candidates();
 
 // The nearest on-screen object the given SKILL would sensibly be aimed at, or NULL when nothing
 // nearby fits. Lets the pad park an armed skill cursor on the obvious target (first aid on the

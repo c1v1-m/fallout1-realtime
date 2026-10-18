@@ -17,6 +17,7 @@
 #include <SDL.h>
 
 #include "game/combat_rt.h"
+#include "game/interact_prompt.h"
 #include "game/critter.h"
 #include "game/game.h"
 #include "game/game_trace.h"
@@ -79,6 +80,7 @@ namespace fallout {
 //   tactical on|off                    MODS "Tactical AI" for this run (default: as the cfg says)
 //   projectiles on|off                 MODS "Projectiles" for this run
 //   tracer <hexes> <r> <g> <b> [underline]   how a bullet looks (r g b 0-31) -- to photograph variants
+//   ipdump <seconds>                   list every interactable in the picker's range and why it is (not) pickable
 //   shots <n>                          up to n screenshots (screenshots/scrNNNNN.bmp beside the exe),
 //                                      each taken while a bullet tracer is in the air, 1 s apart
 //   projectile_speedup <x>             how much faster than its art a rocket / plasma / laser flies
@@ -139,6 +141,7 @@ static float at_projectile_speedup = -1.0f;
 static int at_tactical = -1;
 static int at_projectiles = -1;
 static int at_shots_wanted = 0;
+static float at_ipdump_at = -1.0f; // scenario "ipdump": when to list the interact candidates
 static int at_shots_taken = 0;
 static float at_shot_next = 0.0f;
 static float at_shot_due = -1.0f;
@@ -283,6 +286,8 @@ static bool at_parse(const char* path)
             at_tactical = strcmp(tok[1], "off") == 0 ? 0 : 1;
         } else if (strcmp(tok[0], "projectiles") == 0 && n >= 2) {
             at_projectiles = strcmp(tok[1], "off") == 0 ? 0 : 1;
+        } else if (strcmp(tok[0], "ipdump") == 0 && n >= 2) {
+            at_ipdump_at = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "tracer") == 0 && n >= 5) {
             combat_rt_set_tracer_look((float)atof(tok[1]), atoi(tok[2]), atoi(tok[3]), atoi(tok[4]), n >= 6 && strcmp(tok[5], "underline") == 0);
         } else if (strcmp(tok[0], "shots") == 0 && n >= 2) {
@@ -775,6 +780,10 @@ void autotest_tick(float dt)
         at_throw_at = -1.0f;
         trace_event(TRACE_FLOW, "autotest", "phase at=%.1f policy=%s tile=%d dude=%d",
             at_elapsed, at_policy_names[at_phases[at_phase].policy], at_phases[at_phase].tile, obj_dude->tile);
+    }
+    if (at_ipdump_at >= 0.0f && at_elapsed >= at_ipdump_at) {
+        at_ipdump_at = -1.0f;
+        interact_prompt_trace_candidates();
     }
     int policy = at_phase >= 0 ? at_phases[at_phase].policy : AT_IDLE;
     int phaseTile = at_phase >= 0 ? at_phases[at_phase].tile : -1;

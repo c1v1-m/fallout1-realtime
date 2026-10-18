@@ -2530,6 +2530,38 @@ Object* obj_sight_blocking_at(Object* a1, int tile, int elevation)
     return NULL;
 }
 
+// A WALL or a CLOSED DOOR on this tile -- what hides the far side of it from the eye. Unlike
+// obj_sight_blocking_at it ignores furniture (a table does not hide the book on it, a counter does
+// not hide the shopkeeper), and it looks at every object on the tile, so a wall sharing its hex with
+// a decoration is still found. An open door is LIGHT_THRU and passes. For interact_prompt's
+// "nothing behind a wall".
+Object* obj_wall_blocking_at(Object* a1, int tile, int elevation)
+{
+    if (!hexGridTileIsValid(tile)) {
+        return NULL;
+    }
+
+    for (ObjectListNode* node = objectTable[tile]; node != NULL; node = node->next) {
+        Object* object = node->obj;
+        if (object == a1 || object->elevation != elevation
+            || (object->flags & OBJECT_HIDDEN) != 0 || (object->flags & OBJECT_LIGHT_THRU) != 0) {
+            continue;
+        }
+        int type = FID_TYPE(object->fid);
+        if (type == OBJ_TYPE_WALL) {
+            return object;
+        }
+        if (type == OBJ_TYPE_SCENERY) {
+            Proto* proto;
+            if (proto_ptr(object->pid, &proto) != -1 && proto->scenery.type == SCENERY_TYPE_DOOR) {
+                return object;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 // 0x47D468
 int obj_dist(Object* object1, Object* object2)
 {
