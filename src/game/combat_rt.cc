@@ -15941,6 +15941,21 @@ void combat_rt_update(float dt)
             // the same beat. They used to be registered at FIRE time, before anything was decided,
             // and against bodies that were often busy -- so they never took, and the corpse reap
             // snapped the victims flat with no fall at all.
+            //
+            // ⚠️ THROUGH THE REACTION LAYER FIRST, like the defender (2026-10-18, "enemy umírali
+            // najednou při některých smrtích"). All five standing-flat deaths in trace_2026-10-18_195510
+            // were a minigun burst's EXTRAS: their fall was queued here but nobody told the reaction
+            // layer, so the death grace (rt_death_just_registered) was never armed, and the reap's
+            // stranded-anim test -- dead, not yet prone, still busy -- cut the queued fall the same
+            // frame: show_death <- anim_set_end <- anim_force_clear <- rt_update_actor, the body flat
+            // in its standing pose.
+            for (int x = 0; x < f->ctd.extrasLength; x++) {
+                Object* extra = f->ctd.extras[x];
+                if (extra != NULL && FID_TYPE(extra->fid) == OBJ_TYPE_CRITTER
+                    && (f->ctd.extrasFlags[x] & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT)) != 0) {
+                    rt_reaction_heavy(extra, f->ctd.extrasFlags[x]);
+                }
+            }
             action_extras_reaction(&f->ctd);
 
 
