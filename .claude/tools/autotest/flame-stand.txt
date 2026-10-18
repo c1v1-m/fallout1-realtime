@@ -1,0 +1,12 @@
+# The flamer's jet (2026-10-18): a flamer mutant against a dude who STANDS 4 tiles off, a raider of his
+# own team beside him. Control run: the jet must still burn whoever stands in it.
+name flame-stand
+map DESERT1.MAP
+seed 1
+duration 25
+
+dude tile 20100 rot 2
+dude hp 3000
+dude armor 17
+
+spawn 16777241 20900 rot 5 wield 11 item 32 6 hostile

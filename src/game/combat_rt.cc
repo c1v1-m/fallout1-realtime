@@ -1597,6 +1597,11 @@ struct RtInFlight {
     // The shot or the throw has LEFT THE WEAPON (shoot and move, 2026-10-18): from here on the rest of
     // the shooter's sequence is only his own follow-through, which a move may cut (rt_shot_tail_note).
     bool released;
+
+    // A FLAMER's jet (fire damage, no projectile): who it burns is settled when the jet comes out, by
+    // its reach (rt_flame_filter). reach = the weapon's range when the attack was computed.
+    bool flame;
+    int reach;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1620,6 +1625,10 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->tDischarge = -1.0f;
     f->bulletFlight = 0.0f;
     f->released = false;
+    f->flame = f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
+        && item_w_subtype(f->ctd.weapon, f->ctd.hitMode) == ATTACK_TYPE_RANGED
+        && item_w_damage_type(f->ctd.weapon) == DAMAGE_TYPE_FIRE;
+    f->reach = f->flame ? item_w_range(f->ctd.attacker, f->ctd.hitMode) : 0;
     if (f->explosionFid == -1 || f->ctd.attacker == NULL || f->ctd.weapon == NULL) {
         return;
     }
@@ -14955,6 +14964,9 @@ static bool rt_miss_came_close(const RtInFlight* f)
     if (f->originTile < 0 || f->aimTile < 0) {
         return true;
     }
+    if (f->flame && tile_dist(f->originTile, d->tile) > f->reach + 1) {
+        return false; // the jet ended short of it
+    }
     return rt_off_line(f->originTile, f->aimTile, d->tile) <= RT_DODGE_NEAR_HEXES;
 }
 
@@ -14979,6 +14991,65 @@ static void rt_projectile_dodge(RtInFlight* f)
     at->defenderFlags = 0;
     at->defenderKnockback = 0;
     rt_tracers_fly_on(f->serial); // the bullets it dodged fly on past where it stood
+}
+
+// --- THE FLAMER'S JET REACHES AS FAR AS IT REACHES (2026-10-18) -----------------------------------
+//
+// His death in trace_2026-10-18_194138: a flamer mutant started its attack with him 5 tiles off (its
+// range), raised the gun for half a second while he ran, and the jet killed him at 10 tiles -- and
+// burned its neighbour for 54 on the way -- because compute_attack settled every victim when the
+// trigger was pulled and nothing asked again. A flamer puts nothing in the air: the jet is drawn in
+// the SHOOTER's own animation, full length (~6 tiles) from its first frame (MAMTN2KL.FRM, looked at),
+// so the commit on its action frame IS the moment it comes out. His pick: there, it burns only who is
+// still within the weapon's range (5) of where it was fired from and inside the stream
+// (RT_FLAME_HALF_WIDTH of the line it was aimed along) -- the target and everyone the cone listed,
+// allies included. Under MODS "Projectiles", like the bullets' line check.
+#define RT_FLAME_HALF_WIDTH 1.0f
+
+static bool rt_in_flame(const RtInFlight* f, Object* o, int* dist, float* off)
+{
+    *dist = tile_dist(f->originTile, o->tile);
+    *off = rt_off_line(f->originTile, f->aimTile, o->tile);
+    return *dist <= f->reach && *off <= RT_FLAME_HALF_WIDTH;
+}
+
+static void rt_flame_filter(RtInFlight* f)
+{
+    Attack* at = &f->ctd;
+    if (!rt_projectiles || !f->flame || f->originTile < 0 || f->aimTile < 0 || f->reach <= 0) {
+        return;
+    }
+
+    int dist;
+    float off;
+    if ((at->attackerFlags & DAM_HIT) != 0 && at->defender != NULL && at->defender != at->attacker
+        && FID_TYPE(at->defender->fid) == OBJ_TYPE_CRITTER && !rt_in_flame(f, at->defender, &dist, &off)) {
+        trace_event(TRACE_COMBAT, "flame-clear", "who=defender id=%d pid=%d dist=%d reach=%d off=%.2f dmg=%d t=%.2f",
+            at->defender->id, at->defender->pid, dist, f->reach, off, at->defenderDamage, rt_clock);
+        at->attackerFlags &= ~(DAM_HIT | DAM_CRITICAL);
+        at->defenderDamage = 0;
+        at->defenderFlags = 0;
+        at->defenderKnockback = 0;
+    }
+
+    int kept = 0;
+    for (int i = 0; i < at->extrasLength; i++) {
+        Object* victim = at->extras[i];
+        if (victim != NULL && FID_TYPE(victim->fid) == OBJ_TYPE_CRITTER && !rt_in_flame(f, victim, &dist, &off)) {
+            trace_event(TRACE_COMBAT, "flame-clear", "who=extra id=%d pid=%d dist=%d reach=%d off=%.2f dmg=%d t=%.2f",
+                victim->id, victim->pid, dist, f->reach, off, at->extrasDamage[i], rt_clock);
+            continue;
+        }
+        if (kept != i) {
+            at->extras[kept] = at->extras[i];
+            at->extrasHitLocation[kept] = at->extrasHitLocation[i];
+            at->extrasDamage[kept] = at->extrasDamage[i];
+            at->extrasFlags[kept] = at->extrasFlags[i];
+            at->extrasKnockback[kept] = at->extrasKnockback[i];
+        }
+        kept++;
+    }
+    at->extrasLength = kept;
 }
 
 // --- BULLETS AS TRACERS (2026-10-18, step two of the projectiles) ---------------------------------
@@ -15792,6 +15863,9 @@ void combat_rt_update(float dt)
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             } else if (explosive || f->bullet) {
                 rt_projectile_dodge(f);
+                heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
+            } else if (f->flame) {
+                rt_flame_filter(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             }
 

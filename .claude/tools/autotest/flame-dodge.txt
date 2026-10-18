@@ -1,0 +1,17 @@
+# The flamer's jet (2026-10-18): the same mutant, and a dude who runs sideways the moment its attack
+# starts (reaction 0.2 s) -- the raise takes ~0.5 s, so the jet should often find him out of the stream.
+name flame-dodge
+map DESERT1.MAP
+seed 1
+duration 40
+reaction 0.2
+
+dude tile 20100 rot 2
+dude stat AG 8
+dude stat EN 8
+dude hp 3000
+dude armor 17
+
+spawn 16777241 20900 rot 5 wield 11 item 32 6 hostile
+
+at 0 dodge
