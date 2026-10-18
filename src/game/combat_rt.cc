@@ -15133,8 +15133,7 @@ static void rt_flame_filter(RtInFlight* f)
 // two tall), so a pistol round at ~350 m/s crosses 350 hexes a second and a rifle's at ~900 -- 40 had
 // let him sidestep bullets at range. Now no bullet can be dodged; to-hit, cover and armour decide, as
 // in vanilla. Plasma, rockets and grenades keep their slow flights (anim.cc) and stay dodgeable.
-#define RT_PISTOL_BULLET_SPEED 350.0f // hexes a second
-#define RT_BULLET_SPEED 900.0f        // SMGs, rifles, miniguns
+#define RT_BULLET_SPEED 900.0f        // hexes a second; the fallback -- each caliber has its own (rt_bullet_look)
 #define RT_LASER_BULLET_SPEED 5000.0f // light: instant
 #define RT_ENERGY_BULLET_SPEED 350.0f // electrical, EMP and anything else that is not a bullet or a laser
 // A tracer is on screen at least this long, and the hit waits for it: at real speed it would cross the
@@ -15157,6 +15156,9 @@ typedef struct RtTracer {
     float speed;
     float dist;
     float past; // hexes past the aim point it flies on (0 = it stops there: it hit)
+    float length; // hexes of streak; 0 = a round pellet
+    int thick; // pixels
+    int rgb; // 15-bit colour
     bool painted;
     Rect last;
 } RtTracer;
@@ -15175,19 +15177,73 @@ static void rt_tracers_reset()
     memset(rt_tracers, 0, sizeof(rt_tracers));
 }
 
-static float rt_bullet_speed_for(Object* weapon)
+// ⚠️ EVERY ROUND ITS OWN (2026-10-19, his "neuděláme krazi věc? Každou kulku vytvoříme odlišnou. Třeba
+// kulky do 10mm budou menší než do pušky atd. BB gun bude střílet pellets"). By the ammunition the
+// weapon chambers (item_w_caliber; the values are F1's own: 0 BB, 5 .223, 6 5mm, 8 10mm, 9 .44,
+// 10 14mm, 11 12 ga, 12 9mm): a real muzzle velocity -- a hex being about a metre, so the BB's 90
+// lets you watch it fly while a .223's 990 is a three-frame flicker (RT_TRACER_MIN_SHOW) -- and a look:
+// streak length, thickness and colour; a BB a round copper pellet; a shotgun a spread of lead shot
+// (cosmetic: vanilla's shotgun is one attack). A laser burst is a red beam, other energy a blue-white
+// bolt. Anything unlisted keeps his pick A (rt_tracer_length / rt_tracer_rgb).
+#define RT_RGB(r, g, b) (((r) << 10) | ((g) << 5) | (b))
+#define RT_BRASS RT_RGB(28, 26, 18)
+
+typedef struct RtBulletLook {
+    float speed; // hexes a second
+    float length; // hexes; 0 = a round pellet
+    int thick; // pixels
+    int rgb;
+    int pellets; // shot in one round (a shotgun's spread)
+} RtBulletLook;
+
+static RtBulletLook rt_look(float speed, float length, int thick, int rgb, int pellets)
 {
-    switch (item_w_damage_type(weapon)) {
-    case DAMAGE_TYPE_NORMAL:
-        return item_w_anim_code(weapon) == WEAPON_ANIMATION_PISTOL ? RT_PISTOL_BULLET_SPEED : RT_BULLET_SPEED;
-    case DAMAGE_TYPE_LASER:
-        return RT_LASER_BULLET_SPEED;
-    default:
-        return RT_ENERGY_BULLET_SPEED;
-    }
+    RtBulletLook k;
+    k.speed = speed;
+    k.length = length;
+    k.thick = thick;
+    k.rgb = rgb;
+    k.pellets = pellets;
+    return k;
 }
 
-static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation, float t0, float speed, int jx, int jy)
+static RtBulletLook rt_bullet_look(Object* weapon)
+{
+    RtBulletLook fallback = rt_look(RT_BULLET_SPEED, rt_tracer_length, 1, rt_tracer_rgb, 1);
+    if (weapon == NULL) {
+        return fallback;
+    }
+    switch (item_w_damage_type(weapon)) {
+    case DAMAGE_TYPE_NORMAL:
+        break;
+    case DAMAGE_TYPE_LASER:
+        return rt_look(RT_LASER_BULLET_SPEED, 1.5f, 1, RT_RGB(31, 6, 4), 1);
+    default:
+        return rt_look(RT_ENERGY_BULLET_SPEED, 0.5f, 1, RT_RGB(20, 26, 31), 1);
+    }
+    switch (item_w_caliber(weapon)) {
+    case 0: // BB's: the Red Ryder, ~90 m/s
+        return rt_look(90.0f, 0.0f, 2, RT_RGB(22, 17, 9), 1);
+    case 12: // 9mm ball
+        return rt_look(360.0f, 0.25f, 1, RT_BRASS, 1);
+    case 8: // 10mm
+        return rt_look(380.0f, 0.30f, 1, RT_BRASS, 1);
+    case 9: // .44 Magnum
+        return rt_look(450.0f, 0.35f, 2, RT_RGB(26, 22, 14), 1);
+    case 10: // 14mm
+        return rt_look(400.0f, 0.40f, 2, RT_RGB(26, 22, 14), 1);
+    case 5: // .223
+        return rt_look(990.0f, 0.60f, 1, RT_RGB(31, 30, 24), 1);
+    case 6: // 5mm (minigun, assault rifle)
+        return rt_look(900.0f, 0.45f, 1, RT_BRASS, 1);
+    case 11: // 12 ga. buckshot
+        return rt_look(400.0f, 0.0f, 1, RT_RGB(24, 24, 22), 6);
+    }
+    return fallback;
+}
+
+static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation, float t0, float speed, int jx, int jy,
+    float length, int thick, int rgb)
 {
     for (int i = 0; i < RT_MAX_TRACERS; i++) {
         RtTracer* tr = &rt_tracers[i];
@@ -15204,6 +15260,9 @@ static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation,
         tr->jitterY = jy;
         tr->t0 = t0;
         tr->speed = speed;
+        tr->length = length;
+        tr->thick = thick;
+        tr->rgb = rgb;
         int d = tile_dist(fromTile, toTile);
         tr->dist = d > 0 ? (float)d : 1.0f;
         return;
@@ -15247,7 +15306,7 @@ static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, 
         return false;
     }
     float end = tr->dist + tr->past;
-    float tail = travelled - rt_tracer_length;
+    float tail = travelled - tr->length;
     if (tail >= end) {
         *gone = true;
         return false;
@@ -15277,8 +15336,6 @@ static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, 
 // The overlay (tile.cc refresh_game): every tracer in the air, clipped to what is being repainted.
 static void rt_tracers_render(Rect* rect, int elevation)
 {
-    int core = colorTable[rt_tracer_rgb];
-    int edge = colorTable[(((rt_tracer_rgb >> 10) & 31) * 2 / 3 << 10) | (((rt_tracer_rgb >> 5) & 31) * 2 / 3 << 5) | ((rt_tracer_rgb & 31) * 2 / 3)];
     for (int i = 0; i < RT_MAX_TRACERS; i++) {
         RtTracer* tr = &rt_tracers[i];
         if (!tr->used || tr->elevation != elevation) {
@@ -15289,10 +15346,16 @@ static void rt_tracers_render(Rect* rect, int elevation)
         if (!rt_tracer_segment(tr, &x0, &y0, &x1, &y1, &gone)) {
             continue;
         }
+        int core = colorTable[tr->rgb];
         if (rt_tracer_underline) {
-            tile_overlay_line(rect, x0, y0 + 1, x1, y1 + 1, edge);
+            int edge = colorTable[(((tr->rgb >> 10) & 31) * 2 / 3 << 10) | (((tr->rgb >> 5) & 31) * 2 / 3 << 5) | ((tr->rgb & 31) * 2 / 3)];
+            tile_overlay_line(rect, x0, y0 + tr->thick, x1, y1 + tr->thick, edge);
         }
-        tile_overlay_line(rect, x0, y0, x1, y1, core);
+        for (int t = 0; t < tr->thick; t++) {
+            // A round pellet of thickness n is an n x n dot; a streak is n lines one under the other.
+            int dx = tr->length <= 0.0f ? tr->thick - 1 : 0;
+            tile_overlay_line(rect, x0, y0 + t, x1 + dx, y1 + t, core);
+        }
     }
 }
 
@@ -15378,7 +15441,8 @@ static void rt_reaim(RtInFlight* f)
 static void rt_bullet_discharge(RtInFlight* f)
 {
     f->tDischarge = rt_clock;
-    float speed = rt_bullet_speed_for(f->ctd.weapon);
+    RtBulletLook look = rt_bullet_look(f->ctd.weapon);
+    float speed = look.speed;
     int d = tile_dist(f->originTile, f->aimTile);
     f->bulletFlight = (d > 0 ? (float)d : 1.0f) / speed;
     if (f->bulletFlight < RT_TRACER_MIN_SHOW) {
@@ -15390,14 +15454,22 @@ static void rt_bullet_discharge(RtInFlight* f)
         rounds = 12;
     }
     int elevation = f->ctd.attacker != NULL ? f->ctd.attacker->elevation : map_elevation;
-    // ⚠️ TRACERS AS IN REAL LIFE (2026-10-18, his pick: "stále mi to přijde takovej čůrek"). A bullet
-    // itself is never seen; what shows is a TRACER round, loaded one in four or five in a machine-gun
-    // belt and not at all in a pistol or a rifle. So a single shot draws nothing (the bang, the muzzle
-    // flash in the art, the hit -- vanilla's look) and a burst one streak per four rounds.
-    for (int r = 0; r < rounds && f->ctd.ammoQuantity > 1; r += 4) {
-        int jx = r == 0 ? 0 : roll_random(-6, 6);
-        int jy = r == 0 ? 0 : roll_random(-4, 4);
-        rt_tracer_spawn(f->serial, f->originTile, f->aimTile, elevation, rt_clock + r * RT_TRACER_STAGGER, speed, jx, jy);
+    // Every round drawn again, each in its caliber's look (rt_bullet_look) -- superseding the
+    // tracer-rounds-only rule of the same night (10f5315), his pick "kreslit každou střelu podle ráže".
+    for (int r = 0; r < rounds; r++) {
+        for (int p = 0; p < look.pellets; p++) {
+            int jx;
+            int jy;
+            if (look.pellets > 1) {
+                jx = roll_random(-14, 14); // the shot spreads into a fan at the far end
+                jy = roll_random(-9, 9);
+            } else {
+                jx = r == 0 ? 0 : roll_random(-6, 6);
+                jy = r == 0 ? 0 : roll_random(-4, 4);
+            }
+            rt_tracer_spawn(f->serial, f->originTile, f->aimTile, elevation, rt_clock + r * RT_TRACER_STAGGER, speed, jx, jy,
+                look.length, look.thick, look.rgb);
+        }
     }
     trace_event(TRACE_COMBAT, "bullet", "att=%d def=%d dist=%d speed=%.0f flight=%.2f rounds=%d hit=%d t=%.2f",
         f->ctd.attacker != NULL ? f->ctd.attacker->id : -1, f->ctd.defender != NULL ? f->ctd.defender->id : -1,

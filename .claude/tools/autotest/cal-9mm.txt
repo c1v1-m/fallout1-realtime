@@ -1,0 +1,12 @@
+# Caliber look photo (2026-10-19): one shooter with the 9mm weapon 6 tiles from the dude.
+name cal-9mm
+map DESERT1.MAP
+seed 1
+shots 2
+duration 10
+
+dude tile 20100 rot 2
+dude hp 3000
+dude armor 3
+
+spawn 16777291 21300 rot 5 wield 122 item 121 40 hostile
