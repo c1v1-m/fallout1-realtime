@@ -6,8 +6,7 @@ name rocket-dodge
 map DESERT1.MAP
 seed 1
 duration 45
-reaction 0.3
-projectile_speedup 4
+reaction 1.0
 
 dude tile 20100 rot 2
 dude stat AG 8

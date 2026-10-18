@@ -571,6 +571,7 @@ typedef struct RtActor {
     bool fleeing;      // rt_flee_step owns it: it pays for its legs the way the DUDE pays (no reserve)
     bool flee_blocked; // ran its pool dry: stands, like the dude's rt_move_blocked, until resume_ap
     int flee_done_hp;  // its HP when it ran out to max_dist and left the fight; -1 = not left (rt_flee_step)
+    float rejoin_after; // left the fight that way: not back before this (one turn), unless hurt again
     bool wipe_pending; // entered its breather mid-step: wipe its forehead once the body is free
     // A CROWD MAKES ROOM (rt_room_wait / rt_room_make). Waiter side: whom it asked, since when, the
     // last frame it asked, and how long it walks around instead after a refusal or a timeout.
@@ -6706,6 +6707,7 @@ static bool rt_flee_step(RtActor* a, Object* npc)
         trace_event(TRACE_FLOW, "flee-done", "id=%d pid=%d dist=%d maxDist=%d t=%.2f",
             npc->id, npc->pid, dist, combatai_max_dist(npc), rt_clock);
         a->flee_done_hp = critter_get_hits(npc);
+        a->rejoin_after = rt_clock + rt_script_turn_period(npc);
         a->state = RT_IDLE;
         a->target = NULL;
         a->no_path_since = -1.0f;
@@ -8894,6 +8896,7 @@ static void rt_refresh_registry()
             a->fleeing = prev->fleeing;
             a->flee_blocked = prev->flee_blocked;
             a->flee_done_hp = prev->flee_done_hp;
+            a->rejoin_after = prev->rejoin_after;
             a->wipe_pending = prev->wipe_pending;
             a->room_from = prev->room_from;
             a->room_asked_at = prev->room_asked_at;
@@ -8968,6 +8971,7 @@ static void rt_refresh_registry()
             a->fleeing = false;
             a->flee_blocked = false;
             a->flee_done_hp = -1;
+            a->rejoin_after = 0.0f;
             a->wipe_pending = false;
             a->room_from = NULL;
             a->room_asked_at = -1.0f;
@@ -11254,6 +11258,15 @@ static void rt_update_actor(RtActor* a, float dt)
             if (hurtSinceItsTurn && a->flee_done_hp >= 0 && critter_get_hits(npc) >= a->flee_done_hp) {
                 hurtSinceItsTurn = false;
             }
+
+            // ⚠️ AND NOT BEFORE ITS NEXT TURN (2026-10-18, self-played laser-dodge: a raider with no Energy
+            // Weapons skill, -17 % against combat armour, read its chance as hopeless, ran to its max_dist
+            // and left -- and as the only fighter it ended the fight, whose bookends clear DISENGAGING, so
+            // the next frame it joined again: 592 hopeless-flee lines, the fight starting and ending 15
+            // times a second, and the map scripts run at every end). Vanilla asks once a round; here one
+            // that left at its max_dist waits a turn (rt_script_turn_period) before it may come back,
+            // unless a new hit brings it back first.
+            bool restingAfterFlee = rt_clock < a->rejoin_after && !hurtSinceItsTurn;
             bool toldToStop = (npc->data.critter.combat.maneuver & CRITTER_MANEUVER_DISENGAGING) != 0
                 && !hurtSinceItsTurn;
 
@@ -11267,7 +11280,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 && combatai_flee_reason(npc) != 0
                 && obj_dist(npc, obj_dude) >= combatai_max_dist(npc);
 
-            if (tgt != NULL && !toldToStop && !wouldOnlyLeave
+            if (tgt != NULL && !toldToStop && !wouldOnlyLeave && !restingAfterFlee
                 && (is_within_perception(npc, tgt) || hurtBy == tgt)) {
                 if (rt_can_reach_or_shoot(npc, tgt)) {
                     a->target = tgt;
@@ -14821,7 +14834,14 @@ void combat_rt_update(float dt)
         // since thrown weapons fly at half pace (RT_THROWN_SLOWDOWN in anim.cc, 2026-10-16): a
         // full-range grenade is ~0.6 s of throw pose before the release plus 15 tiles at 5 a
         // second = 3.6 s, and x2 committed its damage in mid-air.
-        bool capped = elapsed >= (explosive ? RT_RESOLVE_MAX_SECONDS * 3.0f : RT_RESOLVE_MAX_SECONDS);
+        // ⚠️ ...and a slow projectile (rockets and plasma at ~10 tiles a second since 2026-10-18) needs its
+        // flight on top: a 40-tile rocket is 4 s in the air. A tile per 0.125 s keeps the cap above the
+        // slowest one; the landing still commits it the moment it arrives.
+        float capFor = explosive ? RT_RESOLVE_MAX_SECONDS * 3.0f : RT_RESOLVE_MAX_SECONDS;
+        if (explosive && f->originTile >= 0 && f->aimTile >= 0) {
+            capFor += tile_dist(f->originTile, f->aimTile) * 0.125f;
+        }
+        bool capped = elapsed >= capFor;
         // Don't let action-frame / swing-done / connect commit before the swing has had time to play
         // (and its SFX to sound) -- that produced "shadow attacks" (damage + AP, no visible swing)
         // when the defender was already reacting or the swing read as done instantly. Cap still wins.
