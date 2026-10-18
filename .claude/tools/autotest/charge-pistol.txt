@@ -1,0 +1,21 @@
+# A shot leaves its target walking (2026-10-19): the dude's 10mm pistol against three raiders charging
+# with knives from 15 tiles -- they must keep running through his shots until a hit staggers them.
+name charge-pistol
+map DESERT1.MAP
+seed 1
+duration 25
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude hp 500
+dude skill small_guns 120
+dude armor 17
+dude wield 8
+dude item 29 6
+
+spawn 16777291 23100 rot 5 wield 4 hostile
+spawn 16777291 23096 rot 5 wield 4 hostile
+spawn 16777291 23104 rot 5 wield 4 hostile
+
+at 0 fight

@@ -806,8 +806,19 @@ int action_attack(Attack* attack)
     // running at him straight from the ground pose. The same holds for the fall and a death. Which of
     // them a new hit may cut is the reaction layer's call at the commit (rt_reaction_heavy), never
     // the trigger pull's.
+    // ⚠️ ...AND A SHOT OR A THROW LEAVES ITS TARGET ALONE ALTOGETHER (2026-10-19, "zamířil jsem,
+    // vystřelil a ten protivník se zastavil -- nemůžeš udělat, že může chodit dál a až ho kulka
+    // zasáhne, tak se zaregistruje hit?"). This clear ended the target's walk the instant the trigger
+    // was pulled -- harmless in turns, a freeze in realtime: the body stood through the whole raise and
+    // flight. Nothing of a ranged attack needs the target's slot at its start (the dodge and the hit
+    // reaction are registered at the commit, the shot is aimed at the release -- rt_reaim), so it walks
+    // on until the bullet arrives; a hit's stagger or a knockdown stops it THEN. A melee swing still
+    // stops its target: it needs it in reach.
+    int targetAnim = item_w_anim(attack->attacker, attack->hitMode);
+    bool shotLeavesTarget = combat_rt_enabled() && (targetAnim >= ANIM_FIRE_SINGLE || targetAnim == ANIM_THROW_ANIM);
     bool keepDefenderReload = combat_rt_enabled()
-        && (combat_rt_is_reloading(attack->defender) || combat_rt_is_injecting(attack->defender)
+        && (shotLeavesTarget
+            || combat_rt_is_reloading(attack->defender) || combat_rt_is_injecting(attack->defender)
             || combat_rt_in_heavy_reaction(attack->defender));
     if (!keepDefenderReload && register_clear(attack->defender) == -2) {
         // The defender is in a PRIORITIZED sequence -- almost always its OWN attack swing.
@@ -844,7 +855,8 @@ int action_attack(Attack* attack)
     for (int index = 0; index < attack->extrasLength; index++) {
         // Same rule for a body caught in the burst: its reload is only a hit's to end, at the commit.
         if (combat_rt_enabled()
-            && (combat_rt_is_reloading(attack->extras[index]) || combat_rt_is_injecting(attack->extras[index])
+            && (shotLeavesTarget
+                || combat_rt_is_reloading(attack->extras[index]) || combat_rt_is_injecting(attack->extras[index])
                 || combat_rt_in_heavy_reaction(attack->extras[index]))) {
             continue;
         }
