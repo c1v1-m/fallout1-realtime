@@ -1608,6 +1608,9 @@ struct RtInFlight {
     // its reach (rt_flame_filter). reach = the weapon's range when the attack was computed.
     bool flame;
     int reach;
+
+    // aimTile / blastTile re-pointed at where the target stands when the shot is released (rt_reaim).
+    bool reaimed;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1631,6 +1634,7 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->tDischarge = -1.0f;
     f->bulletFlight = 0.0f;
     f->released = false;
+    f->reaimed = false;
     f->flame = f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
         && item_w_subtype(f->ctd.weapon, f->ctd.hitMode) == ATTACK_TYPE_RANGED
         && item_w_damage_type(f->ctd.weapon) == DAMAGE_TYPE_FIRE;
@@ -15323,6 +15327,45 @@ static void rt_tracers_tick()
 }
 
 // The action frame: the bullet leaves the gun. Its flight time, and a tracer per round.
+// ⚠️ AIMED WHERE THE TARGET IS WHEN THE SHOT LEAVES THE WEAPON (2026-10-18, his pick "kde jsi při
+// výstřelu"). compute_attack fixed the line when the trigger was pulled -- before the half-second-to-a-
+// second raise -- so anyone who kept moving through an enemy's wind-up was off the line by the time the
+// shot came: in trace_2026-10-18_221747 he was hit by 2 of 15 shots while moving and 16 of 22 standing,
+// dodging the wind-up instead of the shot. Now the line is re-pointed at the release: a hit at the
+// target's tile then (and a blast with it); a bullet's miss through that tile (vanilla's misses pass
+// through the target, check_ranged_miss). Sidestepping is the shot you see coming, Isaac-style. The
+// physical flights do the same at their launch (action_rt_launch_flight); a thrown or fired miss keeps
+// its spot. Both sides, his shots included.
+static void rt_reaim(RtInFlight* f)
+{
+    if (f->reaimed) {
+        return;
+    }
+    f->reaimed = true;
+    Object* d = f->ctd.defender;
+    if (d == NULL || FID_TYPE(d->fid) != OBJ_TYPE_CRITTER || d->tile < 0 || critter_is_dead(d)
+        || f->ctd.attacker == NULL || d->elevation != f->ctd.attacker->elevation || f->originTile < 0) {
+        return;
+    }
+    int oldAim = f->aimTile;
+    if ((f->ctd.attackerFlags & DAM_HIT) != 0) {
+        f->aimTile = d->tile;
+        if (f->blastRadius > 0) {
+            f->blastTile = d->tile;
+        }
+    } else if (f->bullet && f->aimTile >= 0) {
+        int reach = tile_dist(f->originTile, f->aimTile);
+        if (reach <= tile_dist(f->originTile, d->tile)) {
+            reach = tile_dist(f->originTile, d->tile) + 1;
+        }
+        f->aimTile = tile_num_beyond(f->originTile, d->tile, reach);
+    }
+    if (f->aimTile != oldAim) {
+        trace_event(TRACE_COMBAT, "reaim", "att=%d def=%d aim=%d->%d hit=%d t=%.2f",
+            f->ctd.attacker->id, d->id, oldAim, f->aimTile, (f->ctd.attackerFlags & DAM_HIT) != 0 ? 1 : 0, rt_clock);
+    }
+}
+
 static void rt_bullet_discharge(RtInFlight* f)
 {
     f->tDischarge = rt_clock;
@@ -15996,6 +16039,7 @@ void combat_rt_update(float dt)
         // to. Remembering the frame once seen puts the hit back on the shot.
         if (!thrown && !explosive && !f->actionSeen && rt_attack_action_frame_reached(f->attacker)) {
             f->actionSeen = true;
+            rt_reaim(f);
             if (f->bullet) {
                 rt_bullet_discharge(f);
             }
@@ -16020,6 +16064,7 @@ void combat_rt_update(float dt)
                 || (explosive && f->projectile != NULL && (f->projectile->flags & OBJECT_HIDDEN) == 0);
             if (out) {
                 f->released = true;
+                rt_reaim(f);
                 if (!hurtsSelf) {
                     rt_shot_tail_note(f->attacker);
                 }
@@ -16079,6 +16124,14 @@ void combat_rt_update(float dt)
         if ((trigger && ready) || capped) {
             // A blast hurts who is in it NOW (rt_blast_filter); a bolt, a ball or a thrown blade, who
             // is still on its line (rt_projectile_dodge). Before the reaction is chosen.
+            // A flight that landed sits on the tile it flew to (re-aimed at its launch): that is where
+            // the blast is and the line ends.
+            if (explosive && f->projectile != NULL && f->projectile->tile >= 0) {
+                f->aimTile = f->projectile->tile;
+                if (f->blastRadius > 0) {
+                    f->blastTile = f->projectile->tile;
+                }
+            }
             if (f->blastRadius > 0) {
                 rt_blast_filter(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;

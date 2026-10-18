@@ -1,0 +1,16 @@
+# Bullets vs a dude who strafes non-stop (X held, turning every 1.5 s): since the aim is re-pointed at the release (2026-10-18) only the flight time is left to dodge in.
+# Bullets vs a dude who strafes non-stop (X held, turning every 1.5 s): since the aim is re-pointed at the release (2026-10-18) only the flight time is left to dodge in.
+name bullet-strafe-near
+map DESERT1.MAP
+seed 1
+duration 40
+reaction 0.3
+
+dude tile 20100 rot 2
+dude stat AG 8
+dude stat EN 8
+dude hp 3000
+
+spawn 16777291 21100 rot 5 wield 8 item 29 6 hostile
+
+at 0 strafe

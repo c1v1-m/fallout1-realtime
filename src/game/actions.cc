@@ -1096,6 +1096,9 @@ typedef struct ActionFlight {
     Object* barker;
     int barkType;
     int barkHitLocation;
+    // The defender. A HIT flies to where it stands at the LAUNCH, not where it stood when the trigger
+    // was pulled (2026-10-18, his pick "kde jsi při výstřelu"); NULLed by action_notify_object_freed.
+    Object* target;
 } ActionFlight;
 
 #define ACTION_RT_FLIGHT_MAX 16
@@ -1221,6 +1224,12 @@ static int action_rt_launch_flight(void* a1, void* a2)
     (void)a2;
     ActionFlight* fl = (ActionFlight*)a1;
 
+    // Aimed where the target is NOW: the raise before the release is not a free sidestep any more.
+    if (fl->hit && fl->target != NULL && fl->target->elevation == fl->elevation && fl->target->tile >= 0
+        && FID_TYPE(fl->target->fid) == OBJ_TYPE_CRITTER) {
+        fl->tile = fl->target->tile;
+    }
+
     bool flying = false;
     if (fl->projectile != NULL && register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
         action_register_flight(fl, 0);
@@ -1262,6 +1271,9 @@ void action_notify_object_freed(Object* obj)
         }
         if (fl->barker == obj) {
             fl->barker = NULL;
+        }
+        if (fl->target == obj) {
+            fl->target = NULL;
         }
         if (fl->weapon == obj || (fl->weapon != NULL && obj_top_environment(fl->weapon) == obj)) {
             fl->weapon = NULL;
@@ -1406,6 +1418,7 @@ static int action_ranged(Attack* attack, int anim)
                 fl->origin = projectileOrigin;
                 fl->hit = (attack->attackerFlags & DAM_HIT) != 0;
                 fl->tile = fl->hit ? attack->defender->tile : attack->tile;
+                fl->target = combat_rt_enabled() ? attack->defender : NULL;
                 fl->elevation = attack->defender->elevation;
                 fl->thrown = anim == ANIM_THROW_ANIM;
                 fl->isGrenade = isGrenade;
