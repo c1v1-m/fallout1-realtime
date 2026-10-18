@@ -1,0 +1,13 @@
+# Tracers as in real life (2026-10-18): a minigun mutant firing bursts -- one streak per four rounds;
+# the pistol scenario tracer-look must photograph nothing (single shots draw no tracer).
+name tracer-burst
+map DESERT1.MAP
+seed 1
+shots 3
+duration 15
+
+dude tile 20100 rot 2
+dude hp 3000
+dude armor 3
+
+spawn 16777403 22500 rot 5 wield 12 item 35 4 hostile

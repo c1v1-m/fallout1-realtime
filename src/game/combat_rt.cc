@@ -15390,7 +15390,11 @@ static void rt_bullet_discharge(RtInFlight* f)
         rounds = 12;
     }
     int elevation = f->ctd.attacker != NULL ? f->ctd.attacker->elevation : map_elevation;
-    for (int r = 0; r < rounds; r++) {
+    // ⚠️ TRACERS AS IN REAL LIFE (2026-10-18, his pick: "stále mi to přijde takovej čůrek"). A bullet
+    // itself is never seen; what shows is a TRACER round, loaded one in four or five in a machine-gun
+    // belt and not at all in a pistol or a rifle. So a single shot draws nothing (the bang, the muzzle
+    // flash in the art, the hit -- vanilla's look) and a burst one streak per four rounds.
+    for (int r = 0; r < rounds && f->ctd.ammoQuantity > 1; r += 4) {
         int jx = r == 0 ? 0 : roll_random(-6, 6);
         int jy = r == 0 ? 0 : roll_random(-4, 4);
         rt_tracer_spawn(f->serial, f->originTile, f->aimTile, elevation, rt_clock + r * RT_TRACER_STAGGER, speed, jx, jy);
