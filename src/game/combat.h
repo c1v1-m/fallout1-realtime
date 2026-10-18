@@ -77,6 +77,11 @@ int combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool 
 // -1 on cancel. `initialLocation` is where its selection starts.
 int combat_called_shot_pick(Object* critter, int hitMode, int initialLocation);
 bool combat_to_hit(Object* target, int* accuracy);
+
+// THROWN AS FAR AS IT GOES (2026-10-18, realtime only -- combat_rt.cc sets it around one attack): when
+// >= 0, the next THROW attack ignores its range, misses on purpose and lands on this tile (or on the
+// first thing in the way). His pick: a quick-slot grenade at a target out of reach is not put away.
+extern int combat_forced_throw_tile;
 void combat_attack_this(Object* a1);
 void combat_outline_on();
 void combat_outline_off();

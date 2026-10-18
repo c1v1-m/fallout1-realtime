@@ -1,0 +1,20 @@
+# Quick-slot grenade at a target out of reach (his report 2026-10-18 "nemohl jsem házet granátem"):
+# a frag grenade reaches 15 tiles, the raider stands at 30. Good: [ACTION/far-throw] and a blast about
+# 15 tiles out on the line to him, with the lock (LT) and without it. Bad: quick-throw-none.
+name far-throw
+map DESERT1.MAP
+seed 1
+duration 14
+
+dude tile 20100 rot 2
+dude stat ST 5
+dude stat PE 8
+dude hp 200
+dude armor 17
+dude item 25 4
+
+spawn 16777291 26100 rot 5 hostile
+
+at 0 throwfree
+at 3 idle
+at 4 throw

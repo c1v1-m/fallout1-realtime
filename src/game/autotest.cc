@@ -59,6 +59,9 @@ namespace fallout {
 //        kite                          back away from anyone within 4 tiles, otherwise fight
 //        goto <tile>                   walk there and wait (hide behind a wall, say)
 //        shoot                         fight until one attack has gone off, then idle
+//        throw                         hold LT for a lock, then press and let go of RB once (the RB
+//                                      quick slot: a grenade by default)
+//        throwfree                     press and let go of RB once with no lock
 //
 // The run ends at `duration`, 2 s after the dude dies, or 3 s after the last spawned enemy does.
 
@@ -73,9 +76,11 @@ enum {
     AT_KITE,
     AT_GOTO,
     AT_SHOOT,
+    AT_THROW,
+    AT_THROW_FREE,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree" };
 
 typedef struct AtItem {
     int pid;
@@ -143,6 +148,7 @@ static int at_shots = 0;
 static int at_goto_best = 9999;
 static float at_goto_since = 0.0f;
 static bool at_goto_done = false;
+static float at_throw_at = -1.0f;
 
 static void at_trim(char* s)
 {
@@ -678,6 +684,7 @@ void autotest_tick(float dt)
         at_goto_since = at_elapsed;
         at_goto_done = false;
         at_shots = 0;
+        at_throw_at = -1.0f;
         trace_event(TRACE_FLOW, "autotest", "phase at=%.1f policy=%s tile=%d dude=%d",
             at_elapsed, at_policy_names[at_phases[at_phase].policy], at_phases[at_phase].tile, obj_dude->tile);
     }
@@ -758,6 +765,20 @@ void autotest_tick(float dt)
                 }
             } else {
                 at_stick_still();
+            }
+            break;
+        case AT_THROW:
+        case AT_THROW_FREE:
+            // LT first (a lock needs a beat), then RB: down for 6 frames, up -- the quick slot draws on
+            // the press and throws on the release.
+            at_stick_still();
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, policy == AT_THROW ? 32767 : -32768);
+            if (at_throw_at < 0.0f) {
+                at_throw_at = at_elapsed + (policy == AT_THROW ? 0.6f : 0.1f);
+            } else if (at_elapsed >= at_throw_at && at_shots == 0) {
+                at_tap_frames[SDL_CONTROLLER_BUTTON_RIGHTSHOULDER] = 6;
+                at_shots = 1;
+                trace_event(TRACE_FLOW, "autotest", "rb-tap at=%.1f lock=%d", at_elapsed, combat_rt_has_lock() ? 1 : 0);
             }
             break;
         case AT_SHOOT:

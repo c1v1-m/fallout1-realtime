@@ -1687,6 +1687,12 @@ static float rt_player_intent_ttl = 0.0f;
 // The called-shot body part for the latched intent, or HIT_LOCATION_UNCALLED for a
 // normal (non-aimed) attack. Set by the LT aimed-shot picker (and its RB repeat) via combat_rt_aimed_attack.
 static int rt_player_intent_loc = HIT_LOCATION_UNCALLED;
+// THROWN AS FAR AS IT GOES (2026-10-18, his pick after "nemohl jsem házet granátem": every quick-slot
+// throw of the session was refused because the target stood 17-21 tiles off and a grenade reaches 15).
+// While the latched intent is a quick throw at THIS target out of reach, the arbiter lets it through
+// and rt_do_attack makes the engine land it at the weapon's range on the line to the target
+// (combat_forced_throw_tile). The lock-on readout keeps its red X out of range (his call).
+static Object* rt_player_far_target = NULL;
 
 // Pending world-loot target (tap-A on an adjacent corpse/container), set from the
 // input hook via combat_rt_try_world_loot() and opened in combat_rt_update -- the
@@ -6774,6 +6780,10 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     // strikes). On a bad shot, don't fire and don't charge AP -- the caller keeps its intent.
     bool aiming = hitLocation != HIT_LOCATION_UNCALLED;
     int badShot = combat_check_bad_shot(attacker, defender, hitMode, aiming);
+    bool farThrow = attacker == obj_dude && defender != NULL && defender == rt_player_far_target;
+    if (farThrow && badShot == COMBAT_BAD_SHOT_OUT_OF_RANGE) {
+        badShot = COMBAT_BAD_SHOT_OK; // it lands short on purpose (combat_forced_throw_tile)
+    }
     if (badShot != COMBAT_BAD_SHOT_OK) {
         trace_event(TRACE_WARN, "shot-blocked", "%s->pid=%d reason=%d t=%.2f",
             attacker == obj_dude ? "DUDE" : "NPC", defender->pid, badShot, rt_clock);
@@ -6814,6 +6824,11 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
     int swingKeepTile = attacker != NULL ? attacker->tile : -1;
     int swingKeepX = attacker != NULL ? attacker->x : 0;
     int swingKeepY = attacker != NULL ? attacker->y : 0;
+    if (farThrow && obj_dist(attacker, defender) > item_w_range(attacker, hitMode)) {
+        combat_forced_throw_tile = tile_num_beyond(attacker->tile, defender->tile, item_w_range(attacker, hitMode));
+        trace_event(TRACE_ACTION, "far-throw", "target=%d dist=%d range=%d lands=%d t=%.2f",
+            defender->id, obj_dist(attacker, defender), item_w_range(attacker, hitMode), combat_forced_throw_tile, rt_clock);
+    }
     int rc = combat_attack(attacker, defender, hitMode, hitLocation);
 
     // THE "ENEMY NEVER ACTUALLY ATTACKS" DEADLOCK.
@@ -6858,9 +6873,15 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
         }
 
         rc = combat_attack(attacker, defender, hitMode, hitLocation);
+        combat_forced_throw_tile = -1;
         trace_event(TRACE_WARN, "attack-unblock", "%s->pid=%d rc=%d openTx=%d inStop=%d t=%.2f",
             attacker == obj_dude ? "DUDE" : "NPC",
             defender != NULL ? defender->pid : -1, rc, openTx, inStop, rt_clock);
+    }
+
+    combat_forced_throw_tile = -1; // one attack only, whatever became of it
+    if (rc == 0 && farThrow) {
+        rt_player_far_target = NULL;
     }
 
     if (rc == 0) {
@@ -8721,6 +8742,7 @@ static void rt_lock_diag(float sx, float sy)
 // persists (RT_INTENT_TTL) until it fires or expires.
 static void rt_set_player_intent(Object* target, int hitMode, int hitLocation = HIT_LOCATION_UNCALLED)
 {
+    rt_player_far_target = NULL; // only combat_rt_request_throw turns it on, after this
     rt_player_intent_target = target;
     rt_player_intent_mode = hitMode;
     rt_player_intent_loc = hitLocation;
@@ -11821,7 +11843,8 @@ static void rt_resolve_attacks(float dt)
         dudeCost = rt_ap_cost(obj_dude, rt_player_intent_mode, aiming);
         int dudeDist = obj_dist(obj_dude, rt_player_intent_target);
         int dudeRange = item_w_range(obj_dude, rt_player_intent_mode);
-        if (rt_player_ap >= dudeCost && dudeDist <= dudeRange) {
+        bool farThrow = rt_player_far_target != NULL && rt_player_far_target == rt_player_intent_target;
+        if (rt_player_ap >= dudeCost && (dudeDist <= dudeRange || farThrow)) {
             // anim_busy_blocking, not anim_busy: since check_registry stopped letting a SPENT
             // description veto a new animation, the dude legitimately appears in an old sequence
             // (his swing, still dropping his victim) while acting in a new one. Gating the right
@@ -12876,6 +12899,33 @@ static int rt_quick_throw_mode()
     return hitMode;
 }
 
+// The nearest hostile in sight at ANY distance -- what a quick throw with no lock and nobody in
+// reach throws toward (as far as it goes).
+static Object* rt_nearest_visible_hostile()
+{
+    Object* best = NULL;
+    int bestDist = 9999;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (critter == obj_dude || !rt_is_combatant(critter)
+            || !(rt_actors[i].hostile || rt_hostile_by_nature(critter))) {
+            continue;
+        }
+        if (critter->data.critter.combat.team == obj_dude->data.critter.combat.team || isPartyMember(critter)) {
+            continue;
+        }
+        if (!rt_is_lockable(critter) || !rt_lock_in_sight(critter)) {
+            continue;
+        }
+        int dist = obj_dist(obj_dude, critter);
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = critter;
+        }
+    }
+    return best;
+}
+
 Object* combat_rt_quick_throw_target()
 {
     if (!rt_enabled || obj_dude == NULL) {
@@ -12883,13 +12933,11 @@ Object* combat_rt_quick_throw_target()
     }
     int hitMode = rt_quick_throw_mode();
     if (rt_lock_target != NULL) {
-        if (rt_is_combatant(rt_lock_target)
-            && obj_dist(obj_dude, rt_lock_target) <= item_w_range(obj_dude, hitMode)) {
-            return rt_lock_target;
-        }
-        return NULL;
+        // Out of reach it is still the target: the throw lands as far as it goes (rt_player_far_target).
+        return rt_is_combatant(rt_lock_target) ? rt_lock_target : NULL;
     }
-    return rt_unlocked_attack_target(hitMode);
+    Object* target = rt_unlocked_attack_target(hitMode);
+    return target != NULL ? target : rt_nearest_visible_hostile();
 }
 
 bool combat_rt_request_throw(Object* target)
@@ -12899,8 +12947,12 @@ bool combat_rt_request_throw(Object* target)
     }
     int hitMode = rt_quick_throw_mode();
     rt_set_player_intent(target, hitMode);
-    trace_event(TRACE_ACTION, "quick-throw", "target=%d id=%d hm=%d dist=%d range=%d t=%.2f",
-        target->pid, target->id, hitMode, obj_dist(obj_dude, target), item_w_range(obj_dude, hitMode), rt_clock);
+    bool far = obj_dist(obj_dude, target) > item_w_range(obj_dude, hitMode);
+    if (far) {
+        rt_player_far_target = target;
+    }
+    trace_event(TRACE_ACTION, "quick-throw", "target=%d id=%d hm=%d dist=%d range=%d far=%d t=%.2f",
+        target->pid, target->id, hitMode, obj_dist(obj_dude, target), item_w_range(obj_dude, hitMode), far ? 1 : 0, rt_clock);
     return true;
 }
 

@@ -2855,6 +2855,8 @@ static int compute_spray(Attack* attack, int accuracy, int* roundsHitMainTargetP
 }
 
 // 0x421490
+int combat_forced_throw_tile = -1;
+
 static int compute_attack(Attack* attack)
 {
     int weapon_range;
@@ -2870,7 +2872,11 @@ static int compute_attack(Attack* attack)
     weapon_range = item_w_range(attack->attacker, attack->hitMode);
     distance = obj_dist(attack->attacker, attack->defender);
 
-    if (weapon_range < distance) {
+    // A throw as far as it goes (combat_forced_throw_tile): out of range is the point of it.
+    bool forcedThrow = combat_forced_throw_tile >= 0
+        && item_w_subtype(attack->weapon, attack->hitMode) == ATTACK_TYPE_THROW;
+
+    if (weapon_range < distance && !forcedThrow) {
         return -1;
     }
 
@@ -2977,6 +2983,10 @@ static int compute_attack(Attack* attack)
         }
     }
 
+    if (forcedThrow) {
+        roll = ROLL_FAILURE; // it was never going to reach the target; where it lands is decided below
+    }
+
     switch (roll) {
     case ROLL_CRITICAL_SUCCESS:
         damage_multiplier = attack_crit_success(attack);
@@ -2986,7 +2996,7 @@ static int compute_attack(Attack* attack)
         compute_damage(attack, roundsHitMainTarget, damage_multiplier);
         break;
     case ROLL_FAILURE:
-        if (weapon_subtype == ATTACK_TYPE_RANGED || weapon_subtype == ATTACK_TYPE_THROW) {
+        if ((weapon_subtype == ATTACK_TYPE_RANGED || weapon_subtype == ATTACK_TYPE_THROW) && !forcedThrow) {
             check_ranged_miss(attack);
         }
         break;
@@ -2995,7 +3005,27 @@ static int compute_attack(Attack* attack)
         break;
     }
 
-    if (weapon_subtype == ATTACK_TYPE_RANGED || weapon_subtype == ATTACK_TYPE_THROW) {
+    if (forcedThrow) {
+        // It flies from the hand to the tile; the first thing in the way stops it, as a miss's stray
+        // would. Nothing in the way: it lands on the tile, and a grenade goes off there (below).
+        attack->tile = combat_forced_throw_tile;
+        Object* blocker = attack->attacker;
+        make_straight_path(attack->attacker, attack->attacker->tile, attack->tile, NULL, &blocker, 32);
+        if (blocker == attack->attacker) {
+            blocker = NULL;
+        }
+        if (blocker != NULL) {
+            attack->tile = blocker->tile;
+        } else {
+            blocker = obj_blocking_at(attack->attacker, attack->tile, attack->attacker->elevation);
+        }
+        if (blocker != NULL && blocker != attack->attacker && (blocker->flags & OBJECT_SHOOT_THRU) == 0
+            && FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER) {
+            attack->attackerFlags |= DAM_HIT;
+            attack->defender = blocker;
+            compute_damage(attack, 1, 2);
+        }
+    } else if (weapon_subtype == ATTACK_TYPE_RANGED || weapon_subtype == ATTACK_TYPE_THROW) {
         if ((attack->attackerFlags & (DAM_HIT | DAM_CRITICAL)) == 0) {
             int tile;
             int throw_distance;
