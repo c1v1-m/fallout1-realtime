@@ -15128,9 +15128,18 @@ static void rt_flame_filter(RtInFlight* f)
 // RT_TRACER_STAGGER apart. The hit itself commits when the first round ARRIVES (bulletFlight after the
 // action frame) and runs through rt_projectile_dodge like a plasma ball. Speeds by damage type (his
 // words: bullets very fast, a laser almost instant).
-#define RT_BULLET_SPEED 40.0f        // hexes a second
-#define RT_LASER_BULLET_SPEED 150.0f
-#define RT_ENERGY_BULLET_SPEED 60.0f // electrical, EMP and anything else that is not a bullet or a laser
+// ⚠️ REAL SPEEDS (2026-10-18, his question "může člověk v realu uhnout kulce? neměli bychom ji dát
+// ještě rychlejší jako real life" and his pick "jako v realu"). A hex is about a metre (a body stands
+// two tall), so a pistol round at ~350 m/s crosses 350 hexes a second and a rifle's at ~900 -- 40 had
+// let him sidestep bullets at range. Now no bullet can be dodged; to-hit, cover and armour decide, as
+// in vanilla. Plasma, rockets and grenades keep their slow flights (anim.cc) and stay dodgeable.
+#define RT_PISTOL_BULLET_SPEED 350.0f // hexes a second
+#define RT_BULLET_SPEED 900.0f        // SMGs, rifles, miniguns
+#define RT_LASER_BULLET_SPEED 5000.0f // light: instant
+#define RT_ENERGY_BULLET_SPEED 350.0f // electrical, EMP and anything else that is not a bullet or a laser
+// A tracer is on screen at least this long, and the hit waits for it: at real speed it would cross the
+// whole screen inside one frame and never be drawn. Three frames -- too short for any sidestep.
+#define RT_TRACER_MIN_SHOW 0.05f
 #define RT_TRACER_STAGGER 0.05f      // seconds between the rounds of a burst
 #define RT_TRACER_LIFT 30            // pixels: from the feet to the gun
 #define RT_TRACER_FLY_ON 8.0f        // hexes a dodged bullet flies on past where its target stood
@@ -15170,7 +15179,7 @@ static float rt_bullet_speed_for(Object* weapon)
 {
     switch (item_w_damage_type(weapon)) {
     case DAMAGE_TYPE_NORMAL:
-        return RT_BULLET_SPEED;
+        return item_w_anim_code(weapon) == WEAPON_ANIMATION_PISTOL ? RT_PISTOL_BULLET_SPEED : RT_BULLET_SPEED;
     case DAMAGE_TYPE_LASER:
         return RT_LASER_BULLET_SPEED;
     default:
@@ -15372,6 +15381,10 @@ static void rt_bullet_discharge(RtInFlight* f)
     float speed = rt_bullet_speed_for(f->ctd.weapon);
     int d = tile_dist(f->originTile, f->aimTile);
     f->bulletFlight = (d > 0 ? (float)d : 1.0f) / speed;
+    if (f->bulletFlight < RT_TRACER_MIN_SHOW) {
+        f->bulletFlight = RT_TRACER_MIN_SHOW;
+        speed = (d > 0 ? (float)d : 1.0f) / RT_TRACER_MIN_SHOW; // the tracer takes exactly that long
+    }
     int rounds = f->ctd.ammoQuantity > 1 ? f->ctd.ammoQuantity : 1;
     if (rounds > 12) {
         rounds = 12;
@@ -15681,9 +15694,9 @@ static void rt_shot_dodge_tick()
 
     for (int k = 0; k < rt_inflight_count; k++) {
         RtInFlight* f = &rt_inflight[k];
-        if (f->attacker != obj_dude || f->defender == NULL || f->blastRadius > 0 || f->flame
-            || (!f->bullet && f->explosionFid == -1) || f->originTile < 0 || f->aimTile < 0) {
-            continue; // not his, a blast, a flame, or nothing that flies
+        if (f->attacker != obj_dude || f->defender == NULL || f->blastRadius > 0 || f->flame || f->bullet
+            || f->explosionFid == -1 || f->originTile < 0 || f->aimTile < 0) {
+            continue; // not his, a blast, a flame, a bullet (real speed: no dodging it), or nothing that flies
         }
         RtActor* a = rt_actor_of(f->defender);
         Object* npc = f->defender;
@@ -16135,7 +16148,9 @@ void combat_rt_update(float dt)
             if (f->blastRadius > 0) {
                 rt_blast_filter(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
-            } else if (explosive || f->bullet) {
+            } else if (explosive) {
+                // A bullet is not checked: at real speed (RT_TRACER_MIN_SHOW) and aimed at the release it
+                // cannot be sidestepped, and a tile flip of a free-moving body read as a dodge.
                 rt_projectile_dodge(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             } else if (f->flame) {

@@ -423,7 +423,7 @@ static float anim_projectile_speedup = -1.0f; // > 0: anim_set_projectile_speedu
 // multipliers on that. Every other created projectile keeps RT_PROJECTILE_SPEEDUP.
 #define RT_ROCKET_SPEEDUP 1.0f
 #define RT_PLASMA_SPEEDUP 1.0f
-#define RT_LASER_SPEEDUP 15.0f
+#define RT_LASER_SPEEDUP 100.0f // light: as fast as the frame allows (2026-10-18, "jako v realu")
 
 // The projectile art of the rocket (misc proto 1), the plasma ball (2) and the laser bolt (9), looked
 // up once from the protos a weapon names as its projectile.

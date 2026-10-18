@@ -976,7 +976,7 @@ void autotest_tick(float dt)
     // A photograph of the bullets (scenario "shots").
     // A bullet is first drawn inside the shooter's own sprite; 0.12 s on it is a third of the way there.
     if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && combat_rt_tracers_in_air() > 0 && at_shot_due < 0.0f) {
-        at_shot_due = at_elapsed + 0.12f;
+        at_shot_due = at_elapsed + 0.02f; // a real-speed bullet is on screen 0.05 s
     }
     if (at_shot_due >= 0.0f && at_elapsed >= at_shot_due) {
         at_shot_due = -1.0f;
