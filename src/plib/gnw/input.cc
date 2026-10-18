@@ -1258,6 +1258,9 @@ void GNW95_process_message()
                 audioEngineResume();
                 break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
+                if (gnw_headless || gnw_visible_override) {
+                    break; // the game playing by itself never pauses for focus
+                }
                 GNW95_isActive = false;
                 audioEnginePause();
                 break;

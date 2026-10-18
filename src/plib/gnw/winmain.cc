@@ -21,6 +21,9 @@ namespace fallout {
 // 0x53A290
 bool GNW95_isActive = false;
 
+bool gnw_headless = false;
+bool gnw_visible_override = false;
+
 #if _WIN32
 // 0x53A294
 HANDLE GNW95_mutex = NULL;

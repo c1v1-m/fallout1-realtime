@@ -8,6 +8,7 @@
 
 #include "game/actions.h"
 #include "game/anim.h"
+#include "game/autotest.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/art.h"
@@ -341,10 +342,20 @@ bool gamepad_ui_set_suppress_a_click(bool suppress)
 // a release just closes the picker, so there is nothing left to eat.
 static bool gpui_aim_swallow_b = false; // that B press is spent
 
+static bool gpui_on_virtual_pad = false; // the handle is autotest.cc's virtual pad
+
 // Opens the first connected controller if we don't have one yet.
 static void gpui_acquire()
 {
     if (gpui_controller != NULL) {
+        return;
+    }
+
+    // The game playing by itself (autotest.cc) uses its virtual pad, never a real one.
+    int virtualPad = autotest_controller_index();
+    if (virtualPad >= 0) {
+        gpui_controller = SDL_GameControllerOpen(virtualPad);
+        gpui_on_virtual_pad = gpui_controller != NULL;
         return;
     }
 
@@ -364,6 +375,10 @@ SDL_GameController* gamepad_ui_get_controller()
     // Drop a handle that's no longer attached FIRST, then (re)acquire, so a
     // disconnect is recovered within the same call instead of returning NULL for
     // a frame (and so a freshly opened handle is never closed by this same call).
+    if (gpui_controller != NULL && !gpui_on_virtual_pad && autotest_controller_index() >= 0) {
+        SDL_GameControllerClose(gpui_controller); // a real pad opened before the virtual one existed
+        gpui_controller = NULL;
+    }
     if (gpui_controller != NULL && !SDL_GameControllerGetAttached(gpui_controller)) {
         SDL_GameControllerClose(gpui_controller);
         gpui_controller = NULL;

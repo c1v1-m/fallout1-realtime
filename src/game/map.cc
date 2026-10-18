@@ -7,6 +7,7 @@
 
 #include "game/anim.h"
 #include "game/art.h"
+#include "game/autotest.h"
 #include "game/automap.h"
 #include "game/combat.h"
 #include "game/combat_rt.h"
@@ -1040,7 +1041,7 @@ int map_load_file(DB_FILE* stream)
 
         scr_enable();
 
-        if (map_data.scriptIndex > 0) {
+        if (map_data.scriptIndex > 0 && autotest_map_script_allowed()) {
             error = "Error creating new map script";
             if (scr_new(&map_script_id, SCRIPT_TYPE_SYSTEM) == -1) break;
 

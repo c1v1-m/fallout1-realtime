@@ -237,7 +237,9 @@ for (const fight of fights) {
     }
 
     // snapshot detectors
-    const FROZEN_S = 3, IDLE_NEAR_TILES = 8, IDLE_NEAR_S = 3;
+    // FROZEN: a chaser that has not moved for 3 s, or an attacker that has not attacked for 6 s (a
+    // pistol raider's normal cadence is one shot every 4-5 s), neither of them deliberately busy.
+    const FROZEN_CHASE_S = 3, FROZEN_ATTACK_S = 6, IDLE_NEAR_TILES = 8, IDLE_NEAR_S = 3;
     let prevSnap = null;
     for (const sn of fsnaps) {
         for (const [id, f] of sn.npcs) {
@@ -245,17 +247,25 @@ for (const fight of fights) {
             const st = num(f.st), dead = f.dead === '1', prone = f.prone === '1';
             if (n && !dead) n.st[st] = (n.st[st] || 0) + 1;
             // FROZEN: engaged, not moving, not attacking, not deliberately busy
+            // A change of state starts the count again (attacking from a spot, then chasing from it,
+            // is not three seconds of standing about).
+            if (n && n.lastSt !== st) {
+                n.frozenRun = 0;
+                n.lastSt = st;
+            }
             if (n && !dead && !prone && (st === 1 || st === 2) && prevSnap) {
                 const pf = prevSnap.npcs.get(id);
-                const still = pf && pf.tile === f.tile;
+                const still = st === 2 || (pf && pf.tile === f.tile);
                 const attacked = ev.some(e => e.cat === 'COMBAT' && e.sub === 'attack' && e.f.aid == id
                     && e.s > prevSnap.s && e.s <= sn.s);
                 const busy = f.int && BUSY_INTENTS.has(f.int);
                 if (still && !attacked && !busy) {
                     n.frozenRun += sn.s - prevSnap.s;
-                    if (n.frozenRun >= FROZEN_S && !n.frozenReported) {
+                    if (n.frozenRun >= (st === 2 ? FROZEN_ATTACK_S : FROZEN_CHASE_S) && !n.frozenReported) {
                         n.frozenReported = true;
-                        issue(3, sn.s, id, `stood ${fmt(n.frozenRun)} s engaged (st=${st}${f.int ? ' int=' + f.int : ''}, dist=${f.dist}) without moving or attacking`);
+                        issue(3, sn.s, id, st === 2
+                            ? `in range ${fmt(n.frozenRun)} s without attacking (dist=${f.dist}${f.int ? ' int=' + f.int : ''})`
+                            : `chased ${fmt(n.frozenRun)} s without moving (dist=${f.dist}${f.int ? ' int=' + f.int : ''})`);
                     }
                 } else {
                     n.frozenRun = 0;
@@ -329,7 +339,10 @@ const defenders = new Set(byId('defend-hold').map(e => num(e.f.id)));
 for (const d of byId('disengage')) {
     const id = num(d.f.id);
     const searched = ev.some(e => e.cat === 'FLOW' && e.sub === 'search-start' && num(e.f.id) === id && Math.abs(e.s - d.s) < 0.3);
-    if (!searched && !defenders.has(id)) issue(2, d.s, id, `lost the dude (disengage at ${d.f.dist} tiles) and did not search`);
+    // A runner is right not to look for him (rt_flee_step / combatai_flee_reason).
+    const fleeing = ev.some(e => e.cat === 'FLOW' && num(e.f.id) === id && e.s <= d.s && d.s - e.s < 15
+        && (/^flee/.test(e.sub) || (e.sub === 'intent' && /->flee /.test(e.rest))));
+    if (!searched && !defenders.has(id) && !fleeing) issue(2, d.s, id, `lost the dude (disengage at ${d.f.dist} tiles) and did not search`);
 }
 for (const st of byId('search-start')) {
     const id = num(st.f.id);
@@ -362,12 +375,23 @@ if (warnCount('WARN/unstick-move') > 0) issue(1, 0, -1, `unstick-move fired ${wa
 if (warnCount('COMBAT/attack-fail') > 0) issue(2, 0, -1, `attack-fail ${warnCount('COMBAT/attack-fail')}x (attacks the engine refused)`);
 if (warnCount('COMBAT/react-refuse') > 0) issue(1, 0, -1, `react-refuse ${warnCount('COMBAT/react-refuse')}x (a reaction could not play)`);
 if (hasIntent) {
-    // flapping: 4+ intent changes inside 2 s
+    // flapping: going BACK to the intent it left, 3 times inside 2 s (A->B->A->B->A). An opening run
+    // of different intents (watch, approach, hold, attack) is a decision, not a flap.
     const m = new Map();
-    for (const e of byId('intent')) m.set(num(e.f.id), (m.get(num(e.f.id)) || []).concat(e.s));
+    for (const e of byId('intent')) {
+        const im = /(\w+)->(\w+) why=(\S*)/.exec(e.rest);
+        if (im) m.set(num(e.f.id), (m.get(num(e.f.id)) || []).concat({ s: e.s, from: im[1], to: im[2], why: im[3] }));
+    }
     for (const [id, list] of m) {
-        for (let i = 0; i + 3 < list.length; i++) {
-            if (list[i + 3] - list[i] <= 2) { issue(2, list[i], id, `intent flapped 4x in ${fmt(list[i + 3] - list[i])} s`); break; }
+        const back = [];
+        for (let i = 1; i < list.length; i++) {
+            if (list[i].to === list[i - 1].from) back.push(list[i]);
+        }
+        for (let i = 0; i + 2 < back.length; i++) {
+            if (back[i + 2].s - back[i].s <= 2) {
+                issue(2, back[i].s, id, `intent flapped ${back[i].from}<->${back[i].to} (${back[i].why}) 3x in ${fmt(back[i + 2].s - back[i].s)} s`);
+                break;
+            }
         }
     }
     // long holds

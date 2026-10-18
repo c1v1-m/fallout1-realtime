@@ -238,6 +238,14 @@ bool svga_init(VideoOptions* video_options)
         windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     }
 
+    // The game playing by itself (game/autotest.cc): a hidden window, never fullscreen.
+    if (gnw_headless || gnw_visible_override) {
+        windowFlags &= ~SDL_WINDOW_FULLSCREEN_DESKTOP;
+        if (gnw_headless) {
+            windowFlags |= SDL_WINDOW_HIDDEN;
+        }
+    }
+
     gSdlWindow = SDL_CreateWindow(GNW95_title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
         video_options->width * video_options->scale,
         video_options->height * video_options->scale,

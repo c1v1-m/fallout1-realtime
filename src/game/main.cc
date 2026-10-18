@@ -17,6 +17,7 @@
 #include "game/amutex.h"
 #include "game/anim.h"
 #include "game/art.h"
+#include "game/autotest.h"
 #include "game/combat_rt.h"
 #include "game/credits.h"
 #include "game/cycle.h"
@@ -115,12 +116,24 @@ static bool main_death_voiceover_done;
 // 0x4725E8
 int gnw_main(int argc, char** argv)
 {
-    if (!autorun_mutex_create()) {
+    // --autotest: the game plays a scripted fight by itself and quits (game/autotest.cc). It runs beside
+    // a normal game, so it does not take the single-instance mutex.
+    bool autotest = autotest_init(argc, argv);
+
+    if (!autotest && !autorun_mutex_create()) {
         return 1;
     }
 
     if (!main_init_system(argc, argv)) {
         return 1;
+    }
+
+    if (autotest) {
+        roll_set_seed(autotest_seed());
+        main_load_new(autotest_map());
+        autotest_setup_world();
+        main_game_loop();
+        autotest_finish();
     }
 
     gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
@@ -481,6 +494,8 @@ static void main_game_loop()
         combat_rt_update(rtDelta);
         main_ms_rt = main_ms_since(sectionStart);
 
+        autotest_tick(rtDelta); // the bot's pad for the next frame, and the end of a self-played run
+
         // While the debug ring is up, force a full refresh when the dude changes tile
         // so the ring follows cleanly instead of ghosting (partial dirty-rect refreshes
         // would leave trails of the old ring behind).
@@ -520,7 +535,7 @@ static void main_game_loop()
             // anim_stop() ends every animation sequence and force-flattens anyone mid-death
             // (show_death via anim_set_end), so an autosave landing in the second after a kill
             // destroys the fall -- both bodies just drop. See combat_rt_death_anim_pending().
-            bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending();
+            bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending() && !autotest_active();
 
             // The triggers below are LATCHED rather than acted on immediately: the condition that
             // fires them (map changed / quest hash moved) is a one-shot edge, and the old code

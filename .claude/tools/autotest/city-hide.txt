@@ -1,0 +1,26 @@
+# The 2026-10-17 report "schoval jsem se za zeď a voni se deaggrovali": three super mutants (PE 4)
+# with a minigun, a rocket launcher and a flamer south of a ruined wall in CITY1. The dude fires once from the side, walks behind the
+# wall (tiles 24305-24311, 24505-24511) to 23908 and waits. Good: they come round the wall or search
+# and find him. Bad: they forget him.
+name city-hide
+map CITY1.MAP
+seed 1
+duration 60
+
+dude tile 23916 rot 3
+dude stat PE 8
+dude stat AG 8
+dude stat EN 8
+dude hp 90
+dude skill small_guns 110
+dude armor 17
+dude wield 8
+dude item 29 6
+dude item 40 3
+
+spawn 16777225 26508 rot 0 wield 12 item 36 2 hostile
+spawn 16777225 26704 rot 0 wield 13 item 14 3 hostile
+spawn 16777225 26712 rot 0 wield 11 item 32 2 hostile
+
+at 0 shoot
+at 3 goto 23908
