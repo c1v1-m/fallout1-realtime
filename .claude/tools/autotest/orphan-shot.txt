@@ -1,0 +1,21 @@
+# Shots in the air outlive their shooter (2026-10-18): a rocket mutant fires from ~20 tiles (a 2 s
+# flight) and the dude's gatling laser kills it meanwhile; the rocket already flying must still land
+# (orphan-landed), a shot still being raised dies with its shooter (attack-voided).
+name orphan-shot
+map DESERT1.MAP
+seed 1
+duration 20
+
+dude tile 20100 rot 2
+dude stat PE 10
+dude stat AG 10
+dude hp 3000
+dude skill energy 200
+dude wield 28
+dude item 39 10
+
+spawn 16777225 24100 rot 5 wield 13 item 14 10 hostile
+spawn 16777225 24104 rot 5 wield 13 item 14 10 hostile
+
+at 0 idle
+at 1.2 fight

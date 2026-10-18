@@ -15715,7 +15715,23 @@ void combat_rt_update(float dt)
         // Checked at the TOP, before any commit condition, so it holds for every trigger --
         // action frame, swing-done, connect and the hard cap alike. Applies to the dude too: if
         // he dies mid-swing, his blow dies with him.
-        if (f->attacker != NULL && critter_is_dead(f->attacker)) {
+        //
+        // ⚠️ ...BUT WHAT IT HAS ALREADY FIRED FLIES ON (2026-10-18, his pick "ano, dopadnou"). Since shots
+        // fly (the projectiles), a burst already out of the barrel was erased with its shooter: two of
+        // the four minigun bursts at him in trace_2026-10-18_203525 vanished in mid-air when he killed
+        // the gunner 0.5 s after it fired. `released` (the action frame, or a burst's pose ending) is
+        // the line: a swing, or a shot still being raised, dies with the body; bullets, a rocket, a
+        // grenade already thrown land. The dead shooter's own share -- a backwash, a critical miss --
+        // is dropped.
+        if (f->attacker != NULL && critter_is_dead(f->attacker) && f->released) {
+            if ((f->ctd.attackerFlags & ~(DAM_HIT | DAM_CRITICAL)) != 0 || f->ctd.attackerDamage != 0) {
+                f->ctd.attackerFlags &= (DAM_HIT | DAM_CRITICAL);
+                f->ctd.attackerDamage = 0;
+                trace_event(TRACE_COMBAT, "attack-orphaned", "%s pid=%d ->pid=%d elapsed=%.2f t=%.2f",
+                    f->attacker == obj_dude ? "DUDE" : "NPC", f->attacker->pid,
+                    f->defender != NULL ? f->defender->pid : -1, rt_clock - f->started, rt_clock);
+            }
+        } else if (f->attacker != NULL && critter_is_dead(f->attacker)) {
             trace_event(TRACE_COMBAT, "attack-voided",
                 "%s pid=%d ->pid=%d why=attacker-dead elapsed=%.2f t=%.2f",
                 f->attacker == obj_dude ? "DUDE" : "NPC", f->attacker->pid,
@@ -15837,7 +15853,11 @@ void combat_rt_update(float dt)
             bool burst = pose == ANIM_FIRE_BURST || pose == ANIM_FIRE_CONTINUOUS;
             // A gun's action frame is already latched above (actionSeen); a rocket, a bolt or a throw asks.
             bool out = (!burst && (f->actionSeen || ((thrown || explosive) && rt_attack_action_frame_reached(f->attacker))))
-                || (f->tAnimStart >= 0.0f && f->tAnimEnd >= 0.0f);
+                || (f->tAnimStart >= 0.0f && f->tAnimEnd >= 0.0f)
+                // ...or what it fires is visibly in the air: the flight's must-call can run before the
+                // fire pose reaches its action frame (self-played orphan-shot: a rocket launched 0.25 s
+                // after the attack began, the shooter still raising the launcher, and was voided with it).
+                || (explosive && f->projectile != NULL && (f->projectile->flags & OBJECT_HIDDEN) == 0);
             if (out) {
                 f->released = true;
                 if (!hurtsSelf) {
@@ -16012,6 +16032,11 @@ void combat_rt_update(float dt)
                     critter_is_prone(f->ctd.defender) ? 1 : 0, rt_clock);
             }
 
+            if (f->attacker != NULL && critter_is_dead(f->attacker)) {
+                trace_event(TRACE_COMBAT, "orphan-landed", "pid=%d ->pid=%d hit=%d dmg=%d t=%.2f",
+                    f->attacker->pid, f->defender != NULL ? f->defender->pid : -1,
+                    (f->ctd.attackerFlags & DAM_HIT) != 0 ? 1 : 0, f->ctd.defenderDamage, rt_clock);
+            }
             combat_commit_snapshot(&f->ctd, f->callDisplay);
             trace_event(capped ? TRACE_WARN : TRACE_COMBAT, capped ? "resolve-capped" : "resolve",
                 "%s elapsed=%.2f done=%d conn=%d action=%d pose=%d proj=%d capped=%d inflight=%d t=%.2f",
