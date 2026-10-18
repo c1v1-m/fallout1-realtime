@@ -710,6 +710,40 @@ static void tile_render_debug_ring(Rect* rectToUpdate, int elevation)
     }
 }
 
+static TileOverlayFn tile_overlay = NULL;
+
+void tile_set_overlay(TileOverlayFn fn)
+{
+    tile_overlay = fn;
+}
+
+// A one-pixel line into the composited world, clipped to clip (window coordinates, as tile_coord gives).
+void tile_overlay_line(Rect* clip, int x0, int y0, int x1, int y1, int color)
+{
+    int dx = abs(x1 - x0);
+    int dy = -abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (int guard = 0; guard < 4096; guard++) {
+        if (x0 >= clip->ulx && x0 <= clip->lrx && y0 >= clip->uly && y0 <= clip->lry) {
+            buf[y0 * buf_full + x0] = (unsigned char)color;
+        }
+        if (x0 == x1 && y0 == y1) {
+            break;
+        }
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 // 0x49E138
 static void refresh_mapper(Rect* rect, int elevation)
 {
@@ -754,6 +788,9 @@ static void refresh_game(Rect* rect, int elevation)
     bounds_render(&rectToUpdate, elevation);
     obj_render_post_roof(&rectToUpdate, elevation);
     tile_render_debug_ring(&rectToUpdate, elevation);
+    if (tile_overlay != NULL) {
+        tile_overlay(&rectToUpdate, elevation);
+    }
     blit(&rectToUpdate);
 }
 

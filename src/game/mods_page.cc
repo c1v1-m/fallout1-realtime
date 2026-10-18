@@ -84,6 +84,7 @@ enum {
     MODS_FORGIVE_STRAY,
     MODS_CROWD_ROOM,
     MODS_TACTICAL_AI,
+    MODS_PROJECTILES,
     MODS_SCREEN_RES,
     MODS_INTERNAL_RES,
     MODS_COUNT,
@@ -368,6 +369,19 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         2,
     },
     {
+        "Projectiles",
+        { "Vanilla", "Flying" },
+        {
+            "A shot hits or misses the moment it is fired.",
+            "Bullets, bolts and plasma fly: step out of their line and",
+        },
+        {
+            NULL,
+            "they miss. Lasers are almost instant, rockets slow.",
+        },
+        2,
+    },
+    {
         "Screen resolution",
         { "1280x720", "1920x1080", "2560x1440", "Desktop" },
         {
@@ -436,6 +450,7 @@ static_assert(mods_label_is(MODS_MOUSE, "Mouse"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_FORGIVE_STRAY, "Stray hits on allies"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_CROWD_ROOM, "Crowds make room"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_TACTICAL_AI, "Tactical AI"), "MODS row order drifted");
+static_assert(mods_label_is(MODS_PROJECTILES, "Projectiles"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCREEN_RES, "Screen resolution"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_INTERNAL_RES, "Internal resolution"), "MODS row order drifted");
 
@@ -686,6 +701,7 @@ static void mods_load()
     mods_value[MODS_FORGIVE_STRAY] = combat_rt_get_forgive_stray() ? 1 : 0;
     mods_value[MODS_CROWD_ROOM] = combat_rt_get_crowd_make_room() ? 1 : 0;
     mods_value[MODS_TACTICAL_AI] = combat_rt_get_tactical_ai() ? 1 : 0;
+    mods_value[MODS_PROJECTILES] = combat_rt_get_projectiles() ? 1 : 0;
 
     {
         // The OUTPUT the file asks for, matched against the sizes the row offers; anything else
@@ -917,6 +933,13 @@ static void mods_apply(int index)
         bool v = mods_value[index] != 0;
         combat_rt_set_tactical_ai(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TACTICAL_AI_KEY, v ? 1 : 0);
+        break;
+    }
+    case MODS_PROJECTILES: {
+        // DEFAULT ON -- his design ("mít prostě projektily", 2026-10-18). Live: the next shot reads it.
+        bool v = mods_value[index] != 0;
+        combat_rt_set_projectiles(v);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROJECTILES_KEY, v ? 1 : 0);
         break;
     }
     case MODS_HIT_STAGGER: {

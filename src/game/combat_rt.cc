@@ -43,6 +43,7 @@
 #include "game/stat.h"
 #include "game/stat_defs.h"
 #include "game/tile.h"
+#include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
@@ -1316,6 +1317,11 @@ static bool rt_crowd_make_room = true;
 // of a grenade, reloading in cover, searching the last known position, taking a much nearer foe,
 // minding allies in the line of fire. Default ON: his call, 2026-10-17. See the COMBAT AI blocks.
 static bool rt_tactical_ai = true;
+// MODS "Projectiles" (cfg projectiles): bullets fly as tracers and commit on arrival, and every shot that
+// flies checks its line on arrival (rt_projectile_dodge). Default ON, his design (2026-10-18).
+static bool rt_projectiles = true;
+static void rt_tracers_render(Rect* rect, int elevation);
+static void rt_tracers_reset();
 
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
 // prostě vypnout to s tou zbraní, ať se mě neptají při tom konfliktu? zabiju assassina a ještě se jim
@@ -1575,6 +1581,13 @@ struct RtInFlight {
     // that line when it arrives (rt_projectile_dodge).
     int originTile;
     int aimTile;
+
+    // A BULLET (step two of the projectiles, 2026-10-18): a ranged shot with nothing of its own on
+    // screen. It leaves the gun on the action frame (tDischarge) and arrives bulletFlight later; the
+    // tracers (RtTracer) are what the player sees of it.
+    bool bullet;
+    float tDischarge;
+    float bulletFlight;
 };
 #define RT_MAX_INFLIGHT (RT_MAX_ACTORS + 2)
 static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
@@ -1591,6 +1604,12 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->blastRadius = 0;
     f->originTile = f->ctd.attacker != NULL ? f->ctd.attacker->tile : -1;
     f->aimTile = (f->ctd.attackerFlags & DAM_HIT) != 0 && f->ctd.defender != NULL ? f->ctd.defender->tile : f->ctd.tile;
+    f->bullet = rt_projectiles && f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
+        && item_w_subtype(f->ctd.weapon, f->ctd.hitMode) == ATTACK_TYPE_RANGED
+        && item_w_damage_type(f->ctd.weapon) != DAMAGE_TYPE_FIRE // a flamer's stream stays as it is, for now
+        && f->originTile >= 0 && f->aimTile >= 0;
+    f->tDischarge = -1.0f;
+    f->bulletFlight = 0.0f;
     if (f->explosionFid == -1 || f->ctd.attacker == NULL || f->ctd.weapon == NULL) {
         return;
     }
@@ -12208,6 +12227,13 @@ void combat_rt_init()
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_CROWD_MAKE_ROOM_KEY, &crowdRoom);
     rt_crowd_make_room = crowdRoom != 0;
 
+    // Bullets, bolts and balls fly (MODS "Projectiles"). Default ON: his design, 2026-10-18.
+    int projectiles = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROJECTILES_KEY, &projectiles);
+    rt_projectiles = projectiles != 0;
+    tile_set_overlay(rt_tracers_render);
+    rt_tracers_reset();
+
     // The realtime tactics on top of vanilla's rules (MODS "Tactical AI"). Default ON: his call, 2026-10-17.
     int tacticalAi = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TACTICAL_AI_KEY, &tacticalAi);
@@ -14296,10 +14322,12 @@ static float rt_off_line(int origin, int aim, int tile)
     return sqrtf(cx * cx + cy * cy);
 }
 
+static void rt_tracers_fly_on(int serial);
+
 static void rt_projectile_dodge(RtInFlight* f)
 {
     Attack* at = &f->ctd;
-    if ((at->attackerFlags & DAM_HIT) == 0 || at->defender == NULL || at->defender == at->attacker
+    if (!rt_projectiles || (at->attackerFlags & DAM_HIT) == 0 || at->defender == NULL || at->defender == at->attacker
         || FID_TYPE(at->defender->fid) != OBJ_TYPE_CRITTER || f->originTile < 0 || f->aimTile < 0) {
         return;
     }
@@ -14314,6 +14342,219 @@ static void rt_projectile_dodge(RtInFlight* f)
     at->defenderDamage = 0;
     at->defenderFlags = 0;
     at->defenderKnockback = 0;
+    rt_tracers_fly_on(f->serial); // the bullets it dodged fly on past where it stood
+}
+
+// --- BULLETS AS TRACERS (2026-10-18, step two of the projectiles) ---------------------------------
+//
+// A bullet has no art in Fallout -- the gun bangs and the target reacts. So it is drawn: a short bright
+// streak from the shooter's shoulder toward where he aimed, at the gun's speed, one per round of a burst
+// RT_TRACER_STAGGER apart. The hit itself commits when the first round ARRIVES (bulletFlight after the
+// action frame) and runs through rt_projectile_dodge like a plasma ball. Speeds by damage type (his
+// words: bullets very fast, a laser almost instant).
+#define RT_BULLET_SPEED 40.0f        // hexes a second
+#define RT_LASER_BULLET_SPEED 150.0f
+#define RT_ENERGY_BULLET_SPEED 60.0f // electrical, EMP and anything else that is not a bullet or a laser
+#define RT_TRACER_LENGTH 1.2f        // hexes
+#define RT_TRACER_STAGGER 0.05f      // seconds between the rounds of a burst
+#define RT_TRACER_LIFT 30            // pixels: from the feet to the gun
+#define RT_TRACER_FLY_ON 8.0f        // hexes a dodged bullet flies on past where its target stood
+#define RT_MAX_TRACERS 64
+
+typedef struct RtTracer {
+    bool used;
+    int serial; // the RtInFlight it belongs to
+    int elevation;
+    int fromTile;
+    int toTile;
+    int jitterX; // a burst's rounds fan out a little at the far end
+    int jitterY;
+    float t0;
+    float speed;
+    float dist;
+    float past; // hexes past the aim point it flies on (0 = it stops there: it hit)
+    bool painted;
+    Rect last;
+} RtTracer;
+
+static RtTracer rt_tracers[RT_MAX_TRACERS];
+
+static void rt_tracers_reset()
+{
+    memset(rt_tracers, 0, sizeof(rt_tracers));
+}
+
+static float rt_bullet_speed_for(Object* weapon)
+{
+    switch (item_w_damage_type(weapon)) {
+    case DAMAGE_TYPE_NORMAL:
+        return RT_BULLET_SPEED;
+    case DAMAGE_TYPE_LASER:
+        return RT_LASER_BULLET_SPEED;
+    default:
+        return RT_ENERGY_BULLET_SPEED;
+    }
+}
+
+static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation, float t0, float speed, int jx, int jy)
+{
+    for (int i = 0; i < RT_MAX_TRACERS; i++) {
+        RtTracer* tr = &rt_tracers[i];
+        if (tr->used) {
+            continue;
+        }
+        memset(tr, 0, sizeof(*tr));
+        tr->used = true;
+        tr->serial = serial;
+        tr->elevation = elevation;
+        tr->fromTile = fromTile;
+        tr->toTile = toTile;
+        tr->jitterX = jx;
+        tr->jitterY = jy;
+        tr->t0 = t0;
+        tr->speed = speed;
+        int d = tile_dist(fromTile, toTile);
+        tr->dist = d > 0 ? (float)d : 1.0f;
+        return;
+    }
+}
+
+// How many bullet tracers are on screen right now (the self-played runs photograph them).
+int combat_rt_tracers_in_air()
+{
+    int n = 0;
+    for (int i = 0; i < RT_MAX_TRACERS; i++) {
+        if (rt_tracers[i].used && rt_tracers[i].painted && rt_clock >= rt_tracers[i].t0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static void rt_tracers_fly_on(int serial)
+{
+    for (int i = 0; i < RT_MAX_TRACERS; i++) {
+        if (rt_tracers[i].used && rt_tracers[i].serial == serial) {
+            rt_tracers[i].past = RT_TRACER_FLY_ON;
+        }
+    }
+}
+
+// The streak's two ends on screen now; false when it is not in the air (not fired yet, or gone).
+static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, bool* gone)
+{
+    *gone = false;
+    float travelled = (rt_clock - tr->t0) * tr->speed;
+    if (travelled <= 0.0f) {
+        return false;
+    }
+    float end = tr->dist + tr->past;
+    float tail = travelled - RT_TRACER_LENGTH;
+    if (tail >= end) {
+        *gone = true;
+        return false;
+    }
+    float head = travelled < end ? travelled : end;
+    if (tail < 0.0f) {
+        tail = 0.0f;
+    }
+    int ax, ay, bx, by;
+    if (tile_coord(tr->fromTile, &ax, &ay, tr->elevation) == -1 || tile_coord(tr->toTile, &bx, &by, tr->elevation) == -1) {
+        *gone = true;
+        return false;
+    }
+    ax += 16;
+    ay += 8 - RT_TRACER_LIFT;
+    bx += 16 + tr->jitterX;
+    by += 8 - RT_TRACER_LIFT + tr->jitterY;
+    float h = head / tr->dist;
+    float t = tail / tr->dist;
+    *x0 = ax + (int)((bx - ax) * t);
+    *y0 = ay + (int)((by - ay) * t);
+    *x1 = ax + (int)((bx - ax) * h);
+    *y1 = ay + (int)((by - ay) * h);
+    return true;
+}
+
+// The overlay (tile.cc refresh_game): every tracer in the air, clipped to what is being repainted.
+static void rt_tracers_render(Rect* rect, int elevation)
+{
+    int core = colorTable[(31 << 10) | (31 << 5) | 22];
+    int edge = colorTable[(26 << 10) | (20 << 5) | 6];
+    for (int i = 0; i < RT_MAX_TRACERS; i++) {
+        RtTracer* tr = &rt_tracers[i];
+        if (!tr->used || tr->elevation != elevation) {
+            continue;
+        }
+        int x0, y0, x1, y1;
+        bool gone;
+        if (!rt_tracer_segment(tr, &x0, &y0, &x1, &y1, &gone)) {
+            continue;
+        }
+        tile_overlay_line(rect, x0, y0 + 1, x1, y1 + 1, edge);
+        tile_overlay_line(rect, x0, y0, x1, y1, core);
+    }
+}
+
+// Once a frame: repaint where each tracer was and where it is now, and retire the ones that have gone.
+static void rt_tracers_tick()
+{
+    for (int i = 0; i < RT_MAX_TRACERS; i++) {
+        RtTracer* tr = &rt_tracers[i];
+        if (!tr->used) {
+            continue;
+        }
+        int x0, y0, x1, y1;
+        bool gone;
+        bool live = rt_tracer_segment(tr, &x0, &y0, &x1, &y1, &gone);
+        Rect now;
+        if (live) {
+            now.ulx = (x0 < x1 ? x0 : x1) - 2;
+            now.uly = (y0 < y1 ? y0 : y1) - 2;
+            now.lrx = (x0 > x1 ? x0 : x1) + 2;
+            now.lry = (y0 > y1 ? y0 : y1) + 3;
+        }
+        if (tr->elevation == map_elevation) {
+            if (tr->painted) {
+                Rect dirty = tr->last;
+                if (live) {
+                    rect_min_bound(&dirty, &now, &dirty);
+                }
+                tile_refresh_rect(&dirty, tr->elevation);
+            } else if (live) {
+                tile_refresh_rect(&now, tr->elevation);
+            }
+        }
+        if (live) {
+            tr->last = now;
+            tr->painted = true;
+        }
+        if (gone || (!live && tr->painted && rt_clock - tr->t0 > 5.0f)) {
+            tr->used = false;
+        }
+    }
+}
+
+// The action frame: the bullet leaves the gun. Its flight time, and a tracer per round.
+static void rt_bullet_discharge(RtInFlight* f)
+{
+    f->tDischarge = rt_clock;
+    float speed = rt_bullet_speed_for(f->ctd.weapon);
+    int d = tile_dist(f->originTile, f->aimTile);
+    f->bulletFlight = (d > 0 ? (float)d : 1.0f) / speed;
+    int rounds = f->ctd.ammoQuantity > 1 ? f->ctd.ammoQuantity : 1;
+    if (rounds > 12) {
+        rounds = 12;
+    }
+    int elevation = f->ctd.attacker != NULL ? f->ctd.attacker->elevation : map_elevation;
+    for (int r = 0; r < rounds; r++) {
+        int jx = r == 0 ? 0 : roll_random(-6, 6);
+        int jy = r == 0 ? 0 : roll_random(-4, 4);
+        rt_tracer_spawn(f->serial, f->originTile, f->aimTile, elevation, rt_clock + r * RT_TRACER_STAGGER, speed, jx, jy);
+    }
+    trace_event(TRACE_COMBAT, "bullet", "att=%d def=%d dist=%d speed=%.0f flight=%.2f rounds=%d hit=%d t=%.2f",
+        f->ctd.attacker != NULL ? f->ctd.attacker->id : -1, f->ctd.defender != NULL ? f->ctd.defender->id : -1,
+        d, speed, f->bulletFlight, rounds, (f->ctd.attackerFlags & DAM_HIT) != 0 ? 1 : 0, rt_clock);
 }
 
 // ⚠️ A BLAST HURTS WHO IS IN IT WHEN IT GOES OFF, NOT WHEN IT WAS THROWN (2026-10-17). compute_attack
@@ -14815,6 +15056,9 @@ void combat_rt_update(float dt)
         // to. Remembering the frame once seen puts the hit back on the shot.
         if (!thrown && !explosive && !f->actionSeen && rt_attack_action_frame_reached(f->attacker)) {
             f->actionSeen = true;
+            if (f->bullet) {
+                rt_bullet_discharge(f);
+            }
         }
         bool actionReached = !thrown && !explosive && f->actionSeen;
 
@@ -14841,6 +15085,7 @@ void combat_rt_update(float dt)
         if (explosive && f->originTile >= 0 && f->aimTile >= 0) {
             capFor += tile_dist(f->originTile, f->aimTile) * 0.125f;
         }
+        capFor += f->bulletFlight;
         bool capped = elapsed >= capFor;
         // Don't let action-frame / swing-done / connect commit before the swing has had time to play
         // (and its SFX to sound) -- that produced "shadow attacks" (damage + AP, no visible swing)
@@ -14855,16 +15100,25 @@ void combat_rt_update(float dt)
         // sat on this floor until +0.30 s: a quarter of a second between the bang and the hit, on
         // ~60% of his shots. The opening shot of a burst (raise 0.52 s, then fire) was already in
         // sync -- the floor had run out during the raise. Melee and thrown keep the floor.
+        // A BULLET commits when it ARRIVES (step two of the projectiles): bulletFlight after the action
+        // frame. If the action frame never shows (a fire pose that did not register), the swing's end
+        // stands in, as before.
+        bool bulletArrived = f->bullet && f->actionSeen && rt_clock - f->tDischarge >= f->bulletFlight;
+        if (f->bullet) {
+            actionReached = bulletArrived;
+        }
         bool gunFired = actionReached && attackType == ATTACK_TYPE_RANGED;
         bool ready = elapsed >= RT_MIN_SWING_SECONDS || gunFired;
-        bool trigger = explosive ? landed : (swingDone || connected || actionReached || poseEnded);
+        bool trigger = explosive ? landed
+            : f->bullet ? (bulletArrived || (swingDone && !f->actionSeen))
+            : (swingDone || connected || actionReached || poseEnded);
         if ((trigger && ready) || capped) {
             // A blast hurts who is in it NOW (rt_blast_filter); a bolt, a ball or a thrown blade, who
             // is still on its line (rt_projectile_dodge). Before the reaction is chosen.
             if (f->blastRadius > 0) {
                 rt_blast_filter(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
-            } else if (explosive) {
+            } else if (explosive || f->bullet) {
                 rt_projectile_dodge(f);
                 heavyReaction = (f->ctd.defenderFlags & (DAM_DEAD | DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_ON_FIRE)) != 0;
             }
@@ -15010,6 +15264,9 @@ void combat_rt_update(float dt)
     // Grenades in the air first: a fighter that jumps clear registers its run before its own AI
     // decides anything this frame (rt_grenade_dodge_tick).
     rt_grenade_dodge_tick();
+
+    // Bullets in the air: repaint their streaks (rt_tracers_tick).
+    rt_tracers_tick();
 
     for (int i = 0; i < rt_actor_count; i++) {
         rt_update_actor(&rt_actors[i], dt);
@@ -16560,6 +16817,16 @@ bool combat_rt_get_crowd_make_room()
 void combat_rt_set_tactical_ai(bool enabled)
 {
     rt_tactical_ai = enabled;
+}
+
+void combat_rt_set_projectiles(bool enabled)
+{
+    rt_projectiles = enabled;
+}
+
+bool combat_rt_get_projectiles()
+{
+    return rt_projectiles;
 }
 
 bool combat_rt_get_tactical_ai()

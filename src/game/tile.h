@@ -35,6 +35,12 @@ int tile_roof_visible();
 // Debug overlay: draw a red ring at the given hex-tile radius around obj_dude (0 = off)
 // to visualize a tile distance in-world. See tile_render_debug_ring.
 void tile_debug_ring_set(int radius);
+
+// Something drawn over the world after it is composited, clipped to the rect being refreshed (combat_rt's
+// bullet tracers). The callback draws with tile_overlay_line; call tile_refresh_rect to move it.
+typedef void (*TileOverlayFn)(Rect* rect, int elevation);
+void tile_set_overlay(TileOverlayFn fn);
+void tile_overlay_line(Rect* clip, int x0, int y0, int x1, int y1, int color);
 int tile_debug_ring_get();
 
 int tile_coord(int tile, int* x, int* y, int elevation);

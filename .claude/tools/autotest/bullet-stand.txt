@@ -1,0 +1,16 @@
+# Bullets fly at 40 hexes a second (step two of the projectiles): how many can a player who sees
+# the aim (reaction 0.3 s) sidestep? A raider with a 10mm pistol 12 tiles off.
+name bullet-stand
+map DESERT1.MAP
+seed 1
+duration 40
+reaction 0.3
+
+dude tile 20100 rot 2
+dude stat AG 8
+dude stat EN 8
+dude hp 3000
+
+spawn 16777291 22500 rot 5 wield 8 item 29 6 hostile
+
+at 0 idle

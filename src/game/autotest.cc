@@ -29,6 +29,7 @@
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
+#include "plib/gnw/input.h"
 #include "plib/gnw/winmain.h"
 
 namespace fallout {
@@ -69,6 +70,8 @@ namespace fallout {
 //        dodge                         stand (saving AP) and, the moment an attack at him is under way,
 //                                      run sideways for 1.2 s -- a player who sees the shot coming
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
+//   shots <n>                          up to n screenshots (screenshots/scrNNNNN.bmp beside the exe),
+//                                      each taken while a bullet tracer is in the air, 1 s apart
 //   projectile_speedup <x>             how much faster than its art a rocket / plasma / laser flies
 //                                      (the game's own is 4)
 //
@@ -123,6 +126,10 @@ static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
 static float at_projectile_speedup = -1.0f;
+static int at_shots_wanted = 0;
+static int at_shots_taken = 0;
+static float at_shot_next = 0.0f;
+static float at_shot_due = -1.0f;
 static float at_duration = 60.0f;
 static int at_dude_tile = -1;
 static int at_dude_rotation = -1;
@@ -254,6 +261,8 @@ static bool at_parse(const char* path)
             at_team = atoi(tok[1]);
         } else if (strcmp(tok[0], "reaction") == 0 && n >= 2) {
             at_reaction = (float)atof(tok[1]);
+        } else if (strcmp(tok[0], "shots") == 0 && n >= 2) {
+            at_shots_wanted = atoi(tok[1]);
         } else if (strcmp(tok[0], "projectile_speedup") == 0 && n >= 2) {
             at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
@@ -874,6 +883,19 @@ void autotest_tick(float dt)
     } else {
         at_stick_still();
         at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+    }
+
+    // A photograph of the bullets (scenario "shots").
+    // A bullet is first drawn inside the shooter's own sprite; 0.12 s on it is a third of the way there.
+    if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && combat_rt_tracers_in_air() > 0 && at_shot_due < 0.0f) {
+        at_shot_due = at_elapsed + 0.12f;
+    }
+    if (at_shot_due >= 0.0f && at_elapsed >= at_shot_due) {
+        at_shot_due = -1.0f;
+        dump_screen();
+        at_shots_taken++;
+        at_shot_next = at_elapsed + 1.0f;
+        trace_event(TRACE_FLOW, "autotest", "shot n=%d at=%.2f tracers=%d", at_shots_taken, at_elapsed, combat_rt_tracers_in_air());
     }
 
     // The end.
