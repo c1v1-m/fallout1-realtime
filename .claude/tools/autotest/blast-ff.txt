@@ -1,0 +1,25 @@
+# Friendly fire from explosives: three knife raiders rush the dude while a super mutant with a rocket
+# launcher stands behind them. The dude is tough enough to last, so the raiders end up beside him and
+# the rocket has to decide. Good: a careful mutant (INT roll) holds while a raider is in the blast
+# ([FLOW/ff-care] blast=3 hold=1). Bad: rockets into its own men (airep "friendly fire").
+name blast-ff
+map DESERT1.MAP
+seed 1
+duration 45
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude stat EN 8
+dude hp 400
+dude skill small_guns 60
+dude armor 17
+dude wield 8
+dude item 29 6
+
+spawn 16777291 21700 rot 5 wield 4 hostile
+spawn 16777291 21696 rot 5 wield 4 hostile
+spawn 16777291 21704 rot 5 wield 4 hostile
+spawn 16777225 23300 rot 5 wield 13 item 14 8 hostile
+
+at 0 fight

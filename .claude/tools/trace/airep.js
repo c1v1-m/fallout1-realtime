@@ -188,7 +188,10 @@ for (const fight of fights) {
                     const lastSnap = fsnaps.find(sn => sn.s >= e.s) || fsnaps[fsnaps.length - 1];
                     const vf = lastSnap ? lastSnap.npcs.get(def) : null;
                     const af = lastSnap ? lastSnap.npcs.get(att) : null;
-                    if (vf && af && vf.host === '1' && af.host === '1') {
+                    // Same team when the trace says (team= since 2026-10-18), else both hostile to the dude.
+                    const sameSide = vf && af && (vf.team !== undefined && af.team !== undefined
+                        ? vf.team === af.team : vf.host === '1' && af.host === '1');
+                    if (sameSide) {
                         n.ff++;
                         issue(2, e.s, att, `friendly fire: hit its ally ${label(def)} for ${dmg}`);
                     }

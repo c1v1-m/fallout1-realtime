@@ -48,7 +48,8 @@ namespace fallout {
 //   dude item <pid> [qty]
 //   dude wield <pid>                   added and put in the active hand, loaded
 //   dude armor <pid>
-//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile]
+//   team <n>                           the team every hostile spawn joins (default: the first one's)
+//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
 //   at <seconds> <policy> [tile]       the bot's plan; policies:
 //        idle                          do nothing
@@ -89,6 +90,7 @@ typedef struct AtSpawn {
     AtItem items[AT_MAX_ITEMS];
     int itemCount;
     bool hostile;
+    int team;
     Object* obj;
 } AtSpawn;
 
@@ -116,6 +118,7 @@ static int at_dude_hp = -1;
 static int at_dude_armor = -1;
 static AtSpawn at_spawns[AT_MAX_SPAWNS];
 static int at_spawn_count = 0;
+static int at_team = -1; // the team every hostile spawn joins (-1 = the first hostile spawn's own)
 static AtPhase at_phases[AT_MAX_PHASES];
 static int at_phase_count = 0;
 
@@ -223,6 +226,8 @@ static bool at_parse(const char* path)
             SDL_strlcpy(at_name, tok[1], sizeof(at_name));
         } else if (strcmp(tok[0], "map") == 0 && n >= 2) {
             SDL_strlcpy(at_map_name, tok[1], sizeof(at_map_name));
+        } else if (strcmp(tok[0], "team") == 0 && n >= 2) {
+            at_team = atoi(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "seed") == 0 && n >= 2) {
@@ -263,6 +268,7 @@ static bool at_parse(const char* path)
             sp->tile = atoi(tok[2]);
             sp->rotation = -1;
             sp->wield = -1;
+            sp->team = -1;
             for (int i = 3; i < n; i++) {
                 if (strcmp(tok[i], "rot") == 0 && i + 1 < n) {
                     sp->rotation = atoi(tok[++i]);
@@ -275,6 +281,8 @@ static bool at_parse(const char* path)
                     i += 2;
                 } else if (strcmp(tok[i], "hostile") == 0) {
                     sp->hostile = true;
+                } else if (strcmp(tok[i], "team") == 0 && i + 1 < n) {
+                    sp->team = atoi(tok[++i]);
                 }
             }
         } else if (strcmp(tok[0], "at") == 0 && n >= 3 && at_phase_count < AT_MAX_PHASES) {
@@ -464,12 +472,25 @@ void autotest_setup_world()
             at_wield(critter, sp->wield, HAND_RIGHT);
         }
         sp->obj = critter;
+
+        // ONE SIDE: raiders (team 1) and a super mutant (team 6) spawned together are not allies to the
+        // engine, so friendly-fire care, guard joins and the squad rules would not see each other. A real
+        // map keeps one place's fighters in one team; the scenario does the same unless told otherwise.
+        if (sp->team >= 0) {
+            critter->data.critter.combat.team = sp->team;
+        } else if (sp->hostile) {
+            if (at_team < 0) {
+                at_team = critter->data.critter.combat.team;
+            }
+            critter->data.critter.combat.team = at_team;
+        }
         if (sp->hostile) {
             // As a script's "attack the player" does: hostile, but it still has to perceive you.
             combat_rt_notify_attack(critter, obj_dude);
         }
-        trace_event(TRACE_FLOW, "autotest-spawn", "id=%d pid=%d tile=%d wield=%d hostile=%d hp=%d",
-            critter->id, critter->pid, critter->tile, sp->wield, sp->hostile ? 1 : 0, critter->data.critter.hp);
+        trace_event(TRACE_FLOW, "autotest-spawn", "id=%d pid=%d tile=%d wield=%d hostile=%d team=%d hp=%d",
+            critter->id, critter->pid, critter->tile, sp->wield, sp->hostile ? 1 : 0, critter->data.critter.combat.team,
+            critter->data.critter.hp);
     }
 
     trace_event(TRACE_FLOW, "autotest", "start scenario=%s file=%s map=%s seed=%d duration=%.0f dude=%d spawns=%d pad=%d",

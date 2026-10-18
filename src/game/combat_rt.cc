@@ -607,6 +607,7 @@ typedef struct RtActor {
     float search_look_at;
     float retarget_check_at; // next look for a much nearer enemy (rt_retarget_nearer)
     float ff_check_until; // friendly-fire care: no new roll before this (rt_ff_care)
+    float ff_hold_until; // a careful one holding its rocket/grenade while a friend is in the blast
     int attack_loc; // the intent's hit location (HIT_LOCATION_UNCALLED unless a called shot)
     // It is following a route round a wall (or round what blocks its shot): until this, the straight
     // step does not take it back. See RT_DETOUR_COMMIT_SECONDS.
@@ -8906,6 +8907,7 @@ static void rt_refresh_registry()
             a->search_look_at = prev->search_look_at;
             a->retarget_check_at = prev->retarget_check_at;
             a->ff_check_until = prev->ff_check_until;
+            a->ff_hold_until = prev->ff_hold_until;
             prevHostile = prev->hostile;
         } else {
             a->state = RT_IDLE;
@@ -8979,6 +8981,7 @@ static void rt_refresh_registry()
             a->search_look_at = 0.0f;
             a->retarget_check_at = 0.0f;
             a->ff_check_until = 0.0f;
+            a->ff_hold_until = 0.0f;
             a->run_winded = false;
             a->breather = false;
             a->breather_since = -1.0f;
@@ -9815,19 +9818,82 @@ static Object* rt_ally_in_line(Object* shooter, int fromTile, Object* target)
     return NULL;
 }
 
-// True when it stepped aside (this beat is spent).
+// ⚠️ A BLAST HURTS WHOEVER STANDS NEAR THE TARGET, NOT ONLY WHOEVER STANDS IN THE LINE (2026-10-18,
+// seen in the self-played city-hide run: a super mutant's rocket went into the dude with its own
+// flamer-mutant beside him and hit it for 15). The same INT x 10 % roll as the line: a careful one
+// holds the shot while a friend is inside the radius, for as long as the roll holds (RT_FF_PAUSE_SECONDS), a dim one
+// fires anyway, as vanilla would. Radius as rt_inflight_init_blast: a grenade 2, a rocket 3.
+
+static int rt_blast_radius_of(Object* npc, Object* weapon, int attackMode)
+{
+    int damageType = item_w_damage_type(weapon);
+    bool thrown = item_w_anim(npc, attackMode) == ANIM_THROW_ANIM;
+    if (thrown) {
+        return damageType == DAMAGE_TYPE_EXPLOSION || damageType == DAMAGE_TYPE_PLASMA || damageType == DAMAGE_TYPE_EMP ? 2 : 0;
+    }
+    return damageType == DAMAGE_TYPE_EXPLOSION ? 3 : 0;
+}
+
+// The first live friend of the shooter (its team; the dude for a companion) within the radius of the target.
+static Object* rt_ally_in_blast(Object* shooter, Object* target, int radius)
+{
+    int team = shooter->data.critter.combat.team;
+    if (obj_dude != NULL && target != obj_dude && obj_dude->data.critter.combat.team == team
+        && obj_dude->elevation == target->elevation && tile_dist(obj_dude->tile, target->tile) <= radius) {
+        return obj_dude;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* c = rt_actors[i].obj;
+        if (c == NULL || c == shooter || c == target || critter_is_dead(c)
+            || c->data.critter.combat.team != team || c->elevation != target->elevation) {
+            continue;
+        }
+        if (tile_dist(c->tile, target->tile) <= radius) {
+            return c;
+        }
+    }
+    return NULL;
+}
+
+// True when it stepped aside, or is holding a blast off a friend (this beat is spent).
 static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
 {
-    if (rt_clock < a->ff_check_until || a->target == NULL) {
+    if (a->target == NULL) {
         return false;
     }
     Object* weapon = item_hit_with(npc, attackMode);
-    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON
-        || item_w_subtype(weapon, attackMode) != ATTACK_TYPE_RANGED) {
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON) {
+        return false;
+    }
+    int subtype = item_w_subtype(weapon, attackMode);
+    int radius = rt_blast_radius_of(npc, weapon, attackMode);
+    if (subtype != ATTACK_TYPE_RANGED && !(subtype == ATTACK_TYPE_THROW && radius > 0)) {
         return false;
     }
     Object* target = a->target;
+
+    // Already holding: for as long as a friend is still in the way or in the blast and the hold has time left.
+    if (rt_clock < a->ff_hold_until) {
+        if (radius > 0 && (rt_ally_in_blast(npc, target, radius) != NULL || rt_ally_in_line(npc, npc->tile, target) != NULL)) {
+            return true;
+        }
+        a->ff_hold_until = 0.0f;
+    }
+    if (rt_clock < a->ff_check_until) {
+        return false;
+    }
+
+    // An explosive with a friend in the line goes off ON that friend, and one with a friend beside the
+    // target takes it along: either way stepping aside does not help (self-played blast-ff: a careful
+    // mutant found no spot, fired anyway, and the rocket burst on the raider in front). It holds.
     Object* ally = rt_ally_in_line(npc, npc->tile, target);
+    bool blast = false;
+    if (radius > 0) {
+        if (ally == NULL) {
+            ally = rt_ally_in_blast(npc, target, radius);
+        }
+        blast = ally != NULL;
+    }
     if (ally == NULL) {
         return false;
     }
@@ -9836,6 +9902,16 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
     int intelligence = stat_level(npc, STAT_INTELLIGENCE);
     int roll = roll_random(1, 10);
     bool careful = roll <= intelligence;
+
+    if (blast) {
+        // Stepping aside does not help: the friend is at the far end. A careful one waits for it to move.
+        if (careful) {
+            a->ff_hold_until = a->ff_check_until; // the whole time this roll stands, not one beat
+        }
+        trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d blast=%d int=%d roll=%d careful=%d hold=%d t=%.2f",
+            npc->id, npc->pid, ally->id, radius, intelligence, roll, careful ? 1 : 0, careful ? 1 : 0, rt_clock);
+        return careful;
+    }
 
     int dest = -1;
     int destSteps = 0;
@@ -16217,7 +16293,7 @@ void combat_rt_trace_snapshot()
         Object* tgt = a->target;
         trace_event(TRACE_STATE, "critter",
             "id=%d pid=%d tile=%d x=%d y=%d fid=%08x anim=%d frame=%d flat=%d hid=%d dead=%d prone=%d busy=%d rx=%s "
-            "st=%d host=%d frnd=%d tgt=%d dist=%d ap=%d int=%s",
+            "st=%d host=%d frnd=%d tgt=%d dist=%d ap=%d int=%s team=%d",
             o->id, o->pid, o->tile, o->x, o->y, o->fid,
             FID_ANIM_TYPE(o->fid), o->frame,
             (o->flags & OBJECT_FLAT) != 0 ? 1 : 0,
@@ -16226,7 +16302,7 @@ void combat_rt_trace_snapshot()
             rt_react_name(rt_reaction_kind(o)),
             a->state, a->hostile ? 1 : 0, a->friendly ? 1 : 0,
             tgt != NULL ? tgt->id : 0,
-            tgt != NULL ? obj_dist(o, tgt) : -1, a->ap, rt_intent_names[a->intent]);
+            tgt != NULL ? obj_dist(o, tgt) : -1, a->ap, rt_intent_names[a->intent], o->data.critter.combat.team);
     }
 }
 
