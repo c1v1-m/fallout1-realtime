@@ -502,6 +502,10 @@ int gmouse_is_scrolling()
 }
 
 // 0x443274
+// ⚠️ SET WHILE gameMouseRefreshImmediately RUNS, i.e. from INSIDE a db read (2026-10-19, "když jsem kliknul
+// několikrát Áčkem na load, tak hra spadla"). See there.
+static bool gmouse_in_db_refresh = false;
+
 void gmouse_bk_process()
 {
     // 0x595214
@@ -665,6 +669,12 @@ void gmouse_bk_process()
         }
 
         break;
+    }
+
+    // Nothing below may redraw the world from inside a db read (gmouse_in_db_refresh): the hex cursor's
+    // move and the hover test both repaint, and painting needs protos that are read from the same disk.
+    if (gmouse_in_db_refresh) {
+        return;
     }
 
     Rect r1;
@@ -2708,6 +2718,20 @@ void gmouse_remove_item_outline(Object* object)
 
 void gameMouseRefreshImmediately()
 {
+    // ⚠️ IT RUNS INSIDE A DB READ, SO IT MUST NOT DRAW THE WORLD (2026-10-19, trace_2026-10-19_204959: a
+    // load pressed with A a few times crashed, ACCESS_VIOLATION read 0x18). map_load_file registers this
+    // as the db callback (every 8 KB read) and turns tile refresh back on BEFORE unregistering it, so its
+    // last steps -- obj_set_rotation / tile_refresh_display -- paint objects, painting loads protos from
+    // disk, the read calls back here, and the A presses had moved the cursor: gmouse_bk_process moved the
+    // hex cursor and repainted, which loaded another proto from INSIDE the first one's read --
+    // proto_ptr -> proto_list_str -> db_fgets -> db_fgetc -> here -> refresh_game -> proto_ptr, several
+    // levels deep, until a half-read list handed back NULL. The cursor's own animation needs no world
+    // redraw, so from here gmouse_bk_process stops short of the hex cursor (gmouse_in_db_refresh), and
+    // a nested call does nothing at all.
+    if (gmouse_in_db_refresh) {
+        return;
+    }
+    gmouse_in_db_refresh = true;
     gmouse_bk_process();
 
     // ⚠️ AT MOST ~20 PRESENTS A SECOND. This runs every 8 KB a map load reads (map, protos, every
@@ -2720,6 +2744,7 @@ void gameMouseRefreshImmediately()
         lastPresent = now;
         renderPresent();
     }
+    gmouse_in_db_refresh = false;
 }
 
 } // namespace fallout
