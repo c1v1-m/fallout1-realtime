@@ -634,6 +634,7 @@ typedef struct RtActor {
     float ow_in_at;           // when it reached the post; < 0 = still on its way
     int ow_hp;                // its hit points then (a hit ends the wait)
     bool ow_done;             // decided about this approach; reset when the line opens
+    float exposed_check_at;   // next look at whether it stands in its target's sights without a shot (rt_exposed_step)
     float heal_left;          // HP of a drug still coming in (rt_heal_tick)
     int heal_lent;            // ...of which lent to its HP for a save (combat_rt_heal_lend_for_save)
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
@@ -9400,6 +9401,7 @@ static void rt_refresh_registry()
             a->ow_in_at = prev->ow_in_at;
             a->ow_hp = prev->ow_hp;
             a->ow_done = prev->ow_done;
+            a->exposed_check_at = prev->exposed_check_at;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9495,6 +9497,7 @@ static void rt_refresh_registry()
             a->ow_in_at = -1.0f;
             a->ow_hp = 0;
             a->ow_done = false;
+            a->exposed_check_at = 0.0f;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;
@@ -11070,6 +11073,91 @@ static bool rt_walk_to(Object* npc, int dest, const char* why, bool run)
     return rc == 0 && anim_last_path_steps(npc) != 0;
 }
 
+// --- COMBAT AI: NOT STANDING IN HIS SIGHTS WITHOUT A SHOT (2026-10-19, MODS "Tactical AI") -----------
+//
+// trace_2026-10-19_235254, his "Já fakt jen stojím a tohle se děje": he stood in a corner and nine
+// super mutants died at one and two tiles from him, one shot each, for 10 HP in return. They came
+// round out of breath and stopped to catch it (the breather) right in front of him -- 2665 for 1.5 s
+// -- because from where they stood they had no line to him. HE had one to them: Fallout's straight
+// lines are not symmetric, and round a corner one end can see the other and not the other way round.
+// His pick, "Nestát ti na ránu": a chaser its target can shoot, that cannot shoot back from where it
+// stands, does not stay there. With the AP for a shot it steps (up to 2 tiles) to where it has its own
+// line and fires; without them -- or with nowhere to shoot from -- it backs (up to 3 tiles, no nearer)
+// out of the target's line, and the breather holds it there instead. A melee fighter only does the
+// second, and only while winded: closing in is its way to a shot. Looked at twice a second.
+#define RT_EXPOSED_DIST 15
+#define RT_EXPOSED_CHECK 0.5f
+
+static bool rt_exposed_step(RtActor* a, Object* npc, int mode, int range)
+{
+    Object* target = a->target;
+    if (target == NULL || a->fleeing || !rt_can_walk(npc) || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    if (rt_clock < a->exposed_check_at) {
+        return false;
+    }
+    a->exposed_check_at = rt_clock + RT_EXPOSED_CHECK;
+
+    int dist = obj_dist(npc, target);
+    if (dist <= 1 || dist > RT_EXPOSED_DIST) {
+        return false;
+    }
+    if (combat_is_shot_blocked(target, target->tile, npc->tile, npc, NULL)) {
+        return false; // out of its sights
+    }
+    if (!rt_shot_blocked(npc, target, mode)) {
+        return false; // it has a shot of its own: the attack test takes it
+    }
+    bool melee = range <= 1;
+    if (melee && !a->breather) {
+        return false;
+    }
+    int cost = rt_ap_cost(npc, mode);
+    bool toLine = !melee && a->ap >= cost;
+
+    for (int pass = toLine ? 0 : 1; pass < 2; pass++) {
+        bool line = pass == 0;
+        int tiles[64];
+        int count = rt_tiles_around(npc->tile, line ? 2 : 3, tiles, 64);
+        int best = -1;
+        int bestSteps = 0;
+        for (int i = 1; i < count; i++) {
+            int t = tiles[i];
+            if (t == target->tile || obj_blocking_at(npc, t, npc->elevation) != NULL) {
+                continue;
+            }
+            int fromTarget = tile_dist(t, target->tile);
+            if (line) {
+                if (fromTarget > range || combat_is_shot_blocked(npc, t, target->tile, target, NULL)) {
+                    continue;
+                }
+            } else if (fromTarget < dist || !combat_is_shot_blocked(target, target->tile, t, NULL, NULL)) {
+                continue;
+            }
+            int steps = make_path_capped(npc, npc->tile, t, NULL, 1, 200);
+            if (steps <= 0 || steps > tile_dist(npc->tile, t) + 2) {
+                continue;
+            }
+            if (best == -1 || steps < bestSteps) {
+                best = t;
+                bestSteps = steps;
+            }
+        }
+        if (best == -1) {
+            continue;
+        }
+        bool moved = rt_walk_to(npc, best, line ? "exposed-line" : "exposed-cover", false);
+        trace_event(TRACE_FLOW, "exposed", "id=%d pid=%d act=%s from=%d to=%d dist=%d ap=%d cost=%d winded=%d moved=%d t=%.2f",
+            npc->id, npc->pid, line ? "line" : "cover", npc->tile, best, dist, a->ap, cost, a->breather ? 1 : 0,
+            moved ? 1 : 0, rt_clock);
+        return moved;
+    }
+    trace_event(TRACE_FLOW, "exposed", "id=%d pid=%d act=none dist=%d ap=%d cost=%d t=%.2f", npc->id, npc->pid, dist,
+        a->ap, cost, rt_clock);
+    return false;
+}
+
 // --- COMBAT AI: GOING ROUND, AND SPREADING OUT (2026-10-18, MODS "Tactical AI") -------------------
 //
 // His report from Mariposa: "šli za sebou a žádný flankování" -- ten super mutants came down one
@@ -12207,7 +12295,13 @@ static void rt_update_actor(RtActor* a, float dt)
         bool breatherAllowed = a->state == RT_CHASE && !a->fleeing
             && npcEnemyDist >= 0 && npcEnemyDist <= rt_npc_breather_tiles;
 
-        if (npcInFight && breatherAllowed && !a->breather && a->ap <= reserve) {
+        // ⚠️ NOT WITH A FULL POOL (2026-10-19, trace_2026-10-19_235254). A critter whose weapon costs its
+        // whole pool (a 6 AP Gatling laser on a 6 AP mutant) has reserve == maximum: it latched at 6 <= 6,
+        // its target clamped to the same 6 (below) let it out "recovered" on the next frame, and it
+        // latched again -- in and out every frame, 0.02 s apiece, two tiles from him (2832, 25.3-25.8).
+        // Full means nothing to wait for.
+        if (npcInFight && breatherAllowed && !a->breather && a->ap <= reserve
+            && a->ap < stat_level(npc, STAT_MAXIMUM_ACTION_POINTS)) {
             a->breather = true;
             a->breather_since = rt_clock;
             a->wipe_pending = true; // out of breath: wipes its forehead once its step ends (rt_wipe_forehead)
@@ -12793,6 +12887,11 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->corner_hold_start = -1.0f;
                 rt_ow_drop(a, npc, "sees", false); // ...and so is the next post, on a new roll
                 a->tactic_roll = 0;
+            } else if (rt_tactical_ai && rt_exposed_step(a, npc, mode, range)) {
+                // In its target's sights without a shot of its own: a step to a line, or out of sight
+                // (rt_exposed_step). Moving is not failing to route.
+                rt_intent_hint(a, RT_INTENT_REPOSITION, "exposed", 1.5f);
+                a->no_path_since = -1.0f;
             } else if (a->breather) {
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
                 // place it does anything, and what it suppresses is MOVEMENT ONLY.
