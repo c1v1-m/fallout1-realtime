@@ -77,6 +77,7 @@ namespace fallout {
 //                                      sideways for 0.8 s (turning each time) -- shoot and move
 //        heal                          press LB (the heal slot) once, then stand
 //        use                           press A (the interact prompt's use) once, then stand
+//        healhold                      hold LB down for the whole phase
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
@@ -109,9 +110,10 @@ enum {
     AT_SHOOT_MOVE,
     AT_HEAL,
     AT_USE,
+    AT_HEAL_HOLD,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal", "use" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal", "use", "healhold" };
 
 typedef struct AtItem {
     int pid;
@@ -982,6 +984,16 @@ void autotest_tick(float dt)
             at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
             break;
         }
+        case AT_HEAL_HOLD:
+            // LB held down for as long as this phase lasts (the release comes with the next phase).
+            at_stick_still();
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+            at_tap_frames[SDL_CONTROLLER_BUTTON_LEFTSHOULDER] = 3;
+            if (at_shots == 0) {
+                at_shots = 1;
+                trace_event(TRACE_FLOW, "autotest", "heal-hold at=%.2f hp=%d ap=%d", at_elapsed, critter_get_hits(obj_dude), combat_rt_player_ap());
+            }
+            break;
         case AT_USE:
             // One press of A (use what the interact prompt points at), then stand.
             at_stick_still();

@@ -266,6 +266,7 @@ typedef struct AnimationSad {
     int field_1C; // length of field_28
     int field_20; // current index in field_28
     int field_24;
+    int startFrame; // > 0: the animation's first tick jumps here (anim_set_start_frame)
     union {
         unsigned char rotations[3200];
         StraightPathNode field_28[200];
@@ -3778,6 +3779,10 @@ static void object_straight_move(int index)
 }
 
 // 0x417320
+// The start-frame bracket (anim_set_start_frame, below).
+static Object* anim_start_frame_obj = NULL;
+static int anim_start_frame_value = 0;
+
 static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int flags)
 {
     if (curr_sad == ANIMATION_SAD_LIST_CAPACITY) {
@@ -3806,6 +3811,7 @@ static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int f
     sad_entry->ticksPerFrame = compute_tpf(obj, sad_entry->fid);
     sad_entry->field_20 = 0;
     sad_entry->field_1C = 0;
+    sad_entry->startFrame = obj == anim_start_frame_obj && (flags & ANIM_SAD_REVERSE) == 0 ? anim_start_frame_value : 0;
 
     curr_sad++;
 
@@ -3979,6 +3985,21 @@ void object_animate()
                 Rect v19;
                 obj_offset(object, x + frameX, y + frameY, &v19);
                 rect_min_bound(&dirtyRect, &v19, &dirtyRect);
+
+                // Started part way in (anim_set_start_frame): through the skipped frames the way the
+                // forward ticks go, one frame and its hot-spot offset at a time.
+                if (sad_entry->startFrame > 0 && (sad_entry->flags & ANIM_SAD_REVERSE) == 0) {
+                    int last = art_frame_max_frame(art) - 1;
+                    int target = sad_entry->startFrame < last ? sad_entry->startFrame : last;
+                    while (object->frame < target) {
+                        obj_inc_frame(object, &v19);
+                        rect_min_bound(&dirtyRect, &v19, &dirtyRect);
+                        art_frame_hot(art, object->frame, object->rotation, &frameX, &frameY);
+                        obj_offset(object, frameX, frameY, &v19);
+                        rect_min_bound(&dirtyRect, &v19, &dirtyRect);
+                    }
+                    sad_entry->startFrame = 0;
+                }
 
                 art_ptr_unlock(cacheHandle);
             } else {
@@ -4558,6 +4579,18 @@ static Object* anim_injection_timing_obj = NULL;
 void anim_set_injection_timing(Object* critter)
 {
     anim_injection_timing_obj = critter;
+}
+
+// START AN ANIMATION PART WAY IN (2026-10-19, the held-LB heal chain: "kus animace píchnutí znova").
+// A bracket like the timing ones: set around the register_end that starts the animation, and the
+// ANIMATE description that begins for this critter inside it starts at that frame instead of 0 --
+// object_animate's first tick steps the body through the skipped frames exactly as the forward ticks
+// would (frame + its hot-spot offset), so the pose lands where the full animation would have had it.
+// A call registered after it counts its delay from there. Out of the bracket: (NULL, 0).
+void anim_set_start_frame(Object* critter, int frame)
+{
+    anim_start_frame_obj = critter;
+    anim_start_frame_value = frame;
 }
 
 // THE RELOAD ITSELF, registered inside an open register_begin..register_end: the weapon's STAND

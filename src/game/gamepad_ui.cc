@@ -3354,6 +3354,24 @@ static bool gpui_inject_pending = false; // a jab is playing and has not reached
 static int gpui_inject_pid = -1;
 static int gpui_inject_ap = 0;
 static unsigned int gpui_inject_at = 0;
+
+// ⚠️ HOLD THE SLOT, KEEP HEALING -- LIKE ESTUS (2026-10-19, his: "něco jako souls když pije hráč estus
+// flašky. Nejdřív se napije - animace zvednutí ruky a pak další estus je hlt z flašky. Tak v tomto
+// případě se zahraje kus animace píchnutí znova a tak dude se znovu healne" -- "a to nebude stát AP,
+// když už se to healuje po několikáté"). A drug taken from a quick slot whose button is STILL HELD at
+// the jab's action frame is followed, GPUI_CHAIN_DELAY_MS later, by the next one: the hand stays up
+// and only the jab plays again -- the injection animation from GPUI_CHAIN_BACK_FRAMES before its
+// action frame (anim_set_start_frame). The first one paid the pack's price (gpui_pack_cost); the
+// ones after it are free, as everything you take inside the open inventory is. It ends when the
+// button comes up, when nothing is left in the slot to take, at full health (hit points plus the heal
+// still coming in, combat_rt_heal_left -- holding on would only waste them), or when a hit cuts the
+// jab (gpui_inject_tick). The keyboard reports no release, so H never chains.
+#define GPUI_CHAIN_BACK_FRAMES 3
+#define GPUI_CHAIN_DELAY_MS 120
+static int gpui_quick_use_slot = -1;     // the quick slot gpui_quick_use is being called for, else -1
+static int gpui_chain_slot = -1;         // the slot whose held button drives the chain; -1 = none
+static unsigned int gpui_chain_due_at = 0; // when the next one is asked for; 0 = not now
+static int gpui_chain_count = 0;          // follow-ups in this chain
 // The explosive put-down (gpui_place_explosive).
 static bool gpui_place_pending = false;
 static Object* gpui_place_item = NULL; // compared against the pack's pointers only, until dropped
@@ -3419,6 +3437,13 @@ static int gpui_inject_done(void* a1, void* a2)
         return 0;
     }
 
+    if (gpui_chain_slot != -1) {
+        gpui_chain_due_at = get_time() + GPUI_CHAIN_DELAY_MS; // gpui_heal_chain_tick decides then
+        if (gpui_chain_due_at == 0) {
+            gpui_chain_due_at = 1;
+        }
+    }
+
     trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d pool=%d ap=%d cost=%d qp=%d lock=%ums fight=%d jab=%ums",
         gpui_inject_pid, hpBefore, critter_get_hits(obj_dude), combat_rt_heal_left(), combat_rt_player_ap(),
         gpui_inject_ap, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0,
@@ -3428,16 +3453,27 @@ static int gpui_inject_done(void* a1, void* a2)
 
 // Starts the jab. False = it could not register (he is in another live sequence -- a swing, a walk
 // segment -- or a transaction is open), and the caller takes the drug at once, as before.
-static bool gpui_inject_start(Object* item, int apCost)
+// followUp: the next one of a held-slot chain -- only the jab, from GPUI_CHAIN_BACK_FRAMES before the
+// action frame (see gpui_chain_slot).
+static bool gpui_inject_start(Object* item, int apCost, bool followUp = false)
 {
     int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_MAGIC_HANDS_MIDDLE,
         (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
     int actionFrame = 0;
+    int frames = 0;
     CacheEntry* handle;
     Art* art = art_ptr_lock(fid, &handle);
     if (art != NULL) {
         actionFrame = art_frame_action_frame(art);
+        frames = art_frame_max_frame(art);
         art_ptr_unlock(handle);
+    }
+    int startFrame = 0;
+    if (followUp) {
+        startFrame = actionFrame - GPUI_CHAIN_BACK_FRAMES;
+        if (startFrame < 0) {
+            startFrame = 0;
+        }
     }
 
     if (register_begin(ANIMATION_REQUEST_RESERVED) != 0) {
@@ -3445,14 +3481,19 @@ static bool gpui_inject_start(Object* item, int apCost)
     }
     register_object_animate(obj_dude, ANIM_MAGIC_HANDS_MIDDLE, 0);
     // delay = frames of the animation before it: the call runs as the action frame is reached.
-    register_object_call(obj_dude, NULL, gpui_inject_done, actionFrame);
+    register_object_call(obj_dude, NULL, gpui_inject_done, actionFrame - startFrame);
 
     // The bracket makes compute_tpf time the jab by (AGI + INT + PE) / 3 (2026-10-06) -- for the
     // animation, which starts inside register_end, and for the lock measured here alike.
     anim_set_injection_timing(obj_dude);
+    anim_set_start_frame(obj_dude, startFrame);
     int rc = register_end();
+    anim_set_start_frame(NULL, 0);
     unsigned int ms = gpui_injection_duration();
     anim_set_injection_timing(NULL);
+    if (startFrame > 0 && frames > 0) {
+        ms = ms * (unsigned int)(frames - startFrame) / (unsigned int)frames; // the lock is the part played
+    }
 
     if (rc != 0) {
         return false;
@@ -3467,9 +3508,14 @@ static bool gpui_inject_start(Object* item, int apCost)
     gpui_inject_ap = apCost;
     gpui_inject_at = get_time();
     combat_rt_inject_begin(obj_dude);
+    if (!followUp) {
+        gpui_chain_slot = gpui_quick_use_slot; // a slot's own press may chain; anything else may not
+        gpui_chain_count = 0;
+    }
+    gpui_chain_due_at = 0;
 
-    trace_event(TRACE_ACTION, "inject-start", "pid=%d frame=%d lock=%ums ap=%d", item->pid, actionFrame, ms,
-        combat_rt_player_ap());
+    trace_event(TRACE_ACTION, "inject-start", "pid=%d frame=%d from=%d lock=%ums ap=%d", item->pid, actionFrame,
+        startFrame, ms, combat_rt_player_ap());
     return true;
 }
 
@@ -3487,8 +3533,76 @@ static void gpui_inject_tick()
     gpui_inject_pending = false;
     combat_rt_refund_ap(gpui_inject_ap);
     gpui_injection_ms = 0;
+    gpui_chain_slot = -1;
+    gpui_chain_due_at = 0;
     trace_event(TRACE_ACTION, "inject-cut", "pid=%d refund=%d ap=%d anim=%d after=%ums", gpui_inject_pid,
         gpui_inject_ap, combat_rt_player_ap(), FID_ANIM_TYPE(obj_dude->fid), elapsed_time(gpui_inject_at));
+}
+
+static Object* gpui_quick_slot_item(int slot, int* count);
+static bool gpui_item_is_throwable(Object* item);
+static bool gpui_item_is_tool(Object* item);
+
+static void gpui_heal_chain_end(const char* why)
+{
+    if (gpui_chain_slot != -1) {
+        trace_event(TRACE_ACTION, "heal-chain", "end=%s count=%d hp=%d pool=%d", why, gpui_chain_count,
+            obj_dude != NULL ? critter_get_hits(obj_dude) : -1, combat_rt_heal_left());
+    }
+    gpui_chain_slot = -1;
+    gpui_chain_due_at = 0;
+}
+
+// From the safe tick: the next jab of a held slot (gpui_chain_slot), once its moment has come.
+static void gpui_heal_chain_tick()
+{
+    if (gpui_chain_slot == -1 || gpui_chain_due_at == 0 || obj_dude == NULL) {
+        return;
+    }
+    if ((int)(get_time() - gpui_chain_due_at) < 0) {
+        return;
+    }
+    gpui_chain_due_at = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    SDL_GameControllerButton button = gpui_chain_slot == GPUI_QS_LB
+        ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER
+        : SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+    if (pad == NULL || SDL_GameControllerGetButton(pad, button) == 0) {
+        gpui_heal_chain_end("released");
+        return;
+    }
+    if (critter_is_dead(obj_dude) || critter_is_prone(obj_dude) || gpui_inject_pending) {
+        gpui_heal_chain_end("busy");
+        return;
+    }
+    if (critter_get_hits(obj_dude) + combat_rt_heal_left() >= stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS)) {
+        gpui_heal_chain_end("full");
+        return;
+    }
+    int count;
+    Object* item = gpui_quick_slot_item(gpui_chain_slot, &count);
+    if (item == NULL || gpui_item_is_throwable(item) || gpui_item_is_tool(item)
+        || item_get_type(item) != ITEM_TYPE_DRUG) {
+        gpui_heal_chain_end("none");
+        return;
+    }
+    // The jab before is still lowering the hand: that tail is what the next one replaces. Anything
+    // else holding the body (a step, a swing) ends the chain instead.
+    if (anim_busy(obj_dude) != 0) {
+        if (FID_ANIM_TYPE(obj_dude->fid) != ANIM_MAGIC_HANDS_MIDDLE) {
+            gpui_heal_chain_end("busy");
+            return;
+        }
+        anim_force_clear(obj_dude);
+    }
+    if (!gpui_inject_start(item, 0, true)) {
+        gpui_heal_chain_end("refused");
+        return;
+    }
+    gpui_chain_count++;
+    trace_event(TRACE_ACTION, "heal-chain", "next=%d pid=%d hp=%d pool=%d left=%d", gpui_chain_count, item->pid,
+        critter_get_hits(obj_dude), combat_rt_heal_left(), count - 1);
 }
 
 // Use one of `pid` on the dude: the jab, and the drug at its frame (see gpui_inject_pending).
@@ -8111,6 +8225,7 @@ static void gpui_drain_requests()
 {
     // A jab cut before its frame gives its AP back -- before any new press is judged.
     gpui_inject_tick();
+    gpui_heal_chain_tick();
     // ...and an explosive whose put-down was cut still lands.
     gpui_place_tick();
 
@@ -8132,7 +8247,9 @@ static void gpui_drain_requests()
                 gpui_quick_use_on_item(item->pid);
             }
         } else {
+            gpui_quick_use_slot = slot; // a held button may chain this one (gpui_chain_slot)
             gpui_quick_use(item->pid);
+            gpui_quick_use_slot = -1;
         }
     }
     gpui_qt_tick();

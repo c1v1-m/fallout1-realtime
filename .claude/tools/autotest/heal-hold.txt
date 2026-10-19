@@ -1,0 +1,21 @@
+# Holding LB chains the heal like estus (2026-10-19, his "něco jako souls když pije hráč estus"): the dude
+# at 10 HP with five Stimpaks and Agility 10, LB held down for five seconds. The first jab is the full
+# animation and costs the pack's 4 AP; each next one starts 3 frames before the action frame
+# (inject-start from=N), costs nothing (heal-chain next=N) and the chain ends at full health or on the
+# release (heal-chain end=full / released).
+name heal-hold
+map DESERT1.MAP
+seed 4
+duration 9
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 10
+dude stat AG 10
+dude item 40 5
+
+spawn 16777225 24100 rot 5 hostile
+
+at 0 idle
+at 1.0 healhold
+at 6.0 idle

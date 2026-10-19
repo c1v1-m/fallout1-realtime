@@ -210,6 +210,7 @@ void anim_set_reload_timing(Object* critter);
 // Brackets the registration (and the lock measurement) of a DRUG INJECTION: compute_tpf times it by
 // (AGI + INT + PE) / 3 on the reload/swap curve. See anim.cc.
 void anim_set_injection_timing(Object* critter);
+void anim_set_start_frame(Object* critter, int frame);
 // The reload animation (inside register_begin/end): the weapon's STAND loop, or for a pistol a
 // holster-and-draw (put-away + take-out). anim_is_reload_pose: is the body still in it?
 int register_object_reload(Object* critter);
