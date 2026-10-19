@@ -32,9 +32,9 @@ SDL_GameController* gamepad_ui_get_controller();
 // window check.
 bool gamepad_ui_menu_active();
 
-// What reaching into the pack costs in a fight: the inventory's price, 4 AP less one per rank of
-// Quick Pockets (see gpui_pack_cost).
-int gamepad_ui_pack_ap_cost();
+// What using an item from a quick slot costs in a fight: vanilla's 2 (see gpui_pack_cost for the
+// drugs and weapons, which cost the inventory's price).
+int gamepad_ui_item_use_ap_cost();
 
 // True while the on-body aimed-shot picker is up (LB held, green body-part markers drawn on the
 // locked enemy, right stick selecting a part). combat_rt checks this to halt walking and keep the
