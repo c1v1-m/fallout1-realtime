@@ -1073,9 +1073,9 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                             ? HIT_MODE_RIGHT_WEAPON_PRIMARY
                             : HIT_MODE_LEFT_WEAPON_PRIMARY;
 
-                        // A quick-use item is not the hand item: using it costs vanilla's plain 2 AP of using an
-                        // item (gamepad_ui_item_use_ap_cost).
-                        int actionPointsRequired = overridePid != -1 ? gamepad_ui_item_use_ap_cost() : item_mp_cost(obj_dude, hitMode, false);
+                        // A quick-use item is not the hand item: it comes out of the pack, at the pack's price
+                        // (gamepad_ui_pack_ap_cost, 2026-10-19 -- it was the plain 2 AP of using an item).
+                        int actionPointsRequired = overridePid != -1 ? gamepad_ui_pack_ap_cost() : item_mp_cost(obj_dude, hitMode, false);
                         // Realtime holds engine combat.ap maxed, so charge combat_rt's
                         // pool instead (using an item on a world object mid-fight costs
                         // AP like vanilla). Free out of combat; refuses when unaffordable.

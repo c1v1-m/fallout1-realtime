@@ -3492,27 +3492,22 @@ static void gpui_inject_tick()
 }
 
 // Use one of `pid` on the dude: the jab, and the drug at its frame (see gpui_inject_pending).
-// ⚠️ A DRUG, A WEAPON OR ARMOUR FROM THE PACK COSTS WHAT THE INVENTORY COSTS (2026-10-19, his rule:
-// "prostě je to z inventáře. Granát taky stojí 4"). Vanilla reaches into the pack through the
-// inventory screen -- 4 AP to open it, one less per rank of Quick Pockets (inven_action_cursor's own
-// formula) -- and that is the price of a drug from a quick slot, the grenade's quick draw, the weapon
-// wheel and armour. They were 2 (1 with Quick Pockets) and the wheel was free.
-//
-// ...BUT AN ITEM IS VANILLA'S 2 (same day, "tak změn to tnt 2 na vanillu cenu. prostě vanilla cena"):
-// TNT, a detector, a Stealth Boy used from a slot, an explosive put down, an item from a slot used on
-// something cost what using an item costs (item_mp_cost: 2, Quick Pockets no part of it) --
-// GPUI_ITEM_USE_AP. Swapping hands (Y) stays free, and a reload is vanilla's own 2.
+// ⚠️ ANYTHING FROM THE PACK COSTS WHAT THE INVENTORY COSTS (2026-10-19, his rule: "prostě je to z
+// inventáře. Granát taky stojí 4"). Vanilla reaches into the pack through the inventory screen -- 4 AP
+// to open it, one less per rank of Quick Pockets (inven_action_cursor's own formula) -- and every pad
+// shortcut that takes something out of it is that reach: a drug or an item from a quick slot, an
+// explosive put down, an item used on something, the grenade's quick draw, the weapon wheel, armour.
+// They were 2 (1 with Quick Pockets) and the wheel was free. Swapping hands (Y) stays free, and a
+// reload is vanilla's own 2.
 static int gpui_pack_cost()
 {
     int cost = 4 - perk_level(PERK_QUICK_POCKETS);
     return cost > 0 ? cost : 0;
 }
 
-#define GPUI_ITEM_USE_AP 2
-
-int gamepad_ui_item_use_ap_cost()
+int gamepad_ui_pack_ap_cost()
 {
-    return GPUI_ITEM_USE_AP;
+    return gpui_pack_cost();
 }
 
 static void gpui_quick_use(int pid)
@@ -4508,13 +4503,13 @@ static void gpui_place_explosive(Object* item, bool chargeAp)
         gsound_play_sfx_file("iisxxxx1");
         return;
     }
-    if (chargeAp && combat_rt_player_ap() < GPUI_ITEM_USE_AP) {
+    if (chargeAp && combat_rt_player_ap() < gpui_pack_cost()) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "explosive-place-refused", "why=ap ap=%d", combat_rt_player_ap());
         return;
     }
     if (chargeAp) {
-        combat_rt_spend_ap(GPUI_ITEM_USE_AP);
+        combat_rt_spend_ap(gpui_pack_cost());
     }
 
     gpui_place_item = item;
@@ -4634,11 +4629,11 @@ static void gpui_quick_wear(int pid)
 
 // USE an item on yourself, exactly the inventory's Use (inventry.cc, GAME_MOUSE_ACTION_MENU_ITEM_USE):
 // take one out of the stack, protinst_use_item it, destroy it if that consumed it, otherwise put it
-// back. Vanilla's price for using an item in a fight (GPUI_ITEM_USE_AP), refused when the pool cannot
-// pay.
+// back. The pack's price in a fight (gpui_pack_cost), refused when the pool cannot pay -- the same
+// price the drugs have.
 static void gpui_quick_use_item(int pid)
 {
-    int apCost = GPUI_ITEM_USE_AP;
+    int apCost = gpui_pack_cost();
     if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         return;
