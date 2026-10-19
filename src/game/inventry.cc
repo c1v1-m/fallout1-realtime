@@ -2515,41 +2515,11 @@ bool inven_wear_under_cursor()
     return true;
 }
 
-// ⚠️ A DRUG TAKEN INSIDE THE INVENTORY COSTS ITS AP IN A REALTIME FIGHT (2026-10-19, his pick "Každá droga
-// uvnitř 2 AP"). Vanilla charges for opening the screen (4 AP, less with Quick Pockets) and nothing for
-// what you do inside -- and the world stands still while it is open, so in realtime that was five
-// stimpaks for 4 AP, the cheapest heal in the game. Now each drug taken here in a fight costs what it
-// costs from the quick slot (gpui_quick_use): 2 AP, 1 with Quick Pockets, and with less it is refused
-// with a buzz. Weapons and armour put on in here stay free: opening the screen paid for those.
-// False = refused. inven_rt_drug_refund gives the AP back when the drug code then refuses the drug.
-static int inven_rt_drug_cost = 0;
-
-static bool inven_rt_drug_ap(Object* critter)
-{
-    inven_rt_drug_cost = 0;
-    if (critter != obj_dude || !combat_rt_enabled() || !isInCombat()) {
-        return true;
-    }
-    int cost = perk_level(PERK_QUICK_POCKETS) > 0 ? 1 : 2;
-    if (!combat_rt_spend_ap(cost)) {
-        gsound_play_sfx_file("iisxxxx1");
-        trace_event(TRACE_ACTION, "inven-drug-refused", "why=ap ap=%d cost=%d", combat_rt_player_ap(), cost);
-        return false;
-    }
-    inven_rt_drug_cost = cost;
-    trace_event(TRACE_ACTION, "inven-drug", "cost=%d ap=%d", cost, combat_rt_player_ap());
-    return true;
-}
-
-// item_d_take_drug's answer: -1 = refused (dead, robotic), nothing taken, nothing paid.
-static int inven_rt_drug_refund(int rc)
-{
-    if (rc == -1 && inven_rt_drug_cost > 0) {
-        combat_rt_refund_ap(inven_rt_drug_cost);
-    }
-    inven_rt_drug_cost = 0;
-    return rc;
-}
+// A DRUG TAKEN INSIDE THE INVENTORY IS FREE, AS IN VANILLA (2026-10-19). For a few minutes it cost 2 AP
+// (1 with Quick Pockets) -- the screen stops the world, and opening it for 4 AP bought any number of
+// stimpaks -- and then he took it back ("tak asi to nemusí stát už 2 AP", pick "Zdarma, jako ve
+// vanille"): a stimpak heals over time in a fight now (combat_rt_heal_over_time), and while the
+// screen is open nothing comes in at all. What you pay is the opening.
 
 // Controller quick-action for the player's own (normal) inventory list: a tap of
 // A on a list item does the most useful one-shot action without any popup --
@@ -2696,10 +2666,7 @@ bool inven_gamepad_quick_normal()
     }
 
     if (itemType == ITEM_TYPE_DRUG) {
-        if (!inven_rt_drug_ap(stack[0])) {
-            return true; // refused, audibly
-        }
-        if (inven_rt_drug_refund(item_d_take_drug(stack[0], item))) {
+        if (item_d_take_drug(stack[0], item)) {
             if (v43 != NULL) {
                 *v43 = NULL;
             } else {
@@ -4208,10 +4175,7 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
             container_enter(keyCode, inventoryWindowType);
             break;
         case ITEM_TYPE_DRUG:
-            if (!inven_rt_drug_ap(stack[0])) {
-                break;
-            }
-            if (inven_rt_drug_refund(item_d_take_drug(stack[0], item))) {
+            if (item_d_take_drug(stack[0], item)) {
                 if (v43 != NULL) {
                     *v43 = NULL;
                 } else {
