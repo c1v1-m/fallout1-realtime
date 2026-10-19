@@ -635,6 +635,13 @@ typedef struct RtActor {
     int ow_hp;                // its hit points then (a hit ends the wait)
     bool ow_done;             // decided about this approach; reset when the line opens
     float exposed_check_at;   // next look at whether it stands in its target's sights without a shot (rt_exposed_step)
+    float prebreath_since;    // >= 0: topping up its AP out of sight before the corner (rt_prebreathe_holds)
+    bool prebreath_done;      // done so for this approach; reset when the line opens
+    int firepos_tile;         // its firing position (rt_firing_position); -1 = none
+    int firepos_target_tile;  // where the target stood when it was chosen
+    float firepos_check_at;   // next look for one
+    float choke_since;        // >= 0: waiting behind a teammate at the target (rt_choke_waits)
+    float choke_skip_until;   // after a wait that timed out, not again until then
     float heal_left;          // HP of a drug still coming in (rt_heal_tick)
     int heal_lent;            // ...of which lent to its HP for a save (combat_rt_heal_lend_for_save)
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
@@ -9402,6 +9409,13 @@ static void rt_refresh_registry()
             a->ow_hp = prev->ow_hp;
             a->ow_done = prev->ow_done;
             a->exposed_check_at = prev->exposed_check_at;
+            a->prebreath_since = prev->prebreath_since;
+            a->prebreath_done = prev->prebreath_done;
+            a->firepos_tile = prev->firepos_tile;
+            a->firepos_target_tile = prev->firepos_target_tile;
+            a->firepos_check_at = prev->firepos_check_at;
+            a->choke_since = prev->choke_since;
+            a->choke_skip_until = prev->choke_skip_until;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9498,6 +9512,13 @@ static void rt_refresh_registry()
             a->ow_hp = 0;
             a->ow_done = false;
             a->exposed_check_at = 0.0f;
+            a->prebreath_since = -1.0f;
+            a->prebreath_done = false;
+            a->firepos_tile = -1;
+            a->firepos_target_tile = -1;
+            a->firepos_check_at = 0.0f;
+            a->choke_since = -1.0f;
+            a->choke_skip_until = 0.0f;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;
@@ -10398,6 +10419,9 @@ static void rt_retarget_nearer(RtActor* a, Object* npc)
 // clean line, a dim one fires anyway and may well hit its friend, as vanilla would. Either way it does
 // not ask again for RT_FF_PAUSE_SECONDS. Guns only: a melee blow has no line, a grenade its own rules.
 #define RT_FF_PAUSE_SECONDS 3.0f
+// A teammate this close in front is a back, not a line: never fired through, whatever the roll
+// (2026-10-20, rt_choke_waits' half of "Nebýt namačkaní u rohu").
+#define RT_FF_CLOSE 3
 
 // The first live teammate of the shooter on the straight line from fromTile to the target, or NULL
 // (the same walk combat_is_shot_blocked makes; a wall ends it -- that shot is refused anyway).
@@ -10475,7 +10499,9 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
 
     // Already holding: for as long as a friend is still in the way or in the blast and the hold has time left.
     if (rt_clock < a->ff_hold_until) {
-        if (radius > 0 && (rt_ally_in_blast(npc, target, radius) != NULL || rt_ally_in_line(npc, npc->tile, target) != NULL)) {
+        Object* inLine = rt_ally_in_line(npc, npc->tile, target);
+        if ((radius > 0 && (rt_ally_in_blast(npc, target, radius) != NULL || inLine != NULL))
+            || (inLine != NULL && tile_dist(npc->tile, inLine->tile) <= RT_FF_CLOSE)) {
             return true;
         }
         a->ff_hold_until = 0.0f;
@@ -10551,9 +10577,13 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
             moved = rc == 0 && anim_last_path_steps(npc) != 0;
         }
     }
-    trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d int=%d roll=%d careful=%d to=%d moved=%d t=%.2f",
-        npc->id, npc->pid, ally->id, intelligence, roll, careful ? 1 : 0, dest, moved ? 1 : 0, rt_clock);
-    return moved;
+    bool close = !moved && tile_dist(npc->tile, ally->tile) <= RT_FF_CLOSE;
+    if (close) {
+        a->ff_hold_until = a->ff_check_until; // its back: held while it stays there and the roll stands
+    }
+    trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d int=%d roll=%d careful=%d to=%d moved=%d close=%d t=%.2f",
+        npc->id, npc->pid, ally->id, intelligence, roll, careful ? 1 : 0, dest, moved ? 1 : 0, close ? 1 : 0, rt_clock);
+    return moved || close;
 }
 
 // --- COMBAT AI: GROUP TACTICS (2026-10-17, MODS "Tactical AI") ---------------------------------
@@ -11158,6 +11188,201 @@ static bool rt_exposed_step(RtActor* a, Object* npc, int mode, int range)
     return false;
 }
 
+// --- COMBAT AI: AT HIS CORNER (2026-10-20, MODS "Tactical AI") ------------------------------------
+//
+// trace_2026-10-20_001537 ("Řekl bych že lepší. Jde to ještě zlepšit?"): better -- 65 HP off him where
+// the fight before took 10 -- but four of the last five still came round his corner winded (the
+// breather latched at 2 tiles from him), they died at one and two tiles, and two of his nine kills
+// were a teammate's plasma in the back where they had bunched up. His three picks, all of them:
+//
+//   * CATCH BREATH BEFORE THE CORNER (rt_prebreathe_holds): a chaser within RT_PREBREATH_DIST of its
+//     target, out of its sight and without a line of its own, with less AP than two shots (or a full
+//     pool, if that is less), stands and tops up first -- for at most RT_PREBREATH_MAX, once an
+//     approach. It comes round with a shot in hand, not to catch its breath in front of him.
+//   * A FIRING POSITION INSTEAD OF THE CORNER (rt_firing_position): a shooter within RT_FIREPOS_DIST
+//     with no line looks (once a second) for a free tile within RT_FIREPOS_RADIUS of itself, at least
+//     RT_FIREPOS_MIN from the target and within its reach, with a clean line to the target and no
+//     teammate in it, not taken by another, a short walk away -- and goes there to shoot from range
+//     instead of walking up to him round the corner. None (he sits in a nook): the overwatch post.
+//   * NOT BUNCHED AT THE CORNER (rt_choke_waits; rt_ff_care's RT_FF_CLOSE): a chaser with a teammate
+//     already right at the target (RT_CHOKE_NEAR_TARGET), close in front of it, waits behind for
+//     at most RT_CHOKE_MAX instead of pressing in after it; and nobody fires through a teammate within
+//     RT_FF_CLOSE of itself -- that is a back, not a line -- whatever its roll.
+#define RT_PREBREATH_DIST 10
+#define RT_PREBREATH_MAX 5.0f
+#define RT_FIREPOS_DIST 12
+#define RT_FIREPOS_RADIUS 6
+#define RT_FIREPOS_MIN 4
+#define RT_CHOKE_NEAR_TARGET 2
+#define RT_CHOKE_BEHIND 3
+#define RT_CHOKE_MAX 4.0f
+
+static bool rt_prebreathe_holds(RtActor* a, Object* npc, int mode)
+{
+    Object* target = a->target;
+    const char* end = NULL;
+    if (target == NULL || a->fleeing || a->prebreath_done) {
+        end = "off";
+    } else {
+        int dist = obj_dist(npc, target);
+        int maxAp = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS);
+        int cost = rt_ap_cost(npc, mode);
+        int goal = 2 * cost < maxAp ? 2 * cost : maxAp;
+        if (dist > RT_PREBREATH_DIST || dist <= 1) {
+            end = "range";
+        } else if (a->ap >= goal) {
+            end = "ready";
+        } else if (!combat_is_shot_blocked(target, target->tile, npc->tile, npc, NULL)) {
+            end = "seen";
+        } else if (!rt_shot_blocked(npc, target, mode)) {
+            end = "line";
+        } else if (a->prebreath_since < 0.0f) {
+            a->prebreath_since = rt_clock;
+            trace_event(TRACE_FLOW, "prebreath", "id=%d pid=%d start ap=%d goal=%d dist=%d t=%.2f", npc->id, npc->pid,
+                a->ap, goal, dist, rt_clock);
+            return true;
+        } else if (rt_clock - a->prebreath_since >= RT_PREBREATH_MAX) {
+            end = "timeout";
+        } else {
+            return true;
+        }
+    }
+    if (a->prebreath_since >= 0.0f) {
+        trace_event(TRACE_FLOW, "prebreath", "id=%d pid=%d end=%s ap=%d held=%.2f t=%.2f", npc->id, npc->pid, end,
+            a->ap, rt_clock - a->prebreath_since, rt_clock);
+        a->prebreath_since = -1.0f;
+        a->prebreath_done = true; // once an approach
+    }
+    return false;
+}
+
+static bool rt_firepos_taken(RtActor* a, int tile)
+{
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* b = &rt_actors[i];
+        if (b != a && ((b->firepos_tile >= 0 && tile_dist(b->firepos_tile, tile) <= 1)
+                          || (b->ow_tile >= 0 && tile_dist(b->ow_tile, tile) <= 1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rt_firing_position(RtActor* a, Object* npc, int mode, int range)
+{
+    Object* target = a->target;
+    if (target == NULL || a->fleeing || range <= 2 || !rt_can_walk(npc) || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    int dist = obj_dist(npc, target);
+    if (dist > RT_FIREPOS_DIST) {
+        a->firepos_tile = -1;
+        return false; // still travelling
+    }
+
+    if (a->firepos_tile >= 0) {
+        bool stale = tile_dist(target->tile, a->firepos_target_tile) > 2
+            || combat_is_shot_blocked(npc, a->firepos_tile, target->tile, target, NULL);
+        if (npc->tile == a->firepos_tile || stale) {
+            trace_event(TRACE_FLOW, "firepos", "id=%d pid=%d end=%s tile=%d t=%.2f", npc->id, npc->pid,
+                stale ? "stale" : "arrived", a->firepos_tile, rt_clock);
+            a->firepos_tile = -1;
+            return false; // arrived: the attack test takes it from here
+        }
+        rt_walk_to(npc, a->firepos_tile, "firepos", rt_npc_sprint_ok(npc)); // the last leg ended
+        return true;
+    }
+
+    if (rt_clock < a->firepos_check_at) {
+        return false;
+    }
+    a->firepos_check_at = rt_clock + 1.0f;
+
+    int tiles[128];
+    int count = rt_tiles_around(npc->tile, RT_FIREPOS_RADIUS, tiles, 128);
+    int best = -1;
+    int bestScore = 0;
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        int fromTarget = tile_dist(t, target->tile);
+        if (fromTarget < RT_FIREPOS_MIN || fromTarget > range) {
+            continue;
+        }
+        if (obj_blocking_at(npc, t, npc->elevation) != NULL || rt_firepos_taken(a, t)) {
+            continue;
+        }
+        if (combat_is_shot_blocked(npc, t, target->tile, target, NULL) || rt_ally_in_line(npc, t, target) != NULL) {
+            continue;
+        }
+        int walk = tile_dist(npc->tile, t);
+        int score = 3 * walk - (fromTarget < 8 ? fromTarget : 8); // a short walk first, then some distance
+        if (best != -1 && score >= bestScore) {
+            continue;
+        }
+        int steps = make_path_capped(npc, npc->tile, t, NULL, 1, 300);
+        if (steps <= 0 || steps > walk + 3) {
+            continue;
+        }
+        best = t;
+        bestScore = score;
+    }
+    if (best == -1) {
+        return false;
+    }
+    a->firepos_tile = best;
+    a->firepos_target_tile = target->tile;
+    bool moved = rt_walk_to(npc, best, "firepos", rt_npc_sprint_ok(npc));
+    trace_event(TRACE_FLOW, "firepos", "id=%d pid=%d start from=%d to=%d dist=%d at=%d moved=%d t=%.2f", npc->id,
+        npc->pid, npc->tile, best, dist, tile_dist(best, target->tile), moved ? 1 : 0, rt_clock);
+    if (!moved) {
+        a->firepos_tile = -1;
+    }
+    return moved;
+}
+
+static bool rt_choke_waits(RtActor* a, Object* npc, int mode)
+{
+    Object* target = a->target;
+    Object* front = NULL;
+    if (target != NULL && !a->fleeing && rt_clock >= a->choke_skip_until) {
+        int dist = obj_dist(npc, target);
+        if (dist > 1 && dist <= 6 && rt_shot_blocked(npc, target, mode)) {
+            for (int i = 0; i < rt_actor_count; i++) {
+                RtActor* t = &rt_actors[i];
+                Object* mate = t->obj;
+                if (t == a || mate == NULL || t->fleeing || t->target != target || critter_is_dead(mate)
+                    || mate->data.critter.combat.team != npc->data.critter.combat.team) {
+                    continue;
+                }
+                if (tile_dist(mate->tile, target->tile) <= RT_CHOKE_NEAR_TARGET
+                    && tile_dist(mate->tile, npc->tile) <= RT_CHOKE_BEHIND && obj_dist(mate, target) < dist) {
+                    front = mate;
+                    break;
+                }
+            }
+        }
+    }
+    if (front == NULL) {
+        if (a->choke_since >= 0.0f) {
+            trace_event(TRACE_FLOW, "choke-wait", "id=%d pid=%d end=clear held=%.2f t=%.2f", npc->id, npc->pid,
+                rt_clock - a->choke_since, rt_clock);
+        }
+        a->choke_since = -1.0f;
+        return false;
+    }
+    if (a->choke_since < 0.0f) {
+        a->choke_since = rt_clock;
+        trace_event(TRACE_FLOW, "choke-wait", "id=%d pid=%d start front=%d t=%.2f", npc->id, npc->pid, front->id, rt_clock);
+    } else if (rt_clock - a->choke_since >= RT_CHOKE_MAX) {
+        trace_event(TRACE_FLOW, "choke-wait", "id=%d pid=%d end=timeout front=%d t=%.2f", npc->id, npc->pid, front->id,
+            rt_clock);
+        a->choke_since = -1.0f;
+        a->choke_skip_until = rt_clock + 3.0f;
+        return false;
+    }
+    return true;
+}
+
 // --- COMBAT AI: GOING ROUND, AND SPREADING OUT (2026-10-18, MODS "Tactical AI") -------------------
 //
 // His report from Mariposa: "šli za sebou a žádný flankování" -- ten super mutants came down one
@@ -11671,6 +11896,12 @@ static void rt_intent_update(RtActor* a)
         } else if (a->corner_hold_start >= 0.0f && !busy) {
             intent = RT_INTENT_HOLD;
             why = "gather-corner";
+        } else if (a->prebreath_since >= 0.0f && !busy) {
+            intent = RT_INTENT_HOLD;
+            why = "catch-breath";
+        } else if (a->choke_since >= 0.0f && !busy) {
+            intent = RT_INTENT_HOLD;
+            why = "choke-wait";
         } else if (a->defend_covered && !a->defend_provoked && rt_is_defensive(a, npc) && !busy) {
             intent = RT_INTENT_HOLD;
             why = "defend";
@@ -12547,6 +12778,10 @@ static void rt_update_actor(RtActor* a, float dt)
         }
         a->ow_done = false;
         a->tactic_roll = 0;
+        a->prebreath_done = false;
+        a->prebreath_since = -1.0f;
+        a->firepos_tile = -1;
+        a->choke_since = -1.0f;
         // RE-AGGRO IS GATED ON PERCEPTION, and it has to be: the stop rule above drops a chase
         // once the critter perceives nobody, and if this branch could re-acquire on distance
         // alone (rt_nearest_player_side reaches the 50-tile leash) it would re-engage on the very
@@ -12887,6 +13122,10 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->corner_hold_start = -1.0f;
                 rt_ow_drop(a, npc, "sees", false); // ...and so is the next post, on a new roll
                 a->tactic_roll = 0;
+                a->prebreath_done = false; // ...and the next breath before a corner
+                a->prebreath_since = -1.0f;
+                a->firepos_tile = -1;
+                a->choke_since = -1.0f;
             } else if (rt_tactical_ai && rt_exposed_step(a, npc, mode, range)) {
                 // In its target's sights without a shot of its own: a step to a line, or out of sight
                 // (rt_exposed_step). Moving is not failing to route.
@@ -12906,6 +13145,16 @@ static void rt_update_actor(RtActor* a, float dt)
                 // An in-flight walk segment is left alone rather than force-cleared: it finishes
                 // its current tile and then nothing new is issued, so the stop reads as slowing to
                 // a halt instead of snapping mid-stride.
+            } else if (rt_tactical_ai && rt_prebreathe_holds(a, npc, mode)) {
+                // Topping up out of sight before going round (rt_prebreathe_holds).
+                a->no_path_since = -1.0f;
+            } else if (inRange && !closeForHit && rt_tactical_ai && rt_firing_position(a, npc, mode, range)) {
+                // To a tile it can shoot from at range, instead of up to him round the corner.
+                a->no_path_since = -1.0f;
+                rt_intent_hint(a, RT_INTENT_REPOSITION, "firing-position", 1.5f);
+            } else if (inRange && !closeForHit && rt_tactical_ai && rt_choke_waits(a, npc, mode)) {
+                // A teammate is already at him, right in front: wait behind it (rt_choke_waits).
+                a->no_path_since = -1.0f;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_overwatch_holds(a, npc, range)) {
                 // On its way to its post, or at it covering the door (rt_overwatch_holds). Holding is
                 // not failing to route.
