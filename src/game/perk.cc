@@ -317,9 +317,11 @@ const char* perk_realtime_note(int perk)
 {
     switch (perk) {
     case PERK_QUICK_POCKETS:
-        // gpui_quick_use (the RB / H heal and the item wheel's drugs) and, since 2026-10-15, the
-        // quick slots' draw (LB / RB / T): "Jsou quick pockets zmíněné, že LB a RB stojí míň?"
-        return "Realtime: quick slots (LB/RB, T, H) and wheel drugs cost 1 AP, not 2.";
+        // Since 2026-10-19 everything a pad shortcut takes out of the pack costs what the inventory
+        // costs (gpui_pack_cost: the quick slots LB / RB / T / H and their drugs, items and grenades,
+        // the weapon wheel, armour) -- 4 AP, one less per rank, so the perk reaches all of them. It
+        // was "1 AP, not 2" for the slots (2026-10-13/15). His ask: "ještě bych to zmínil".
+        return "Realtime: quick slots, weapon wheel, armour too: 4 AP, 1 less per rank.";
     case PERK_AWARENESS:
         // gmouse_3d_awareness_hp: the second line of the to-hit cursor, lock-on or mouse.
         return "Realtime: aim at someone to see their hit points.";

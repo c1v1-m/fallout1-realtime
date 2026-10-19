@@ -32,6 +32,10 @@ SDL_GameController* gamepad_ui_get_controller();
 // window check.
 bool gamepad_ui_menu_active();
 
+// What reaching into the pack costs in a fight: the inventory's price, 4 AP less one per rank of
+// Quick Pockets (see gpui_pack_cost).
+int gamepad_ui_pack_ap_cost();
+
 // True while the on-body aimed-shot picker is up (LB held, green body-part markers drawn on the
 // locked enemy, right stick selecting a part). combat_rt checks this to halt walking and keep the
 // right stick on part-selection instead of lock-switching, like it does for the radial wheels.

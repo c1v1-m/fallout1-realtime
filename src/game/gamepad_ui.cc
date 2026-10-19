@@ -3492,6 +3492,24 @@ static void gpui_inject_tick()
 }
 
 // Use one of `pid` on the dude: the jab, and the drug at its frame (see gpui_inject_pending).
+// ⚠️ ANYTHING FROM THE PACK COSTS WHAT THE INVENTORY COSTS (2026-10-19, his rule: "prostě je to z
+// inventáře. Granát taky stojí 4"). Vanilla reaches into the pack through the inventory screen -- 4 AP
+// to open it, one less per rank of Quick Pockets (inven_action_cursor's own formula) -- and every pad
+// shortcut that takes something out of it is that reach: a drug or an item from a quick slot, an
+// explosive put down, an item used on something, the grenade's quick draw, the weapon wheel, armour.
+// They were 2 (1 with Quick Pockets) and the wheel was free. Swapping hands (Y) stays free, and a
+// reload is vanilla's own 2.
+static int gpui_pack_cost()
+{
+    int cost = 4 - perk_level(PERK_QUICK_POCKETS);
+    return cost > 0 ? cost : 0;
+}
+
+int gamepad_ui_pack_ap_cost()
+{
+    return gpui_pack_cost();
+}
+
 static void gpui_quick_use(int pid)
 {
     // ⚠️ COSTS 2 AP AND REFUSES WHEN YOU CANNOT PAY (2026-08-29). It used to charge only when
@@ -3504,10 +3522,9 @@ static void gpui_quick_use(int pid)
     // destroyed -- refusing down there would eat the drug and heal nothing. Out of combat the
     // pool sits at maximum, so this never bites outside a fight.
     //
-    // QUICK POCKETS TAKES ONE OFF (2026-10-11, his idea: "quick pocket by mohl snížit cenu stimpacku
-    // o 1"). Vanilla's perk makes reaching into the pack cheaper (inventory 4 AP -> 3, inventry.cc);
-    // in realtime the quick-use IS reaching into the pack, so every drug taken this way costs 1 AP.
-    int apCost = perk_level(PERK_QUICK_POCKETS) > 0 ? 1 : 2;
+    // QUICK POCKETS (2026-10-11, his idea: "quick pocket by mohl snížit cenu stimpacku o 1") -- and
+    // since 2026-10-19 the whole price is the pack's (gpui_pack_cost): 4, less one per rank.
+    int apCost = gpui_pack_cost();
     if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=ap ap=%d", pid, combat_rt_player_ap());
@@ -3941,14 +3958,6 @@ static Object* gpui_qt_hand_item()
     return gpui_qt_hand ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
 }
 
-// Changing what is in the hand in a fight: vanilla's inventory price, 4 AP less one per rank of Quick
-// Pockets (inven_action_cursor's own formula). The weapon wheel and the grenade's quick draw (RB).
-static int gpui_weapon_change_cost()
-{
-    int cost = 4 - perk_level(PERK_QUICK_POCKETS);
-    return cost > 0 ? cost : 0;
-}
-
 // The safe-tick half (gpui_drain_requests): every wield and every throw happens here.
 static void gpui_qt_tick()
 {
@@ -3984,9 +3993,9 @@ static void gpui_qt_tick()
             gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
             return;
         }
-        // A weapon change, priced like the wheel's (gpui_weapon_change_cost, 2026-10-19 -- it was 2, 1
+        // A weapon change, priced like the wheel's (gpui_pack_cost, 2026-10-19 -- it was 2, 1
         // with Quick Pockets). The put-back after the throw stays free: one draw, one price.
-        int apCost = gpui_weapon_change_cost();
+        int apCost = gpui_pack_cost();
         if (combat_rt_player_ap() < apCost) {
             gpui_qt_set(GPUI_QT_IDLE);
             gsound_play_sfx_file("iisxxxx1");
@@ -4494,13 +4503,13 @@ static void gpui_place_explosive(Object* item, bool chargeAp)
         gsound_play_sfx_file("iisxxxx1");
         return;
     }
-    if (chargeAp && combat_rt_player_ap() < 2) {
+    if (chargeAp && combat_rt_player_ap() < gpui_pack_cost()) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "explosive-place-refused", "why=ap ap=%d", combat_rt_player_ap());
         return;
     }
     if (chargeAp) {
-        combat_rt_spend_ap(2);
+        combat_rt_spend_ap(gpui_pack_cost());
     }
 
     gpui_place_item = item;
@@ -4557,10 +4566,7 @@ static void gpui_place_tick()
 // under it.
 static void gpui_quick_wear(int pid)
 {
-    int apCost = 4 - perk_level(PERK_QUICK_POCKETS);
-    if (apCost < 0) {
-        apCost = 0;
-    }
+    int apCost = gpui_pack_cost();
     if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "quick-wear-refused", "pid=%d why=ap ap=%d cost=%d", pid, combat_rt_player_ap(), apCost);
@@ -4623,10 +4629,12 @@ static void gpui_quick_wear(int pid)
 
 // USE an item on yourself, exactly the inventory's Use (inventry.cc, GAME_MOUSE_ACTION_MENU_ITEM_USE):
 // take one out of the stack, protinst_use_item it, destroy it if that consumed it, otherwise put it
-// back. 2 AP in a fight, refused when the pool cannot pay -- the same price the drugs have.
+// back. The pack's price in a fight (gpui_pack_cost), refused when the pool cannot pay -- the same
+// price the drugs have.
 static void gpui_quick_use_item(int pid)
 {
-    if (combat_rt_player_ap() < 2) {
+    int apCost = gpui_pack_cost();
+    if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         return;
     }
@@ -4667,9 +4675,9 @@ static void gpui_quick_use_item(int pid)
     }
 
     if (rc != -1) {
-        combat_rt_spend_ap(2);
+        combat_rt_spend_ap(apCost);
     }
-    trace_event(TRACE_ACTION, "quick-use-item", "pid=%d rc=%d ap=%d", pid, rc, combat_rt_player_ap());
+    trace_event(TRACE_ACTION, "quick-use-item", "pid=%d rc=%d cost=%d ap=%d", pid, rc, apCost, combat_rt_player_ap());
     intface_update_items(true);
 }
 
@@ -4988,7 +4996,7 @@ static void gpui_weapon_equip(int index)
     // Quick Pockets -- and the wheel is only a quicker way there; it was free, the put-away and the
     // draw were its only price. Swapping hands (Y) stays free, as in vanilla. Out of a fight the pool
     // is full and nothing is taken (combat_rt_spend_ap).
-    int apCost = gpui_weapon_change_cost();
+    int apCost = gpui_pack_cost();
     if (combat_rt_player_ap() < apCost) {
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_INPUT, "weapon-equip-refused", "why=ap ap=%d cost=%d", combat_rt_player_ap(), apCost);
