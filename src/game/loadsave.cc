@@ -1944,7 +1944,18 @@ static int LSGameEnd(int windowType)
 }
 
 // 0x46F978
+static int SaveSlotBody();
+
+// The save itself, with a heal still coming in written as finished (combat_rt_heal_lend_for_save).
 static int SaveSlot()
+{
+    int lent = combat_rt_heal_lend_for_save();
+    int rc = SaveSlotBody();
+    combat_rt_heal_return_after_save(lent);
+    return rc;
+}
+
+static int SaveSlotBody()
 {
     ls_error_code = 0;
     map_backup_count = -1;

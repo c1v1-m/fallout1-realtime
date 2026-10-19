@@ -1,0 +1,17 @@
+# One Super Stimpak in a fight (2026-10-19): the dude at 5 HP, 66 HP into the heal pool -- fast at first,
+# slow for the last few points, ~6 s in all. A mutant walks up from 20 tiles meanwhile.
+name heal-super
+map DESERT1.MAP
+seed 4
+duration 9
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 5
+dude item 144 1
+
+spawn 16777225 24100 rot 5 hostile
+
+at 0 idle
+at 1.0 heal
+at 1.9 idle

@@ -28,6 +28,7 @@
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
+#include "game/loadsave.h" // isLoadingGame, for the heal pool at a map teardown
 #include "game/map.h"
 #include "game/object.h"
 #include "game/party.h"
@@ -1793,6 +1794,104 @@ static float rt_lock_held = 0.0f;
 
 // Monotonic seconds since combat_rt_init, for event timestamps.
 static float rt_clock = 0.0f;
+
+// ⚠️ A STIMPAK HEALS OVER TIME IN A FIGHT (2026-10-19, "přijde mi že jsem ho mohl spamovat a vyléčit se
+// na max"; his picks "Léčení postupně" and then "Sčítají se, větší = rychlejší"). trace_2026-10-19_204959
+// went 36 -> 71 HP in under two seconds: five stimpaks, every one taken on the floor or while getting
+// up, where the drug works at once with no jab (gpui_quick_use) -- one press, the whole heal, at once.
+//
+// Now the HP a drug gives the dude in a fight (combat_rt_active) go into this pool instead of onto his
+// bar, and come in from here: fast while a lot is still to come, slow for the last few points --
+// RT_HEAL_TAU is the time the pool takes to shrink by about two thirds, RT_HEAL_MIN_RATE the slowest
+// it ever goes. A Stimpak's 10-20 HP take ~3 s, a Super Stimpak's 75 ~6 s, two at once go faster than
+// one (the pool is bigger). Hits during it still hurt: they come off the bar as ever, and the pool
+// goes on adding to whatever is left. The drug itself is vanilla, capped at the moment it is taken
+// (what the pool holds is what vanilla would have added right then). Out of a fight nothing changes:
+// the heal is instant there.
+#define RT_HEAL_TAU 1.6f
+#define RT_HEAL_MIN_RATE 3.0f
+
+static float rt_heal_left = 0.0f;   // HP still to come
+static float rt_heal_started = 0.0f; // rt_clock when the pool last filled from empty
+static int rt_heal_total = 0;        // HP put in since then
+
+void combat_rt_heal_over_time(int hp, int pid)
+{
+    if (hp <= 0) {
+        return;
+    }
+    if (rt_heal_left <= 0.0f) {
+        rt_heal_started = rt_clock;
+        rt_heal_total = 0;
+    }
+    rt_heal_left += (float)hp;
+    rt_heal_total += hp;
+    trace_event(TRACE_ACTION, "heal-pool", "pid=%d add=%d left=%.1f hp=%d t=%.2f", pid, hp, rt_heal_left,
+        obj_dude != NULL ? critter_get_hits(obj_dude) : -1, rt_clock);
+}
+
+int combat_rt_heal_left()
+{
+    return (int)ceilf(rt_heal_left);
+}
+
+static void rt_heal_clear(const char* why)
+{
+    if (rt_heal_left > 0.0f) {
+        trace_event(TRACE_ACTION, "heal-pool", "end=%s lost=%d total=%d t=%.2f", why, combat_rt_heal_left(),
+            rt_heal_total, rt_clock);
+    }
+    rt_heal_left = 0.0f;
+}
+
+// ⚠️ A SAVE TAKES THE POOL AS HEALED. Quick save works in a fight, and the pool is not part of any
+// saved chunk, so a save in the middle of a heal would have lost the rest of it for good. SaveSlot
+// lends it to the bar for the write and takes it back after: the file holds the finished heal, the
+// game goes on healing as it was.
+int combat_rt_heal_lend_for_save()
+{
+    if (obj_dude == NULL || rt_heal_left <= 0.0f) {
+        return 0;
+    }
+    int room = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS) - obj_dude->data.critter.hp;
+    int lent = combat_rt_heal_left() < room ? combat_rt_heal_left() : (room > 0 ? room : 0);
+    obj_dude->data.critter.hp += lent;
+    return lent;
+}
+
+void combat_rt_heal_return_after_save(int lent)
+{
+    if (obj_dude != NULL && lent > 0) {
+        obj_dude->data.critter.hp -= lent;
+    }
+}
+
+// From combat_rt_update, next to the HP counter, so it holds still whenever the world does.
+static void rt_heal_tick(float dt)
+{
+    if (rt_heal_left <= 0.0f || dt <= 0.0f) {
+        return;
+    }
+    if (obj_dude == NULL || (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        rt_heal_clear("dead");
+        return;
+    }
+
+    float rate = fmaxf(RT_HEAL_MIN_RATE, rt_heal_left / RT_HEAL_TAU);
+    float before = rt_heal_left;
+    rt_heal_left = fmaxf(0.0f, rt_heal_left - rate * dt);
+    // Whole points only, and exactly the pool in the end: what has crossed an integer comes in.
+    int points = (int)ceilf(before) - (int)ceilf(rt_heal_left);
+    if (points > 0) {
+        critter_adjust_hits(obj_dude, points);
+        intface_update_hit_points(true);
+    }
+
+    if (rt_heal_left <= 0.0f) {
+        trace_event(TRACE_ACTION, "heal-pool", "end=done total=%d took=%.2f hp=%d t=%.2f", rt_heal_total,
+            rt_clock - rt_heal_started, critter_get_hits(obj_dude), rt_clock);
+    }
+}
 
 // Critters whose death reaction was registered in the last instant. A fall registered at the
 // commit point has NOT started yet, so critter_is_prone() is still false for it -- and every
@@ -6189,7 +6288,13 @@ static bool rt_medic_needs_care(Object* c)
         return false;
     }
 
-    return (float)stat_level(c, STAT_CURRENT_HIT_POINTS) < rt_medic_hp_fraction * (float)maxHp;
+    // The dude counts with the heal still coming in (rt_heal_left): a companion does not spend a
+    // second stimpak on him while the first is still working.
+    int hp = stat_level(c, STAT_CURRENT_HIT_POINTS);
+    if (c == obj_dude) {
+        hp += combat_rt_heal_left();
+    }
+    return (float)hp < rt_medic_hp_fraction * (float)maxHp;
 }
 
 // The best healing item this critter carries, or NULL. Drugs are preferred over kits: a Stimpak is
@@ -12911,6 +13016,7 @@ static void rt_reset_session_state()
     // A roll in flight is animating the PREVIOUS session's hit points; nothing ticks it once
     // combat_rt is torn down, so it would sit on a stale number over the new game's bar.
     intface_hp_roll_cancel();
+    rt_heal_clear("reset"); // ...and the heal pool is the previous session's too
 
     rt_refresh_timer = 0.0f;
     rt_dude_flinch_accum = 0.0f;
@@ -16002,6 +16108,9 @@ void combat_rt_update(float dt)
     // holds still exactly when the world does.
     intface_hp_roll_tick(dt);
 
+    // The heal pool comes in at the same beat (rt_heal_left).
+    rt_heal_tick(dt);
+
     // ...and so are the combat curtains on the bar's end-turn box: open while a fight is live,
     // shut once it is over (the held D-pad right, or nobody left to fight). See intface.cc.
     intface_rt_combat_box_tick(rt_engaged, dt);
@@ -17610,6 +17719,21 @@ void combat_rt_notify_objects_freed()
     // runs while the pointers are still valid -- and after it the table is empty, which is what
     // stops the reconciler sweeping freed memory on the first frame of the next map.
     rt_reaction_clear_all();
+
+    // A heal still coming in when he leaves the map lands at once -- the pool does not tick across
+    // the load, and walking onto an exit grid must not cost him the rest of a Super Stimpak. A
+    // savegame load drops it instead: the file's hit points are the truth there.
+    if (rt_heal_left > 0.0f && obj_dude != NULL) {
+        if (isLoadingGame()) {
+            rt_heal_clear("load");
+        } else {
+            int points = combat_rt_heal_left();
+            trace_event(TRACE_ACTION, "heal-pool", "end=map-exit landed=%d total=%d t=%.2f", points,
+                rt_heal_total, rt_clock);
+            rt_heal_left = 0.0f;
+            critter_adjust_hits(obj_dude, points);
+        }
+    }
 
     // Snap the HP counter to the truth before the teardown. Safe here specifically because
     // obj_remove_all calls us at its TOP, before a single object is freed.

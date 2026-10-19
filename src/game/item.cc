@@ -2285,7 +2285,22 @@ int item_d_take_drug(Object* critter, Object* item)
     wd_onset = proto->item.data.drug.withdrawalOnset;
 
     queue_clear_type(EVENT_TYPE_WITHDRAWAL, item_wd_clear_all);
+
+    // ⚠️ IN A REALTIME FIGHT THE DUDE'S HEAL COMES IN OVER TIME (2026-10-19, see rt_heal_left in
+    // combat_rt.cc). Here rather than at the quick-use, so every way a drug reaches him -- the heal
+    // slot, the inventory, a companion medic -- gets the same rule. Only the immediate effect: the
+    // delayed ones (Super Stimpak's later damage) come through the queue as in vanilla. The message
+    // ("You gained 15 hit points.") stays -- they are coming.
+    int hpBefore = critter->data.critter.hp;
     perform_drug_effect(critter, proto->item.data.drug.stat, proto->item.data.drug.amount, true);
+    if (critter == obj_dude && combat_rt_active()) {
+        int gained = critter->data.critter.hp - hpBefore;
+        if (gained > 0) {
+            critter->data.critter.hp = hpBefore;
+            combat_rt_heal_over_time(gained, item->pid);
+            intface_update_hit_points(true); // re-aim the counter perform_drug_effect sent to the full value
+        }
+    }
     insert_drug_effect(critter, item, proto->item.data.drug.duration1, proto->item.data.drug.stat, proto->item.data.drug.amount1);
     insert_drug_effect(critter, item, proto->item.data.drug.duration2, proto->item.data.drug.stat, proto->item.data.drug.amount2);
 

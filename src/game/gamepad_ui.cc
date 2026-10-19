@@ -3375,6 +3375,9 @@ static Object* gpui_carried_drug(int pid)
 // deliberately the same sequence combatai.cc:370 runs when an NPC self-medicates -- remove one,
 // apply it, destroy it -- so the player's quick-use and the AI's go through identical engine paths.
 // False = the drug code refused (robotic body, dead) and the item is back in the pack.
+//
+// In a fight the hit points it gives do not land at once: item_d_take_drug puts them into the heal
+// pool (combat_rt_heal_over_time).
 static bool gpui_take_drug_now(Object* item)
 {
     if (item_remove_mult(obj_dude, item, 1) != 0) {
@@ -3416,9 +3419,9 @@ static int gpui_inject_done(void* a1, void* a2)
         return 0;
     }
 
-    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d cost=%d qp=%d lock=%ums fight=%d jab=%ums",
-        gpui_inject_pid, hpBefore, critter_get_hits(obj_dude), combat_rt_player_ap(), gpui_inject_ap,
-        perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0,
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d pool=%d ap=%d cost=%d qp=%d lock=%ums fight=%d jab=%ums",
+        gpui_inject_pid, hpBefore, critter_get_hits(obj_dude), combat_rt_heal_left(), combat_rt_player_ap(),
+        gpui_inject_ap, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0,
         elapsed_time(gpui_inject_at));
     return 0;
 }
@@ -3533,14 +3536,20 @@ static void gpui_quick_use(int pid)
     // anim 20 (falling) -> anim 11 (this) -> anim 14, and the standup pass then reported
     // `fall=14`, i.e. it stood him up from a hit-react he should never have been in.
     //
-    // The HEAL still happens -- at once, below, with the AP; only the animation is skipped (the same
-    // fallback covers a jab that could not register). Making the drug itself fail here would be a
-    // silent balance change: being knocked down would start costing you the heal.
+    // The HEAL still happens -- below, with the AP; only the animation is skipped (the same fallback
+    // covers a jab that could not register: in the traces that is always the stand-up after a fall).
+    // Making the drug itself fail here would be a silent balance change: being knocked down would
+    // start costing you the heal.
+    //
+    // ⚠️ ...BUT IN A FIGHT IT NO LONGER LANDS AT ONCE (2026-10-19). This path was the spam: five
+    // stimpaks on the floor and getting up, 36 -> 71 HP in under two seconds (trace_2026-10-19_204959,
+    // every one jab=0). It goes into the heal pool like the jab's does (item_d_take_drug).
     if (!critter_is_prone(obj_dude) && gpui_inject_start(item, apCost)) {
         return;
     }
 
-    // On the floor, or the jab could not register: the drug works at once, with no animation.
+    // On the floor, or the jab could not register: the drug is taken now, with no animation (in a fight
+    // its hit points still come in over time).
     int hpBefore = critter_get_hits(obj_dude);
     int apBefore = combat_rt_player_ap();
     if (!gpui_take_drug_now(item)) {
@@ -3558,8 +3567,8 @@ static void gpui_quick_use(int pid)
     // the top of this function, before the item was spent.
     combat_rt_spend_ap(apCost);
 
-    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d jab=0",
-        pid, hpBefore, critter_get_hits(obj_dude), apBefore, combat_rt_player_ap(),
+    trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d pool=%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d jab=0",
+        pid, hpBefore, critter_get_hits(obj_dude), combat_rt_heal_left(), apBefore, combat_rt_player_ap(),
         apCost, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0);
 }
 

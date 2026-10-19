@@ -1,0 +1,23 @@
+# Heal over time in a fight (2026-10-19, "mohl jsem ho spamovat a vyléčit se na max"): the dude at 10 HP
+# takes three Stimpaks a second apart while a mutant walks up from 20 tiles. Each one's HP must go into
+# the pool (heal-pool add=), come in over seconds, faster while the pool is big (the second and third
+# land on top of the first), and the HP counter must follow without crawling.
+name heal-pool
+map DESERT1.MAP
+seed 4
+duration 9
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 10
+dude item 40 5
+
+spawn 16777225 24100 rot 5 hostile
+
+at 0 idle
+at 1.0 heal
+at 1.9 idle
+at 2.0 heal
+at 2.9 idle
+at 3.0 heal
+at 3.9 idle

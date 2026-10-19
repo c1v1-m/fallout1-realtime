@@ -2060,10 +2060,17 @@ static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
 // step drawn through the *static* (delay 0) path of intface_rotate_numbers. Same look,
 // nothing blocks.
 //
-// Vanilla spends ~250ms on the whole roll no matter how big the change is
-// (delay = 250 / (diff + 1) per step); keeping that means a scratch and a shotgun blast
-// take the same time to read.
-#define HP_ROLL_TOTAL_SECONDS (0.25f)
+// ⚠️ THE SPEED IS A SPECTRUM (2026-10-19, his "50HP ultra rychle, malé hp 5 se bude posouvat
+// pomaleji", picked for hits and heals alike). Vanilla spends ~250 ms on any roll (delay =
+// 250 / (diff + 1) per step), and the one-phase-per-tick rule below stretched a big one far past that:
+// a 50-point change crawled for 2.5 s at 60 fps, one point per three frames. Now the counter runs at
+// a speed set by how far it still has to go -- HP_ROLL_TAU is the time the gap takes to shrink by
+// about two thirds, HP_ROLL_MIN_RATE (points per second) the slowest it ever goes -- so a big change
+// flies and settles, a scratch ticks over point by point. A heal coming in over time
+// (combat_rt_heal_over_time) is followed the same way: the counter keeps a few points behind the bar
+// and runs as fast as the heal does.
+#define HP_ROLL_TAU (0.25f)
+#define HP_ROLL_MIN_RATE (10.0f)
 
 // Vanilla's counter is an ODOMETER, not a sequence of numbers. Every single point costs three
 // drawn frames (see intface_rotate_numbers): the digit rolls OUT upwards (upSrc), the value is
@@ -2078,15 +2085,32 @@ static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
 
 // AT MOST ONE PHASE PER TICK. A frame loop cannot show more sub-frames than it draws frames, so
 // burning several phases in one tick would silently drop exactly the frames that ARE the animation
-// -- the snap we are fixing. A big hit therefore takes longer than vanilla's fixed ~250 ms, which
-// is the right trade in realtime: the roll stays visible instead of being compressed into nothing.
-// It also makes a hitch harmless: a long frame advances one phase, never a burst.
+// -- the snap we are fixing. It also makes a hitch harmless: a long frame advances one phase, never
+// a burst. When the spectrum asks for more points per second than three frames a point can show,
+// one roll steps SEVERAL points instead (hp_roll_owed) -- the odometer turns over faster, every
+// phase is still drawn.
 
 static bool hp_roll_active = false;
 static int hp_roll_target = 0;
-static float hp_roll_step_seconds = 0.0f; // per PHASE, not per point
-static float hp_roll_accum = 0.0f;
+static float hp_roll_accum = 0.0f;  // time spent in the current phase
+static float hp_roll_owed = 0.0f;   // points the speed has earned and the counter not yet shown
+static int hp_roll_step = 0;        // the points this roll moves, signed (chosen at its OUT phase)
 static int hp_roll_phase = HP_ROLL_PHASE_OUT;
+// For the trace line at the end of a roll (intface_hp_roll_done).
+static int hp_roll_from = 0;
+static float hp_roll_took = 0.0f;
+static int hp_roll_rolls = 0;
+static int hp_roll_max_step = 0;
+
+// [STATE/hp-roll]: how long the counter took and in how many rolls (biggest step), for a change of
+// three points or more -- what the spectrum (HP_ROLL_TAU) is checked against.
+static void intface_hp_roll_done()
+{
+    if (abs(last_points - hp_roll_from) >= 3) {
+        trace_event(TRACE_STATE, "hp-roll", "from=%d to=%d took=%.2f rolls=%d maxstep=%d", hp_roll_from,
+            last_points, hp_roll_took, hp_roll_rolls, hp_roll_max_step);
+    }
+}
 
 // The color thresholds vanilla applies at 25% / 50% of max HP. Evaluated per intermediate
 // value, which reproduces for free what vanilla does by splitting the roll into colored
@@ -2192,21 +2216,21 @@ static void intface_hp_roll_start()
     hp_roll_target = critter_get_hits(obj_dude);
 
     if (hp_roll_target == last_points) {
-        // Nothing to roll (damage fully absorbed, heal for 0). Any roll already in flight is
-        // left alone -- it is heading here anyway.
+        // Nothing to roll (damage fully absorbed, heal for 0). A roll in flight finishes the point
+        // it is on and stops there (its OUT phase finds no gap) -- it is heading here anyway.
         return;
     }
 
-    // Vanilla budgets the WHOLE roll at ~250 ms regardless of size; keep that intent by dividing it
-    // across every phase. The one-phase-per-tick rule stretches a big roll past it rather than
-    // dropping frames -- see the note at HP_ROLL_PHASES.
-    hp_roll_step_seconds = HP_ROLL_TOTAL_SECONDS
-        / (float)((abs(hp_roll_target - last_points) + 1) * HP_ROLL_PHASES);
-
+    // The speed is not fixed here: the tick reads it off the gap every frame (HP_ROLL_TAU).
     if (!hp_roll_active) {
         hp_roll_accum = 0.0f;
+        hp_roll_owed = 0.0f;
         hp_roll_phase = HP_ROLL_PHASE_OUT;
         hp_roll_active = true;
+        hp_roll_from = last_points;
+        hp_roll_took = 0.0f;
+        hp_roll_rolls = 0;
+        hp_roll_max_step = 0;
     }
 }
 
@@ -2223,27 +2247,80 @@ void intface_hp_roll_tick(float dt)
         return;
     }
 
+    // Points per second for the gap as it is now; one point = three phases.
+    int gap = hp_roll_target - last_points;
+    float rate = (float)abs(gap) / HP_ROLL_TAU;
+    if (rate < HP_ROLL_MIN_RATE) {
+        rate = HP_ROLL_MIN_RATE;
+    }
+    float phaseSeconds = 1.0f / (rate * (float)HP_ROLL_PHASES);
+
+    hp_roll_owed += rate * dt;
+    hp_roll_took += dt;
+    if (hp_roll_owed > (float)abs(gap) + 1.0f) {
+        hp_roll_owed = (float)abs(gap) + 1.0f; // a long frame or a pause banks nothing beyond the gap
+    }
+
     hp_roll_accum += dt;
 
-    if (hp_roll_accum < hp_roll_step_seconds) {
+    if (hp_roll_accum < phaseSeconds) {
         return;
     }
 
     // Exactly one phase per tick; drop whatever time is left over so a hitch cannot bank up a burst.
     hp_roll_accum = 0.0f;
 
-    int step = hp_roll_target > last_points ? 1 : -1;
-
     switch (hp_roll_phase) {
-    case HP_ROLL_PHASE_OUT:
+    case HP_ROLL_PHASE_OUT: {
+        if (gap == 0) {
+            // Arrived (or the bar came back to the shown value mid-roll): settle and stop.
+            last_points_color = intface_hp_points_color(last_points);
+            intface_hp_roll_draw(last_points, 0, 0);
+            hp_roll_active = false;
+            hp_roll_owed = 0.0f;
+            intface_hp_roll_done();
+            break;
+        }
+        // How many points this roll moves: one while a point takes longer than a frame per phase,
+        // otherwise as many as the speed has earned since the last one.
+        int points = 1;
+        if (phaseSeconds < dt) {
+            points = (int)hp_roll_owed;
+            if (points < 1) {
+                points = 1;
+            }
+            if (points > abs(gap)) {
+                points = abs(gap);
+            }
+            hp_roll_owed -= (float)points;
+        } else {
+            hp_roll_owed = 0.0f;
+        }
+        if (hp_roll_owed < 0.0f) {
+            hp_roll_owed = 0.0f;
+        }
+        hp_roll_step = gap > 0 ? points : -points;
+        hp_roll_rolls++;
+        if (points > hp_roll_max_step) {
+            hp_roll_max_step = points;
+        }
+
         // The digits about to turn over roll upwards, still showing the OLD value.
         last_points_color = intface_hp_points_color(last_points);
-        intface_hp_roll_draw(last_points, intface_hp_digit_mask(last_points, last_points + step), 1);
+        intface_hp_roll_draw(last_points, intface_hp_digit_mask(last_points, last_points + hp_roll_step), 1);
         hp_roll_phase = HP_ROLL_PHASE_IN;
         break;
+    }
 
     case HP_ROLL_PHASE_IN: {
-        // Step the value, then show those same digits arriving from below.
+        // Step the value, then show those same digits arriving from below. The target may have moved
+        // since the OUT phase: never step past it, and not at all if it is now the other way.
+        int step = hp_roll_step;
+        if (gap * step <= 0) {
+            step = 0;
+        } else if (abs(step) > abs(gap)) {
+            step = gap;
+        }
         int previous = last_points;
         last_points += step;
         last_points_color = intface_hp_points_color(last_points);
@@ -2261,6 +2338,7 @@ void intface_hp_roll_tick(float dt)
 
         if (last_points == hp_roll_target) {
             hp_roll_active = false;
+            intface_hp_roll_done();
         }
         break;
     }
