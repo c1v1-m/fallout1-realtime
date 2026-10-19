@@ -1949,9 +1949,9 @@ static int SaveSlotBody();
 // The save itself, with a heal still coming in written as finished (combat_rt_heal_lend_for_save).
 static int SaveSlot()
 {
-    int lent = combat_rt_heal_lend_for_save();
+    combat_rt_heal_lend_for_save();
     int rc = SaveSlotBody();
-    combat_rt_heal_return_after_save(lent);
+    combat_rt_heal_return_after_save();
     return rc;
 }
 

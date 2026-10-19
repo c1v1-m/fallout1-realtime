@@ -56,7 +56,7 @@ namespace fallout {
 //   dude armor <pid>
 //   dude curhp <n>                     start with n hit points (after the maximum is set)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
-//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>]
+//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
 //   at <seconds> <policy> [tile]       the bot's plan; policies:
 //        idle                          do nothing
@@ -125,6 +125,7 @@ typedef struct AtSpawn {
     int itemCount;
     bool hostile;
     int team;
+    int curhp; // "hp <n>": start wounded (0 = full)
     Object* obj;
 } AtSpawn;
 
@@ -356,6 +357,8 @@ static bool at_parse(const char* path)
                     sp->hostile = true;
                 } else if (strcmp(tok[i], "team") == 0 && i + 1 < n) {
                     sp->team = atoi(tok[++i]);
+                } else if (strcmp(tok[i], "hp") == 0 && i + 1 < n) {
+                    sp->curhp = atoi(tok[++i]);
                 }
             }
         } else if (strcmp(tok[0], "at") == 0 && n >= 3 && at_phase_count < AT_MAX_PHASES) {
@@ -561,6 +564,9 @@ void autotest_setup_world()
             at_wield(critter, sp->wield, HAND_RIGHT);
         }
         sp->obj = critter;
+        if (sp->curhp > 0 && sp->curhp < critter->data.critter.hp) {
+            critter->data.critter.hp = sp->curhp;
+        }
 
         // ONE SIDE: raiders (team 1) and a super mutant (team 6) spawned together are not allies to the
         // engine, so friendly-fire care, guard joins and the squad rules would not see each other. A real

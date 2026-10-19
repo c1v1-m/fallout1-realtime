@@ -1,0 +1,14 @@
+# An enemy's stimpak heals over time too (2026-10-19, "ať i nepřátelé"): a mutant at 8 HP with two
+# Stimpaks, next to the dude (a walker is never free for its medic beat). Its medic beat (rt_medic_step) must put the drug's HP into its pool
+# (heal-pool id=... add=) and they must come in over seconds (end=done), not at once.
+name heal-npc
+map DESERT1.MAP
+seed 4
+duration 9
+
+dude tile 20100 rot 2
+dude hp 71
+
+spawn 16777225 20300 rot 5 item 40 2 hp 8 hostile
+
+at 0 idle

@@ -626,6 +626,8 @@ typedef struct RtActor {
     bool squad_hold_done;     // held once this engagement; reset in IDLE
     float corner_hold_start;  // < 0 = not gathering at a corner (rt_corner_holds)
     bool corner_done;         // decided about this blocked approach; reset when the line opens
+    float heal_left;          // HP of a drug still coming in (rt_heal_tick)
+    int heal_lent;            // ...of which lent to its HP for a save (combat_rt_heal_lend_for_save)
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
     bool defend_covered;      // looked for cover when it started holding
     float defend_since;       // when it started holding (the standoff cap, RT_DEFEND_MAX)
@@ -1808,31 +1810,61 @@ static float rt_clock = 0.0f;
 // goes on adding to whatever is left. The drug itself is vanilla, capped at the moment it is taken
 // (what the pool holds is what vanilla would have added right then). Out of a fight nothing changes:
 // the heal is instant there.
+//
+// ⚠️ ...AND THE SAME FOR EVERY FIGHTER (2026-10-19, his "ať i nepřátelé"). A stimpak an enemy or a
+// companion takes -- or is given by a medic (rt_medic_step, the only way an NPC heals in realtime) --
+// comes in at the same rate into its RtActor's heal_left. A critter that is not in the table gets
+// vanilla's instant heal.
 #define RT_HEAL_TAU 1.6f
 #define RT_HEAL_MIN_RATE 3.0f
 
-static float rt_heal_left = 0.0f;   // HP still to come
+static float rt_heal_left = 0.0f;   // the DUDE's HP still to come (fighters: RtActor.heal_left)
 static float rt_heal_started = 0.0f; // rt_clock when the pool last filled from empty
 static int rt_heal_total = 0;        // HP put in since then
+static int rt_heal_dude_lent = 0;    // lent to his HP for a save
 
-void combat_rt_heal_over_time(int hp, int pid)
+bool combat_rt_heal_over_time(Object* critter, int hp, int pid)
 {
-    if (hp <= 0) {
-        return;
+    if (critter == NULL || hp <= 0) {
+        return false;
     }
-    if (rt_heal_left <= 0.0f) {
-        rt_heal_started = rt_clock;
-        rt_heal_total = 0;
+
+    if (critter == obj_dude) {
+        if (rt_heal_left <= 0.0f) {
+            rt_heal_started = rt_clock;
+            rt_heal_total = 0;
+        }
+        rt_heal_left += (float)hp;
+        rt_heal_total += hp;
+        trace_event(TRACE_ACTION, "heal-pool", "pid=%d add=%d left=%.1f hp=%d t=%.2f", pid, hp, rt_heal_left,
+            critter_get_hits(obj_dude), rt_clock);
+        return true;
     }
-    rt_heal_left += (float)hp;
-    rt_heal_total += hp;
-    trace_event(TRACE_ACTION, "heal-pool", "pid=%d add=%d left=%.1f hp=%d t=%.2f", pid, hp, rt_heal_left,
-        obj_dude != NULL ? critter_get_hits(obj_dude) : -1, rt_clock);
+
+    RtActor* a = rt_actor_of(critter);
+    if (a == NULL) {
+        return false;
+    }
+    a->heal_left += (float)hp;
+    trace_event(TRACE_ACTION, "heal-pool", "id=%d who=%d add=%d left=%.1f hp=%d t=%.2f", critter->id, critter->pid,
+        hp, a->heal_left, critter_get_hits(critter), rt_clock);
+    return true;
 }
 
 int combat_rt_heal_left()
 {
     return (int)ceilf(rt_heal_left);
+}
+
+// A critter's HP plus whatever a drug is still bringing it.
+static int rt_hp_with_heal(Object* critter)
+{
+    int hp = stat_level(critter, STAT_CURRENT_HIT_POINTS);
+    if (critter == obj_dude) {
+        return hp + combat_rt_heal_left();
+    }
+    RtActor* a = rt_actor_of(critter);
+    return a != NULL ? hp + (int)ceilf(a->heal_left) : hp;
 }
 
 static void rt_heal_clear(const char* why)
@@ -1844,32 +1876,92 @@ static void rt_heal_clear(const char* why)
     rt_heal_left = 0.0f;
 }
 
-// ⚠️ A SAVE TAKES THE POOL AS HEALED. Quick save works in a fight, and the pool is not part of any
-// saved chunk, so a save in the middle of a heal would have lost the rest of it for good. SaveSlot
-// lends it to the bar for the write and takes it back after: the file holds the finished heal, the
-// game goes on healing as it was.
-int combat_rt_heal_lend_for_save()
+// Whole points only, and exactly the pool in the end: what has crossed an integer comes in. Fast
+// while a lot is still to come, never slower than RT_HEAL_MIN_RATE.
+static int rt_heal_drain(float* left, float dt)
 {
-    if (obj_dude == NULL || rt_heal_left <= 0.0f) {
-        return 0;
-    }
-    int room = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS) - obj_dude->data.critter.hp;
-    int lent = combat_rt_heal_left() < room ? combat_rt_heal_left() : (room > 0 ? room : 0);
-    obj_dude->data.critter.hp += lent;
-    return lent;
+    float rate = fmaxf(RT_HEAL_MIN_RATE, *left / RT_HEAL_TAU);
+    float before = *left;
+    *left = fmaxf(0.0f, *left - rate * dt);
+    return (int)ceilf(before) - (int)ceilf(*left);
 }
 
-void combat_rt_heal_return_after_save(int lent)
+// What the pool can still add to this body right now: its own pool, up to its maximum.
+static int rt_heal_lendable(Object* critter, float left)
 {
-    if (obj_dude != NULL && lent > 0) {
-        obj_dude->data.critter.hp -= lent;
+    int room = stat_level(critter, STAT_MAXIMUM_HIT_POINTS) - critter->data.critter.hp;
+    int want = (int)ceilf(left);
+    return want < room ? want : (room > 0 ? room : 0);
+}
+
+// ⚠️ A SAVE TAKES THE POOL AS HEALED. Quick save works in a fight, and the pool is not part of any
+// saved chunk, so a save in the middle of a heal would have lost the rest of it for good. SaveSlot
+// lends it to the bodies for the write and takes it back after: the file holds the finished heal,
+// the game goes on healing as it was.
+void combat_rt_heal_lend_for_save()
+{
+    rt_heal_dude_lent = 0;
+    if (obj_dude != NULL && rt_heal_left > 0.0f) {
+        rt_heal_dude_lent = rt_heal_lendable(obj_dude, rt_heal_left);
+        obj_dude->data.critter.hp += rt_heal_dude_lent;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        a->heal_lent = 0;
+        if (a->obj != NULL && a->heal_left > 0.0f && !critter_is_dead(a->obj)) {
+            a->heal_lent = rt_heal_lendable(a->obj, a->heal_left);
+            a->obj->data.critter.hp += a->heal_lent;
+        }
+    }
+}
+
+void combat_rt_heal_return_after_save()
+{
+    if (obj_dude != NULL && rt_heal_dude_lent > 0) {
+        obj_dude->data.critter.hp -= rt_heal_dude_lent;
+    }
+    rt_heal_dude_lent = 0;
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (a->obj != NULL && a->heal_lent > 0) {
+            a->obj->data.critter.hp -= a->heal_lent;
+        }
+        a->heal_lent = 0;
     }
 }
 
 // From combat_rt_update, next to the HP counter, so it holds still whenever the world does.
 static void rt_heal_tick(float dt)
 {
-    if (rt_heal_left <= 0.0f || dt <= 0.0f) {
+    if (dt <= 0.0f) {
+        return;
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        if (a->heal_left <= 0.0f) {
+            continue;
+        }
+        Object* c = a->obj;
+        if (c == NULL || critter_is_dead(c)) {
+            if (c != NULL) {
+                trace_event(TRACE_ACTION, "heal-pool", "id=%d who=%d end=dead lost=%d t=%.2f", c->id, c->pid,
+                    (int)ceilf(a->heal_left), rt_clock);
+            }
+            a->heal_left = 0.0f;
+            continue;
+        }
+        int points = rt_heal_drain(&a->heal_left, dt);
+        if (points > 0) {
+            critter_adjust_hits(c, points);
+        }
+        if (a->heal_left <= 0.0f) {
+            trace_event(TRACE_ACTION, "heal-pool", "id=%d who=%d end=done hp=%d t=%.2f", c->id, c->pid,
+                critter_get_hits(c), rt_clock);
+        }
+    }
+
+    if (rt_heal_left <= 0.0f) {
         return;
     }
     if (obj_dude == NULL || (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
@@ -1877,11 +1969,7 @@ static void rt_heal_tick(float dt)
         return;
     }
 
-    float rate = fmaxf(RT_HEAL_MIN_RATE, rt_heal_left / RT_HEAL_TAU);
-    float before = rt_heal_left;
-    rt_heal_left = fmaxf(0.0f, rt_heal_left - rate * dt);
-    // Whole points only, and exactly the pool in the end: what has crossed an integer comes in.
-    int points = (int)ceilf(before) - (int)ceilf(rt_heal_left);
+    int points = rt_heal_drain(&rt_heal_left, dt);
     if (points > 0) {
         critter_adjust_hits(obj_dude, points);
         intface_update_hit_points(true);
@@ -6288,13 +6376,9 @@ static bool rt_medic_needs_care(Object* c)
         return false;
     }
 
-    // The dude counts with the heal still coming in (rt_heal_left): a companion does not spend a
-    // second stimpak on him while the first is still working.
-    int hp = stat_level(c, STAT_CURRENT_HIT_POINTS);
-    if (c == obj_dude) {
-        hp += combat_rt_heal_left();
-    }
-    return (float)hp < rt_medic_hp_fraction * (float)maxHp;
+    // Counted with the heal still coming in (rt_heal_left, RtActor.heal_left): nobody spends a second
+    // stimpak on a patient while the first is still working.
+    return (float)rt_hp_with_heal(c) < rt_medic_hp_fraction * (float)maxHp;
 }
 
 // The best healing item this critter carries, or NULL. Drugs are preferred over kits: a Stimpak is
@@ -9293,6 +9377,8 @@ static void rt_refresh_registry()
             a->squad_hold_done = prev->squad_hold_done;
             a->corner_hold_start = prev->corner_hold_start;
             a->corner_done = prev->corner_done;
+            a->heal_left = prev->heal_left;
+            a->heal_lent = prev->heal_lent;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9378,6 +9464,8 @@ static void rt_refresh_registry()
             a->squad_hold_done = false;
             a->corner_hold_start = -1.0f;
             a->corner_done = false;
+            a->heal_left = 0.0f;
+            a->heal_lent = 0;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;

@@ -344,11 +344,12 @@ void combat_rt_inject_begin(Object* critter);
 void combat_rt_inject_end(Object* critter);
 bool combat_rt_is_injecting(Object* critter);
 
-// The dude's healing in a fight comes in over time (see rt_heal_left in combat_rt.cc).
-void combat_rt_heal_over_time(int hp, int pid);
+// A drug's healing in a fight comes in over time, the dude's and every fighter's (see rt_heal_left in
+// combat_rt.cc). False = not pooled (not in the fight's table); the caller leaves the heal as it was.
+bool combat_rt_heal_over_time(Object* critter, int hp, int pid);
 int combat_rt_heal_left();
-int combat_rt_heal_lend_for_save();
-void combat_rt_heal_return_after_save(int lent);
+void combat_rt_heal_lend_for_save();
+void combat_rt_heal_return_after_save();
 // A body in a knockdown or a death -- falling, lying, getting up, dying (the reaction layer's view).
 // An enemy's trigger pull must not cut it (action_attack); only the commit decides what a new hit does.
 bool combat_rt_in_heavy_reaction(Object* critter);

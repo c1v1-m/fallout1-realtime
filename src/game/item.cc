@@ -2286,18 +2286,19 @@ int item_d_take_drug(Object* critter, Object* item)
 
     queue_clear_type(EVENT_TYPE_WITHDRAWAL, item_wd_clear_all);
 
-    // ⚠️ IN A REALTIME FIGHT THE DUDE'S HEAL COMES IN OVER TIME (2026-10-19, see rt_heal_left in
-    // combat_rt.cc). Here rather than at the quick-use, so every way a drug reaches him -- the heal
-    // slot, the inventory, a companion medic -- gets the same rule. Only the immediate effect: the
-    // delayed ones (Super Stimpak's later damage) come through the queue as in vanilla. The message
-    // ("You gained 15 hit points.") stays -- they are coming.
+    // ⚠️ IN A REALTIME FIGHT A HEAL COMES IN OVER TIME (2026-10-19, see rt_heal_left in combat_rt.cc),
+    // the dude's and every fighter's. Here rather than at the quick-use, so every way a drug reaches a
+    // body -- the heal slot, the inventory, a medic -- gets the same rule. Only the immediate effect:
+    // the delayed ones (Super Stimpak's later damage) come through the queue as in vanilla. The
+    // message ("You gained 15 hit points.") stays -- they are coming.
     int hpBefore = critter->data.critter.hp;
     perform_drug_effect(critter, proto->item.data.drug.stat, proto->item.data.drug.amount, true);
-    if (critter == obj_dude && combat_rt_active()) {
-        int gained = critter->data.critter.hp - hpBefore;
-        if (gained > 0) {
-            critter->data.critter.hp = hpBefore;
-            combat_rt_heal_over_time(gained, item->pid);
+    int gained = critter->data.critter.hp - hpBefore;
+    if (gained > 0 && combat_rt_active()) {
+        critter->data.critter.hp = hpBefore;
+        if (!combat_rt_heal_over_time(critter, gained, item->pid)) {
+            critter->data.critter.hp += gained; // not in the fight's table: vanilla, at once
+        } else if (critter == obj_dude) {
             intface_update_hit_points(true); // re-aim the counter perform_drug_effect sent to the full value
         }
     }
