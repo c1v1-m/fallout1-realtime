@@ -76,6 +76,7 @@ namespace fallout {
 //        shootmove                     fight, and the moment his own attack is under way push the stick
 //                                      sideways for 0.8 s (turning each time) -- shoot and move
 //        heal                          press LB (the heal slot) once, then stand
+//        use                           press A (the interact prompt's use) once, then stand
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
@@ -107,9 +108,10 @@ enum {
     AT_DODGE,
     AT_SHOOT_MOVE,
     AT_HEAL,
+    AT_USE,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal", "use" };
 
 typedef struct AtItem {
     int pid;
@@ -980,6 +982,16 @@ void autotest_tick(float dt)
             at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
             break;
         }
+        case AT_USE:
+            // One press of A (use what the interact prompt points at), then stand.
+            at_stick_still();
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, -32768);
+            if (at_shots == 0) {
+                at_tap(SDL_CONTROLLER_BUTTON_A);
+                at_shots = 1;
+                trace_event(TRACE_FLOW, "autotest", "use-tap at=%.2f ap=%d", at_elapsed, combat_rt_player_ap());
+            }
+            break;
         case AT_HEAL:
             // One press of LB (the heal slot), then stand.
             at_stick_still();

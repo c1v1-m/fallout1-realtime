@@ -3941,6 +3941,14 @@ static Object* gpui_qt_hand_item()
     return gpui_qt_hand ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
 }
 
+// Changing what is in the hand in a fight: vanilla's inventory price, 4 AP less one per rank of Quick
+// Pockets (inven_action_cursor's own formula). The weapon wheel and the grenade's quick draw (RB).
+static int gpui_weapon_change_cost()
+{
+    int cost = 4 - perk_level(PERK_QUICK_POCKETS);
+    return cost > 0 ? cost : 0;
+}
+
 // The safe-tick half (gpui_drain_requests): every wield and every throw happens here.
 static void gpui_qt_tick()
 {
@@ -3976,7 +3984,9 @@ static void gpui_qt_tick()
             gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
             return;
         }
-        int apCost = perk_level(PERK_QUICK_POCKETS) > 0 ? 1 : 2;
+        // A weapon change, priced like the wheel's (gpui_weapon_change_cost, 2026-10-19 -- it was 2, 1
+        // with Quick Pockets). The put-back after the throw stays free: one draw, one price.
+        int apCost = gpui_weapon_change_cost();
         if (combat_rt_player_ap() < apCost) {
             gpui_qt_set(GPUI_QT_IDLE);
             gsound_play_sfx_file("iisxxxx1");
@@ -4973,12 +4983,26 @@ static void gpui_weapon_equip(int index)
         return;
     }
 
+    // ⚠️ IN A FIGHT IT COSTS WHAT VANILLA'S WAY TO DO IT COSTS (2026-10-19, his pick "Jako inventář: 4 AP
+    // (− QP)"). Vanilla changes weapons through the inventory -- 4 AP to open it, one less per rank of
+    // Quick Pockets -- and the wheel is only a quicker way there; it was free, the put-away and the
+    // draw were its only price. Swapping hands (Y) stays free, as in vanilla. Out of a fight the pool
+    // is full and nothing is taken (combat_rt_spend_ap).
+    int apCost = gpui_weapon_change_cost();
+    if (combat_rt_player_ap() < apCost) {
+        gsound_play_sfx_file("iisxxxx1");
+        trace_event(TRACE_INPUT, "weapon-equip-refused", "why=ap ap=%d cost=%d", combat_rt_player_ap(), apCost);
+        return;
+    }
+
     if (item == NULL) {
         // The bare-hands entry. inven_unwield plays the put-away animation itself when the hand
         // being emptied is the one the interface bar shows, so the swap reads on screen just like
         // a wield does.
+        combat_rt_spend_ap(apCost);
         inven_unwield(obj_dude, hand);
         intface_update_items(true);
+        trace_event(TRACE_ACTION, "weapon-equip", "pid=-1 cost=%d ap=%d", apCost, combat_rt_player_ap());
         return;
     }
 
@@ -4994,8 +5018,10 @@ static void gpui_weapon_equip(int index)
         return;
     }
 
+    combat_rt_spend_ap(apCost);
     inven_wield(obj_dude, item, hand);
     intface_update_items(true);
+    trace_event(TRACE_ACTION, "weapon-equip", "pid=%d cost=%d ap=%d", item->pid, apCost, combat_rt_player_ap());
 }
 
 // Drive from the per-frame safe tick (gamepad_ui_tick), exactly like the quick-use wheel.

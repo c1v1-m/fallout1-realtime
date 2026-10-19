@@ -9,6 +9,7 @@
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/game.h"
+#include "game/combat_rt.h"
 #include "game/game_trace.h"
 #include "game/gsound.h"
 #include "game/intface.h"
@@ -1102,6 +1103,33 @@ int check_scenery_ap_cost(Object* obj, Object* a2)
 {
     if (!isInCombat()) {
         return 0;
+    }
+
+    // ⚠️ IN REALTIME IT TAKES THE 3 AP FROM THE REAL POOL (2026-10-19, his "změnil bych"). Vanilla's
+    // price for picking something up, opening a door or using scenery, looting, a ladder -- taken from
+    // the engine's combat.ap, which realtime holds full all the time (movement is free in its model),
+    // so in a fight every one of them had silently become free. The dude pays combat_rt's pool now,
+    // and with less than 3 the action stops where vanilla stops it: "You don't have enough action
+    // points." Critters do not do these in a fight; their engine pool is left as it was.
+    if (combat_rt_enabled()) {
+        if (obj != obj_dude) {
+            return 0;
+        }
+        if (combat_rt_spend_ap(3)) {
+            trace_event(TRACE_ACTION, "scenery-ap", "pid=%d cost=3 ap=%d", a2 != NULL ? a2->pid : -1,
+                combat_rt_player_ap());
+            return 0;
+        }
+        trace_event(TRACE_ACTION, "scenery-ap-refused", "pid=%d ap=%d", a2 != NULL ? a2->pid : -1,
+            combat_rt_player_ap());
+        MessageListItem refused;
+        // You don't have enough action points.
+        refused.num = 700;
+        if (message_search(&proto_main_msg_file, &refused)) {
+            display_print(refused.text);
+        }
+        gsound_play_sfx_file("iisxxxx1");
+        return -1;
     }
 
     int actionPoints = obj->data.critter.combat.ap;

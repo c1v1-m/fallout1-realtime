@@ -1,12 +1,14 @@
-# A quick throw short of AP (2026-10-18): Agility 1 = 5 AP, the draw takes 2, the throw costs 4 -- the
-# grenade must wait in the hand and go the moment the pool reaches 4 (quick-throw-wait, -waited).
+# A quick throw short of AP (2026-10-18): the grenade must wait in the hand and go the moment the pool
+# reaches the throw's 4 (quick-throw-wait, -waited). Since 2026-10-19 the draw costs 4 (a weapon change,
+# his pick), so Agility 3 = 6 AP: the draw leaves 2, the wait is ~1.5 s (Agility 1 could no longer make
+# it inside the 2 s the hand waits).
 name throw-wait
 map DESERT1.MAP
 seed 1
 duration 12
 
 dude tile 20100 rot 2
-dude stat AG 1
+dude stat AG 3
 dude stat ST 8
 dude hp 400
 dude item 25 3

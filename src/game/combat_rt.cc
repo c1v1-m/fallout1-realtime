@@ -3452,6 +3452,8 @@ static bool rt_register_begin(int requestOptions, const char* where)
 // corrupt a saturated anim table, the very condition combat_rt can hit). The
 // knocked-down flag is cleared only once the animation actually registers, so a
 // table-full frame simply retries next frame.
+static void rt_drain_standup_ap(Object* critter);
+
 static void rt_stand_up(Object* critter)
 {
     // NOTE: the dude used to WAIT prone until his AP pool could afford the 3-AP standup. Combined
@@ -3484,8 +3486,11 @@ static void rt_stand_up(Object* critter)
     // in the shared combatai / can't-act checks (combatai.cc, critter.cc) after it stood up.
     critter->data.critter.combat.results &= ~(DAM_KNOCKED_DOWN | DAM_LOSE_TURN);
 
+    // ⚠️ GETTING UP COSTS 3 AP, EVERYONE (2026-10-19, his "ať stávají i NPC"). Vanilla's price; only the
+    // dude paid it, every critter got up for free. Whatever is there up to 3 now, for both -- a pool
+    // below 3 used to make the dude's standup free too (combat_rt_spend_ap refuses rather than drains).
+    rt_drain_standup_ap(critter);
     if (critter == obj_dude) {
-        combat_rt_spend_ap(3);
         // A knockdown recovery is a fresh start: clear sprint-exhaustion so the player can move
         // again immediately after getting up, instead of being double-locked (down THEN blocked).
         rt_move_blocked = false;
@@ -17637,6 +17642,27 @@ void combat_rt_refund_ap(int amount)
     int maxAp = combat_rt_player_max_ap();
     if (rt_player_ap > maxAp) {
         rt_player_ap = maxAp;
+    }
+}
+
+// The standup's 3 AP (rt_stand_up): taken down to zero, never refused -- getting up is not optional.
+static void rt_drain_standup_ap(Object* critter)
+{
+    if (critter == obj_dude) {
+        if (!rt_engaged) {
+            return;
+        }
+        int maxAp = combat_rt_player_max_ap();
+        if (rt_player_ap > maxAp) {
+            rt_player_ap = maxAp;
+        }
+        rt_player_ap = rt_player_ap > 3 ? rt_player_ap - 3 : 0;
+        return;
+    }
+    RtActor* a = rt_actor_of(critter);
+    if (a != NULL) {
+        a->ap = a->ap > 3 ? a->ap - 3 : 0;
+        trace_event(TRACE_FLOW, "standup-ap", "id=%d pid=%d ap=%d t=%.2f", critter->id, critter->pid, a->ap, rt_clock);
     }
 }
 

@@ -1,0 +1,19 @@
+# Vanilla's 3 AP for using scenery in a fight (2026-10-19, his "změnil bych"): the dude by the Mariposa
+# lockers with a hostile mutant in the room, A on a locker twice. The first open must cost 3 AP from the
+# realtime pool (scenery-ap), and with under 3 left it must be refused (scenery-ap-refused) -- realtime
+# held the engine's pool full, so it had been free.
+name scenery-ap
+map MBSTRG12.MAP
+seed 1
+duration 6
+
+dude tile 28072 rot 2
+dude elevation 1
+dude hp 400
+
+spawn 16777225 27280 rot 2 hostile
+
+at 0 idle
+at 1.5 use
+at 3.0 idle
+at 3.1 use
