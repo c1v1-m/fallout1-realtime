@@ -626,6 +626,14 @@ typedef struct RtActor {
     bool squad_hold_done;     // held once this engagement; reset in IDLE
     float corner_hold_start;  // < 0 = not gathering at a corner (rt_corner_holds)
     bool corner_done;         // decided about this blocked approach; reset when the line opens
+    int tactic_roll;          // this approach's roll for the corner tactics: 0 not yet, 1 passed, -1 failed
+    int ow_tile;              // its overwatch post (rt_overwatch_holds); -1 = none
+    int ow_entry;             // the tile it covers from there: where its target would step into view
+    int ow_target_tile;       // where the target stood when the post was chosen
+    float ow_since;           // when the post was chosen
+    float ow_in_at;           // when it reached the post; < 0 = still on its way
+    int ow_hp;                // its hit points then (a hit ends the wait)
+    bool ow_done;             // decided about this approach; reset when the line opens
     float heal_left;          // HP of a drug still coming in (rt_heal_tick)
     int heal_lent;            // ...of which lent to its HP for a save (combat_rt_heal_lend_for_save)
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
@@ -9379,6 +9387,14 @@ static void rt_refresh_registry()
             a->corner_done = prev->corner_done;
             a->heal_left = prev->heal_left;
             a->heal_lent = prev->heal_lent;
+            a->tactic_roll = prev->tactic_roll;
+            a->ow_tile = prev->ow_tile;
+            a->ow_entry = prev->ow_entry;
+            a->ow_target_tile = prev->ow_target_tile;
+            a->ow_since = prev->ow_since;
+            a->ow_in_at = prev->ow_in_at;
+            a->ow_hp = prev->ow_hp;
+            a->ow_done = prev->ow_done;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9466,6 +9482,14 @@ static void rt_refresh_registry()
             a->corner_done = false;
             a->heal_left = 0.0f;
             a->heal_lent = 0;
+            a->tactic_roll = 0;
+            a->ow_tile = -1;
+            a->ow_entry = -1;
+            a->ow_target_tile = -1;
+            a->ow_since = 0.0f;
+            a->ow_in_at = -1.0f;
+            a->ow_hp = 0;
+            a->ow_done = false;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;
@@ -10113,6 +10137,50 @@ static int rt_tiles_around(int centre, int radius, int* out, int cap)
     return count;
 }
 
+// --- COMBAT AI: RELOAD ON THE WAY (2026-10-19, his pick "Přebít cestou, mimo výhled") ------------
+//
+// A shooter reloaded only in RT_ATTACK -- when it wanted to fire -- the way vanilla's ai_try_attack
+// does it at the start of a turn. In realtime that turned into: empty the gun at 25 tiles, walk the
+// twelve-second detour round to the dude with nothing in it, step into his doorway and only THEN
+// start the reload loop, in his sights (trace_2026-10-19_213643: 2521, 3170 and 3228, all three
+// arriving dry; 2521 was shot mid-reload). Now a chaser whose gun is empty reloads as soon as its
+// target has no line of fire to it: it stops where it is, plays the same loop for the same AP, and
+// goes on loaded. For every NPC, not only with Tactical AI -- it is not a tactic, it is not walking
+// into a fight with an empty gun. A dry one with no ammo left is left to RT_ATTACK, which swaps.
+static bool rt_reload_on_the_way(RtActor* a, Object* npc)
+{
+    Object* target = a->target;
+    if (target == NULL || a->ap < RT_RELOAD_AP_COST) {
+        return false;
+    }
+    int hitMode = rt_hit_mode(npc);
+    if (!rt_needs_reload(npc, hitMode)) {
+        return false;
+    }
+    Object* weapon = item_hit_with(npc, hitMode);
+    if (weapon == NULL || !rt_npc_has_ammo_for(npc, weapon)) {
+        return false;
+    }
+    if (!combat_is_shot_blocked(target, target->tile, npc->tile, npc, NULL)) {
+        return false; // in its sights: RT_ATTACK reloads, behind cover first
+    }
+
+    trace_event(TRACE_FLOW, "reload-way", "id=%d pid=%d dist=%d t=%.2f", npc->id, npc->pid,
+        obj_dist(npc, target), rt_clock);
+    if (anim_get_reload_anim() && rt_npc_start_reload_anim(a, npc, weapon)) {
+        return true;
+    }
+    if (anim_busy(npc) != 0) {
+        return true; // the body is not free yet: asked again next frame, the gun is empty regardless
+    }
+    if (item_w_try_reload(npc, weapon) != -1) {
+        a->ap -= RT_RELOAD_AP_COST;
+        trace_event(TRACE_FLOW, "npc-reload", "id=%d pid=%d ap=%d t=%.2f", npc->id, npc->pid, a->ap, rt_clock);
+        return true;
+    }
+    return false;
+}
+
 // --- COMBAT AI: RELOAD IN COVER (2026-10-17, MODS "Tactical AI") ---------------------------------
 //
 // A shooter whose magazine runs dry used to reload where it stood, in the open, in your sights.
@@ -10601,6 +10669,29 @@ static bool rt_squad_holds(RtActor* a, Object* npc)
 #define RT_CORNER_GROUP 2
 #define RT_CORNER_HOLD_MAX 4.0f
 
+// Whether it thinks of a tactic on this approach at all -- the overwatch post (rt_overwatch_holds)
+// or, failing a post, the gathering at the corner. ONE roll per approach for both, INT x 10 % but
+// never under RT_TACTIC_MIN_CHANCE (2026-10-19, his "Podle INT, ale aspoň polovina": a super mutant's
+// INT 2-5 made it 20-50 %, and they came round one at a time). Rolled again once it has had its
+// target in its line of fire.
+#define RT_TACTIC_MIN_CHANCE 50
+
+static bool rt_tactic_roll(RtActor* a, Object* npc, const char* what)
+{
+    if (a->tactic_roll == 0) {
+        int intelligence = stat_level(npc, STAT_INTELLIGENCE);
+        int chance = intelligence * 10;
+        if (chance < RT_TACTIC_MIN_CHANCE) {
+            chance = RT_TACTIC_MIN_CHANCE;
+        }
+        int roll = roll_random(1, 100);
+        a->tactic_roll = roll <= chance ? 1 : -1;
+        trace_event(TRACE_FLOW, "tactic-roll", "id=%d pid=%d for=%s int=%d chance=%d roll=%d ok=%d t=%.2f",
+            npc->id, npc->pid, what, intelligence, chance, roll, a->tactic_roll > 0 ? 1 : 0, rt_clock);
+    }
+    return a->tactic_roll > 0;
+}
+
 static bool rt_corner_holds(RtActor* a, Object* npc)
 {
     if (a->corner_done || a->target == NULL || !rt_can_walk(npc) || a->fleeing) {
@@ -10650,23 +10741,286 @@ static bool rt_corner_holds(RtActor* a, Object* npc)
     }
 
     if (a->corner_hold_start < 0.0f) {
-        int intelligence = stat_level(npc, STAT_INTELLIGENCE);
-        int roll = roll_random(1, 100);
-        if (roll > intelligence * 10) {
-            trace_event(TRACE_FLOW, "corner-skip", "id=%d pid=%d int=%d roll=%d dist=%d coming=%d t=%.2f",
-                npc->id, npc->pid, intelligence, roll, myDist, coming, rt_clock);
+        if (!rt_tactic_roll(a, npc, "corner")) {
+            trace_event(TRACE_FLOW, "corner-skip", "id=%d pid=%d dist=%d coming=%d t=%.2f",
+                npc->id, npc->pid, myDist, coming, rt_clock);
             a->corner_done = true;
             return false;
         }
         a->corner_hold_start = rt_clock;
-        trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d start dist=%d near=%d coming=%d int=%d roll=%d t=%.2f",
-            npc->id, npc->pid, myDist, near, coming, intelligence, roll, rt_clock);
+        trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d start dist=%d near=%d coming=%d t=%.2f",
+            npc->id, npc->pid, myDist, near, coming, rt_clock);
     } else if (rt_clock - a->corner_hold_start >= RT_CORNER_HOLD_MAX) {
         trace_event(TRACE_FLOW, "corner-hold", "id=%d pid=%d end=timeout near=%d held=%.2f t=%.2f",
             npc->id, npc->pid, near, rt_clock - a->corner_hold_start, rt_clock);
         a->corner_done = true;
         a->corner_hold_start = -1.0f;
         return false;
+    }
+    return true;
+}
+
+// ⚠️ OVERWATCH: TAKE A POST AND COVER THE DOOR (2026-10-19, his "co udělat něco taktického, jako jít
+// zpátky a stát a mířit na dveře"; his picks "Po čase vyrazí všichni naraz" and "Podle INT, ale aspoň
+// polovina"). trace_2026-10-19_213643: he held a spot six tiles past a door and the mutants walked a
+// twelve-second detour to it and through it one at a time, 2-3 s apart -- each one stepped into his
+// sights and took one aimed shot to the eyes. "pif paf pif paf".
+//
+// Now a chaser close to its target (RT_OW_DIST) that has no line of fire to it works out WHERE it
+// would step into that line on its way in -- the ENTRY, the first tile of its route the target can
+// shoot -- and instead of walking through it, takes a POST: a free tile near it that the target has
+// no line of fire to, but from which it has a line of fire to the entry (RT_OW_MIN_FROM_ENTRY back
+// from it, within its weapon's reach; a melee fighter waits right beside the entry instead). It
+// walks there, turns to the entry and waits. Whoever comes through gets it first -- the trick he was
+// doing to them. When its target does show itself, the ordinary attack test takes over.
+//
+// It waits for the group: every teammate after the same target that is still coming (in RT_CHASE
+// within RT_SQUAD_RADIUS and not yet at a post). When none is, and the first of them has held
+// RT_OW_MIN_HOLD, or when the first has held RT_OW_MAX whatever happens, ALL of the group's posts
+// end on the same frame and they go in together. A hit ends one's wait (fight), and so does its
+// target coming close; its target moving more than RT_OW_TARGET_SLACK makes it pick again -- that
+// post covered the wrong door. Whether it thinks of it at all is the shared roll (rt_tactic_roll);
+// with no post to be had it falls back to gathering at the corner (rt_corner_holds).
+#define RT_OW_DIST 10
+#define RT_OW_RADIUS 6
+#define RT_OW_MIN_FROM_ENTRY 3
+#define RT_OW_MIN_HOLD 3.0f
+#define RT_OW_MAX 8.0f
+#define RT_OW_WALK_MAX 6.0f
+#define RT_OW_TARGET_SLACK 2
+
+static void rt_intent_hint(RtActor* a, int intent, const char* why, float seconds);
+
+static void rt_ow_drop(RtActor* a, Object* npc, const char* why, bool done)
+{
+    if (a->ow_tile >= 0) {
+        trace_event(TRACE_FLOW, "overwatch", "id=%d pid=%d end=%s post=%d entry=%d held=%.2f t=%.2f", npc->id,
+            npc->pid, why, a->ow_tile, a->ow_entry, a->ow_in_at >= 0.0f ? rt_clock - a->ow_in_at : -1.0f, rt_clock);
+    }
+    a->ow_tile = -1;
+    a->ow_in_at = -1.0f;
+    a->ow_done = done;
+}
+
+// Every post kept for this target ends now: they go in together.
+static void rt_ow_go(Object* target, const char* why)
+{
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* b = &rt_actors[i];
+        if (b->ow_tile >= 0 && b->target == target && b->obj != NULL) {
+            rt_ow_drop(b, b->obj, why, true);
+            b->corner_done = true; // and no gathering at the corner on top of it
+        }
+    }
+}
+
+// The route as the walls lay it: a critter in the way -- a teammate in the doorway, the very crowd this
+// is for -- is no part of where the door is.
+static Object* rt_ow_wall_at(Object* obj, int tile, int elevation)
+{
+    Object* blocker = obj_blocking_at(obj, tile, elevation);
+    return blocker != NULL && FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER ? NULL : blocker;
+}
+
+// The first tile of npc's route to its target that the target has a line of fire to; -1 = none.
+static int rt_ow_entry_tile(Object* npc, Object* target, int* outSteps)
+{
+    unsigned char rotations[800];
+    int steps = make_path_func(npc, npc->tile, target->tile, rotations, 0, rt_ow_wall_at);
+    *outSteps = steps;
+    int tile = npc->tile;
+    for (int i = 0; i < steps; i++) {
+        tile = tile_num_in_direction(tile, rotations[i], 1);
+        if (tile == target->tile) {
+            break;
+        }
+        if (!combat_is_shot_blocked(target, target->tile, tile, NULL, NULL)) {
+            return tile;
+        }
+    }
+    return -1;
+}
+
+static bool rt_ow_post_taken(RtActor* a, int tile)
+{
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* b = &rt_actors[i];
+        if (b != a && b->ow_tile >= 0 && tile_dist(b->ow_tile, tile) <= 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Its post: out of the target's line of fire, covering the entry. Candidates by a cheap score first
+// (a shooter: further back from the entry, up to 6, and a short walk; a melee fighter: beside the
+// entry, nearest), then the first one with a short route. -1 = none.
+static int rt_ow_find_post(RtActor* a, Object* npc, Object* target, int entry, int range, int* outSteps)
+{
+    bool melee = range <= 2;
+    int tiles[128];
+    int count = rt_tiles_around(melee ? entry : npc->tile, melee ? 1 : RT_OW_RADIUS, tiles, 128);
+    int cand[128];
+    int score[128];
+    int n = 0;
+    for (int i = 0; i < count; i++) {
+        int t = tiles[i];
+        if (t == target->tile || t == entry) {
+            continue;
+        }
+        int fromEntry = tile_dist(t, entry);
+        if (melee ? fromEntry != 1 : (fromEntry < RT_OW_MIN_FROM_ENTRY || fromEntry > range)) {
+            continue;
+        }
+        if (t != npc->tile && obj_blocking_at(npc, t, npc->elevation) != NULL) {
+            continue;
+        }
+        if (!combat_is_shot_blocked(target, target->tile, t, NULL, NULL)) {
+            continue; // it would stand in the target's sights
+        }
+        if (!melee && combat_is_shot_blocked(npc, t, entry, NULL, NULL)) {
+            continue; // it could not cover the entry from there
+        }
+        if (rt_ow_post_taken(a, t)) {
+            continue;
+        }
+        int walk = tile_dist(npc->tile, t);
+        cand[n] = t;
+        score[n] = melee ? -walk : 2 * (fromEntry < 6 ? fromEntry : 6) - walk;
+        n++;
+    }
+
+    while (n > 0) {
+        int best = 0;
+        for (int i = 1; i < n; i++) {
+            if (score[i] > score[best]) {
+                best = i;
+            }
+        }
+        int t = cand[best];
+        int steps = t == npc->tile ? 0 : make_path_capped(npc, npc->tile, t, NULL, 1, 400);
+        if (t == npc->tile || (steps > 0 && steps <= tile_dist(npc->tile, t) + 4)) {
+            *outSteps = steps;
+            return t;
+        }
+        cand[best] = cand[n - 1];
+        score[best] = score[n - 1];
+        n--;
+    }
+    return -1;
+}
+
+static void rt_ow_walk(Object* npc, int tile)
+{
+    anim_end_lone_stand(npc);
+    npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+    if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "overwatch")) {
+        return;
+    }
+    register_object_run_to_tile(npc, tile, npc->elevation, -1, 0);
+    register_end();
+}
+
+static bool rt_overwatch_holds(RtActor* a, Object* npc, int range)
+{
+    Object* target = a->target;
+    if (target == NULL || a->fleeing || !rt_can_walk(npc) || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+
+    if (a->ow_tile >= 0) {
+        if (tile_dist(target->tile, a->ow_target_tile) > RT_OW_TARGET_SLACK) {
+            rt_ow_drop(a, npc, "moved", false); // decides again next frame, for the door it is at now
+            return false;
+        }
+        if (critter_get_hits(npc) < a->ow_hp) {
+            rt_ow_drop(a, npc, "hit", true);
+            return false;
+        }
+        if (obj_dist(npc, target) <= 2) {
+            rt_ow_drop(a, npc, "close", true);
+            return false;
+        }
+
+        if (a->ow_in_at < 0.0f) {
+            if (npc->tile != a->ow_tile) {
+                if (rt_clock - a->ow_since > RT_OW_WALK_MAX) {
+                    rt_ow_drop(a, npc, "late", true);
+                    return false;
+                }
+                rt_ow_walk(npc, a->ow_tile); // the FSM only gets here with the body free: the last leg ended
+                rt_intent_hint(a, RT_INTENT_REPOSITION, "overwatch-post", RT_OW_WALK_MAX);
+                return true;
+            }
+            a->ow_in_at = rt_clock;
+            trace_event(TRACE_FLOW, "overwatch", "id=%d pid=%d in-place post=%d entry=%d took=%.2f t=%.2f", npc->id,
+                npc->pid, a->ow_tile, a->ow_entry, rt_clock - a->ow_since, rt_clock);
+        }
+
+        // At its post: facing the door, waiting for the group.
+        rt_look_set_rotation(npc, tile_dir(npc->tile, a->ow_entry));
+        float groupHeld = rt_clock - a->ow_in_at;
+        int pending = 0;
+        for (int i = 0; i < rt_actor_count; i++) {
+            RtActor* t = &rt_actors[i];
+            Object* mate = t->obj;
+            if (t == a || mate == NULL || t->fleeing || t->target != target || !rt_is_combatant(mate)
+                || mate->data.critter.combat.team != npc->data.critter.combat.team) {
+                continue;
+            }
+            if (t->ow_tile >= 0 && t->ow_in_at >= 0.0f) {
+                if (rt_clock - t->ow_in_at > groupHeld) {
+                    groupHeld = rt_clock - t->ow_in_at;
+                }
+            } else if (t->state == RT_CHASE && tile_dist(mate->tile, npc->tile) <= RT_SQUAD_RADIUS) {
+                pending++;
+            }
+        }
+        if ((pending == 0 && groupHeld >= RT_OW_MIN_HOLD) || groupHeld >= RT_OW_MAX) {
+            rt_ow_go(target, pending == 0 ? "together" : "timeout");
+            return false;
+        }
+        rt_intent_hint(a, RT_INTENT_HOLD, "overwatch", 0.5f);
+        return true;
+    }
+
+    if (a->ow_done) {
+        return false;
+    }
+    int dist = obj_dist(npc, target);
+    if (dist > RT_OW_DIST || dist <= 2) {
+        return false; // still on its way, or already on top of it
+    }
+    if (!rt_tactic_roll(a, npc, "overwatch")) {
+        a->ow_done = true;
+        return false;
+    }
+    a->ow_done = true;
+
+    int routeSteps = 0;
+    int entry = rt_ow_entry_tile(npc, target, &routeSteps);
+    int steps = 0;
+    int post = entry >= 0 ? rt_ow_find_post(a, npc, target, entry, range, &steps) : -1;
+    if (post < 0) {
+        trace_event(TRACE_FLOW, "overwatch", "id=%d pid=%d none why=%s dist=%d route=%d entry=%d t=%.2f", npc->id,
+            npc->pid, entry < 0 ? "no-entry" : "no-post", dist, routeSteps, entry, rt_clock);
+        return false; // the corner gathering may still do
+    }
+
+    a->ow_tile = post;
+    a->ow_entry = entry;
+    a->ow_target_tile = target->tile;
+    a->ow_since = rt_clock;
+    a->ow_in_at = -1.0f;
+    a->ow_hp = critter_get_hits(npc);
+    trace_event(TRACE_FLOW, "overwatch", "id=%d pid=%d start post=%d entry=%d steps=%d dist=%d melee=%d t=%.2f",
+        npc->id, npc->pid, post, entry, steps, dist, range <= 2 ? 1 : 0, rt_clock);
+    if (npc->tile != post) {
+        rt_ow_walk(npc, post);
+        rt_intent_hint(a, RT_INTENT_REPOSITION, "overwatch-post", RT_OW_WALK_MAX);
+    } else {
+        a->ow_in_at = rt_clock;
+        rt_intent_hint(a, RT_INTENT_HOLD, "overwatch", 0.5f);
     }
     return true;
 }
@@ -11218,6 +11572,12 @@ static void rt_intent_update(RtActor* a)
         if (a->squad_hold_start >= 0.0f && !busy) {
             intent = RT_INTENT_HOLD;
             why = "wait-for-squad";
+        } else if (a->ow_tile >= 0 && a->ow_in_at >= 0.0f && !busy) {
+            intent = RT_INTENT_HOLD;
+            why = "overwatch";
+        } else if (a->corner_hold_start >= 0.0f && !busy) {
+            intent = RT_INTENT_HOLD;
+            why = "gather-corner";
         } else if (a->defend_covered && !a->defend_provoked && rt_is_defensive(a, npc) && !busy) {
             intent = RT_INTENT_HOLD;
             why = "defend";
@@ -12083,6 +12443,11 @@ static void rt_update_actor(RtActor* a, float dt)
         a->squad_hold_start = -1.0f;
         a->defend_covered = false;
         a->flank_tile = -1;
+        if (a->ow_tile >= 0) {
+            rt_ow_drop(a, npc, "idle", false);
+        }
+        a->ow_done = false;
+        a->tactic_roll = 0;
         // RE-AGGRO IS GATED ON PERCEPTION, and it has to be: the stop rule above drops a chase
         // once the critter perceives nobody, and if this branch could re-acquire on distance
         // alone (rt_nearest_player_side reaches the 50-tile leash) it would re-engage on the very
@@ -12345,6 +12710,11 @@ static void rt_update_actor(RtActor* a, float dt)
             rt_retarget_nearer(a, npc);
         }
 
+        // An empty gun is reloaded on the way, out of its target's sight (rt_reload_on_the_way).
+        if (rt_reload_on_the_way(a, npc)) {
+            break; // the loop reads as RT_INTENT_RELOAD on its own (combat_rt_is_reloading)
+        }
+
         {
             // Close to the PREFERRED engagement distance before opening fire (capped at the
             // weapon's own range), not just to max weapon range -- a ranged shooter that stops
@@ -12416,6 +12786,8 @@ static void rt_update_actor(RtActor* a, float dt)
                 a->detour_until = 0.0f;
                 a->corner_done = false; // it has the foe in its line: the next corner is a new decision
                 a->corner_hold_start = -1.0f;
+                rt_ow_drop(a, npc, "sees", false); // ...and so is the next post, on a new roll
+                a->tactic_roll = 0;
             } else if (a->breather) {
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
                 // place it does anything, and what it suppresses is MOVEMENT ONLY.
@@ -12430,11 +12802,20 @@ static void rt_update_actor(RtActor* a, float dt)
                 // An in-flight walk segment is left alone rather than force-cleared: it finishes
                 // its current tile and then nothing new is issued, so the stop reads as slowing to
                 // a halt instead of snapping mid-stride.
+            } else if (inRange && !closeForHit && rt_tactical_ai && rt_overwatch_holds(a, npc, range)) {
+                // On its way to its post, or at it covering the door (rt_overwatch_holds). Holding is
+                // not failing to route.
+                a->no_path_since = -1.0f;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_corner_holds(a, npc)) {
                 // Gathering at the corner before going round it (rt_corner_holds). Holding is not
                 // failing to route.
                 a->no_path_since = -1.0f;
                 rt_intent_hint(a, RT_INTENT_HOLD, "gather-corner", 0.5f);
+            } else if (!inRange && range <= 2 && rt_tactical_ai
+                && combat_is_shot_blocked(a->target, a->target->tile, npc->tile, npc, NULL)
+                && rt_overwatch_holds(a, npc, range)) {
+                // A melee fighter coming unseen waits beside the door instead (rt_overwatch_holds).
+                a->no_path_since = -1.0f;
             } else if (inRange && !closeForHit) {
                 // In range but no LINE OF FIRE (target behind a wall/building): don't
                 // just stand -- path AROUND the obstacle to get an angle. A plain step

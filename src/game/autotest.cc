@@ -56,7 +56,7 @@ namespace fallout {
 //   dude armor <pid>
 //   dude curhp <n>                     start with n hit points (after the maximum is set)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
-//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>]
+//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>] [empty]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
 //   at <seconds> <policy> [tile]       the bot's plan; policies:
 //        idle                          do nothing
@@ -126,6 +126,7 @@ typedef struct AtSpawn {
     bool hostile;
     int team;
     int curhp; // "hp <n>": start wounded (0 = full)
+    bool empty; // "empty": the wielded gun starts with no rounds in it
     Object* obj;
 } AtSpawn;
 
@@ -359,6 +360,8 @@ static bool at_parse(const char* path)
                     sp->team = atoi(tok[++i]);
                 } else if (strcmp(tok[i], "hp") == 0 && i + 1 < n) {
                     sp->curhp = atoi(tok[++i]);
+                } else if (strcmp(tok[i], "empty") == 0) {
+                    sp->empty = true;
                 }
             }
         } else if (strcmp(tok[0], "at") == 0 && n >= 3 && at_phase_count < AT_MAX_PHASES) {
@@ -562,6 +565,10 @@ void autotest_setup_world()
         }
         if (sp->wield >= 0) {
             at_wield(critter, sp->wield, HAND_RIGHT);
+            Object* gun = inven_right_hand(critter);
+            if (sp->empty && gun != NULL && item_get_type(gun) == ITEM_TYPE_WEAPON && item_w_max_ammo(gun) > 0) {
+                item_w_set_curr_ammo(gun, 0);
+            }
         }
         sp->obj = critter;
         if (sp->curhp > 0 && sp->curhp < critter->data.critter.hp) {

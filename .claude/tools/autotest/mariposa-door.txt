@@ -1,0 +1,20 @@
+# His doorway from trace_2026-10-19_213643 (tile 16710): six tiles past the door at 16304, he stood and
+# shot each mutant as it came through, one at a time, 2-3 s apart ("šli pomalu za sebou ... pif paf").
+# What we watch: posts taken out of his sight covering the door (overwatch start / in-place), empty
+# guns reloaded on the way (reload-way), and the group going in together (overwatch end=together).
+name mariposa-door
+map MBSTRG12.MAP
+seed 1
+duration 40
+
+dude elevation 1
+provoke
+dude tile 16710 rot 4
+dude stat PE 8
+dude stat AG 8
+dude hp 2000
+dude armor 17
+dude wield 8
+dude item 29 6
+
+at 0 shoot
