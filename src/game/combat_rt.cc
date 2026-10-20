@@ -10440,6 +10440,8 @@ static void rt_retarget_nearer(RtActor* a, Object* npc)
 // A teammate this close in front is a back, not a line: never fired through, whatever the roll
 // (2026-10-20, rt_choke_waits' half of "Nebýt namačkaní u rohu").
 #define RT_FF_CLOSE 3
+// No breather this close to the foe (see breatherAllowed).
+#define RT_BREATHER_MIN_DIST 3
 
 // The first live teammate of the shooter on the straight line from fromTile to the target, or NULL
 // (the same walk combat_is_shot_blocked makes; a wall ends it -- that shot is refused anyway).
@@ -10560,7 +10562,11 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
 
     int dest = -1;
     int destSteps = 0;
-    if (careful && rt_can_walk(npc) && (npc->flags & OBJECT_MULTIHEX) == 0) {
+    // A teammate right in front (RT_FF_CLOSE) is stepped round whatever the roll (2026-10-20, the same
+    // trace: four shooters held their fire behind a back with the roll failed and never looked for a
+    // spot -- "když vkročí, ani nezaútočí"); only with no spot to be had does it hold.
+    bool closeAlly = tile_dist(npc->tile, ally->tile) <= RT_FF_CLOSE;
+    if ((careful || closeAlly) && rt_can_walk(npc) && (npc->flags & OBJECT_MULTIHEX) == 0) {
         int range = item_w_range(npc, attackMode);
         int tiles[24];
         int count = rt_tiles_around(npc->tile, 2, tiles, 24);
@@ -12541,8 +12547,13 @@ static void rt_update_actor(RtActor* a, float dt)
         // report seconds during which nothing was being suppressed at all.
         // Never for a FLEEING critter: the breather is a chaser's tactical pause, and one that flees
         // already stops on an empty pool (flee_blocked, rt_flee_step).
+        // ⚠️ NOT RIGHT AT HIM (2026-10-20, trace_2026-10-20_205439: "někteří supermutanti ani nezaútočí,
+        // když vkročí"). The latch comes at ap <= reserve -- one attack's worth, a shot in hand -- and two
+        // sentries (3034, 3228) took it at one and two tiles from him round his corner, stood there with
+        // no line and the shot unspent, and were shot. Within RT_BREATHER_MIN_DIST a pause is no tactic:
+        // the chase goes on to where it can fire.
         bool breatherAllowed = a->state == RT_CHASE && !a->fleeing
-            && npcEnemyDist >= 0 && npcEnemyDist <= rt_npc_breather_tiles;
+            && npcEnemyDist >= 0 && npcEnemyDist <= rt_npc_breather_tiles && npcEnemyDist > RT_BREATHER_MIN_DIST;
 
         // ⚠️ NOT WITH A FULL POOL (2026-10-19, trace_2026-10-19_235254). A critter whose weapon costs its
         // whole pool (a 6 AP Gatling laser on a 6 AP mutant) has reserve == maximum: it latched at 6 <= 6,
