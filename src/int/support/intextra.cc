@@ -827,6 +827,8 @@ static void op_display_msg(Program* program)
 {
     char* string = programStackPopString(program);
     display_print(string);
+    // Which script said it (the message window line is traced as [STATE/msg] by display_print).
+    trace_event(TRACE_STATE, "script-msg", "prog=%s", program != NULL && program->name != NULL ? program->name : "?");
 
     bool showScriptMessages = false;
     configGetBool(&game_config, GAME_CONFIG_DEBUG_KEY, GAME_CONFIG_SHOW_SCRIPT_MESSAGES_KEY, &showScriptMessages);

@@ -1,0 +1,20 @@
+# MARIPOSA ON THE PAD, step 1: into the base. MBENT's security door (MBOut2In, tile 21271) opens with
+# the code from the tape (GVAR 271) and a second use takes you inside (load_map 12). The dude stands
+# a few tiles off; A uses whatever the interact prompt points at, as the player's A does. The door
+# guard is cleared away (a guard there starts a conversation and then a fight -- a different test).
+name mb-door
+map MBENT.MAP
+mapscript on
+seed 1
+duration 16
+gvar 271 1
+cleararea 12
+dude tile 21473 rot 5
+dude hp 3000
+
+tap 3000 A 300
+tap 8000 A 300
+note 14000 inside?
+
+expect \[STATE/msg\] You enter the code from the tape
+expect \[FLOW/map-load-stage\] done name=MBSTRG12

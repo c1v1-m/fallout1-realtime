@@ -19,17 +19,24 @@
 #include "game/combat_rt.h"
 #include "game/interact_prompt.h"
 #include "game/critter.h"
+#include "game/editor.h"
 #include "game/game.h"
 #include "game/game_trace.h"
+#include "game/gamepad_ui.h"
+#include "game/gdialog.h"
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
 #include "game/map.h"
+#include "game/scripts.h"
+#include "game/worldmap.h"
 #include "game/object.h"
+#include "game/options.h"
 #include "game/proto.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
+#include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/winmain.h"
 
@@ -44,13 +51,16 @@ namespace fallout {
 //   seed <n>                           the dice (default 1)
 //   mapscript on                       keep the map's own script (off by default: an encounter map's
 //                                      script spawns its own critters into the arena)
+//   gvar <n> <value>                   a global variable set before the run (a quest part way, a code known)
+//   cleararea <tiles>                  every other critter within that many tiles of the dude is removed
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
 //   dude elevation <0-2>               the floor of the map (default: the map's entrance floor); the
 //                                      enemies are spawned on the same floor
 //   dude stat <ST|PE|EN|CH|IN|AG|LK> <value>
 //   dude hp <n>                        maximum HP, as a higher-level character would have
-//   dude skill <small_guns|big_guns|energy|unarmed|melee|throwing|first_aid|sneak> <level>
+//   dude skill <small_guns|big_guns|energy|unarmed|melee|throwing|first_aid|sneak|lockpick|steal|
+//              traps|science|repair|speech|doctor> <level>
 //   dude item <pid> [qty]
 //   dude wield <pid>                   added and put in the active hand, loaded
 //   dude armor <pid>
@@ -96,6 +106,41 @@ namespace fallout {
 //                                      (the game's own is 4)
 //
 // The run ends at `duration`, 2 s after the dude dies, or 3 s after the last spawned enemy does.
+//
+// SCREENS: THE PAD TIMELINE. Any of the lines below make the scenario a SCREEN test: the bot is off
+// (its `at` plan is ignored -- one owner of the pad) and the virtual pad is pressed on a timeline
+// instead. The timeline keeps running INSIDE modal screens (character editor, its age / sex / options
+// windows, dialog boxes, inventory, Pip-Boy, file dialogs), which the bot cannot: it is a GNW
+// background process, run by every get_input() on the main thread, not a tick of the game loop. Its
+// clock is the WALL clock from the `start` line, in ms; `+<ms>` means that long after the previous
+// timeline line. `duration` is a hard stop on the same clock, kept inside any screen.
+//
+//   pad <ms> <button> <0|1>            a button down (1) or up (0)
+//   tap <ms> <button> [hold_ms]        down, and up again hold_ms later (default 120)
+//   axis <ms> <axis> <value>           -32768..32767; a TRIGGER is released at -32768 and fully
+//                                      pulled at 32767 (the pad starts centred, triggers released)
+//   open <ms> <screen>                 open a screen THE WAY THE PAD DOES, from the world:
+//        sheet                         D-pad down held 500 ms (the pad's hold is 350)
+//        pipboy                        D-pad up held 500 ms (refused in combat, as for the player)
+//        automap                       D-pad left held 500 ms
+//        inventory                     BACK tapped (a hold past 450 ms runs for the exit instead)
+//        options                       START tapped (a hold quick-saves instead)
+//        creation                      character CREATION as the new-game selector's MODIFY opens it:
+//                                      the menus are skipped here, so there is no pad route to it.
+//                                      Opened by the game loop: the timeline waits until the world is
+//                                      back on top, and the lines after it are timed from the open.
+//   note <ms> <text...>                a marker in the trace
+//   walkto <ms> <tile>                 the dude runs there along the pathfinder's route (a click's walk),
+//                                      for the long way across a level; traced with its step count
+//
+//   buttons: a b x y back guide start leftstick rightstick leftshoulder rightshoulder dpup dpdown
+//            dpleft dpright, or A B X Y BACK START L3 R3 LB RB UP DOWN LEFT RIGHT
+//   axes:    leftx lefty rightx righty lefttrigger righttrigger, or LX LY RX RY LT RT
+//
+// Traced as [FLOW/autotest] pad / axis / open / opened / closed / note lines, and a `modal` line
+// whenever the topmost modal window changes (its id, position and size -- which screen is up). The
+// run.js report checks `expect <regex>` / `expect-not <regex>` / `expect-count <n> <regex>` lines
+// against the trace (this parser ignores them; a regex cannot contain `#`, the comment sign).
 
 #define AT_MAX_SPAWNS 32
 #define AT_MAX_ITEMS 8
@@ -169,6 +214,15 @@ static float at_duration = 60.0f;
 static int at_dude_tile = -1;
 static int at_dude_rotation = -1;
 static int at_dude_elevation = -1;
+// "gvar <n> <value>": global variables set before the run starts (a quest's state, a code the
+// character already knows), so a scenario can start partway through a quest.
+#define AT_MAX_GVARS 16
+static int at_gvar_index[AT_MAX_GVARS];
+static int at_gvar_value[AT_MAX_GVARS];
+static int at_gvar_count = 0;
+// "cleararea <tiles>": every other critter that close to the dude is taken off the map at the start
+// (a quest step tested on its own: the guards at a door are a fight, not the door).
+static int at_clear_radius = -1;
 static bool at_provoke = false;
 static int at_dude_stats[7] = { -1, -1, -1, -1, -1, -1, -1 };
 static int at_dude_skills[SKILL_COUNT];
@@ -183,6 +237,59 @@ static int at_spawn_count = 0;
 static int at_team = -1; // the team every hostile spawn joins (-1 = the first hostile spawn's own)
 static AtPhase at_phases[AT_MAX_PHASES];
 static int at_phase_count = 0;
+
+// The pad timeline (see SCREENS above).
+#define AT_MAX_STEPS 512
+#define AT_MAX_BAD_LINES 8
+
+enum {
+    AT_STEP_BUTTON, // index = button, value = 0/1
+    AT_STEP_AXIS, // index = axis, value = raw
+    AT_STEP_PAD_OPEN, // a pad-route open: traces the open, then presses `index` (its release is a BUTTON step)
+    AT_STEP_OPEN, // index = AT_SCREEN_*: a screen the game loop opens itself (no pad route to it)
+    AT_STEP_NOTE,
+    AT_STEP_WALKTO, // index = tile: the dude is sent there along the pathfinder's route, as a click sends him
+};
+
+enum {
+    AT_SCREEN_SHEET,
+    AT_SCREEN_PIPBOY,
+    AT_SCREEN_AUTOMAP,
+    AT_SCREEN_INVENTORY,
+    AT_SCREEN_OPTIONS,
+    AT_SCREEN_CREATION,
+};
+
+// How the pad opens each screen from the world (gamepad_ui.cc: the D-pad holds, BACK / START taps).
+// ⚠️ IF THE LAYOUT MOVES ONE OF THESE, THIS TABLE MOVES WITH IT -- the trace's `modal` line is what
+// says the screen really came up.
+static const struct {
+    const char* name;
+    int button; // -1: no pad route from the world, autotest_tick opens it
+    int holdMs;
+} at_screens[] = {
+    { "sheet", SDL_CONTROLLER_BUTTON_DPAD_DOWN, 500 },
+    { "pipboy", SDL_CONTROLLER_BUTTON_DPAD_UP, 500 },
+    { "automap", SDL_CONTROLLER_BUTTON_DPAD_LEFT, 500 },
+    { "inventory", SDL_CONTROLLER_BUTTON_BACK, 120 },
+    { "options", SDL_CONTROLLER_BUTTON_START, 120 },
+    { "creation", -1, 0 },
+};
+
+typedef struct AtStep {
+    int ms; // timeline time
+    int order; // line order, so equal times keep the file's order
+    int kind;
+    int index;
+    int value;
+    char text[64]; // a note's text
+} AtStep;
+
+static AtStep at_steps[AT_MAX_STEPS];
+static int at_step_count = 0;
+static int at_step_last_ms = 0; // the previous timeline line's time, for `+<ms>`
+static char at_bad_lines[AT_MAX_BAD_LINES][80]; // reported once the trace is up
+static int at_bad_line_count = 0;
 
 // run state
 static SDL_Joystick* at_joy = NULL;
@@ -214,6 +321,14 @@ static float at_dodge_from = 0.0f;
 static float at_reaction = 0.3f; // a player notices the wind-up this late (scenario "reaction")
 static bool at_was_attacking = false;
 static float at_move_until = 0.0f;
+
+// timeline run state
+static bool at_tl_running = false;
+static Uint32 at_tl_t0 = 0; // SDL_GetTicks() at the start line
+static int at_tl_shift = 0; // ms the timeline waited for a game-loop open
+static int at_tl_next = 0;
+static int at_tl_open = -1; // the AT_STEP_OPEN step waiting for autotest_tick, or -1
+static int at_tl_modal = -2; // the topmost modal window last traced (-2 = none traced yet)
 
 static void at_trim(char* s)
 {
@@ -252,6 +367,13 @@ static int at_skill_index(const char* s)
         { "throwing", SKILL_THROWING },
         { "first_aid", SKILL_FIRST_AID },
         { "sneak", SKILL_SNEAK },
+        { "lockpick", SKILL_LOCKPICK },
+        { "steal", SKILL_STEAL },
+        { "traps", SKILL_TRAPS },
+        { "science", SKILL_SCIENCE },
+        { "repair", SKILL_REPAIR },
+        { "speech", SKILL_SPEECH },
+        { "doctor", SKILL_DOCTOR },
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (SDL_strcasecmp(s, names[i].name) == 0) {
@@ -269,6 +391,197 @@ static int at_policy_index(const char* s)
         }
     }
     return -1;
+}
+
+// The F2 pad test's short names first (rt_f2_hooks.cc), then SDL's own.
+static int at_button_index(const char* s)
+{
+    static const struct {
+        const char* name;
+        int button;
+    } names[] = {
+        { "A", SDL_CONTROLLER_BUTTON_A },
+        { "B", SDL_CONTROLLER_BUTTON_B },
+        { "X", SDL_CONTROLLER_BUTTON_X },
+        { "Y", SDL_CONTROLLER_BUTTON_Y },
+        { "BACK", SDL_CONTROLLER_BUTTON_BACK },
+        { "START", SDL_CONTROLLER_BUTTON_START },
+        { "L3", SDL_CONTROLLER_BUTTON_LEFTSTICK },
+        { "R3", SDL_CONTROLLER_BUTTON_RIGHTSTICK },
+        { "LB", SDL_CONTROLLER_BUTTON_LEFTSHOULDER },
+        { "RB", SDL_CONTROLLER_BUTTON_RIGHTSHOULDER },
+        { "UP", SDL_CONTROLLER_BUTTON_DPAD_UP },
+        { "DOWN", SDL_CONTROLLER_BUTTON_DPAD_DOWN },
+        { "LEFT", SDL_CONTROLLER_BUTTON_DPAD_LEFT },
+        { "RIGHT", SDL_CONTROLLER_BUTTON_DPAD_RIGHT },
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (SDL_strcasecmp(s, names[i].name) == 0) {
+            return names[i].button;
+        }
+    }
+    int button = SDL_GameControllerGetButtonFromString(s);
+    // The virtual pad has buttons up to the D-pad only (see autotest_setup_world).
+    return button >= 0 && button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT ? button : -1;
+}
+
+static int at_axis_index(const char* s)
+{
+    static const struct {
+        const char* name;
+        int axis;
+    } names[] = {
+        { "LX", SDL_CONTROLLER_AXIS_LEFTX },
+        { "LY", SDL_CONTROLLER_AXIS_LEFTY },
+        { "RX", SDL_CONTROLLER_AXIS_RIGHTX },
+        { "RY", SDL_CONTROLLER_AXIS_RIGHTY },
+        { "LT", SDL_CONTROLLER_AXIS_TRIGGERLEFT },
+        { "RT", SDL_CONTROLLER_AXIS_TRIGGERRIGHT },
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (SDL_strcasecmp(s, names[i].name) == 0) {
+            return names[i].axis;
+        }
+    }
+    return SDL_GameControllerGetAxisFromString(s);
+}
+
+static int at_screen_index(const char* s)
+{
+    for (int i = 0; i < (int)(sizeof(at_screens) / sizeof(at_screens[0])); i++) {
+        if (SDL_strcasecmp(s, at_screens[i].name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// "1500" = 1500 ms after the start line, "+500" = 500 ms after the previous timeline line.
+static int at_step_time(const char* s)
+{
+    int ms = s[0] == '+' ? at_step_last_ms + atoi(s + 1) : atoi(s);
+    at_step_last_ms = ms;
+    return ms;
+}
+
+static void at_bad_line(const char* what, const char* line)
+{
+    if (at_bad_line_count < AT_MAX_BAD_LINES) {
+        snprintf(at_bad_lines[at_bad_line_count++], sizeof(at_bad_lines[0]), "%s: %s", what, line);
+    }
+}
+
+static AtStep* at_add_step(int ms, int kind, int index, int value)
+{
+    if (at_step_count >= AT_MAX_STEPS) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            at_bad_line("timeline full", "the rest of the file is dropped");
+        }
+        return NULL;
+    }
+    AtStep* st = &(at_steps[at_step_count]);
+    memset(st, 0, sizeof(*st));
+    st->ms = ms;
+    st->order = at_step_count;
+    st->kind = kind;
+    st->index = index;
+    st->value = value;
+    at_step_count++;
+    return st;
+}
+
+static int at_step_compare(const void* a, const void* b)
+{
+    const AtStep* sa = (const AtStep*)a;
+    const AtStep* sb = (const AtStep*)b;
+    if (sa->ms != sb->ms) {
+        return sa->ms < sb->ms ? -1 : 1;
+    }
+    return sa->order - sb->order;
+}
+
+// The route a player could walk once he has opened the doors on it: walls and scenery block, a door
+// or a critter does not (walkto's "steps without doors").
+static Object* at_block_but_doors(Object* obj, int tile, int elevation)
+{
+    Object* blocker = obj_blocking_at(obj, tile, elevation);
+    if (blocker == NULL || FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER) {
+        return NULL;
+    }
+    if (FID_TYPE(blocker->fid) == OBJ_TYPE_SCENERY) {
+        Proto* proto;
+        if (proto_ptr(blocker->pid, &proto) == 0 && proto->scenery.type == SCENERY_TYPE_DOOR) {
+            return NULL;
+        }
+    }
+    return blocker;
+}
+
+// One timeline line, already split into tokens. False when it is not a timeline command at all.
+static bool at_parse_step(char** tok, int n)
+{
+    bool button = strcmp(tok[0], "pad") == 0;
+    bool tap = strcmp(tok[0], "tap") == 0;
+    bool axis = strcmp(tok[0], "axis") == 0;
+    bool open = strcmp(tok[0], "open") == 0;
+    bool note = strcmp(tok[0], "note") == 0;
+    bool walkto = strcmp(tok[0], "walkto") == 0;
+    if (!button && !tap && !axis && !open && !note && !walkto) {
+        return false;
+    }
+    if (n < 3 || ((button || axis) && n < 4)) {
+        at_bad_line("too short", tok[0]);
+        return true;
+    }
+
+    int ms = at_step_time(tok[1]);
+    if (walkto) {
+        at_add_step(ms, AT_STEP_WALKTO, atoi(tok[2]), 0);
+        return true;
+    }
+    if (button || tap) {
+        int index = at_button_index(tok[2]);
+        if (index < 0) {
+            at_bad_line("unknown button", tok[2]);
+        } else if (button) {
+            at_add_step(ms, AT_STEP_BUTTON, index, atoi(tok[3]) != 0 ? 1 : 0);
+        } else {
+            int hold = n >= 4 ? atoi(tok[3]) : 120;
+            at_add_step(ms, AT_STEP_BUTTON, index, 1);
+            at_add_step(ms + (hold > 0 ? hold : 120), AT_STEP_BUTTON, index, 0);
+        }
+    } else if (axis) {
+        int index = at_axis_index(tok[2]);
+        if (index < 0) {
+            at_bad_line("unknown axis", tok[2]);
+        } else {
+            int value = atoi(tok[3]);
+            at_add_step(ms, AT_STEP_AXIS, index, value < -32768 ? -32768 : (value > 32767 ? 32767 : value));
+        }
+    } else if (open) {
+        int screen = at_screen_index(tok[2]);
+        if (screen < 0) {
+            at_bad_line("unknown screen", tok[2]);
+        } else if (at_screens[screen].button < 0) {
+            at_add_step(ms, AT_STEP_OPEN, screen, 0);
+        } else {
+            at_add_step(ms, AT_STEP_PAD_OPEN, screen, 0);
+            at_add_step(ms + at_screens[screen].holdMs, AT_STEP_BUTTON, at_screens[screen].button, 0);
+        }
+    } else {
+        AtStep* st = at_add_step(ms, AT_STEP_NOTE, 0, 0);
+        if (st != NULL) {
+            for (int i = 2; i < n; i++) {
+                if (i > 2) {
+                    SDL_strlcat(st->text, " ", sizeof(st->text));
+                }
+                SDL_strlcat(st->text, tok[i], sizeof(st->text));
+            }
+        }
+    }
+    return true;
 }
 
 static bool at_parse(const char* path)
@@ -317,6 +630,12 @@ static bool at_parse(const char* path)
             at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
+        } else if (strcmp(tok[0], "cleararea") == 0 && n >= 2) {
+            at_clear_radius = atoi(tok[1]);
+        } else if (strcmp(tok[0], "gvar") == 0 && n >= 3 && at_gvar_count < AT_MAX_GVARS) {
+            at_gvar_index[at_gvar_count] = atoi(tok[1]);
+            at_gvar_value[at_gvar_count] = atoi(tok[2]);
+            at_gvar_count++;
         } else if (strcmp(tok[0], "seed") == 0 && n >= 2) {
             at_seed = atoi(tok[1]);
         } else if (strcmp(tok[0], "duration") == 0 && n >= 2) {
@@ -388,6 +707,8 @@ static bool at_parse(const char* path)
                     i += 2;
                 }
             }
+        } else if (at_parse_step(tok, n)) {
+            // a timeline line
         } else if (strcmp(tok[0], "at") == 0 && n >= 3 && at_phase_count < AT_MAX_PHASES) {
             int policy = at_policy_index(tok[2]);
             if (policy >= 0) {
@@ -399,6 +720,7 @@ static bool at_parse(const char* path)
         }
     }
     fclose(f);
+    qsort(at_steps, at_step_count, sizeof(at_steps[0]), at_step_compare);
     return at_map_name[0] != '\0';
 }
 
@@ -485,6 +807,8 @@ static void at_wield(Object* critter, int pid, int hand)
     }
 }
 
+static void at_tl_start();
+
 void autotest_setup_world()
 {
     if (!at_active || obj_dude == NULL) {
@@ -528,6 +852,21 @@ void autotest_setup_world()
         }
     }
     stat_recalc_derived(obj_dude);
+
+    // ⚠️ THE PARTY STANDS WHERE THIS MAP IS ON THE WORLD MAP, as it would after walking there. A map
+    // change (an elevator, a door into the next map) calls worldmap_script_jump, which otherwise
+    // "travels" from the new game's start and adds the weeks of the journey to the clock: on the
+    // first elevator ride in Mariposa 15 days passed and the self-destruct timer was long gone.
+    {
+        int savedTime = game_time();
+        worldmap_script_jump(xlate_mapidx_to_town(map_data.field_34), 0);
+        set_game_time(savedTime);
+    }
+
+    for (int g = 0; g < at_gvar_count; g++) {
+        game_set_global_var(at_gvar_index[g], at_gvar_value[g]);
+        trace_event(TRACE_FLOW, "autotest", "gvar %d=%d", at_gvar_index[g], at_gvar_value[g]);
+    }
     Proto* proto;
     if (proto_ptr(obj_dude->pid, &proto) == 0) {
         for (int s = 0; s < SKILL_COUNT; s++) {
@@ -570,6 +909,22 @@ void autotest_setup_world()
     tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
     intface_update_hit_points(false);
     intface_update_items(false);
+    if (at_clear_radius >= 0) {
+        Object** list = NULL;
+        int count = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_CRITTER, &list);
+        int cleared = 0;
+        for (int i = 0; i < count; i++) {
+            Object* c = list[i];
+            if (c != obj_dude && tile_dist(c->tile, obj_dude->tile) <= at_clear_radius) {
+                obj_erase_object(c, NULL);
+                cleared++;
+            }
+        }
+        if (list != NULL) {
+            obj_delete_list(list);
+        }
+        trace_event(TRACE_FLOW, "autotest", "cleararea radius=%d cleared=%d", at_clear_radius, cleared);
+    }
 
     // The enemies.
     for (int i = 0; i < at_spawn_count; i++) {
@@ -640,8 +995,19 @@ void autotest_setup_world()
         trace_event(TRACE_FLOW, "autotest", "provoked %d critters", provoked);
     }
 
-    trace_event(TRACE_FLOW, "autotest", "start scenario=%s file=%s map=%s seed=%d duration=%.0f dude=%d spawns=%d pad=%d",
-        at_name, at_file, at_map_name, at_seed, at_duration, obj_dude->tile, at_spawn_count, at_joy_index);
+    for (int i = 0; i < at_bad_line_count; i++) {
+        trace_event(TRACE_WARN, "autotest", "bad timeline line -- %s", at_bad_lines[i]);
+    }
+    if (at_step_count > 0 && at_phase_count > 0) {
+        trace_event(TRACE_WARN, "autotest", "the `at` plan is ignored -- the timeline owns the pad");
+    }
+
+    trace_event(TRACE_FLOW, "autotest", "start scenario=%s file=%s map=%s seed=%d duration=%.0f dude=%d spawns=%d pad=%d steps=%d",
+        at_name, at_file, at_map_name, at_seed, at_duration, obj_dude->tile, at_spawn_count, at_joy_index, at_step_count);
+
+    if (at_step_count > 0) {
+        at_tl_start();
+    }
 }
 
 // --- THE BOT ---------------------------------------------------------------------------------------
@@ -807,12 +1173,186 @@ static void at_end(const char* why, float delay)
     }
 }
 
+// --- THE PAD TIMELINE ------------------------------------------------------------------------------
+
+static const char* at_button_name(int button)
+{
+    const char* name = SDL_GameControllerGetStringForButton((SDL_GameControllerButton)button);
+    return name != NULL ? name : "?";
+}
+
+static const char* at_axis_name(int axis)
+{
+    const char* name = SDL_GameControllerGetStringForAxis((SDL_GameControllerAxis)axis);
+    return name != NULL ? name : "?";
+}
+
+// Which screen is up: the topmost modal window, traced whenever it changes. Every screen the pad
+// reaches registers WINDOW_MODAL -- the editor and its age / sex / options windows, dialog_out, the
+// inventory, the Pip-Boy, the automap, the options menu -- so its id, place and size say which.
+static void at_tl_watch_modal(int wall)
+{
+    int top = win_get_top_modal();
+    if (top == at_tl_modal) {
+        return;
+    }
+    at_tl_modal = top;
+    Rect rect;
+    if (top != -1 && win_get_rect(top, &rect) == 0) {
+        trace_event(TRACE_FLOW, "autotest", "modal win=%d at=%d,%d size=%dx%d inv=%d options=%d talk=%d t=%d",
+            top, rect.ulx, rect.uly, rect.lrx - rect.ulx + 1, rect.lry - rect.uly + 1,
+            inven_any_open() ? 1 : 0, options_is_open() ? 1 : 0, dialog_active() ? 1 : 0, wall);
+    } else {
+        trace_event(TRACE_FLOW, "autotest", "modal none t=%d", wall);
+    }
+}
+
+// `duration` on the wall clock -- from inside a screen too, where the game loop never gets to end it.
+[[noreturn]] static void at_tl_end(int wall)
+{
+    at_tl_running = false;
+    if (!at_done) {
+        at_done = true;
+        trace_event(TRACE_FLOW, "autotest", "end why=time elapsed=%.1f dudeHp=%d dudeDead=%d modal=%d",
+            wall / 1000.0f, critter_get_hits(obj_dude), critter_is_dead(obj_dude) ? 1 : 0, win_get_top_modal());
+    }
+    autotest_finish();
+}
+
+// The GNW background process: every get_input() of every loop runs it, the world's and each screen's.
+static void at_tl_bk()
+{
+    if (!at_tl_running) {
+        return;
+    }
+    int wall = (int)(SDL_GetTicks() - at_tl_t0);
+    at_tl_watch_modal(wall);
+    if (wall >= (int)(at_duration * 1000.0f)) {
+        at_tl_end(wall);
+    }
+
+    int t = wall - at_tl_shift;
+    while (at_tl_next < at_step_count && at_tl_open < 0) {
+        AtStep* st = &(at_steps[at_tl_next]);
+        if (t < st->ms) {
+            break;
+        }
+        switch (st->kind) {
+        case AT_STEP_BUTTON:
+            at_button((SDL_GameControllerButton)st->index, st->value != 0);
+            trace_event(TRACE_FLOW, "autotest", "pad t=%d %s=%d", t, at_button_name(st->index), st->value);
+            break;
+        case AT_STEP_AXIS:
+            at_axis((SDL_GameControllerAxis)st->index, (Sint16)st->value);
+            trace_event(TRACE_FLOW, "autotest", "axis t=%d %s=%d", t, at_axis_name(st->index), st->value);
+            break;
+        case AT_STEP_PAD_OPEN: {
+            int button = at_screens[st->index].button;
+            trace_event(TRACE_FLOW, "autotest", "open screen=%s via=%s hold=%d t=%d",
+                at_screens[st->index].name, at_button_name(button), at_screens[st->index].holdMs, t);
+            at_button((SDL_GameControllerButton)button, true);
+            break;
+        }
+        case AT_STEP_OPEN:
+            // Only the game loop may open a screen (this runs INSIDE get_input), so autotest_tick takes
+            // it -- once the world is back on top -- and the timeline stands still until it has.
+            at_tl_open = at_tl_next;
+            trace_event(TRACE_FLOW, "autotest", "open screen=%s via=game-loop t=%d", at_screens[st->index].name, t);
+            return;
+        case AT_STEP_NOTE:
+            trace_event(TRACE_FLOW, "autotest", "note t=%d %s", t, st->text);
+            break;
+        case AT_STEP_WALKTO: {
+            // The long way through a level, whose turns no stick timeline can be written for: the route is
+            // the pathfinder's, as a click would walk it. 0 steps = no way there (a force field, a door).
+            int steps = make_path(obj_dude, obj_dude->tile, st->index, NULL, 0);
+            bool ok = false;
+            if (steps > 0 && register_begin(ANIMATION_REQUEST_RESERVED) == 0) {
+                ok = register_object_run_to_tile(obj_dude, st->index, obj_dude->elevation, -1, 0) == 0;
+                register_end();
+            }
+            int open = make_path_func(obj_dude, obj_dude->tile, st->index, NULL, 0, at_block_but_doors);
+            trace_event(TRACE_FLOW, "autotest", "walkto t=%d from=%d to=%d elev=%d steps=%d ok=%d doorsOpen=%d", t,
+                obj_dude->tile, st->index, obj_dude->elevation, steps, ok ? 1 : 0, open);
+            break;
+        }
+        }
+        at_tl_next++;
+    }
+}
+
+static int at_open_screen(int screen)
+{
+    int rc = -1;
+    switch (screen) {
+    case AT_SCREEN_CREATION: {
+        // As the new-game selector runs it (select.cc): a flushed queue, the selector's A-click
+        // suppression on, no world animating behind it.
+        flush_input_buffer();
+        bool wasSuppressed = gamepad_ui_set_suppress_a_click(true);
+        bool isoWasEnabled = map_disable_bk_processes();
+        rc = editor_design(true);
+        if (isoWasEnabled) {
+            map_enable_bk_processes();
+        }
+        flush_input_buffer();
+        gamepad_ui_set_suppress_a_click(wasSuppressed);
+        // The button that closed it is still down, and the world is not where creation returns to.
+        gamepad_ui_bump_input_epoch();
+        break;
+    }
+    }
+    return rc;
+}
+
+// From autotest_tick, the game loop: a game-loop open the timeline is waiting for.
+static void at_tl_take_open()
+{
+    if (at_tl_open < 0) {
+        return;
+    }
+    const AtStep* st = &(at_steps[at_tl_open]);
+    int wall = (int)(SDL_GetTicks() - at_tl_t0);
+    int late = wall - at_tl_shift - st->ms;
+    // From here on the timeline counts from the moment the screen opened, as if it had been on time.
+    at_tl_shift = wall - st->ms;
+    at_tl_next = at_tl_open + 1;
+    at_tl_open = -1;
+    trace_event(TRACE_FLOW, "autotest", "opened screen=%s t=%d late=%d", at_screens[st->index].name, st->ms, late);
+    int rc = at_open_screen(st->index);
+    trace_event(TRACE_FLOW, "autotest", "closed screen=%s rc=%d t=%d", at_screens[st->index].name, rc,
+        (int)(SDL_GetTicks() - at_tl_t0) - at_tl_shift);
+}
+
+static void at_tl_start()
+{
+    // The pad at rest: sticks centred, triggers RELEASED (-32768 on this pad -- a trigger left at 0
+    // reads half pulled), every button up. The bot used to keep it there every frame.
+    for (int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; axis++) {
+        bool trigger = axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+        at_axis((SDL_GameControllerAxis)axis, trigger ? -32768 : 0);
+    }
+    for (int button = 0; button <= SDL_CONTROLLER_BUTTON_DPAD_RIGHT; button++) {
+        at_button((SDL_GameControllerButton)button, false);
+    }
+    at_tl_t0 = SDL_GetTicks();
+    at_tl_running = true;
+    add_bk_process(at_tl_bk, "autotest");
+}
+
 void autotest_tick(float dt)
 {
     if (!at_active || at_done || obj_dude == NULL) {
         return;
     }
     at_elapsed += dt;
+
+    // A screen test: the timeline owns the pad (and ends the run); the game loop only opens the screens
+    // it asks for.
+    if (at_step_count > 0) {
+        at_tl_take_open();
+        return;
+    }
 
     // The plan.
     int next = at_phase;

@@ -1,0 +1,40 @@
+# MARIPOSA ON THE PAD, step 4: the Vats Control Computer (VConComp, MBVATS12 floor 2, tile 12325).
+# It talks only after a Science success on it (use_skill_on -> local 0 = 1); then A opens its
+# conversation. Pad route: L3 opens the skill wheel, the left stick points DOWN at Science (the
+# 5th of 8, clockwise from Lockpick at the top) and letting go picks it and arms the skill cursor,
+# A applies it to what the cursor has picked. The pad keeps a skill armed for another try until B
+# (gmouse, gamepad_ui_skill_cursor_sticky), so B, then A uses the computer: its dialogue comes up.
+# "Display security codes" (A on the first option), then the 4th code (3 x DOWN, A):
+# 31914-1041-1251514 = the 3-minute silent self-destruct (VConComp06: GVAR 147 = now, 308 = 2).
+name mb-vcon
+map MBVATS12.MAP
+mapscript on
+seed 1
+duration 32
+dude elevation 1
+dude tile 12527 rot 5
+dude hp 3000
+dude skill science 150
+cleararea 8
+
+tap 2500 L3 150
+axis 3200 LY 32000
+axis 3900 LY 0
+note 4300 released on Science: the skill cursor is armed
+tap 4800 A 150
+note 9000 science used? -- the pad keeps the skill armed until B
+tap 9500 B 150
+tap 10500 A 200
+note 16000 the computer talking?
+tap 17000 A 200
+note 20000 the codes: 3 x down = 31914-1041-1251514, 3 minute silent self-destruct
+tap 21000 DOWN
+tap 21700 DOWN
+tap 22400 DOWN
+tap 23300 A 200
+note 28000 the timer runs from here (mb-timer checks the countdown on the way out)
+
+expect \[STATE/msg\] You manage to get an interface screen out of the vats control computer
+expect \[FLOW/dialog-start\]
+expect \[INPUT/dialog-choice\] idx=3 msg=110
+expect \[FLOW/dialog-reply\] msg=117 text=Executing 31914-1041-1251514

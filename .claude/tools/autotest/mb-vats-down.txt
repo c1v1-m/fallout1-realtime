@@ -1,0 +1,17 @@
+# MARIPOSA, the way across the Vats' upper floor from elevator 4's arrival (12944) to the lower
+# elevator (elev5.int, spatial on 24120). There are doors on it, which a click's route stops at and the
+# player opens with A, so this only asks whether a way exists once they are open: walkto's doorsOpen
+# is the route through them (115 steps, 2026-10-20), steps=0 is the closed doors. Enemies cleared.
+name mb-vats-down
+map MBVATS12.MAP
+mapscript on
+seed 1
+duration 6
+cleararea 200
+dude tile 12944 rot 2
+dude hp 3000
+
+walkto 1500 24120
+note 4000 measured
+
+expect \[FLOW/autotest\] walkto .* doorsOpen=[1-9]

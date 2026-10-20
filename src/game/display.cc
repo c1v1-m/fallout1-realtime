@@ -5,6 +5,7 @@
 #include "game/art.h"
 #include "game/combat.h"
 #include "game/gmouse.h"
+#include "game/game_trace.h"
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "plib/color/color.h"
@@ -195,6 +196,9 @@ void display_print(char* str)
     if (!disp_init) {
         return;
     }
+
+    // What the message window said: a script's "You unlock the door" is often the only sign it ran.
+    trace_event(TRACE_STATE, "msg", "%s", str);
 
     // ⚠️ WORK ON A COPY (2026-10-17, crash in trace_2026-10-17_205745: "write 0x7ff7f0e6aa33" from
     // gpui_run_to_exit). The word wrap below cuts the text by writing '\0' into it and patches the

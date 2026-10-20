@@ -1126,6 +1126,13 @@ static int gdAddOption(int messageListId, int messageId, int reaction)
     optionEntry->btn = -1;
     optionEntry->text[0] = '\0';
 
+    // What he is offered, in order (the pad's D-pad walks this list); dialog-choice says which he took.
+    {
+        const char* text = scr_get_msg_str(messageListId, messageId);
+        trace_event(TRACE_FLOW, "dialog-option", "idx=%d msg=%d text=%.80s", gdNumOptions, messageId,
+            text != NULL ? text : "-");
+    }
+
     gdNumOptions++;
 
     return 0;

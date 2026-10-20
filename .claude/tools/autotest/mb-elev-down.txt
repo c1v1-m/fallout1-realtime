@@ -1,0 +1,26 @@
+# MARIPOSA ON THE PAD, step 2: the Stronghold's elevator (elev4.int, a spatial script on tile 14520)
+# down to the Vats. The dude stands a step away (14721), the left stick walks him onto it (screen
+# direction up-right), the elevator panel opens, the D-pad picks the floor and A rides it. Elevator 4
+# goes to MBSTRG12 levels 1-2 and to MBVATS12 (map 32) at tile 12944: the third button.
+name mb-elev-down
+map MBSTRG12.MAP
+mapscript on
+seed 1
+duration 16
+cleararea 10
+dude tile 14721 rot 0
+dude hp 3000
+
+axis 2000 LX 25600
+axis 2000 LY -19200
+axis 2600 LX 0
+axis 2600 LY 0
+note 5000 the panel should be up
+tap 6000 DOWN
+tap 6800 DOWN
+tap 7600 A 200
+note 13000 vats?
+
+expect \[FLOW/autotest\] modal win=
+expect \[FLOW/elev-closed\]
+expect \[FLOW/map-load-stage\] done name=MBVATS12

@@ -1,0 +1,35 @@
+# SCREEN TEST: the character SHEET from the world, the way the pad opens it (D-pad down held), then
+# the inventory (BACK) and the Pip-Boy (D-pad up held) -- open, step, back out.
+# (Replay 2e: the sheet ran without its A-click suppression, so A also clicked under the pointer.)
+name screen-sheet
+map DESERT1.MAP
+seed 1
+duration 15
+dude tile 20100 rot 2
+
+open 1000 sheet
+# two rows down, then A on a skill: a point to spend, or a buzz with none -- never a click
+tap 2500 DOWN
+tap 3100 DOWN
+tap 3800 A
+# B backs out of the sheet
+tap 5000 B
+# BACK opens the inventory and BACK shuts it
+open 6500 inventory
+tap 8500 BACK
+# the Pip-Boy last: B should back out of it too
+open 10000 pipboy
+tap 12000 B
+note 13500 every screen should be closed by now
+
+# the checks (run.js)
+expect \[FLOW/autotest\] open screen=sheet
+expect \[INPUT/ce-key\] code=27 glbl=0
+# the sheet keeps its A-click suppression, so A never reaches it as a pointer click (code -2)
+expect-not \[INPUT/ce-state\] suppress=0
+expect-not \[INPUT/ce-key\] code=-2
+expect \[FLOW/autotest\] modal .* inv=1
+# sheet and Pip-Boy are both full-screen modal windows
+expect-count 2 \[FLOW/autotest\] modal win=\d+ at=\d+,\d+ size=640x480
+# and B closed the Pip-Boy: nothing is open at the end
+expect \[FLOW/autotest\] end why=time .* modal=-1

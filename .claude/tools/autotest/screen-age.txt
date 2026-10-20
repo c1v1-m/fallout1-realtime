@@ -1,0 +1,35 @@
+# SCREEN TEST: character creation on the pad -- open AGE, one year up, confirm with A, B out.
+# (The 2026-10-20 editor pad fixes, replay 2e: the confirming A must not reopen the age window or
+# leave a click behind, and the editor must keep its A-click suppression on.)
+name screen-age
+map DESERT1.MAP
+seed 1
+duration 16
+dude tile 20100 rot 2
+
+# creation, as the new-game selector's MODIFY opens it; everything below is timed from that open
+open 1000 creation
+# RB x3: stats -> skills -> traits -> NAME
+tap 2500 RB
+tap 3100 RB
+tap 3700 RB
+# right: NAME -> AGE
+tap 4300 RIGHT
+# A on AGE (acts on the release): the age window opens
+tap 5000 A
+# one year up inside it
+tap 6200 RIGHT
+# confirm: the A press is DONE there; held 0.4 s, short of the editor's own 0.9 s hold
+tap 7200 A 400
+# B leaves the editor (creation cancelled, rc=1)
+tap 9500 B
+note 11000 the editor should be closed by now
+
+# the checks (run.js)
+expect \[FLOW/autotest\] opened screen=creation
+# the age window opened ONCE: before the fix the confirming A's release reopened it (code 519 = AGE)
+expect-count 1 \[INPUT/ce-key\] code=519
+# B then left the editor instead of closing that second age window
+expect \[FLOW/autotest\] closed screen=creation rc=1
+expect \[FLOW/autotest\] end why=time .* modal=-1
+expect-not \[INPUT/ce-state\] suppress=0

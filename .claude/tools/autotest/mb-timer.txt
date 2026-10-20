@@ -1,0 +1,30 @@
+# MARIPOSA ON THE PAD, step 5: the way out with the self-destruct running. The 3-minute code
+# (VConComp06) sets GVAR 147 = game time in seconds (and 308 = 2); every Mariposa map script counts
+# 300 s from it on entering ("Time left: N seconds", then the end movie at 0). Here 100 s are gone:
+# the dude stands outside elevator 4's car on the Vats' upper floor (its arrival tile 12944), A opens
+# the car door, he walks in onto the elevator (12544), UP UP picks the Stronghold's first floor, A rides.
+name mb-timer
+map MBVATS12.MAP
+mapscript on
+seed 1
+duration 26
+cleararea 300
+gvar 147 26360
+gvar 308 2
+dude elevation 0
+dude tile 12944 rot 0
+dude hp 3000
+
+tap 2000 A 200
+walkto 6000 12544
+note 10000 the panel should be up
+tap 11000 UP
+tap 11800 UP
+tap 12600 A 200
+note 20000 upstairs, counting?
+
+expect \[FLOW/elev-open\] type=4
+expect \[FLOW/map-load-stage\] done name=MBSTRG12
+expect \[STATE/msg\] Time left
+expect-not \[STATE/msg\] Time left:  -
+expect-not \[FLOW/autotest\] modal win=\d+ at=\d+,0 size=640x480

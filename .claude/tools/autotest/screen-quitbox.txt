@@ -1,0 +1,29 @@
+# SCREEN TEST: a dialog box -- the pause menu's EXIT asks "are you sure?" (dialog_out, YES / NO).
+# The A that picks EXIT is still held when the box comes up; it must NOT answer the box (bmpdlog.cc,
+# dialog_pad_prime: "áčko při výběru exit game přeskočí i potvrzení a hned souhlasí"). B says NO.
+name screen-quitbox
+map DESERT1.MAP
+seed 1
+duration 11
+dude tile 20100 rot 2
+
+# START tapped: the pause menu opens on the release, its highlight on SAVE GAME
+open 1000 options
+# SAVE -> LOAD -> PREFERENCES -> EXIT
+tap 2200 DOWN
+tap 2700 DOWN
+tap 3200 DOWN
+# A on EXIT, held 0.4 s: the box opens on the press, and this hold must not be its answer
+tap 4000 A 400
+# NO
+tap 6000 B
+# B shuts the pause menu
+tap 7500 B
+note 9000 the world should be back
+
+# the checks (run.js)
+expect \[FLOW/autotest\] modal .* options=1
+# the box came up over the pause menu (dialog_out's large box is 302x127; the menu is 164x217)
+expect \[FLOW/autotest\] modal win=\d+ at=\d+,\d+ size=302x127 inv=0 options=1
+# not quit: the run ends on time with the world on top (a YES ends it as "loop-ended")
+expect \[FLOW/autotest\] end why=time .* modal=-1
