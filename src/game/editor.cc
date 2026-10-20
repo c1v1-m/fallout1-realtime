@@ -2048,14 +2048,7 @@ int editor_design(bool isCreationMode)
         // Frame goes back on last, over whatever the engine repainted this iteration, and before
         // the single win_draw that publishes the window.
         ce_hl_erase();
-    // And leave none of OUR codes behind for whatever loop runs next, for the same reason.
-    flush_input_buffer();
-    gamepad_ui_set_suppress_a_click(ceSuppressWas);
-    if (cePad != NULL) {
-        gamepad_ui_set_suppress_snap(false);
-    }
-
-    if (cePad != NULL) {
+        if (cePad != NULL) {
             ce_hl_draw();
         }
 
@@ -2065,7 +2058,17 @@ int editor_design(bool isCreationMode)
         sharedFpsLimiter.throttle();
     }
 
+    // ⚠️ AFTER THE LOOP, NOT IN IT (2026-10-20). This block sat inside the loop body from the day it
+    // was written, so EVERY FRAME emptied the input queue, put the A-click suppression back to what
+    // it was before this screen and turned the stick snap back on -- one frame after setting them
+    // up above. It mostly worked anyway only because ce_tick_cursor re-parks the pointer each frame.
+    // The loop has no other way out than rc, so this runs on every exit.
+    //
+    // And leave none of OUR codes behind for whatever loop runs next, for the same reason.
+    flush_input_buffer();
+    gamepad_ui_set_suppress_a_click(ceSuppressWas);
     if (cePad != NULL) {
+        gamepad_ui_set_suppress_snap(false);
         gmouse_set_cursor(MOUSE_CURSOR_ARROW);
     }
 
@@ -4494,6 +4497,14 @@ static int AgeWindow()
             }
 
             win_delete(win);
+
+            // ⚠️ THIS EXIT NEEDS THE SAME BUMP AS THE CANCEL ONE BELOW (2026-10-20). The pad's A confirms
+            // here on the PRESS edge, so it is still down as the editor's poll resumes -- and there A
+            // acts on RELEASE, on the AGE row that is still focused: letting go opened this window
+            // again (and a long hold with no points left typed DONE). And drain what the pad typed
+            // after the 500 (a held left/right repeats), as SexWindow does.
+            flush_input_buffer();
+            gamepad_ui_bump_input_epoch();
             return 0;
         } else if (keyCode == KEY_ESCAPE || game_user_wants_to_quit != 0) {
             break;
@@ -4610,6 +4621,10 @@ static int AgeWindow()
     win_draw(edit_win);
     win_draw(win);
     win_delete(win);
+
+    // Drain what the pad typed after the ESC (a held left/right repeats). The editor loop used to
+    // empty the queue every frame by accident, which is what hid this until 2026-10-20.
+    flush_input_buffer();
 
     // ⚠️ SAME REASON AS perks_dialog: the button that closed this window is still held as
     // the parent's poll resumes. See the epoch guard in ce_pad_poll.
@@ -5204,6 +5219,9 @@ static int OptionWindow()
                     if (loadFileDialogRc == -1) {
                         db_free_file_list(&fileNameList, NULL);
                         // FIXME: This branch ignores cleanup at the end of the loop.
+                        // The A that pressed LOAD is still held, and file_dialog failed before its own
+                        // loop (and its own bump) ran -- see the confirm path in AgeWindow.
+                        gamepad_ui_bump_input_epoch();
                         return -1;
                     }
 
