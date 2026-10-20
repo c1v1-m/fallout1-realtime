@@ -1565,6 +1565,12 @@ static Object* rt_lock_push_anchor = NULL;
 // a lock exists; forgotten with the encounter and when its critter is freed.
 static Object* rt_lock_last_target = NULL;
 
+// The critter the right stick put the lock on while it was only PEEKING round cover (rt_lock_peeking):
+// aimed on purpose, so RT held on it waits for it to step out instead of hopping to someone in the
+// open. Compared by pointer only, never dereferenced; dropped the moment the lock is elsewhere or the
+// critter is in plain sight.
+static Object* rt_lock_preaim_target = NULL;
+
 // CONCURRENT ATTACK RESOLUTION. combat_attack() computes one attack into the single global
 // main_ctd; the classic flow holds that global until the damage commits, which serializes
 // attacks to one-at-a-time (a turn-based feel under realtime). Instead, the instant combat_attack
@@ -8598,6 +8604,34 @@ static bool rt_lock_in_sight(Object* critter)
     return !combat_is_shot_blocked(obj_dude, obj_dude->tile, critter->tile, critter, NULL);
 }
 
+// ⚠️ HALF ROUND THE CORNER (2026-10-20, his "zamířit na toho, co vyjde zpoza rohu ... tak v půlce,
+// abych měl čas zareagovat přesunem aimingu a vystřelit"). trace_2026-10-20_220255 s=83.3: 3228 came
+// round the corner 4 tiles off, the right stick was pushed at it and refused it for 1.2 s until it
+// stood in the open, and 0.2 s after his shot he was dead. A critter ONE STEP from a clean line -- a
+// free tile next to it is in the open -- may now be picked by the stick (rt_directional_lock), and
+// RT held on it fires the moment it steps out. A FREE neighbour, not any: one behind a straight wall
+// has only the wall on this side, so nobody is aimed through a wall again (lt-lock-pick, 2026-10-10).
+static bool rt_lock_peeking(Object* critter)
+{
+    if (critter == NULL || obj_dude == NULL || critter->elevation != obj_dude->elevation) {
+        return false;
+    }
+    for (int dir = 0; dir < ROTATION_COUNT; dir++) {
+        int t = tile_num_in_direction(critter->tile, dir, 1);
+        if (t < 0 || t == obj_dude->tile) {
+            continue;
+        }
+        Object* blocker = obj_blocking_at(critter, t, critter->elevation);
+        if (blocker != NULL && FID_TYPE(blocker->fid) != OBJ_TYPE_CRITTER) {
+            continue;
+        }
+        if (!combat_is_shot_blocked(obj_dude, obj_dude->tile, t, NULL, NULL)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Lower is better: tiles away plus the angle off the facing in tiles.
 static float rt_lock_score(int dist, float offDeg)
 {
@@ -8776,6 +8810,26 @@ static bool rt_hostile_by_nature(Object* critter)
 // enemy-by-nature in weapon range and in sight -- a rat, a radscorpion, never a person: people stay a
 // deliberate LT. rt_nearest_hostile_in_range itself is untouched, because it also decides the A-vs-
 // prompt split, and an idle rat must not switch the interact prompt off.
+// The nearest active hostile in weapon range with a clean line from the dude, or NULL.
+static Object* rt_nearest_hostile_in_sight(int hitMode)
+{
+    int range = item_w_range(obj_dude, hitMode);
+    Object* best = NULL;
+    int bestDist = range + 1;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (!rt_is_combatant(critter) || !rt_actors[i].hostile) {
+            continue;
+        }
+        int dist = obj_dist(obj_dude, critter);
+        if (dist <= range && dist < bestDist && rt_lock_in_sight(critter)) {
+            bestDist = dist;
+            best = critter;
+        }
+    }
+    return best;
+}
+
 static Object* rt_unlocked_attack_target(int hitMode)
 {
     // ⚠️ THE NEAREST ONE YOU CAN HIT, NOT THE NEAREST ONE (2026-10-20, trace_2026-10-20_220255 s=74.4:
@@ -8784,20 +8838,7 @@ static Object* rt_unlocked_attack_target(int hitMode)
     // nobody in sight it is the nearest as before -- nothing fires then either way.
     Object* target = rt_nearest_hostile_in_range(hitMode);
     if (target != NULL && !rt_lock_in_sight(target)) {
-        int range = item_w_range(obj_dude, hitMode);
-        Object* seen = NULL;
-        int seenDist = range + 1;
-        for (int i = 0; i < rt_actor_count; i++) {
-            Object* critter = rt_actors[i].obj;
-            if (!rt_is_combatant(critter) || !rt_actors[i].hostile) {
-                continue;
-            }
-            int dist = obj_dist(obj_dude, critter);
-            if (dist <= range && dist < seenDist && rt_lock_in_sight(critter)) {
-                seenDist = dist;
-                seen = critter;
-            }
-        }
+        Object* seen = rt_nearest_hostile_in_sight(hitMode);
         if (seen != NULL) {
             target = seen;
         }
@@ -9119,7 +9160,7 @@ static bool rt_directional_lock(float sx, float sy)
 
     for (int i = 0; i < rt_actor_count; i++) {
         Object* c = rt_actors[i].obj;
-        if (c == anchor || !rt_is_lockable(c) || !rt_lock_in_sight(c)) {
+        if (c == anchor || !rt_is_lockable(c) || (!rt_lock_in_sight(c) && !rt_lock_peeking(c))) {
             continue;
         }
 
@@ -9156,6 +9197,7 @@ static bool rt_directional_lock(float sx, float sy)
     }
 
     rt_lock_target = best;
+    rt_lock_preaim_target = rt_lock_in_sight(best) ? NULL : best; // aimed at round the corner
     return true;
 }
 
@@ -9215,6 +9257,8 @@ static void rt_lock_diag(float sx, float sy)
                 : "unperceived";
         } else if (dist > reach) {
             why = "out-of-reach";
+        } else if (!rt_lock_in_sight(c) && !rt_lock_peeking(c)) {
+            why = "no-line"; // behind cover, and not even one step from the open (rt_lock_peeking)
         } else {
             float offDeg;
             if (!rt_lock_step_angle(ax, ay, c, sx, sy, &offDeg)) {
@@ -9226,9 +9270,9 @@ static void rt_lock_diag(float sx, float sy)
                 // anchor; `dist` = tiles from you, for the reach rule).
                 int step = obj_dist(anchor, c);
                 trace_event(TRACE_INPUT, "aim-cand",
-                    "pid=%d id=%d name=%s dist=%d step=%d off=%.0fdeg score=%.1f anchor=%d t=%.2f",
+                    "pid=%d id=%d name=%s dist=%d step=%d off=%.0fdeg score=%.1f anchor=%d sight=%d t=%.2f",
                     c->pid, c->id, object_name(c), dist, step, offDeg,
-                    step + offDeg / RT_LOCK_STEP_DEG_PER_TILE, anchor->id, rt_clock);
+                    step + offDeg / RT_LOCK_STEP_DEG_PER_TILE, anchor->id, rt_lock_in_sight(c) ? 1 : 0, rt_clock);
             }
         }
 
@@ -13940,6 +13984,7 @@ static void rt_abandon_encounter()
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
+    rt_lock_preaim_target = NULL;
     rt_aim_outlined_count = 0; // pointers only: the objects are being freed by the caller
     rt_aim_outline_next = 0.0f;
     rt_lock_held = 0.0f;
@@ -15416,6 +15461,10 @@ void combat_rt_poll_gamepad()
     } else {
         rt_lock_last_target = rt_lock_target; // the next aim starts here (rt_lock_pick_initial)
     }
+    if (rt_lock_preaim_target != NULL
+        && (rt_lock_target != rt_lock_preaim_target || rt_lock_in_sight(rt_lock_target))) {
+        rt_lock_preaim_target = NULL; // out in the open now, or the lock went elsewhere
+    }
 
     // While locked: aim the RIGHT STICK toward the enemy you want and the lock switches to the
     // best-matching enemy in that screen direction (rt_directional_lock) -- just point at who you
@@ -15464,12 +15513,13 @@ void combat_rt_poll_gamepad()
                 // from the target you had, when a nearer one was on that side, is the bug, and this
                 // is where it would show. `dist` is from you, as before.
                 Object* anchor = rt_lock_step_anchor();
-                trace_event(TRACE_INPUT, "aim", "target=%d id=%d dist=%d step=%d anchor=%d t=%.2f",
+                trace_event(TRACE_INPUT, "aim", "target=%d id=%d dist=%d step=%d anchor=%d peek=%d t=%.2f",
                     rt_lock_target != NULL ? rt_lock_target->pid : -1,
                     rt_lock_target != NULL ? rt_lock_target->id : -1,
                     rt_lock_target != NULL ? obj_dist(obj_dude, rt_lock_target) : -1,
                     rt_lock_target != NULL && anchor != NULL ? obj_dist(anchor, rt_lock_target) : -1,
-                    anchor != NULL ? anchor->id : -1, rt_clock);
+                    anchor != NULL ? anchor->id : -1,
+                    rt_lock_target != NULL && rt_lock_target == rt_lock_preaim_target ? 1 : 0, rt_clock);
             }
 
             // ⚠️ ON EVERY PUSH, not only on a refusal. The complaint that started this was "I want
@@ -15569,6 +15619,23 @@ void combat_rt_poll_gamepad()
         int hitMode = rt_player_hit_mode();
         // AIMED MODE in the weapon slot = this pull goes to the bound part (rt_player_called_loc).
         int loc = rt_player_called_loc(hitMode);
+        // ⚠️ A LOCK BEHIND COVER HOPS TO ONE YOU CAN HIT (2026-10-20, his pick "Přeskočit na
+        // viditelného"). trace_2026-10-20_220255 s=25: the locked guard stepped round the corner, RT
+        // was refused for a second (AIM_BLOCKED, silent) and the one 4 tiles off in plain sight shot
+        // him dead. The lock itself still survives cover (lt-lock-pick); only a pull of RT moves it.
+        // ...but not off one HE put the stick on while it peeked round the corner (rt_lock_peeking):
+        // that pull is held for the moment it steps out. One that ducked back behind cover by itself
+        // (2521 above stood one tile past the corner) still hops.
+        if (rt_lock_target != NULL && rt_lock_target != rt_lock_preaim_target && !rt_lock_in_sight(rt_lock_target)) {
+            Object* seen = rt_nearest_hostile_in_sight(hitMode);
+            if (seen != NULL) {
+                trace_event(TRACE_ACTION, "lock-hop", "from=%d to=%d toPid=%d why=no-line t=%.2f",
+                    rt_lock_target->id, seen->id, seen->pid, rt_clock);
+                rt_lock_target = seen;
+                rt_lock_last_target = seen;
+                gsound_play_sfx_file("ib1p1xx1"); // the lock-on click: he hears the aim move
+            }
+        }
         if (rt_lock_target != NULL) {
             if (obj_dist(obj_dude, rt_lock_target) <= item_w_range(obj_dude, hitMode)) {
                 rt_set_player_intent(rt_lock_target, hitMode, loc);
@@ -15608,6 +15675,12 @@ bool combat_rt_hostile_in_attack_range()
 bool combat_rt_has_lock()
 {
     return rt_lock_target != NULL;
+}
+
+// The locked critter, or NULL (the self-played fights steer the right stick from it).
+Object* combat_rt_lock_target()
+{
+    return rt_lock_target;
 }
 
 // Is the player currently walking under LEFT-STICK control (as opposed to standing, or walking out
@@ -18802,6 +18875,9 @@ void combat_rt_notify_critter_removed(Object* removed)
     if (rt_lock_last_target == removed) {
         rt_lock_last_target = NULL;
     }
+    if (rt_lock_preaim_target == removed) {
+        rt_lock_preaim_target = NULL;
+    }
     rt_aim_outlines_forget(removed);
     if (rt_player_intent_target == removed) {
         rt_player_intent_target = NULL;
@@ -18937,6 +19013,7 @@ void combat_rt_end_for_map_exit()
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
+    rt_lock_preaim_target = NULL;
     rt_player_intent_target = NULL;
     rt_player_intent_ttl = 0.0f;
     rt_pending_loot = NULL;

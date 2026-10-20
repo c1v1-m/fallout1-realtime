@@ -1,0 +1,25 @@
+# Pre-aiming at one peeking round a corner (2026-10-20, his "zamířit na toho, co vyjde zpoza rohu ...
+# v půlce"). CITY1's ruined wall: the dude north of it with PE 10 (12 tiles within lock reach), a
+# pistol raider in the open to his west (the first lock), and two NEUTRALS standing still south of
+# the wall: 24696 just past its west end (one step from the open), 24702 behind its middle. The bot
+# locks the pistol raider, then holds RT and flicks the right stick toward 24696.
+# Good: [INPUT/aim] ... id=<24696's> peek=1, [INPUT/aim-skip] why=no-line for 24702 (nobody is aimed
+# through a wall), and no [ACTION/lock-hop] off the peeker while RT is held.
+name rt-peek
+map CITY1.MAP
+seed 1
+duration 4
+
+dude tile 23908 rot 3
+dude stat PE 10
+dude hp 400
+dude skill small_guns 100
+dude wield 8
+dude item 29 6
+
+spawn 16777291 23901 rot 2 wield 8 item 29 6 hostile
+spawn 16777291 24696 rot 0 team 50
+spawn 16777291 24702 rot 0 team 50
+
+at 0 fight
+at 0.8 aimother 24696

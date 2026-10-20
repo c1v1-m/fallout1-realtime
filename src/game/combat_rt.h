@@ -87,6 +87,7 @@ bool combat_rt_is_hostile(Object* obj);
 // on an out-of-range target still consumes A (it just doesn't fire) instead of
 // falling through to a world click.
 bool combat_rt_has_lock();
+Object* combat_rt_lock_target();
 // True while the player is walking under left-stick control (not standing, not walking out a
 // click-to-move path).
 bool combat_rt_stick_walking();

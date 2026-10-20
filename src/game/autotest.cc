@@ -80,6 +80,9 @@ namespace fallout {
 //        healhold                      hold LB down for the whole phase
 //        rthold                        hold RT down for the whole phase with NO lock (no LT): the
 //                                      unlocked attack picks its own target
+//        aimother [tile]               hold LT and RT, and flick the RIGHT stick from the locked critter
+//                                      toward the tile (or the nearest other enemy) every 0.6 s
+//                                      (pre-aiming at one peeking round a corner)
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
@@ -114,9 +117,10 @@ enum {
     AT_USE,
     AT_HEAL_HOLD,
     AT_RT_HOLD,
+    AT_AIM_OTHER,
 };
 
-static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal", "use", "healhold", "rthold" };
+static const char* const at_policy_names[] = { "idle", "fight", "advance", "kite", "goto", "shoot", "throw", "throwfree", "strafe", "dodge", "shootmove", "heal", "use", "healhold", "rthold", "aimother" };
 
 typedef struct AtItem {
     int pid;
@@ -1001,6 +1005,45 @@ void autotest_tick(float dt)
             }
             at_axis(SDL_CONTROLLER_AXIS_LEFTX, (Sint16)(-32000.0f * dy / len * at_strafe_dir));
             at_axis(SDL_CONTROLLER_AXIS_LEFTY, (Sint16)(32000.0f * dx / len * at_strafe_dir));
+            break;
+        }
+        case AT_AIM_OTHER: {
+            at_stick_still();
+            at_axis(SDL_CONTROLLER_AXIS_TRIGGERLEFT, 32767);
+            at_rt_frames = 3;
+            at_rt_rest = 0;
+            Object* lock = combat_rt_lock_target();
+            Object* other = NULL;
+            int otherDist = 9999;
+            Object** list = NULL;
+            int count = obj_create_list(-1, map_elevation, OBJ_TYPE_CRITTER, &list);
+            for (int i = 0; i < count; i++) {
+                if (list[i] != lock && at_is_enemy(list[i]) && obj_dist(obj_dude, list[i]) < otherDist) {
+                    other = list[i];
+                    otherDist = obj_dist(obj_dude, list[i]);
+                }
+            }
+            if (list != NULL) {
+                obj_delete_list(list);
+            }
+            int toTile = phaseTile >= 0 ? phaseTile : (other != NULL ? other->tile : -1);
+            // A flick: 0.25 s pushed, then home until the next one.
+            float cycle = fmodf(at_elapsed, 0.6f);
+            if (lock != NULL && toTile >= 0 && cycle < 0.25f) {
+                int x1, y1, x2, y2;
+                tile_coord(lock->tile, &x1, &y1, obj_dude->elevation);
+                tile_coord(toTile, &x2, &y2, obj_dude->elevation);
+                float dx = (float)(x2 - x1);
+                float dy = (float)(y2 - y1);
+                float len = sqrtf(dx * dx + dy * dy);
+                if (len >= 1.0f) {
+                    at_axis(SDL_CONTROLLER_AXIS_RIGHTX, (Sint16)(32000.0f * dx / len));
+                    at_axis(SDL_CONTROLLER_AXIS_RIGHTY, (Sint16)(32000.0f * dy / len));
+                }
+            } else {
+                at_axis(SDL_CONTROLLER_AXIS_RIGHTX, 0);
+                at_axis(SDL_CONTROLLER_AXIS_RIGHTY, 0);
+            }
             break;
         }
         case AT_RT_HOLD:
