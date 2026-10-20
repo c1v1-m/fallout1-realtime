@@ -1,0 +1,22 @@
+# Held short of AP, the stimpak waits (2026-10-20, "jo udělej to"): Agility 3 = 6 AP; a tap of LB takes
+# 4, and LB held again a second later finds 2-3 -- one buzz (quick-use-refused why=ap), then it must go
+# in by itself the moment the pool reaches 4 (quick-use-wait end=paid), and the held slot then chains a
+# whole jab at a time (heal-chain next=N, ~a jab apart) until full.
+name heal-apwait
+map DESERT1.MAP
+seed 4
+duration 10
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 10
+dude stat AG 3
+dude item 40 5
+
+spawn 16777225 24100 rot 5 hostile
+
+at 0 idle
+at 1.0 heal
+at 2.3 idle
+at 2.4 healhold
+at 8.0 idle

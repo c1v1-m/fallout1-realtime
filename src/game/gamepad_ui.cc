@@ -3376,6 +3376,27 @@ static unsigned int gpui_inject_at = 0;
 // (GPUI_CHAIN_INSTANT_MS); once he is up the chain goes on with a full jab.
 #define GPUI_CHAIN_INSTANT_MS 380
 static bool gpui_chain_last_instant = false; // the last one went in with no jab (he was down)
+// ⚠️ EACH ONE A WHOLE JAB (2026-10-20, "Strašně rychle se aktivuje ten druhej stimpack"; his pick "Celý
+// vpich znovu"). The jab-only follow-up came 0.3 s after the first -- 120 ms, then three frames to the
+// needle. Now the next one waits for the jab before it to finish and plays the whole injection again,
+// like another draw on the estus: one stimpak per jab (~0.75 s at his stats). On the floor the same
+// pace (gpui_chain_floor_ms). GPUI_CHAIN_BACK_FRAMES / anim_set_start_frame stay, unused by the chain.
+static unsigned int gpui_chain_floor_ms()
+{
+    anim_set_injection_timing(obj_dude);
+    unsigned int ms = gpui_injection_duration();
+    anim_set_injection_timing(NULL);
+    return ms > GPUI_CHAIN_INSTANT_MS ? ms : GPUI_CHAIN_INSTANT_MS;
+}
+
+// ⚠️ HELD SHORT OF AP, IT WAITS (2026-10-20, "jo udělej to"). He held LB 2.3 s with 2 AP of the 4 a
+// stimpak costs: one buzz, and nothing when the AP came back in the meantime. Now a slot's drug refused
+// for AP while its button stays down waits for the pool -- for GPUI_AP_WAIT_MS at most, as the grenade
+// waits in the hand (RT_THROW_AP_WAIT) -- and goes in the moment it can be paid. Letting go ends it.
+#define GPUI_AP_WAIT_MS 2000
+static int gpui_ap_wait_slot = -1;
+static int gpui_ap_wait_pid = -1;
+static unsigned int gpui_ap_wait_since = 0;
 static int gpui_quick_use_slot = -1;     // the quick slot gpui_quick_use is being called for, else -1
 static int gpui_chain_slot = -1;         // the slot whose held button drives the chain; -1 = none
 static unsigned int gpui_chain_due_at = 0; // when the next one is asked for; 0 = not now
@@ -3553,6 +3574,41 @@ static Object* gpui_quick_slot_item(int slot, int* count);
 static bool gpui_item_is_throwable(Object* item);
 static bool gpui_item_is_tool(Object* item);
 
+static void gpui_quick_use(int pid);
+static int gpui_pack_cost();
+
+static void gpui_ap_wait_tick()
+{
+    if (gpui_ap_wait_slot == -1 || obj_dude == NULL) {
+        return;
+    }
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    SDL_GameControllerButton button = gpui_ap_wait_slot == GPUI_QS_LB
+        ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER
+        : SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+    const char* end = NULL;
+    if (pad == NULL || SDL_GameControllerGetButton(pad, button) == 0) {
+        end = "released";
+    } else if (elapsed_time(gpui_ap_wait_since) > GPUI_AP_WAIT_MS) {
+        end = "timeout";
+    } else if (combat_rt_player_ap() >= gpui_pack_cost()) {
+        int slot = gpui_ap_wait_slot;
+        int pid = gpui_ap_wait_pid;
+        gpui_ap_wait_slot = -1;
+        trace_event(TRACE_ACTION, "quick-use-wait", "end=paid pid=%d waited=%ums ap=%d", pid,
+            elapsed_time(gpui_ap_wait_since), combat_rt_player_ap());
+        gpui_quick_use_slot = slot; // a held slot: it may chain from here (gpui_chain_slot)
+        gpui_quick_use(pid);
+        gpui_quick_use_slot = -1;
+        return;
+    }
+    if (end != NULL) {
+        trace_event(TRACE_ACTION, "quick-use-wait", "end=%s pid=%d waited=%ums ap=%d", end, gpui_ap_wait_pid,
+            elapsed_time(gpui_ap_wait_since), combat_rt_player_ap());
+        gpui_ap_wait_slot = -1;
+    }
+}
+
 static void gpui_heal_chain_end(const char* why)
 {
     if (gpui_chain_slot != -1) {
@@ -3606,7 +3662,7 @@ static void gpui_heal_chain_tick()
         }
         gpui_chain_count++;
         gpui_chain_last_instant = true;
-        gpui_chain_due_at = get_time() + GPUI_CHAIN_INSTANT_MS;
+        gpui_chain_due_at = get_time() + gpui_chain_floor_ms();
         if (gpui_chain_due_at == 0) {
             gpui_chain_due_at = 1;
         }
@@ -3615,17 +3671,18 @@ static void gpui_heal_chain_tick()
         return;
     }
 
-    // The jab before is still lowering the hand: that tail is what the next one replaces. Anything
-    // else holding the body (a step, a swing) ends the chain instead.
+    // The jab before is still playing: the next one waits for it to end (asked again next frame).
+    // Anything else holding the body (a step, a swing) ends the chain instead.
     if (anim_busy(obj_dude) != 0) {
         if (FID_ANIM_TYPE(obj_dude->fid) != ANIM_MAGIC_HANDS_MIDDLE) {
             gpui_heal_chain_end("busy");
             return;
         }
-        anim_force_clear(obj_dude);
+        gpui_chain_due_at = get_time() + 1;
+        return;
     }
-    // Just up from the floor, the hand is not raised yet: a whole jab, not only its end.
-    if (!gpui_inject_start(item, 0, true, gpui_chain_last_instant)) {
+    // A whole jab every time (see gpui_chain_floor_ms).
+    if (!gpui_inject_start(item, 0, true, true)) {
         gpui_heal_chain_end("refused");
         return;
     }
@@ -3670,8 +3727,17 @@ static void gpui_quick_use(int pid)
     // since 2026-10-19 the whole price is the pack's (gpui_pack_cost): 4, less one per rank.
     int apCost = gpui_pack_cost();
     if (combat_rt_player_ap() < apCost) {
+        if (gpui_ap_wait_slot != -1 && gpui_ap_wait_slot == gpui_quick_use_slot) {
+            return; // still waiting for the pool (gpui_ap_wait_tick)
+        }
         gsound_play_sfx_file("iisxxxx1");
         trace_event(TRACE_ACTION, "quick-use-refused", "pid=%d why=ap ap=%d", pid, combat_rt_player_ap());
+        if (gpui_quick_use_slot != -1) {
+            gpui_ap_wait_slot = gpui_quick_use_slot; // a held slot waits (GPUI_AP_WAIT_MS)
+            gpui_ap_wait_pid = pid;
+            gpui_ap_wait_since = get_time();
+            trace_event(TRACE_ACTION, "quick-use-wait", "pid=%d ap=%d cost=%d", pid, combat_rt_player_ap(), apCost);
+        }
         return;
     }
 
@@ -3738,7 +3804,7 @@ static void gpui_quick_use(int pid)
     gpui_chain_last_instant = true;
     gpui_chain_due_at = 0;
     if (gpui_chain_slot != -1) {
-        gpui_chain_due_at = get_time() + GPUI_CHAIN_INSTANT_MS;
+        gpui_chain_due_at = get_time() + gpui_chain_floor_ms();
         if (gpui_chain_due_at == 0) {
             gpui_chain_due_at = 1;
         }
@@ -8268,6 +8334,7 @@ static void gpui_drain_requests()
     // A jab cut before its frame gives its AP back -- before any new press is judged.
     gpui_inject_tick();
     gpui_heal_chain_tick();
+    gpui_ap_wait_tick();
     // ...and an explosive whose put-down was cut still lands.
     gpui_place_tick();
 
