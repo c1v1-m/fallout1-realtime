@@ -1644,6 +1644,25 @@ static RtInFlight rt_inflight[RT_MAX_INFLIGHT];
 static int rt_inflight_count = 0;
 static int rt_inflight_serial_next = 1;
 
+// The hit points check_for_death judged this attack's lethality against: the critter's own, less the
+// damage of every OTHER attack in flight at it (combat_rt_pending_damage_on, subtracted at the fire).
+// rt_late_survive needs exactly that number to tell a death the hit points decided from one a
+// critical dealt outright.
+static int rt_hp_at_fire(RtInFlight* self, Object* critter)
+{
+    if (critter == NULL || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+        return -1;
+    }
+    int hp = critter_get_hits(critter);
+    for (int i = 0; i < rt_inflight_count; i++) {
+        RtInFlight* other = &rt_inflight[i];
+        if (other != self && other->defender == critter && other->ctd.defenderDamage > 0) {
+            hp -= other->ctd.defenderDamage;
+        }
+    }
+    return hp;
+}
+
 // Where this attack's blast goes off and how far it reaches, as compute_attack decided it: a grenade
 // (thrown, explosion / plasma / EMP damage) reaches 2, any other explosion 3 (compute_explosion_on_
 // extras); centred on the defender when it hit, on the tile it fell to when it missed.
@@ -1662,12 +1681,11 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->bulletFlight = 0.0f;
     f->released = false;
     f->reaimed = false;
-    f->defHpAtFire = f->ctd.defender != NULL && FID_TYPE(f->ctd.defender->fid) == OBJ_TYPE_CRITTER
-        ? critter_get_hits(f->ctd.defender)
-        : -1;
+    // ⚠️ LESS WHAT ELSE WAS IN THE AIR (2026-10-20, "umřel jsem a měl jsem 27 životů"): see rt_hp_at_fire.
+    f->defHpAtFire = rt_hp_at_fire(f, f->ctd.defender);
     for (int x = 0; x < EXPLOSION_TARGET_COUNT; x++) {
         Object* extra = x < f->ctd.extrasLength ? f->ctd.extras[x] : NULL;
-        f->extrasHpAtFire[x] = extra != NULL && FID_TYPE(extra->fid) == OBJ_TYPE_CRITTER ? critter_get_hits(extra) : -1;
+        f->extrasHpAtFire[x] = rt_hp_at_fire(f, extra);
     }
     f->flame = f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
         && item_w_subtype(f->ctd.weapon, f->ctd.hitMode) == ATTACK_TYPE_RANGED
@@ -16454,6 +16472,13 @@ static void rt_tracers_tick()
 // opposite case only. A DAM_DEAD that came from the HIT POINTS (the damage reached the hp at the fire)
 // is withdrawn when the hp now exceed the damage; one a critical dealt outright (the damage was below
 // the hp even then -- an instant-death critical) stands.
+// ⚠️ "THE HP THEN" ARE THE HP LESS WHAT WAS ALREADY IN THE AIR (2026-10-20, trace_2026-10-20_200245:
+// "umřel jsem a měl jsem 27 životů"). check_for_death takes every other in-flight attack's damage off
+// the hit points before it decides, so a shot fired while two more were flying at him was lethal on
+// paper -- and when he then sidestepped one of those (proj-dodged, 25) or it missed, the one that did
+// land kept its death: 71 HP and dead of an 18, 60 and dead of a 33, 34 and dead of a 13. This test
+// read the plain hit points (71 > 18) and took it for an instant-death critical. defHpAtFire is now
+// the number check_for_death used (rt_hp_at_fire), so those deaths are withdrawn like the healed one.
 static void rt_late_survive(RtInFlight* f)
 {
     Attack* at = &f->ctd;

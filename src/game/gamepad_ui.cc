@@ -3368,6 +3368,14 @@ static unsigned int gpui_inject_at = 0;
 // jab (gpui_inject_tick). The keyboard reports no release, so H never chains.
 #define GPUI_CHAIN_BACK_FRAMES 3
 #define GPUI_CHAIN_DELAY_MS 120
+// ⚠️ ...AND ON THE FLOOR TOO (2026-10-20, trace_2026-10-20_200245: "ten stimpack quick heal nic nefunguje
+// jak jsme řešili ala dark souls"). He held LB 3.7 s getting up after a knockdown -- exactly when a
+// heal is wanted -- and got one stimpak: no jab can register on a body that is down or standing up, the
+// first one went in at once (gpui_quick_use's no-jab path) and that path never armed the chain. Now it
+// does, and while he is down or getting up the next ones go in at once too, at the jab's pace
+// (GPUI_CHAIN_INSTANT_MS); once he is up the chain goes on with a full jab.
+#define GPUI_CHAIN_INSTANT_MS 380
+static bool gpui_chain_last_instant = false; // the last one went in with no jab (he was down)
 static int gpui_quick_use_slot = -1;     // the quick slot gpui_quick_use is being called for, else -1
 static int gpui_chain_slot = -1;         // the slot whose held button drives the chain; -1 = none
 static unsigned int gpui_chain_due_at = 0; // when the next one is asked for; 0 = not now
@@ -3454,8 +3462,9 @@ static int gpui_inject_done(void* a1, void* a2)
 // Starts the jab. False = it could not register (he is in another live sequence -- a swing, a walk
 // segment -- or a transaction is open), and the caller takes the drug at once, as before.
 // followUp: the next one of a held-slot chain -- only the jab, from GPUI_CHAIN_BACK_FRAMES before the
-// action frame (see gpui_chain_slot).
-static bool gpui_inject_start(Object* item, int apCost, bool followUp = false)
+// action frame (see gpui_chain_slot); fullJab: a chained one that plays the whole animation all the same
+// (the first after getting up, when the hand is not raised).
+static bool gpui_inject_start(Object* item, int apCost, bool followUp = false, bool fullJab = false)
 {
     int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_MAGIC_HANDS_MIDDLE,
         (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
@@ -3469,7 +3478,7 @@ static bool gpui_inject_start(Object* item, int apCost, bool followUp = false)
         art_ptr_unlock(handle);
     }
     int startFrame = 0;
-    if (followUp) {
+    if (followUp && !fullJab) {
         startFrame = actionFrame - GPUI_CHAIN_BACK_FRAMES;
         if (startFrame < 0) {
             startFrame = 0;
@@ -3511,6 +3520,7 @@ static bool gpui_inject_start(Object* item, int apCost, bool followUp = false)
     if (!followUp) {
         gpui_chain_slot = gpui_quick_use_slot; // a slot's own press may chain; anything else may not
         gpui_chain_count = 0;
+        gpui_chain_last_instant = false;
     }
     gpui_chain_due_at = 0;
 
@@ -3572,7 +3582,7 @@ static void gpui_heal_chain_tick()
         gpui_heal_chain_end("released");
         return;
     }
-    if (critter_is_dead(obj_dude) || critter_is_prone(obj_dude) || gpui_inject_pending) {
+    if (critter_is_dead(obj_dude) || gpui_inject_pending) {
         gpui_heal_chain_end("busy");
         return;
     }
@@ -3587,6 +3597,24 @@ static void gpui_heal_chain_tick()
         gpui_heal_chain_end("none");
         return;
     }
+    // Down or getting up: no jab can register (see GPUI_CHAIN_INSTANT_MS) -- the next one goes in now.
+    int bodyAnim = FID_ANIM_TYPE(obj_dude->fid);
+    if (critter_is_prone(obj_dude) || bodyAnim == ANIM_PRONE_TO_STANDING || bodyAnim == ANIM_BACK_TO_STANDING) {
+        if (!gpui_take_drug_now(item)) {
+            gpui_heal_chain_end("refused");
+            return;
+        }
+        gpui_chain_count++;
+        gpui_chain_last_instant = true;
+        gpui_chain_due_at = get_time() + GPUI_CHAIN_INSTANT_MS;
+        if (gpui_chain_due_at == 0) {
+            gpui_chain_due_at = 1;
+        }
+        trace_event(TRACE_ACTION, "heal-chain", "next=%d pid=%d hp=%d pool=%d left=%d instant=1", gpui_chain_count,
+            item->pid, critter_get_hits(obj_dude), combat_rt_heal_left(), count - 1);
+        return;
+    }
+
     // The jab before is still lowering the hand: that tail is what the next one replaces. Anything
     // else holding the body (a step, a swing) ends the chain instead.
     if (anim_busy(obj_dude) != 0) {
@@ -3596,10 +3624,12 @@ static void gpui_heal_chain_tick()
         }
         anim_force_clear(obj_dude);
     }
-    if (!gpui_inject_start(item, 0, true)) {
+    // Just up from the floor, the hand is not raised yet: a whole jab, not only its end.
+    if (!gpui_inject_start(item, 0, true, gpui_chain_last_instant)) {
         gpui_heal_chain_end("refused");
         return;
     }
+    gpui_chain_last_instant = false;
     gpui_chain_count++;
     trace_event(TRACE_ACTION, "heal-chain", "next=%d pid=%d hp=%d pool=%d left=%d", gpui_chain_count, item->pid,
         critter_get_hits(obj_dude), combat_rt_heal_left(), count - 1);
@@ -3701,6 +3731,18 @@ static void gpui_quick_use(int pid)
     trace_event(TRACE_ACTION, "quick-use", "pid=%d hp=%d->%d pool=%d ap=%d->%d cost=%d qp=%d lock=%ums fight=%d jab=0",
         pid, hpBefore, critter_get_hits(obj_dude), combat_rt_heal_left(), apBefore, combat_rt_player_ap(),
         apCost, perk_level(PERK_QUICK_POCKETS), gpui_injection_ms, combat_rt_active() ? 1 : 0);
+
+    // A held slot goes on from here too (GPUI_CHAIN_INSTANT_MS).
+    gpui_chain_slot = gpui_quick_use_slot;
+    gpui_chain_count = 0;
+    gpui_chain_last_instant = true;
+    gpui_chain_due_at = 0;
+    if (gpui_chain_slot != -1) {
+        gpui_chain_due_at = get_time() + GPUI_CHAIN_INSTANT_MS;
+        if (gpui_chain_due_at == 0) {
+            gpui_chain_due_at = 1;
+        }
+    }
 }
 
 // What the dedicated heal button (LB+B) reaches for, best first. Fallout 1 has no other
