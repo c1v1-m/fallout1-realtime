@@ -617,6 +617,7 @@ typedef struct RtActor {
     float retarget_check_at; // next look for a much nearer enemy (rt_retarget_nearer)
     float ff_check_until; // friendly-fire care: no new roll before this (rt_ff_care)
     float ff_hold_until; // a careful one holding its rocket/grenade while a friend is in the blast
+    bool ff_careful; // the last friendly-fire roll passed (rt_ff_care: a careful burst holds on)
     int attack_loc; // the intent's hit location (HIT_LOCATION_UNCALLED unless a called shot)
     // It is following a route round a wall (or round what blocks its shot): until this, the straight
     // step does not take it back. See RT_DETOUR_COMMIT_SECONDS.
@@ -9475,6 +9476,7 @@ static void rt_refresh_registry()
             a->retarget_check_at = prev->retarget_check_at;
             a->ff_check_until = prev->ff_check_until;
             a->ff_hold_until = prev->ff_hold_until;
+            a->ff_careful = prev->ff_careful;
             prevHostile = prev->hostile;
         } else {
             a->state = RT_IDLE;
@@ -9578,6 +9580,7 @@ static void rt_refresh_registry()
             a->retarget_check_at = 0.0f;
             a->ff_check_until = 0.0f;
             a->ff_hold_until = 0.0f;
+            a->ff_careful = false;
             a->run_winded = false;
             a->breather = false;
             a->breather_since = -1.0f;
@@ -10440,6 +10443,9 @@ static void rt_retarget_nearer(RtActor* a, Object* npc)
 // A teammate this close in front is a back, not a line: never fired through, whatever the roll
 // (2026-10-20, rt_choke_waits' half of "Nebýt namačkaní u rohu").
 #define RT_FF_CLOSE 3
+// A careful burst with no clean spot only hesitates this long, then fires: friends at its target's
+// side may never move (self-played burst-ff: an INT 10 minigun mutant held 37 s behind knife raiders).
+#define RT_FF_SPRAY_HOLD 1.5f
 // No breather this close to the foe (see breatherAllowed).
 #define RT_BREATHER_MIN_DIST 3
 
@@ -10461,6 +10467,61 @@ static Object* rt_ally_in_line(Object* shooter, int fromTile, Object* target)
         from = obstacle->tile;
     }
     return NULL;
+}
+
+// ⚠️ A BURST HITS A CONE, NOT A LINE (2026-10-20, self-played mariposa-corner after 5b919de: friendly
+// fire up from 6/4 to 9/9 hits, nearly all of them Gatling-laser bursts into a mutant BESIDE the
+// line, which rt_ally_in_line never sees). compute_spray sends the rounds down three lines -- the
+// centre one and one a hex to either side of the target (of a tile 3 out, the target being nearer)
+// -- each out to the weapon's range, past the target too, and every critter on them may be hit.
+// The same INT x 10 % roll: a careful one looks for a spot with all three clean, or fires a plain
+// shot if it has one, or holds; a dim one bursts anyway -- his "mně nevadí střelba do vlastní, ať
+// tam taky je".
+
+// The first live teammate on one spray line from fromTile, met as shoot_along_path meets critters.
+static Object* rt_ally_on_spray_line(Object* shooter, int fromTile, int endTile)
+{
+    Object* obstacle = shooter;
+    int from = fromTile;
+    for (int guard = 0; guard < 16 && obstacle != NULL && from != endTile; guard++) {
+        make_straight_path(shooter, from, endTile, NULL, &obstacle, 32);
+        if (obstacle == NULL || FID_TYPE(obstacle->fid) != OBJ_TYPE_CRITTER) {
+            return NULL;
+        }
+        if (obstacle != shooter && !critter_is_dead(obstacle)
+            && obstacle->data.critter.combat.team == shooter->data.critter.combat.team) {
+            return obstacle;
+        }
+        from = obstacle->tile;
+    }
+    return NULL;
+}
+
+// The first live teammate on any of the burst's three lines fired from fromTile, or NULL.
+static Object* rt_ally_in_burst(Object* shooter, int fromTile, Object* target, int attackMode)
+{
+    int range = item_w_range(shooter, attackMode);
+    int centerTile = tile_dist(fromTile, target->tile) <= 3
+        ? tile_num_beyond(fromTile, target->tile, 3)
+        : target->tile;
+    int rotation = tile_dir(centerTile, fromTile);
+    int ends[3];
+    ends[0] = tile_num_beyond(fromTile, target->tile, range);
+    ends[1] = tile_num_beyond(fromTile, tile_num_in_direction(centerTile, (rotation + 1) % ROTATION_COUNT, 1), range);
+    ends[2] = tile_num_beyond(fromTile, tile_num_in_direction(centerTile, (rotation + 5) % ROTATION_COUNT, 1), range);
+    for (int i = 0; i < 3; i++) {
+        Object* ally = rt_ally_on_spray_line(shooter, fromTile, ends[i]);
+        if (ally != NULL) {
+            return ally;
+        }
+    }
+    return NULL;
+}
+
+static bool rt_is_spray(Object* npc, int attackMode)
+{
+    int anim = item_w_anim(npc, attackMode);
+    return anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS;
 }
 
 // ⚠️ A BLAST HURTS WHOEVER STANDS NEAR THE TARGET, NOT ONLY WHOEVER STANDS IN THE LINE (2026-10-18,
@@ -10500,9 +10561,11 @@ static Object* rt_ally_in_blast(Object* shooter, Object* target, int radius)
     return NULL;
 }
 
-// True when it stepped aside, or is holding a blast off a friend (this beat is spent).
-static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
+// True when it stepped aside, or is holding a blast off a friend (this beat is spent). A careful
+// burst with a friend beside the line may instead come back as the plain shot (*attackModePtr).
+static bool rt_ff_care(RtActor* a, Object* npc, int* attackModePtr, int* attackLocPtr)
 {
+    int attackMode = *attackModePtr;
     if (a->target == NULL) {
         return false;
     }
@@ -10516,12 +10579,15 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
         return false;
     }
     Object* target = a->target;
+    bool spray = subtype == ATTACK_TYPE_RANGED && rt_is_spray(npc, attackMode);
 
     // Already holding: for as long as a friend is still in the way or in the blast and the hold has time left.
     if (rt_clock < a->ff_hold_until) {
         Object* inLine = rt_ally_in_line(npc, npc->tile, target);
         if ((radius > 0 && (rt_ally_in_blast(npc, target, radius) != NULL || inLine != NULL))
-            || (inLine != NULL && tile_dist(npc->tile, inLine->tile) <= RT_FF_CLOSE)) {
+            || (inLine != NULL && tile_dist(npc->tile, inLine->tile) <= RT_FF_CLOSE)
+            || (spray && a->ff_careful
+                && (inLine != NULL || rt_ally_in_burst(npc, npc->tile, target, attackMode) != NULL))) {
             return true;
         }
         a->ff_hold_until = 0.0f;
@@ -10535,11 +10601,15 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
     // mutant found no spot, fired anyway, and the rocket burst on the raider in front). It holds.
     Object* ally = rt_ally_in_line(npc, npc->tile, target);
     bool blast = false;
+    bool cone = false; // the friend is beside the line, in the burst's spray only
     if (radius > 0) {
         if (ally == NULL) {
             ally = rt_ally_in_blast(npc, target, radius);
         }
         blast = ally != NULL;
+    } else if (ally == NULL && spray) {
+        ally = rt_ally_in_burst(npc, npc->tile, target, attackMode);
+        cone = ally != NULL;
     }
     if (ally == NULL) {
         return false;
@@ -10549,6 +10619,7 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
     int intelligence = stat_level(npc, STAT_INTELLIGENCE);
     int roll = roll_random(1, 10);
     bool careful = roll <= intelligence;
+    a->ff_careful = careful;
 
     if (blast) {
         // Stepping aside does not help: the friend is at the far end. A careful one waits for it to move.
@@ -10560,12 +10631,34 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
         return careful;
     }
 
+    if (cone) {
+        // Only in the spray: a dim one fires anyway.
+        if (!careful) {
+            trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d cone=1 int=%d roll=%d careful=0 t=%.2f",
+                npc->id, npc->pid, ally->id, intelligence, roll, rt_clock);
+            return false;
+        }
+        // A planned burst on a gun with a plain shot: the plain one goes down the clean centre line.
+        int plain = HIT_MODE_RIGHT_WEAPON_PRIMARY;
+        if (attackMode == HIT_MODE_RIGHT_WEAPON_SECONDARY
+            && item_w_subtype(weapon, plain) == ATTACK_TYPE_RANGED && !rt_is_spray(npc, plain)
+            && obj_dist(npc, target) <= item_w_range(npc, plain)) {
+            a->plan_mode = plain;
+            a->plan_loc = HIT_LOCATION_UNCALLED;
+            *attackModePtr = plain;
+            *attackLocPtr = HIT_LOCATION_UNCALLED;
+            trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d cone=1 int=%d roll=%d careful=1 plain=1 t=%.2f",
+                npc->id, npc->pid, ally->id, intelligence, roll, rt_clock);
+            return false;
+        }
+    }
+
     int dest = -1;
     int destSteps = 0;
     // A teammate right in front (RT_FF_CLOSE) is stepped round whatever the roll (2026-10-20, the same
     // trace: four shooters held their fire behind a back with the roll failed and never looked for a
     // spot -- "když vkročí, ani nezaútočí"); only with no spot to be had does it hold.
-    bool closeAlly = tile_dist(npc->tile, ally->tile) <= RT_FF_CLOSE;
+    bool closeAlly = !cone && tile_dist(npc->tile, ally->tile) <= RT_FF_CLOSE;
     if ((careful || closeAlly) && rt_can_walk(npc) && (npc->flags & OBJECT_MULTIHEX) == 0) {
         int range = item_w_range(npc, attackMode);
         int tiles[24];
@@ -10577,6 +10670,10 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
                 continue;
             }
             if (combat_is_shot_blocked(npc, t, target->tile, target, NULL) || rt_ally_in_line(npc, t, target) != NULL) {
+                continue;
+            }
+            // A careful burst wants the whole spray clean from there.
+            if (spray && careful && rt_ally_in_burst(npc, t, target, attackMode) != NULL) {
                 continue;
             }
             int steps = make_path(npc, npc->tile, t, NULL, 1);
@@ -10601,13 +10698,17 @@ static bool rt_ff_care(RtActor* a, Object* npc, int attackMode)
             moved = rc == 0 && anim_last_path_steps(npc) != 0;
         }
     }
-    bool close = !moved && tile_dist(npc->tile, ally->tile) <= RT_FF_CLOSE;
-    if (close) {
-        a->ff_hold_until = a->ff_check_until; // its back: held while it stays there and the roll stands
+    bool close = !moved && closeAlly;
+    // A careful burst with no clean spot waits a moment for its friend to clear the spray, then fires
+    // (RT_FF_SPRAY_HOLD); a back is held while it stays there and the roll stands.
+    bool hold = !moved && (close || (spray && careful));
+    if (hold) {
+        a->ff_hold_until = close ? a->ff_check_until : rt_clock + RT_FF_SPRAY_HOLD;
     }
-    trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d int=%d roll=%d careful=%d to=%d moved=%d close=%d t=%.2f",
-        npc->id, npc->pid, ally->id, intelligence, roll, careful ? 1 : 0, dest, moved ? 1 : 0, close ? 1 : 0, rt_clock);
-    return moved || close;
+    trace_event(TRACE_FLOW, "ff-care", "id=%d pid=%d ally=%d cone=%d spray=%d int=%d roll=%d careful=%d to=%d moved=%d close=%d hold=%d t=%.2f",
+        npc->id, npc->pid, ally->id, cone ? 1 : 0, spray ? 1 : 0, intelligence, roll, careful ? 1 : 0, dest,
+        moved ? 1 : 0, close ? 1 : 0, hold ? 1 : 0, rt_clock);
+    return moved || hold;
 }
 
 // --- COMBAT AI: GROUP TACTICS (2026-10-17, MODS "Tactical AI") ---------------------------------
@@ -12380,6 +12481,16 @@ static void rt_update_actor(RtActor* a, float dt)
                 npc->id, npc->pid, npc->tile,
                 rt_is_combatant(a->target) ? obj_dist(npc, a->target) : -1, rt_clock);
             giveUp = true;
+            // ⚠️ ...AND STOPS WALKING THE CHASE'S ROUTE (2026-10-20, trace_2026-10-20_205439: 3170 lost
+            // him at 35 tiles a few steps into a 38-step detour and went IDLE -- and the walk went on, 17 s
+            // with its eyes shut, as the FSM waits out a walking body, right up to him; no search leg, no
+            // look for him on the way). From where it stands the search takes over, three tiles a leg,
+            // looking between them (rt_search_tick).
+            int walkCut = anim_end_moves(npc);
+            if (walkCut > 0) {
+                trace_event(TRACE_FLOW, "disengage-walk-cut", "id=%d pid=%d sequences=%d t=%.2f",
+                    npc->id, npc->pid, walkCut, rt_clock);
+            }
             // Lost it, not beaten it: go and look where it was last seen (rt_search_tick).
             // ⚠️ NOT ONE THAT IS RUNNING AWAY (2026-10-18, self-played open-raiders: a knife raider at 3 HP
             // fled, ran dry at 12 tiles, lost sight of the dude -- and walked back to where it had last
@@ -13517,7 +13628,7 @@ static void rt_update_actor(RtActor* a, float dt)
         }
 
         // A teammate between it and its target (rt_ff_care): a bright shooter steps aside first.
-        if (rt_tactical_ai && rt_ff_care(a, npc, attackMode)) {
+        if (rt_tactical_ai && rt_ff_care(a, npc, &attackMode, &attackLoc)) {
             rt_intent_hint(a, RT_INTENT_REPOSITION, "clean-line", 2.0f);
             break;
         }

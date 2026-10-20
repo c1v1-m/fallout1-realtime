@@ -1,0 +1,27 @@
+# The dim twin of burst-ff (INT 1): it should still burst through its friends now and then.
+# a minigun stands behind them. A burst sprays three lines -- the centre one and one a hex to either
+# side of the target -- so a raider beside the dude is in it even off the straight line. This one is
+# INT 10, careful every roll: good = it steps to a spot with the whole spray clean, or holds
+# ([FLOW/ff-care] cone=1 / spray=1 hold=1); bad = bursts into its own men (airep "friendly fire").
+# burst-ff-dim is the same with INT 1: that one must still spray them (friendly fire stays).
+name burst-ff-dim
+map DESERT1.MAP
+seed 1
+duration 45
+
+dude tile 20100 rot 2
+dude stat PE 8
+dude stat AG 8
+dude stat EN 8
+dude hp 400
+dude skill small_guns 60
+dude armor 17
+dude wield 8
+dude item 29 6
+
+spawn 16777291 21700 rot 5 wield 4 hostile
+spawn 16777291 21696 rot 5 wield 4 hostile
+spawn 16777291 21704 rot 5 wield 4 hostile
+spawn 16777403 23300 rot 5 wield 12 item 35 6 hostile stat IN 1
+
+at 0 fight

@@ -131,6 +131,11 @@ typedef struct AtSpawn {
     int team;
     int curhp; // "hp <n>": start wounded (0 = full)
     bool empty; // "empty": the wielded gun starts with no rounds in it
+    // "stat <ST..LK> <n>": ⚠️ sets the PROTO's base stat (stat_set_base on a critter writes its proto),
+    // so every critter of that pid gets it -- give the one under test a pid of its own.
+    int statIndex[4];
+    int statValue[4];
+    int statCount;
     Object* obj;
 } AtSpawn;
 
@@ -366,6 +371,14 @@ static bool at_parse(const char* path)
                     sp->curhp = atoi(tok[++i]);
                 } else if (strcmp(tok[i], "empty") == 0) {
                     sp->empty = true;
+                } else if (strcmp(tok[i], "stat") == 0 && i + 2 < n && sp->statCount < 4) {
+                    int st = at_stat_index(tok[i + 1]);
+                    if (st >= 0) {
+                        sp->statIndex[sp->statCount] = st;
+                        sp->statValue[sp->statCount] = atoi(tok[i + 2]);
+                        sp->statCount++;
+                    }
+                    i += 2;
                 }
             }
         } else if (strcmp(tok[0], "at") == 0 && n >= 3 && at_phase_count < AT_MAX_PHASES) {
@@ -562,6 +575,9 @@ void autotest_setup_world()
         obj_move_to_tile(critter, sp->tile, elevation, NULL);
         if (sp->rotation >= 0) {
             obj_set_rotation(critter, sp->rotation, NULL);
+        }
+        for (int k = 0; k < sp->statCount; k++) {
+            stat_set_base(critter, STAT_STRENGTH + sp->statIndex[k], sp->statValue[k]);
         }
         critter->data.critter.hp = stat_level(critter, STAT_MAXIMUM_HIT_POINTS);
         for (int k = 0; k < sp->itemCount; k++) {
