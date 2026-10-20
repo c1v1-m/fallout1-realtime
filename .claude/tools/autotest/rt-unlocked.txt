@@ -1,0 +1,20 @@
+# RT with no lock picks the nearest enemy YOU CAN HIT (2026-10-20, trace_2026-10-20_220255 s=74.4: it
+# took a guard just behind the corner wall, every shot was refused for 1.5 s, and the one in plain
+# sight kept shooting). CITY1's ruined wall (rows 121-122, cols 105-111): the dude north of it, a
+# knife raider 4 tiles away SOUTH of the wall, a pistol raider 7 tiles off on his side in the open.
+# Good: [ACTION/attack] locked=0 at the open one and no [WARN/shot-blocked] DUDE. Bad: blocked shots.
+name rt-unlocked
+map CITY1.MAP
+seed 1
+duration 6
+
+dude tile 23908 rot 3
+dude hp 400
+dude skill small_guns 100
+dude wield 8
+dude item 29 6
+
+spawn 16777291 24708 rot 0 wield 4 hostile
+spawn 16777291 23901 rot 2 wield 8 item 29 6 hostile
+
+at 0 rthold

@@ -8778,7 +8778,30 @@ static bool rt_hostile_by_nature(Object* critter)
 // prompt split, and an idle rat must not switch the interact prompt off.
 static Object* rt_unlocked_attack_target(int hitMode)
 {
+    // ⚠️ THE NEAREST ONE YOU CAN HIT, NOT THE NEAREST ONE (2026-10-20, trace_2026-10-20_220255 s=74.4:
+    // RT with no lock took a guard 2 tiles away on the far side of the corner wall, every shot was
+    // refused as AIM_BLOCKED for 1.5 s, and the one 5 tiles off in plain sight kept shooting him). With
+    // nobody in sight it is the nearest as before -- nothing fires then either way.
     Object* target = rt_nearest_hostile_in_range(hitMode);
+    if (target != NULL && !rt_lock_in_sight(target)) {
+        int range = item_w_range(obj_dude, hitMode);
+        Object* seen = NULL;
+        int seenDist = range + 1;
+        for (int i = 0; i < rt_actor_count; i++) {
+            Object* critter = rt_actors[i].obj;
+            if (!rt_is_combatant(critter) || !rt_actors[i].hostile) {
+                continue;
+            }
+            int dist = obj_dist(obj_dude, critter);
+            if (dist <= range && dist < seenDist && rt_lock_in_sight(critter)) {
+                seenDist = dist;
+                seen = critter;
+            }
+        }
+        if (seen != NULL) {
+            target = seen;
+        }
+    }
     if (target != NULL) {
         return target;
     }
