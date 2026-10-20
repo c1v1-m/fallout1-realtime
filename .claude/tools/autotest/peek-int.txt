@@ -1,0 +1,24 @@
+# Lean out, shoot, duck back (2026-10-20, his "vychcané AI", one shot a time). CITY1's ruined wall:
+# the dude north of its middle, three plasma-rifle mutants south of it, each a pid of its own so "stat IN"
+# (which writes the proto) gives them INT 10, 7 and 5. Provoked, so they know where he is.
+# Good: [FLOW/peek] start int=10/7 to a tile next to cover (back ... cut=1 for INT 10), int=5 further
+# out in the open; [FLOW/peek] back after each shot. Bad: no peeks, or one standing out in the open.
+name peek-int
+map CITY1.MAP
+seed 1
+duration 40
+provoke
+
+dude tile 23908 rot 3
+dude stat PE 8
+dude hp 600
+dude skill small_guns 80
+dude armor 17
+dude wield 8
+dude item 29 12
+
+spawn 16777403 24702 rot 1 wield 15 item 39 8 hostile stat IN 10
+spawn 16777402 24706 rot 1 wield 15 item 39 8 hostile stat IN 7
+spawn 16777241 24710 rot 1 wield 15 item 39 8 hostile stat IN 5
+
+at 0 fight

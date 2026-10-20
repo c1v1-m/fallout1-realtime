@@ -643,6 +643,13 @@ typedef struct RtActor {
     float firepos_check_at;   // next look for one
     float choke_since;        // >= 0: waiting behind a teammate at the target (rt_choke_waits)
     float choke_skip_until;   // after a wait that timed out, not again until then
+    int peek_phase;           // RT_PEEK_*: out for one shot, or on its way back to cover (rt_peek_holds)
+    int peek_cover;           // the tile it leaned out from
+    int peek_out;             // the tile it shoots from; -1 = none found (looked for again at peek_check_at)
+    int peek_shots;           // bal_attacks when it went out: one more = its shot is gone
+    float peek_since;         // when it went out
+    float peek_check_at;      // next look for a tile to lean out to
+    float peek_wait_since;    // >= 0: a smart one waiting in cover while he aims at it
     float heal_left;          // HP of a drug still coming in (rt_heal_tick)
     int heal_lent;            // ...of which lent to its HP for a save (combat_rt_heal_lend_for_save)
     bool defend_provoked;     // a defender that was hit or approached fights normally (rt_defend_holds)
@@ -9502,6 +9509,13 @@ static void rt_refresh_registry()
             a->firepos_check_at = prev->firepos_check_at;
             a->choke_since = prev->choke_since;
             a->choke_skip_until = prev->choke_skip_until;
+            a->peek_phase = prev->peek_phase;
+            a->peek_cover = prev->peek_cover;
+            a->peek_out = prev->peek_out;
+            a->peek_shots = prev->peek_shots;
+            a->peek_since = prev->peek_since;
+            a->peek_check_at = prev->peek_check_at;
+            a->peek_wait_since = prev->peek_wait_since;
             a->defend_provoked = prev->defend_provoked;
             a->defend_covered = prev->defend_covered;
             a->defend_since = prev->defend_since;
@@ -9606,6 +9620,13 @@ static void rt_refresh_registry()
             a->firepos_check_at = 0.0f;
             a->choke_since = -1.0f;
             a->choke_skip_until = 0.0f;
+            a->peek_phase = 0; // RT_PEEK_NONE
+            a->peek_cover = -1;
+            a->peek_out = -1;
+            a->peek_shots = 0;
+            a->peek_since = -1.0f;
+            a->peek_check_at = 0.0f;
+            a->peek_wait_since = -1.0f;
             a->defend_provoked = false;
             a->defend_covered = false;
             a->defend_since = 0.0f;
@@ -11453,7 +11474,8 @@ static bool rt_firepos_taken(RtActor* a, int tile)
     for (int i = 0; i < rt_actor_count; i++) {
         RtActor* b = &rt_actors[i];
         if (b != a && ((b->firepos_tile >= 0 && tile_dist(b->firepos_tile, tile) <= 1)
-                          || (b->ow_tile >= 0 && tile_dist(b->ow_tile, tile) <= 1))) {
+                          || (b->ow_tile >= 0 && tile_dist(b->ow_tile, tile) <= 1)
+                          || (b->peek_out >= 0 && tile_dist(b->peek_out, tile) <= 1))) {
             return true;
         }
     }
@@ -11573,6 +11595,254 @@ static bool rt_choke_waits(RtActor* a, Object* npc, int mode)
         return false;
     }
     return true;
+}
+
+// --- COMBAT AI: LEAN OUT, SHOOT, DUCK BACK (2026-10-20, MODS "Tactical AI") -------------------------
+//
+// His idea, "vychcané AI": a mutant behind a corner leans out, fires and is back behind the wall --
+// and his rule for it, intelligence showing in HOW it fights: "průměrní Super mutanti kolem INT 5 ...
+// vylezli třeba celý, vystřelili a zase šli za roh. Kolem 7 by se mohli ukázat s 80% skrytým spritem
+// za zdí, aby mohli rychleji se zašatročit, no a ty chytří 9-10 se ukáží co nejméně", one shot a time
+// (his pick "Jedna rána a zpátky"). A shooter in cover -- within RT_PEEK_DIST and its reach, its
+// target with no line to it -- that has a tile to shoot from close by:
+//   * INT 5-6 walks out into the open (of the tiles it can shoot from within 3, the one its target
+//     sees most round), fires once, and walks back once the shot is done;
+//   * INT 7-8 runs to the NEAREST tile it can shoot from that keeps cover one step behind it -- most
+//     of it still behind the wall -- fires, and runs back once the shot is done;
+//   * INT 9-10 does that from the least exposed such tile, is gone again in its own shot's
+//     follow-through (shoot and move), and leans out when he is NOT aiming at it -- his lock on
+//     someone else, or him reloading -- waiting RT_PEEK_SMART_WAIT for that at most.
+// In cover short of a shot it waits there (and rt_prebreathe_holds tops it up first, nearer than
+// RT_PREBREATH_DIST), then goes again. A peek whose shot does not go off in RT_PEEK_OUT_MAX goes back.
+// ...AND IT DUCKS AFTER EVERY SHOT, however it got its line (self-played peek-int: three of them behind
+// the middle of a long wall had no tile to lean out to within 3, walked to firing positions -- and
+// stood there in the open, shot after shot). After a shot taken in its target's sight it goes to the
+// nearest tile out of it within reach (3 tiles, the bright ones 2): the one it leaned out from, if it
+// did. None near: it stays and fights as before.
+// Below INT 5 nothing changes: a firing position, or round the corner as before.
+#define RT_PEEK_MIN_INT 5
+#define RT_PEEK_DIST 12
+#define RT_PEEK_OUT_MAX 3.0f
+#define RT_PEEK_SMART_WAIT 2.5f
+enum {
+    RT_PEEK_NONE,
+    RT_PEEK_OUT,
+    RT_PEEK_BACK,
+};
+
+static bool rt_tile_hidden_from(Object* target, int tile)
+{
+    return combat_is_shot_blocked(target, target->tile, tile, NULL, NULL);
+}
+
+// How many of a tile's free neighbours its target can see (how far out in the open it is), and
+// whether one of them is out of its sight (cover a step away).
+static int rt_peek_exposure(Object* target, Object* npc, int tile, bool* coverNext)
+{
+    int seen = 0;
+    *coverNext = false;
+    for (int dir = 0; dir < ROTATION_COUNT; dir++) {
+        int n = tile_num_in_direction(tile, dir, 1);
+        Object* blocker = obj_blocking_at(npc, n, npc->elevation);
+        if (blocker != NULL && FID_TYPE(blocker->fid) != OBJ_TYPE_CRITTER) {
+            continue; // a wall: nobody stands there
+        }
+        if (rt_tile_hidden_from(target, n)) {
+            *coverNext = true;
+        } else {
+            seen++;
+        }
+    }
+    return seen;
+}
+
+static int rt_peek_pick(RtActor* a, Object* npc, Object* target, int intel, int mode, int range)
+{
+    // Not into its own blast: a rocket from 3 tiles takes the shooter along (self-played
+    // mariposa-corner, 2521 walked out "into the open" to 3 tiles of him with a launcher).
+    Object* weapon = item_hit_with(npc, mode);
+    int blast = weapon != NULL && item_get_type(weapon) == ITEM_TYPE_WEAPON ? rt_blast_radius_of(npc, weapon, mode) : 0;
+    int minDist = blast > 0 ? blast + 2 : 2;
+    int tiles[64];
+    int count = rt_tiles_around(npc->tile, intel >= 7 ? 2 : 3, tiles, 64);
+    int best = -1;
+    int bestScore = 0;
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        int fromTarget = tile_dist(t, target->tile);
+        if (fromTarget < minDist || fromTarget > range) {
+            continue;
+        }
+        if (obj_blocking_at(npc, t, npc->elevation) != NULL || rt_firepos_taken(a, t)) {
+            continue;
+        }
+        if (combat_is_shot_blocked(npc, t, target->tile, target, NULL) || rt_ally_in_line(npc, t, target) != NULL) {
+            continue;
+        }
+        bool coverNext;
+        int exposure = rt_peek_exposure(target, npc, t, &coverNext);
+        if (intel >= 7 && !coverNext) {
+            continue; // the bright ones keep the wall a step behind them
+        }
+        int walk = tile_dist(npc->tile, t);
+        int score;
+        if (intel >= 9) {
+            score = walk * 10 + exposure; // nearest, then least seen
+        } else if (intel >= 7) {
+            score = walk * 10; // nearest
+        } else {
+            score = walk - exposure * 10; // out in the open
+        }
+        if (best != -1 && score >= bestScore) {
+            continue;
+        }
+        int steps = make_path_capped(npc, npc->tile, t, NULL, 1, 200);
+        if (steps <= 0 || steps > walk + 1) {
+            continue;
+        }
+        best = t;
+        bestScore = score;
+    }
+    return best;
+}
+
+// True when it leans out now or waits in cover for it (this beat is spent).
+static bool rt_peek_holds(RtActor* a, Object* npc, int mode, int range)
+{
+    Object* target = a->target;
+    int intel = stat_level(npc, STAT_INTELLIGENCE);
+    if (a->peek_phase == RT_PEEK_BACK) {
+        trace_event(TRACE_FLOW, "peek", "id=%d pid=%d end=back tile=%d cover=%d ap=%d t=%.2f", npc->id, npc->pid,
+            npc->tile, a->peek_cover, a->ap, rt_clock);
+        a->peek_phase = RT_PEEK_NONE;
+    } else if (a->peek_phase == RT_PEEK_OUT) {
+        // Out there with no line after all (he moved on): the usual rules take it from here.
+        trace_event(TRACE_FLOW, "peek", "id=%d pid=%d end=no-line tile=%d t=%.2f", npc->id, npc->pid, npc->tile,
+            rt_clock);
+        a->peek_phase = RT_PEEK_NONE;
+        a->peek_out = -1;
+        return false;
+    }
+    if (target == NULL || a->fleeing || intel < RT_PEEK_MIN_INT || range <= 2 || !rt_can_walk(npc)
+        || (npc->flags & OBJECT_MULTIHEX) != 0) {
+        return false;
+    }
+    int dist = obj_dist(npc, target);
+    if (dist > RT_PEEK_DIST || dist > range || !rt_tile_hidden_from(target, npc->tile)) {
+        a->peek_wait_since = -1.0f;
+        return false; // too far, or not in cover (in its sights: rt_exposed_step's business)
+    }
+
+    if (rt_clock >= a->peek_check_at) {
+        a->peek_check_at = rt_clock + 0.5f;
+        a->peek_out = rt_peek_pick(a, npc, target, intel, mode, range);
+    }
+    if (a->peek_out < 0) {
+        return false; // nowhere to lean out to: a firing position, or round the corner
+    }
+
+    if (a->ap < rt_ap_cost(npc, mode)) {
+        rt_intent_hint(a, RT_INTENT_HOLD, "peek-wait", 0.3f);
+        return true; // in cover until it has the shot
+    }
+    if (intel >= 9 && target == obj_dude && rt_lock_target == npc && !combat_rt_is_reloading(obj_dude)) {
+        if (a->peek_wait_since < 0.0f) {
+            a->peek_wait_since = rt_clock;
+        }
+        if (rt_clock - a->peek_wait_since < RT_PEEK_SMART_WAIT) {
+            rt_intent_hint(a, RT_INTENT_HOLD, "peek-wait", 0.3f);
+            return true; // he is aiming at this corner: not now
+        }
+    }
+
+    int cover = npc->tile;
+    int out = a->peek_out;
+    bool run = intel >= 7 && rt_npc_sprint_ok(npc);
+    if (!rt_walk_to(npc, out, "peek-out", run)) {
+        a->peek_out = -1;
+        return false;
+    }
+    trace_event(TRACE_FLOW, "peek", "id=%d pid=%d start int=%d from=%d to=%d dist=%d at=%d waited=%.2f run=%d t=%.2f",
+        npc->id, npc->pid, intel, cover, out, dist, tile_dist(out, target->tile),
+        a->peek_wait_since >= 0.0f ? rt_clock - a->peek_wait_since : 0.0f, run ? 1 : 0, rt_clock);
+    a->peek_phase = RT_PEEK_OUT;
+    a->peek_cover = cover;
+    a->peek_shots = a->bal_attacks;
+    a->peek_since = rt_clock;
+    a->peek_wait_since = -1.0f;
+    rt_intent_hint(a, RT_INTENT_REPOSITION, "peek-out", 1.5f);
+    return true;
+}
+
+// The nearest free tile out of its target's sight within reach, or -1.
+static int rt_peek_cover_pick(RtActor* a, Object* npc, Object* target, int intel)
+{
+    int tiles[64];
+    int count = rt_tiles_around(npc->tile, intel >= 7 ? 2 : 3, tiles, 64);
+    int best = -1;
+    int bestWalk = 0;
+    for (int i = 1; i < count; i++) {
+        int t = tiles[i];
+        int walk = tile_dist(npc->tile, t);
+        if (best != -1 && walk >= bestWalk) {
+            continue;
+        }
+        if (obj_blocking_at(npc, t, npc->elevation) != NULL || rt_firepos_taken(a, t) || !rt_tile_hidden_from(target, t)) {
+            continue;
+        }
+        int steps = make_path_capped(npc, npc->tile, t, NULL, 1, 200);
+        if (steps <= 0 || steps > walk + 1) {
+            continue;
+        }
+        best = t;
+        bestWalk = walk;
+    }
+    return best;
+}
+
+// After a shot in its target's sight (or a peek whose shot never went off): back into cover.
+static bool rt_peek_back(RtActor* a, Object* npc)
+{
+    bool fired = a->bal_attacks != a->peek_shots;
+    bool late = a->peek_phase == RT_PEEK_OUT && rt_clock - a->peek_since > RT_PEEK_OUT_MAX;
+    if (!fired && !late) {
+        return false;
+    }
+    Object* target = a->target;
+    int intel = stat_level(npc, STAT_INTELLIGENCE);
+    int mode = rt_hit_mode(npc);
+    int cover = -1;
+    if (rt_tactical_ai && target != NULL && !a->fleeing && intel >= RT_PEEK_MIN_INT && item_w_range(npc, mode) > 2
+        && rt_can_walk(npc) && (npc->flags & OBJECT_MULTIHEX) == 0 && !rt_tile_hidden_from(target, npc->tile)) {
+        if (a->peek_phase == RT_PEEK_OUT && a->peek_cover >= 0 && a->peek_cover != npc->tile
+            && rt_tile_hidden_from(target, a->peek_cover)) {
+            cover = a->peek_cover; // the corner it leaned out from
+        } else {
+            cover = rt_peek_cover_pick(a, npc, target, intel);
+        }
+    }
+    if (cover < 0) {
+        a->peek_shots = a->bal_attacks; // nowhere to duck: it fights on from here
+        a->peek_phase = RT_PEEK_NONE;
+        return false;
+    }
+    if (anim_busy(npc) != 0 && intel < 9) {
+        return true; // the shot plays out first; only the brightest cut it short
+    }
+    bool run = intel >= 7 && rt_npc_sprint_ok(npc);
+    bool cut = anim_busy(npc) != 0; // leaving in its own shot's follow-through
+    bool moved = rt_walk_to(npc, cover, "peek-back", run);
+    trace_event(TRACE_FLOW, "peek", "id=%d pid=%d back int=%d fired=%d out=%.2f from=%d to=%d moved=%d cut=%d t=%.2f",
+        npc->id, npc->pid, intel, fired ? 1 : 0, a->peek_phase == RT_PEEK_OUT ? rt_clock - a->peek_since : 0.0f,
+        npc->tile, cover, moved ? 1 : 0, cut ? 1 : 0, rt_clock);
+    a->peek_shots = a->bal_attacks;
+    a->peek_phase = moved ? RT_PEEK_BACK : RT_PEEK_NONE;
+    a->peek_out = -1;
+    if (moved) {
+        a->state = RT_CHASE;
+        rt_intent_hint(a, RT_INTENT_REPOSITION, "peek-back", 1.0f);
+    }
+    return moved;
 }
 
 // --- COMBAT AI: GOING ROUND, AND SPREADING OUT (2026-10-18, MODS "Tactical AI") -------------------
@@ -12989,6 +13259,10 @@ static void rt_update_actor(RtActor* a, float dt)
         a->prebreath_since = -1.0f;
         a->firepos_tile = -1;
         a->choke_since = -1.0f;
+        a->peek_phase = RT_PEEK_NONE;
+        a->peek_out = -1;
+        a->peek_wait_since = -1.0f;
+        a->peek_shots = a->bal_attacks; // a shot from before this fight is not one to duck after
         // RE-AGGRO IS GATED ON PERCEPTION, and it has to be: the stop rule above drops a chase
         // once the critter perceives nobody, and if this branch could re-acquire on distance
         // alone (rt_nearest_player_side reaches the 50-tile leash) it would re-engage on the very
@@ -13355,6 +13629,9 @@ static void rt_update_actor(RtActor* a, float dt)
             } else if (rt_tactical_ai && rt_prebreathe_holds(a, npc, mode)) {
                 // Topping up out of sight before going round (rt_prebreathe_holds).
                 a->no_path_since = -1.0f;
+            } else if (inRange && !closeForHit && rt_tactical_ai && rt_peek_holds(a, npc, mode, range)) {
+                // Lean out of cover for one shot, or wait in it for the next (rt_peek_holds).
+                a->no_path_since = -1.0f;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_firing_position(a, npc, mode, range)) {
                 // To a tile it can shoot from at range, instead of up to him round the corner.
                 a->no_path_since = -1.0f;
@@ -13541,6 +13818,11 @@ static void rt_update_actor(RtActor* a, float dt)
             a->state = RT_IDLE;
             a->target = NULL;
             a->weapon_checked = false;
+            break;
+        }
+
+        // Leaned out for one shot: once it is gone, back behind the corner (rt_peek_back).
+        if (rt_peek_back(a, npc)) {
             break;
         }
 
