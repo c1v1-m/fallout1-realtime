@@ -2557,21 +2557,22 @@ static void rt_ensure_weapon_drawn(RtActor* a)
         return;
     }
 
-    // ⚠️ HOLDING *A* WEAPON IS NOT THE SAME AS HOLDING ITS *BEST* ONE, and the old code stopped
-    // at the former. Lorenzo (proto 120) carries a 10mm SMG **and** a Knife, and the map puts the
-    // KNIFE in his hand -- so he closed to melee range and stabbed, with a submachine gun in his
-    // pack, because the check was only "is there a weapon in the hand?". Vanilla never settles
-    // for that: every AI turn runs ai_switch_weapons -> ai_search_inven -> ai_best_weapon, which
-    // prefers RANGED over melee and the pricier of two of a kind.
+    // ⚠️ A WEAPON IN THE HAND IS KEPT, AS VANILLA KEEPS IT (2026-10-22, his "kdybych hrál čistou tak by
+    // lorenzo vytáhl nůž a bodal mě, to je vanilla chování, jedná se o bug"). Lorenzo (proto 120)
+    // carries a 10mm SMG and a Knife, and the map puts the KNIFE in his hand. This code used to
+    // "upgrade" any held weapon to ai_search_inven's best -- on the belief that every vanilla AI turn
+    // runs ai_switch_weapons. It does not: ai_try_attack switches only when the hand holds NO weapon,
+    // when the gun is dry (rt_swap_dry_weapon here) or for want of AP / a crippled arm; out of range
+    // with a weapon in hand it simply walks closer (combatai.cc, COMBAT_BAD_SHOT_OUT_OF_RANGE). So he
+    // shot you with the SMG where the original has him close in and stab.
     //
-    // ai_search_inven skips whatever is already held, so it returns the best OTHER weapon; the
-    // ai_best_weapon comparison against the held one decides whether swapping is actually an
-    // upgrade. check_action_points = 0: combat_rt runs its own AP pool, so the engine AP field
-    // must not veto the choice.
+    // An EMPTY hand still draws the best weapon in the pack (ai_switch_weapons' job): Gizmo's assassin
+    // carries his gun stowed. check_action_points = 0: combat_rt runs its own AP pool, so the engine
+    // AP field must not veto the choice.
     Object* held = rt_hand_holds_weapon(npc) ? inven_right_hand(npc) : NULL;
-    Object* candidate = ai_search_inven(npc, 0);
+    Object* candidate = held == NULL ? ai_search_inven(npc, 0) : NULL;
 
-    if (candidate != NULL && ai_best_weapon(held, candidate) == candidate) {
+    if (candidate != NULL) {
         // Inside a transaction of our own: inven_wield stamps the new weapon POSE through
         // register_object_take_out, which is a registered animation and silently does nothing
         // when no transaction is open -- that leaves the item in the hand and the body still

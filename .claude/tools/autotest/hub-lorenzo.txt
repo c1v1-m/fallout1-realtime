@@ -1,18 +1,26 @@
 # Lorenzo, the Hub's loan shark, with HIS save's Hub state (2026-10-21, "proč bankéř přede mnou utíká
 # z obchodu?"): map vars 11 and 44 are 1 -- set when the player falls out with the Underground (Decker
-# declined or insulted, Kane hostile, or either killed). The dude stands by Lorenzo (23309), A talks
-# twice. Watch [STATE/float] for what Lorenzo says and what his men do.
+# declined or insulted, Kane hostile, or either killed). The dude talks to Lorenzo twice (wherever his
+# timer has walked him). Watch [STATE/float] for what Lorenzo says and what his men do.
+# 2026-10-22: he must fight with the KNIFE the map puts in his hand, as vanilla does ("kdybych hrál
+# čistou tak by lorenzo vytáhl nůž a bodal mě"), not the SMG in his pack.
 name hub-lorenzo
 map HUBDWNTN.MAP
 mapscript on
 seed 1
-duration 20
+duration 30
 mapvar 11 1
 mapvar 44 1
 dude tile 23509 rot 0
 dude hp 400
 
-tap 2500 A 200
+talk 2500 16777336
 note 7000 second time
-tap 8000 A 200
-note 18000 end
+talk 8000 16777336
+note 28000 end
+
+expect float\] prog=scripts.lorenzo.int .*Okay boys
+expect \[FLOW/combat-enter\]
+expect COMBAT/hit\] att=2295 .* dist=1
+expect-not COMBAT/bullet\] att=2295
+expect-not draw-weapon\] npc pid=16777336
