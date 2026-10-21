@@ -4634,8 +4634,13 @@ static int gpui_collect_usable_items(int* pids, int* counts, int count, int max)
         // ⚠️ NO ARMOUR (2026-10-17, "quick menu dej pryč brnění, docela tam překáží"). It was added the
         // same day ("Quick inventory i pro armour by se hodil") and taken out again; gpui_quick_wear and
         // its dispatch stay, unreachable, should it come back.
+        // ⚠️ AND KEYS (2026-10-21, "klíč se neobjevil v quick inventory"). A key is its own item type, not
+        // MISC, so it never made the list -- and in Fallout a key is only ever used ON a door (its script
+        // checks the key's pid). Listed, it arms the use-on crosshair like the rope.
         int type = item_get_type(item);
-        if (type != ITEM_TYPE_MISC) {
+        if (type == ITEM_TYPE_KEY) {
+            // in: always a use-on
+        } else if (type != ITEM_TYPE_MISC) {
             continue;
         } else if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
             continue;
@@ -5341,11 +5346,12 @@ static void gpui_weapon_wheel(SDL_GameController* pad)
                     bool isDrug = proto_ptr(pid, &proto) != -1 && proto != NULL
                         && proto->item.type == ITEM_TYPE_DRUG;
                     bool isArmor = proto != NULL && proto->item.type == ITEM_TYPE_ARMOR;
+                    bool isKey = proto != NULL && proto->item.type == ITEM_TYPE_KEY;
                     if (isArmor) {
                         gpui_quick_wear(pid);
                     } else if (isDrug) {
                         gpui_quick_use(pid);
-                    } else if (proto_action_can_use(pid)) {
+                    } else if (!isKey && proto_action_can_use(pid)) {
                         gpui_quick_use_item(pid);
                     } else {
                         gpui_quick_use_on_item(pid);
