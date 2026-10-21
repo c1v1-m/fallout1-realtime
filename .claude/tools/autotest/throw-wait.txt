@@ -1,7 +1,8 @@
 # A quick throw short of AP (2026-10-18): the grenade must wait in the hand and go the moment the pool
-# reaches the throw's 4 (quick-throw-wait, -waited). Since 2026-10-19 the draw costs 4 (a weapon change,
-# his pick), so Agility 3 = 6 AP: the draw leaves 2, the wait is ~1.5 s (Agility 1 could no longer make
-# it inside the 2 s the hand waits).
+# reaches the throw's price (quick-throw-wait, -waited). Since 2026-10-21 a grenade from the quick slot
+# costs what a stimpak from it does -- the pack price, 4 - QP rank, for the throw, and the draw is free
+# (his "jako stimpack za 4 body ten hod"). Agility 3 = 6 AP: the first RB throw costs 4 of them (the
+# draw nothing), the second one 1 s later finds 2-3 and waits in the hand for the 4th.
 name throw-wait
 map DESERT1.MAP
 seed 1
@@ -15,4 +16,9 @@ dude item 25 3
 
 spawn 16777291 21700 rot 5 wield 8 item 29 6 hostile
 
-at 0 throw
+at 0.3 throw
+at 2.3 throw
+
+expect \[ACTION/quick-draw\] slot=1 pid=25
+expect \[ACTION/quick-throw-wait\] ap=[0-3] cost=4
+expect \[ACTION/quick-throw\]

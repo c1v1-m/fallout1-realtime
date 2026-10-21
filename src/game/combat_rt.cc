@@ -2586,8 +2586,28 @@ static void rt_ensure_weapon_drawn(RtActor* a)
 
 // The AP an actor must pay to attack in the given hit mode (its original Fallout
 // move-point cost, floored at 1 so a zero-cost weapon still gates).
+// ⚠️ A GRENADE FROM THE QUICK SLOT COSTS WHAT A STIMPAK FROM IT DOES (2026-10-21, his "zkusíme to dát
+// jako stimpack za 4 body ten hod"). The RB throw cost the pack price for the draw AND the card's 4 for
+// the throw -- 8, 7 with Quick Pockets, "to je trochu moc". Now the draw is free and the throw of the
+// grenade it put in the hand costs the pack price (4 - QP rank, gamepad_ui_pack_ap_cost) in all;
+// gamepad_ui sets this while that grenade is out and clears it when it is put away. A grenade wielded
+// any other way (the weapon wheel) still throws at its card's price. -1 = no quick throw on.
+static int rt_quick_throw_cost = -1;
+
+void combat_rt_set_quick_throw_cost(int cost)
+{
+    rt_quick_throw_cost = cost;
+}
+
 static int rt_ap_cost(Object* actor, int hitMode, bool aiming = false)
 {
+    if (actor == obj_dude && rt_quick_throw_cost >= 0 && !aiming) {
+        Object* weapon = item_hit_with(actor, hitMode);
+        if (weapon != NULL && item_get_type(weapon) == ITEM_TYPE_WEAPON
+            && item_w_subtype(weapon, hitMode) == ATTACK_TYPE_THROW) {
+            return rt_quick_throw_cost > 0 ? rt_quick_throw_cost : 1;
+        }
+    }
     int apCost = item_w_mp_cost(actor, hitMode, aiming);
     if (apCost < 1) {
         apCost = 1;
@@ -14314,6 +14334,7 @@ static void rt_resolve_attacks(float dt)
 // are being freed by the caller), so it never touches the animation tables.
 static void rt_abandon_encounter()
 {
+    rt_quick_throw_cost = -1; // a grenade out of the pack does not carry its price into the next map
     rt_inflight_count = 0;
     rt_actor_count = 0;
     rt_engaged = false;

@@ -4082,6 +4082,9 @@ void gamepad_ui_quick_slots_reset()
 
 static void gpui_qt_set(int state)
 {
+    if (state == GPUI_QT_IDLE || state == GPUI_QT_RESTORE) {
+        combat_rt_set_quick_throw_cost(-1); // put away: a grenade in the hand is priced by its card again
+    }
     gpui_qt_state = state;
     gpui_qt_since = get_time();
 }
@@ -4209,21 +4212,17 @@ static void gpui_qt_tick()
         gpui_qt_hand = intface_is_item_right_hand();
         Object* current = gpui_qt_hand_item();
         if (current != NULL && current->pid == gpui_qt_pid) {
-            // Already in the hand: nothing to draw, nothing to pay, nothing to put back.
+            // Already in the hand: nothing to draw, nothing to put back -- and the throw at the slot's price.
             gpui_qt_prev_pid = gpui_qt_pid;
             gpui_qt_prev_obj = current;
+            combat_rt_set_quick_throw_cost(gpui_pack_cost());
             gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
             return;
         }
-        // A weapon change, priced like the wheel's (gpui_pack_cost, 2026-10-19 -- it was 2, 1
-        // with Quick Pockets). The put-back after the throw stays free: one draw, one price.
-        int apCost = gpui_pack_cost();
-        if (combat_rt_player_ap() < apCost) {
-            gpui_qt_set(GPUI_QT_IDLE);
-            gsound_play_sfx_file("iisxxxx1");
-            trace_event(TRACE_INPUT, "quick-draw-refused", "why=ap ap=%d", combat_rt_player_ap());
-            return;
-        }
+        // ⚠️ THE DRAW IS FREE, THE THROW IS THE PRICE (2026-10-21, his "jako stimpack za 4 body"): the
+        // pack price (gpui_pack_cost, 4 - QP rank) used to be paid here AND the card's 4 for the throw,
+        // 8 in all. Now the whole thing is one item from the pack, like a stimpak: the throw costs
+        // gpui_pack_cost (combat_rt_set_quick_throw_cost) and waits in the hand when short of it.
         // The art inven_wield is about to check itself (see gpui_weapon_equip for why first).
         int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF,
             item_w_anim_weap(item, HIT_MODE_RIGHT_WEAPON_PRIMARY), item_w_anim_code(item),
@@ -4236,7 +4235,7 @@ static void gpui_qt_tick()
         }
         gpui_qt_prev_pid = current != NULL ? current->pid : -1;
         gpui_qt_prev_obj = current;
-        combat_rt_spend_ap(apCost);
+        combat_rt_set_quick_throw_cost(gpui_pack_cost());
         // ⚠️ NO HOLSTER (2026-10-16, his pick "Bez schování" to "ať je přepínání víc smooth"): the
         // put-away of the gun was ~0.6 s of nothing between the press and the throw. The grenade is
         // in the hand at once; the gun comes back with its own take-out after the throw (RESTORE).
