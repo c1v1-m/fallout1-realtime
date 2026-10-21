@@ -1,0 +1,18 @@
+# Lorenzo, the Hub's loan shark, with HIS save's Hub state (2026-10-21, "proč bankéř přede mnou utíká
+# z obchodu?"): map vars 11 and 44 are 1 -- set when the player falls out with the Underground (Decker
+# declined or insulted, Kane hostile, or either killed). The dude stands by Lorenzo (23309), A talks
+# twice. Watch [STATE/float] for what Lorenzo says and what his men do.
+name hub-lorenzo
+map HUBDWNTN.MAP
+mapscript on
+seed 1
+duration 20
+mapvar 11 1
+mapvar 44 1
+dude tile 23509 rot 0
+dude hp 400
+
+tap 2500 A 200
+note 7000 second time
+tap 8000 A 200
+note 18000 end

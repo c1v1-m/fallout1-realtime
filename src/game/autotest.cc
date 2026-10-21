@@ -52,6 +52,7 @@ namespace fallout {
 //   mapscript on                       keep the map's own script (off by default: an encounter map's
 //                                      script spawns its own critters into the arena)
 //   gvar <n> <value>                   a global variable set before the run (a quest part way, a code known)
+//   mapvar <n> <value>                 one of the loaded map's own variables (its scripts' map_var)
 //   cleararea <tiles>                  every other critter within that many tiles of the dude is removed
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
@@ -220,6 +221,10 @@ static int at_dude_elevation = -1;
 static int at_gvar_index[AT_MAX_GVARS];
 static int at_gvar_value[AT_MAX_GVARS];
 static int at_gvar_count = 0;
+// "mapvar <n> <value>": the loaded map's own variables (map_var in its scripts), e.g. a town's grudge.
+static int at_mvar_index[AT_MAX_GVARS];
+static int at_mvar_value[AT_MAX_GVARS];
+static int at_mvar_count = 0;
 // "cleararea <tiles>": every other critter that close to the dude is taken off the map at the start
 // (a quest step tested on its own: the guards at a door are a fight, not the door).
 static int at_clear_radius = -1;
@@ -632,6 +637,10 @@ static bool at_parse(const char* path)
             at_map_script = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "cleararea") == 0 && n >= 2) {
             at_clear_radius = atoi(tok[1]);
+        } else if (strcmp(tok[0], "mapvar") == 0 && n >= 3 && at_mvar_count < AT_MAX_GVARS) {
+            at_mvar_index[at_mvar_count] = atoi(tok[1]);
+            at_mvar_value[at_mvar_count] = atoi(tok[2]);
+            at_mvar_count++;
         } else if (strcmp(tok[0], "gvar") == 0 && n >= 3 && at_gvar_count < AT_MAX_GVARS) {
             at_gvar_index[at_gvar_count] = atoi(tok[1]);
             at_gvar_value[at_gvar_count] = atoi(tok[2]);
@@ -866,6 +875,13 @@ void autotest_setup_world()
     for (int g = 0; g < at_gvar_count; g++) {
         game_set_global_var(at_gvar_index[g], at_gvar_value[g]);
         trace_event(TRACE_FLOW, "autotest", "gvar %d=%d", at_gvar_index[g], at_gvar_value[g]);
+    }
+    for (int m = 0; m < at_mvar_count; m++) {
+        ProgramValue value;
+        value.opcode = VALUE_TYPE_INT;
+        value.integerValue = at_mvar_value[m];
+        map_set_global_var(at_mvar_index[m], value);
+        trace_event(TRACE_FLOW, "autotest", "mapvar %d=%d", at_mvar_index[m], at_mvar_value[m]);
     }
     Proto* proto;
     if (proto_ptr(obj_dude->pid, &proto) == 0) {

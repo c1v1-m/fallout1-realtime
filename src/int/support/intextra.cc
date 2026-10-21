@@ -2802,6 +2802,10 @@ static void op_float_msg(Program* program)
         return;
     }
 
+    // What an NPC said over its head -- a refusal, a threat -- which no other trace line carries.
+    trace_event(TRACE_STATE, "float", "prog=%s pid=%d id=%d text=%.80s", program != NULL && program->name != NULL ? program->name : "?",
+        obj->pid, obj->id, string);
+
     if (obj->elevation != map_elevation) {
         return;
     }
