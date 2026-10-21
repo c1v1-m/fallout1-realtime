@@ -1733,8 +1733,11 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         // ⚠️ NOT THE CHARACTER SHEET. That one grew real navigation, where Down means "next row",
         // so the toggle was eating the most-used direction on the screen: every step down the skill
         // list also closed it. B / BACK still back out of it, like everywhere else.
-        bool sameDirection = (gpui_dpad_screen_open == GPUI_DPAD_PIPBOY && upPressed)
-            || (gpui_dpad_screen_open == GPUI_DPAD_AUTOMAP && leftPressed);
+        //
+        // ⚠️ AND NOT THE PIP-BOY, for the same reason (2026-10-21): its lists step with the D-pad
+        // (pipboy.cc), so Up -- "the entry above" -- shut the whole Pip-Boy instead. Found by the
+        // screen test photographing the CONTROLS pages.
+        bool sameDirection = gpui_dpad_screen_open == GPUI_DPAD_AUTOMAP && leftPressed;
         if (bPressed || backPressed || sameDirection) {
             // ⚠️ SPEND THE PRESS THAT CLOSES, or its RELEASE reopens the screen. BACK and
             // START open on the release edge now (they grew a hold -- exit-run and quick

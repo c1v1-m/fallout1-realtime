@@ -1,0 +1,29 @@
+# SCREEN TEST: the Pip-Boy CONTROLS pages, photographed (2026-10-21, "v pipboyi upravme controls, ať to
+# vypadá jako moderní hra. Controller, který ukáže, co tlačítka dělají"). D-pad up opens the Pip-Boy,
+# RB twice is the ARCHIVES tab, the CONTROLS entries are the list's last four (a new game has no movies).
+name screen-controls
+map DESERT1.MAP
+seed 1
+duration 17
+dude tile 20100 rot 2
+
+open 1000 pipboy
+tap 2600 RB
+tap 3200 RB
+# a step down and back up parks the pointer on the first entry (an RB page change does not)
+tap 3800 DOWN
+tap 4300 UP
+tap 4900 A
+shot 6000
+tap 6800 B
+tap 7600 DOWN
+tap 8200 A
+shot 9400
+tap 10200 B
+tap 11000 DOWN
+tap 11600 A
+shot 12800
+tap 13600 B
+tap 14400 B
+
+expect \[FLOW/autotest\] shot t=

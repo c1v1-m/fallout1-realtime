@@ -137,6 +137,7 @@ namespace fallout {
 //                                      Opened by the game loop: the timeline waits until the world is
 //                                      back on top, and the lines after it are timed from the open.
 //   note <ms> <text...>                a marker in the trace
+//   shot <ms>                          a screenshot (scrNNNNN.bmp beside the exe), a modal screen included
 //   talk <ms> <pid>                    the dude talks to the nearest critter of that pid wherever it stands
 //                                      (action_talk_to, the use prompt's TALK), for one that paces about
 //   walkto <ms> <tile>                 the dude runs there along the pathfinder's route (a click's walk),
@@ -265,6 +266,7 @@ enum {
     AT_STEP_NOTE,
     AT_STEP_WALKTO, // index = tile: the dude is sent there along the pathfinder's route, as a click sends him
     AT_STEP_TALK, // index = pid: the dude talks to the nearest critter of that pid, as the use prompt does
+    AT_STEP_SHOT, // a screenshot of whatever is up, a modal screen included
 };
 
 enum {
@@ -545,8 +547,13 @@ static bool at_parse_step(char** tok, int n)
     bool note = strcmp(tok[0], "note") == 0;
     bool walkto = strcmp(tok[0], "walkto") == 0;
     bool talk = strcmp(tok[0], "talk") == 0;
-    if (!button && !tap && !axis && !open && !note && !walkto && !talk) {
+    bool shot = strcmp(tok[0], "shot") == 0;
+    if (!button && !tap && !axis && !open && !note && !walkto && !talk && !shot) {
         return false;
+    }
+    if (shot && n >= 2) {
+        at_add_step(at_step_time(tok[1]), AT_STEP_SHOT, 0, 0);
+        return true;
     }
     if (n < 3 || ((button || axis) && n < 4)) {
         at_bad_line("too short", tok[0]);
@@ -1326,6 +1333,10 @@ static void at_tl_bk()
                 obj_dude->tile, st->index, obj_dude->elevation, steps, ok ? 1 : 0, open);
             break;
         }
+        case AT_STEP_SHOT:
+            dump_screen();
+            trace_event(TRACE_FLOW, "autotest", "shot t=%d", t);
+            break;
         case AT_STEP_TALK: {
             Object* who = NULL;
             Object** list = NULL;

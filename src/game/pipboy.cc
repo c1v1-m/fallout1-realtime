@@ -2,7 +2,10 @@
 
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include <SDL.h>
 
 #include "game/automap.h"
 #include "game/bmpdlog.h"
@@ -176,7 +179,7 @@ typedef struct PipboyBomb {
     unsigned char field_10;
 } PipboyBomb;
 
-// One row of the CONTROLS page in the archives -- see ctrl_lines.
+// One row of the CONTROLS pages in the archives -- see ctrl_more_lines.
 typedef struct PipboyControl {
     const char* button;
     const char* action;
@@ -452,60 +455,94 @@ static PipboyRenderProc* PipFnctn[5] = {
 // smears. The budget is 1 (title) + as many entries as fit; blank spacers are dropped wholesale
 // first (`spacious` in ShowControlsPage), which buys back one line per section boundary. That is
 // why there are THREE pages: the world/combat table alone spends its whole 40.
-static const PipboyControl ctrl_lines[] = {
-    { NULL, "MOVEMENT" },
-    { "Left stick", "Walk" },
-    { "X", "Reload" },
+// THE WORLD PAGE IS A PICTURE OF THE PAD (2026-10-21, "ať to vypadá jako moderní hra. Controller, který
+// ukáže, co tlačítka dělají"), and on a Steam Deck it is a picture of the DECK ("můžeš udělat art pro
+// steam deck, když hráč hraje na steam decku? ... se to bude měnit"). The device is drawn line by line in
+// the Pip-Boy's own greens (no art file: nothing to ship, nothing to license), every button's TAP
+// labelled with a leader line (ctrl_xbox_callouts / ctrl_deck_callouts), and what a HOLD, a double press
+// or a combination does listed under it (ctrl_more_lines). Everything the old table said is still on
+// the page -- a control that is not written down does not exist.
+//
+// Coordinates are inside the Pip-Boy's content view (374 x 410). The label is drawn at (x, y), y its
+// top: `align` -1 = ending at x, 0 = centred on x, +1 = starting at x. Its leader line runs from (ax, ay)
+// to the button at (px, py) -- across to x = ex first when ex is not 0 (round another button) -- and
+// ax < 0 means no line at all (the Deck's face-button legend hangs off one line).
+typedef struct PipboyCallout {
+    const char* button;
+    const char* action;
+    int x;
+    int y;
+    int align;
+    int ax;
+    int ay;
+    int ex;
+    int px;
+    int py;
+} PipboyCallout;
+
+static const PipboyCallout ctrl_xbox_callouts[] = {
+    { "LT", "Aim lock", 98, 44, -1, 101, 49, 0, 120, 55 },
+    { "LB", "Quick slot", 98, 60, -1, 101, 65, 0, 112, 69 },
+    { "L-stick", "Walk", 98, 93, -1, 101, 98, 0, 122, 98 },
+    { "D-pad", "Screens", 98, 119, -1, 101, 124, 0, 157, 124 },
+    { "RT", "Attack", 276, 44, 1, 273, 49, 0, 254, 55 },
+    { "RB", "Grenade", 276, 60, 1, 273, 65, 0, 262, 69 },
+    { "Y", "Swap hand", 276, 81, 1, 273, 86, 0, 247, 85 },
+    { "B", "Cancel", 276, 95, 1, 273, 100, 0, 261, 98 },
+    { "A", "Use", 276, 109, 1, 273, 114, 0, 247, 112 },
+    { "R-stick", "Cursor", 276, 125, 1, 273, 130, 0, 224, 126 },
+    // X is the face button furthest in: its line comes from below, between the right stick and A.
+    { "X", "Reload", 276, 140, 1, 273, 145, 226, 226, 105 },
+    { "BACK", "Inventory", 172, 180, -1, 174, 185, 178, 178, 96 },
+    { "START", "Pause", 202, 180, 1, 200, 185, 196, 196, 96 },
+};
+
+// The Deck spans the whole page, so its labels sit above and below it instead of beside it. Steam's own
+// names for its buttons: L1/R1 the bumpers, L2/R2 the triggers, View and Menu the two small ones.
+static const PipboyCallout ctrl_deck_callouts[] = {
+    { "L2", "Aim lock", 62, 14, 0, 62, 24, 0, 62, 58 },
+    { "L1", "Quick slot", 112, 27, 0, 98, 37, 0, 98, 68 },
+    { "R2", "Attack", 312, 14, 0, 312, 24, 0, 312, 58 },
+    { "R1", "Grenade", 262, 27, 0, 276, 37, 0, 276, 68 },
+    // View and Menu sit at the screen's top corners, and the screen is the only room left: their
+    // labels go on it.
+    { "VIEW", "Inventory", 124, 87, 1, 122, 92, 0, 114, 86 },
+    { "MENU", "Pause", 250, 100, -1, 252, 105, 0, 260, 86 },
+    { "D-pad", "Screens", 4, 152, 1, 58, 150, 0, 58, 108 },
+    { "L-stick", "Walk", 114, 152, 1, 124, 150, 0, 102, 101 },
+    { "R-stick", "Cursor", 262, 164, -1, 250, 162, 0, 270, 100 },
+    { "Y", "Swap hand", 292, 152, 1, 320, 150, 0, 320, 116 },
+    { "X", "Reload", 292, 164, 1, -1, 0, 0, 0, 0 },
+    { "B", "Cancel", 292, 176, 1, -1, 0, 0, 0, 0 },
+    { "A", "Use", 292, 188, 1, -1, 0, 0, 0, 0 },
+};
+
+// Under the picture: everything that is not a single press. Same row shape as the other pages; on a
+// Deck the pad's names are swapped for the Deck's on the way out (ctrl_deck_names).
+//
+// ⚠️ THE STICK EACH WHEEL READS IS PART OF ITS ENTRY. A wheel is aimed with the thumb that is NOT
+// holding it open, so the face-button wheels (Y, B) read the LEFT stick -- and since 2026-10-17 so does
+// L3: click the stick, tilt that same stick at the skill (his pick, one thumb). Naming the wrong stick
+// is worse than naming none. Since 2026-10-04 the drugs are the weapon ring's LAST page too, and the
+// paging wraps -- so from the first page they are a single LB away; that is why the Y row says LB.
+static const PipboyControl ctrl_more_lines[] = {
+    { NULL, "HOLD, TWICE, TOGETHER" },
+    { "RT (hold)", "Keep attacking" },
     { "X (hold)", "Run" },
-    { "Right stick", "Cursor, pick a target" },
-    { "LT (hold)", "Aim: lock the nearest enemy" },
-    { NULL, NULL },
-    { NULL, "FIGHTING" },
-    { "RT", "Attack (hold to keep attacking)" },
-    // ⚠️ 2026-10-09: the aimed shot is the weapon slot's AIMED mode (bullseye + its AP price), RT
-    // fires it; RB is the heal, LT + Y the firing mode. LB + B still heals but is not listed -- one row, one gesture.
-    { "R3", "Called shot: pick a body part" },
-    { "In that window", "A or R3: slot goes AIMED there" },
-    { "LB", "Quick slot: stimpack, or the tool / drug you put there" },
-    { "RB", "Quick slot: grenade - hold to draw, let go = throw" },
-    { "LT + Y", "Firing mode: single / aimed / burst" },
-    { NULL, NULL },
-    { NULL, "ACTION" },
-    { "A", "Use what is lit up / confirm" },
+    { "A (hold)", "Aim the held item at something" },
     { "A twice", "Loot the body you stand on" },
-    { "A (hold)", "Aim held item at something" },
-    { "B", "Cancel / stop what you ordered" },
-    { "Y", "Swap active hand" },
-    { NULL, NULL },
-    // ⚠️ THE STICK EACH WHEEL READS IS PART OF ITS ENTRY. A wheel is aimed with the thumb that is
-    // NOT holding it open, so the face-button wheels (Y, B) read the LEFT stick -- and since
-    // 2026-10-17 so does L3: click the stick, tilt that same stick at the skill (his pick, one thumb).
-    // Naming the wrong stick is worse than naming none.
-    //
-    // ⚠️ AMMUNITION LOST ITS OWN ROW (2026-09-17) because it lost its own button -- RB had to be
-    // freed to become a held fire button. Since 2026-09-20 it is not a page you have to go looking
-    // for either: bare hands, Unload and every kind of round the gun takes are the FIRST segments
-    // of the weapon ring, so the entry says where they are rather than how to page to them.
-    { NULL, "WHEELS - hold the button (L3: press), aim, release to pick" },
-    // Since 2026-10-04 the drugs are this ring's LAST page too, and the paging wraps -- so from the
-    // first page they are a single LB away. That is the whole reason the entry spells LB out.
-    { "Y", "Weapons + ammo; LB = drugs and items" },
-    { "B", "Drugs and quick items - aim LEFT" },
-    { "L3 (press)", "Skills: tilt the SAME stick at one, let go or A picks" },
-    { "A", "Take what is highlighted" },
-    { NULL, NULL },
-    { NULL, "D-PAD - HOLD each of these; a TAP cycles the action" },
-    { "Up", "Pip-Boy" },
-    { "Down", "Character sheet" },
-    { "Left", "Automap" },
-    { "Right", "End combat (refused if enemies still want you)" },
-    { "Tap", "Next action (on a follower: push past)" },
-    { "Tap Up / Down", "Nothing lit up: scroll the messages" },
-    { NULL, NULL },
-    { NULL, "OTHER" },
-    { "BACK", "Inventory" },
+    { "R3", "Called shot: pick a part, A = aimed there" },
+    { "LT + Y", "Firing mode: single / aimed / burst" },
+    { "LB", "Stimpack, or whatever you put there" },
+    { "RB (hold)", "Draw the grenade, let go = throw it" },
+    { "Y (hold)", "Weapons + ammo wheel, LB = drugs, items" },
+    { "B (hold)", "Drugs + quick items wheel, aim LEFT" },
+    { "L3 (press)", "Skills: tilt the SAME stick, let go" },
+    { "D-pad (hold)", "Up Pip-Boy, Down sheet, Left map" },
+    { "Right (hold)", "End combat, if nobody still wants you" },
+    { "D-pad (tap)", "Next action (on a follower: push past)" },
+    { "Up/Down (tap)", "Nothing lit up: scroll the messages" },
     { "BACK (hold)", "Run to the nearest way out" },
-    { "START", "Pause menu" },
     { "START (hold)", "Quick save" },
 };
 
@@ -2426,10 +2463,380 @@ static void pip_ctrl_line(const char* button, const char* action, int color)
     }
 }
 
+// --- THE PAD, DRAWN (see ctrl_xbox_callouts) -------------------------------------------------------
+//
+// Shapes are unions of rounded rectangles and ellipses, rasterised by testing pixel centres; the edge
+// is every inside pixel with an outside 4-neighbour. All coordinates are in the content view.
+enum {
+    CTRL_RRECT, // a, b, c, d = left, top, right, bottom; r = corner radius
+    CTRL_ELLIPSE, // a, b = centre; c, d = radii
+};
+
+typedef struct PipboyShape {
+    int kind;
+    int a;
+    int b;
+    int c;
+    int d;
+    int r;
+} PipboyShape;
+
+// The Pip-Boy's greens: the text green for edges, a darker one for the leader lines, a near-black one to
+// fill with -- and the heading colour for the buttons' names.
+static int ctrl_bright;
+static int ctrl_dim;
+static int ctrl_dark;
+static int ctrl_label;
+
+// A Steam Deck: Steam sets SteamDeck=1 in every game's environment there (Proton passes it on), and
+// under Steam Input the pad may also introduce itself by name.
+static bool ctrl_on_deck()
+{
+    const char* deck = getenv("SteamDeck");
+    if (deck != NULL && strcmp(deck, "1") == 0) {
+        return true;
+    }
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    const char* name = pad != NULL ? SDL_GameControllerName(pad) : NULL;
+    return name != NULL && strstr(name, "Steam Deck") != NULL;
+}
+
+// The pad's button names as the Deck spells them: LB/RB = L1/R1, LT/RT = L2/R2, BACK/START = VIEW/MENU.
+// Whole words only ("BACK (hold)" changes, "Backpack" would not).
+static const char* ctrl_deck_names(const char* text, char* out, size_t size)
+{
+    static const char* from[] = { "LB", "RB", "LT", "RT", "BACK", "START" };
+    static const char* to[] = { "L1", "R1", "L2", "R2", "VIEW", "MENU" };
+    size_t n = 0;
+    const char* p = text;
+    while (*p != '\0' && n + 1 < size) {
+        bool replaced = false;
+        if (p == text || !isalnum((unsigned char)p[-1])) {
+            for (int index = 0; index < 6; index++) {
+                size_t len = strlen(from[index]);
+                if (strncmp(p, from[index], len) == 0 && !isalnum((unsigned char)p[len])) {
+                    size_t rlen = strlen(to[index]);
+                    if (n + rlen < size) {
+                        memcpy(out + n, to[index], rlen);
+                        n += rlen;
+                    }
+                    p += len;
+                    replaced = true;
+                    break;
+                }
+            }
+        }
+        if (!replaced) {
+            out[n++] = *p++;
+        }
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static bool ctrl_shape_inside(const PipboyShape* shape, int x, int y)
+{
+    if (shape->kind == CTRL_ELLIPSE) {
+        float dx = (x - shape->a) / (float)shape->c;
+        float dy = (y - shape->b) / (float)shape->d;
+        return dx * dx + dy * dy <= 1.0f;
+    }
+
+    if (x < shape->a || x > shape->c || y < shape->b || y > shape->d) {
+        return false;
+    }
+    int r = shape->r;
+    int cx = x < shape->a + r ? shape->a + r : (x > shape->c - r ? shape->c - r : x);
+    int cy = y < shape->b + r ? shape->b + r : (y > shape->d - r ? shape->d - r : y);
+    return (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r * r;
+}
+
+static bool ctrl_union_inside(const PipboyShape* shapes, int count, int x, int y)
+{
+    for (int index = 0; index < count; index++) {
+        if (ctrl_shape_inside(&(shapes[index]), x, y)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ctrl_put(int x, int y, int color)
+{
+    if (x < 0 || y < 0 || x >= PIPBOY_WINDOW_CONTENT_VIEW_WIDTH || y >= PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT) {
+        return;
+    }
+    scrn_buf[PIPBOY_WINDOW_WIDTH * (PIPBOY_WINDOW_CONTENT_VIEW_Y + y) + PIPBOY_WINDOW_CONTENT_VIEW_X + x] = color;
+}
+
+// fill < 0 = outline only.
+static void ctrl_draw_union(const PipboyShape* shapes, int count, int fill, int edge)
+{
+    int left = PIPBOY_WINDOW_CONTENT_VIEW_WIDTH;
+    int top = PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT;
+    int right = 0;
+    int bottom = 0;
+    for (int index = 0; index < count; index++) {
+        const PipboyShape* shape = &(shapes[index]);
+        int l = shape->kind == CTRL_ELLIPSE ? shape->a - shape->c : shape->a;
+        int t = shape->kind == CTRL_ELLIPSE ? shape->b - shape->d : shape->b;
+        int r = shape->kind == CTRL_ELLIPSE ? shape->a + shape->c : shape->c;
+        int b = shape->kind == CTRL_ELLIPSE ? shape->b + shape->d : shape->d;
+        left = l < left ? l : left;
+        top = t < top ? t : top;
+        right = r > right ? r : right;
+        bottom = b > bottom ? b : bottom;
+    }
+
+    for (int y = top; y <= bottom; y++) {
+        for (int x = left; x <= right; x++) {
+            if (!ctrl_union_inside(shapes, count, x, y)) {
+                continue;
+            }
+            bool edgePixel = !ctrl_union_inside(shapes, count, x - 1, y)
+                || !ctrl_union_inside(shapes, count, x + 1, y)
+                || !ctrl_union_inside(shapes, count, x, y - 1)
+                || !ctrl_union_inside(shapes, count, x, y + 1);
+            if (edgePixel) {
+                ctrl_put(x, y, edge);
+            } else if (fill >= 0) {
+                ctrl_put(x, y, fill);
+            }
+        }
+    }
+}
+
+static void ctrl_rrect(int left, int top, int right, int bottom, int radius)
+{
+    PipboyShape shape = { CTRL_RRECT, left, top, right, bottom, radius };
+    ctrl_draw_union(&shape, 1, ctrl_dark, ctrl_bright);
+}
+
+static void ctrl_circle(int x, int y, int radius, int fill)
+{
+    PipboyShape shape = { CTRL_ELLIPSE, x, y, radius, radius, 0 };
+    ctrl_draw_union(&shape, 1, fill, ctrl_bright);
+}
+
+static void ctrl_line(int x1, int y1, int x2, int y2, int color)
+{
+    draw_line(scrn_buf, PIPBOY_WINDOW_WIDTH,
+        PIPBOY_WINDOW_CONTENT_VIEW_X + x1, PIPBOY_WINDOW_CONTENT_VIEW_Y + y1,
+        PIPBOY_WINDOW_CONTENT_VIEW_X + x2, PIPBOY_WINDOW_CONTENT_VIEW_Y + y2,
+        color);
+}
+
+static void ctrl_text(int x, int y, const char* text, int color)
+{
+    text_to_buf(scrn_buf + PIPBOY_WINDOW_WIDTH * (PIPBOY_WINDOW_CONTENT_VIEW_Y + y) + PIPBOY_WINDOW_CONTENT_VIEW_X + x,
+        text,
+        PIPBOY_WINDOW_WIDTH,
+        PIPBOY_WINDOW_WIDTH,
+        color);
+}
+
+// A face button: a ring with its letter in it.
+static void ctrl_face_button(int x, int y, int radius, const char* letter)
+{
+    ctrl_circle(x, y, radius, ctrl_dark);
+    ctrl_text(x - text_width(letter) / 2 + 1, y - text_height() / 2 + 1, letter, ctrl_bright);
+}
+
+// A thumbstick: the well, and the cap in it.
+static void ctrl_stick(int x, int y, int radius)
+{
+    ctrl_circle(x, y, radius, ctrl_dark);
+    ctrl_circle(x, y, radius - 5, -1);
+}
+
+static void ctrl_dpad(int x, int y, int arm)
+{
+    PipboyShape cross[] = {
+        { CTRL_RRECT, x - arm, y - 4, x + arm, y + 4, 2 },
+        { CTRL_RRECT, x - 4, y - arm, x + 4, y + arm, 2 },
+    };
+    ctrl_draw_union(cross, 2, ctrl_dark, ctrl_bright);
+}
+
+static void ctrl_leader_lines(const PipboyCallout* callouts, int count)
+{
+    for (int index = 0; index < count; index++) {
+        const PipboyCallout* callout = &(callouts[index]);
+        if (callout->ax < 0) {
+            continue;
+        }
+        if (callout->ex != 0) {
+            ctrl_line(callout->ax, callout->ay, callout->ex, callout->ay, ctrl_dim);
+            ctrl_line(callout->ex, callout->ay, callout->px, callout->py, ctrl_dim);
+        } else {
+            ctrl_line(callout->ax, callout->ay, callout->px, callout->py, ctrl_dim);
+        }
+    }
+}
+
+// The labels: the button's name in the heading colour, then what its press does.
+static void ctrl_labels(const PipboyCallout* callouts, int count)
+{
+    for (int index = 0; index < count; index++) {
+        const PipboyCallout* callout = &(callouts[index]);
+        int nameWidth = text_width(callout->button);
+        int gap = text_width("  ");
+        int width = nameWidth + gap + text_width(callout->action);
+        int x = callout->align < 0 ? callout->x - width : (callout->align == 0 ? callout->x - width / 2 : callout->x);
+        ctrl_text(x, callout->y, callout->button, ctrl_label);
+        ctrl_text(x + nameWidth + gap, callout->y, callout->action, ctrl_bright);
+    }
+}
+
+// An Xbox-shaped pad: what Windows reports for nearly every controller, and how the pages name them.
+static void ctrl_draw_xbox()
+{
+    // Triggers and bumpers first: the body covers their lower edge.
+    ctrl_rrect(120, 46, 148, 66, 5);
+    ctrl_rrect(226, 46, 254, 66, 5);
+    ctrl_rrect(112, 65, 156, 74, 4);
+    ctrl_rrect(218, 65, 262, 74, 4);
+
+    static const PipboyShape body[] = {
+        { CTRL_RRECT, 104, 72, 270, 132, 18 },
+        { CTRL_ELLIPSE, 132, 140, 28, 34, 0 },
+        { CTRL_ELLIPSE, 242, 140, 28, 34, 0 },
+    };
+    ctrl_draw_union(body, 3, ctrl_dark, ctrl_bright);
+
+    // The lines over the body, under the buttons: every button covers the end of its own line.
+    int count = (int)(sizeof(ctrl_xbox_callouts) / sizeof(ctrl_xbox_callouts[0]));
+    ctrl_leader_lines(ctrl_xbox_callouts, count);
+
+    ctrl_stick(134, 98, 12);
+    ctrl_stick(212, 124, 12);
+    ctrl_dpad(162, 124, 11);
+    ctrl_face_button(240, 85, 7, "Y");
+    ctrl_face_button(226, 98, 7, "X");
+    ctrl_face_button(254, 98, 7, "B");
+    ctrl_face_button(240, 111, 7, "A");
+    ctrl_rrect(174, 89, 182, 95, 3);
+    ctrl_rrect(192, 89, 200, 95, 3);
+    ctrl_circle(187, 80, 5, ctrl_dark);
+
+    ctrl_labels(ctrl_xbox_callouts, count);
+}
+
+// A Steam Deck from the front: the screen between two halves, each a stick and a D-pad / the face
+// buttons over a square trackpad, View / Steam left of the screen, Menu / quick access right of it.
+static void ctrl_draw_deck()
+{
+    ctrl_rrect(50, 58, 90, 70, 4);
+    ctrl_rrect(284, 58, 324, 70, 4);
+    ctrl_rrect(42, 68, 100, 78, 4);
+    ctrl_rrect(274, 68, 332, 78, 4);
+
+    static const PipboyShape body[] = {
+        { CTRL_RRECT, 34, 76, 340, 148, 22 },
+    };
+    ctrl_draw_union(body, 1, ctrl_dark, ctrl_bright);
+
+    // The screen belongs to the body: lines may cross it.
+    PipboyShape screen = { CTRL_RRECT, 120, 82, 254, 142, 3 };
+    ctrl_draw_union(&screen, 1, ctrl_dark, ctrl_dim);
+    for (int y = 86; y < 140; y += 3) {
+        ctrl_line(124, y, 250, y, colorTable[7 << 5]);
+    }
+    const char* name = "STEAM DECK";
+    ctrl_text(187 - text_width(name) / 2, 124, name, ctrl_dim);
+
+    int count = (int)(sizeof(ctrl_deck_callouts) / sizeof(ctrl_deck_callouts[0]));
+    ctrl_leader_lines(ctrl_deck_callouts, count);
+
+    ctrl_dpad(58, 98, 10);
+    ctrl_stick(94, 96, 11);
+    ctrl_rrect(64, 114, 104, 142, 4);
+    ctrl_rrect(106, 82, 114, 88, 3);
+    ctrl_rrect(106, 136, 114, 142, 3);
+
+    ctrl_stick(280, 96, 11);
+    ctrl_rrect(270, 114, 310, 142, 4);
+    ctrl_rrect(260, 82, 268, 88, 3);
+    ctrl_rrect(260, 136, 268, 142, 3);
+    ctrl_face_button(320, 86, 6, "Y");
+    ctrl_face_button(308, 98, 6, "X");
+    ctrl_face_button(332, 98, 6, "B");
+    ctrl_face_button(320, 110, 6, "A");
+
+    ctrl_labels(ctrl_deck_callouts, count);
+}
+
+static void ShowControlsPad()
+{
+    buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_CONTENT_VIEW_WIDTH,
+        PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT,
+        PIPBOY_WINDOW_WIDTH,
+        scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
+        PIPBOY_WINDOW_WIDTH);
+
+    ctrl_bright = colorTable[992];
+    ctrl_dim = colorTable[14 << 5];
+    ctrl_dark = colorTable[4 << 5];
+    ctrl_label = colorTable[32747];
+
+    bool deck = ctrl_on_deck();
+
+    if (bottom_line >= 0) {
+        cursor_line = 0;
+    }
+    pip_print(ctrl_entry, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, ctrl_bright);
+
+    if (deck) {
+        ctrl_draw_deck();
+    } else {
+        ctrl_draw_xbox();
+    }
+
+    // ...and the list of everything else, in the ordinary row shape, under the picture.
+    int count = (int)(sizeof(ctrl_more_lines) / sizeof(ctrl_more_lines[0]));
+    ctrl_col = 0;
+    for (int index = 0; index < count; index++) {
+        if (ctrl_more_lines[index].button != NULL) {
+            int width = text_width(ctrl_more_lines[index].button);
+            if (width > ctrl_col) {
+                ctrl_col = width;
+            }
+        }
+    }
+    ctrl_col += 8 + 12;
+
+    if (bottom_line >= 0) {
+        cursor_line = 20;
+    }
+    char button[64];
+    char action[96];
+    for (int index = 0; index < count; index++) {
+        const PipboyControl* entry = &(ctrl_more_lines[index]);
+        if (entry->button == NULL) {
+            pip_print(entry->action, PIPBOY_TEXT_STYLE_UNDERLINE, ctrl_label);
+        } else if (deck) {
+            pip_ctrl_line(ctrl_deck_names(entry->button, button, sizeof(button)),
+                ctrl_deck_names(entry->action, action, sizeof(action)),
+                ctrl_bright);
+        } else {
+            pip_ctrl_line(entry->button, entry->action, ctrl_bright);
+        }
+    }
+    // The installer sets the Deck's right trackpad to be the mouse (Steam's "Gamepad with Mouse Trackpad").
+    if (deck) {
+        pip_ctrl_line("R trackpad", "Mouse pointer", ctrl_bright);
+    }
+
+    pip_back(ctrl_bright);
+
+    win_draw_rect(pip_win, &pip_rect);
+}
+
 // 0x000000 (not vanilla)
 static void ShowControls()
 {
-    ShowControlsPage(ctrl_entry, ctrl_lines, (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0])));
+    ShowControlsPad();
 }
 
 static void ShowControls2()
