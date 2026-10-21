@@ -485,13 +485,13 @@ static const PipboyCallout ctrl_xbox_callouts[] = {
     { "LT", "Aim lock", 98, 44, -1, 101, 49, 0, 122, 54 },
     { "LB", "Quick slot", 98, 60, -1, 101, 65, 0, 114, 67 },
     { "L-stick", "Walk", 98, 89, -1, 101, 94, 0, 124, 94 },
-    { "D-pad", "Screens", 98, 117, -1, 101, 122, 0, 151, 122 },
+    { "D-pad", "Screens", 98, 115, -1, 101, 120, 0, 149, 120 },
     { "RT", "Attack", 276, 44, 1, 273, 49, 0, 252, 54 },
     { "RB", "Grenade", 276, 60, 1, 273, 65, 0, 260, 67 },
     { "Y", "Swap hand", 276, 76, 1, 273, 81, 0, 245, 81 },
     { "B", "Cancel", 276, 90, 1, 273, 95, 0, 258, 94 },
     { "A", "Use", 276, 104, 1, 273, 109, 0, 245, 108 },
-    { "R-stick", "Cursor", 276, 120, 1, 273, 125, 0, 222, 124 },
+    { "R-stick", "Cursor", 276, 120, 1, 273, 125, 0, 224, 121 },
     // X is the face button furthest in: its line comes from below, between the right stick and A.
     { "X", "Reload", 276, 140, 1, 273, 145, 225, 225, 101 },
     { "BACK", "Inventory", 172, 194, -1, 174, 199, 178, 178, 95 },
@@ -2473,6 +2473,7 @@ enum {
     CTRL_RRECT, // a, b, c, d = left, top, right, bottom; r = corner radius
     CTRL_ELLIPSE, // a, b = centre; c, d = radii; r = tilt in degrees (the long axis' bottom end swings
                   // left for a positive r)
+    CTRL_CUT, // an ellipse like CTRL_ELLIPSE, taken OUT of the union (the arch between the grips)
 };
 
 typedef struct PipboyShape {
@@ -2539,7 +2540,7 @@ static const char* ctrl_deck_names(const char* text, char* out, size_t size)
 
 static bool ctrl_shape_inside(const PipboyShape* shape, int x, int y)
 {
-    if (shape->kind == CTRL_ELLIPSE) {
+    if (shape->kind == CTRL_ELLIPSE || shape->kind == CTRL_CUT) {
         float dx = (float)(x - shape->a);
         float dy = (float)(y - shape->b);
         if (shape->r != 0) {
@@ -2565,12 +2566,22 @@ static bool ctrl_shape_inside(const PipboyShape* shape, int x, int y)
 
 static bool ctrl_union_inside(const PipboyShape* shapes, int count, int x, int y)
 {
+    bool inside = false;
     for (int index = 0; index < count; index++) {
-        if (ctrl_shape_inside(&(shapes[index]), x, y)) {
-            return true;
+        if (shapes[index].kind != CTRL_CUT && ctrl_shape_inside(&(shapes[index]), x, y)) {
+            inside = true;
+            break;
         }
     }
-    return false;
+    if (!inside) {
+        return false;
+    }
+    for (int index = 0; index < count; index++) {
+        if (shapes[index].kind == CTRL_CUT && ctrl_shape_inside(&(shapes[index]), x, y)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void ctrl_put(int x, int y, int color)
@@ -2590,6 +2601,9 @@ static void ctrl_draw_union(const PipboyShape* shapes, int count, int fill, int 
     int bottom = 0;
     for (int index = 0; index < count; index++) {
         const PipboyShape* shape = &(shapes[index]);
+        if (shape->kind == CTRL_CUT) {
+            continue;
+        }
         // A tilted ellipse fits in the square of its longer radius.
         int reach = shape->c > shape->d ? shape->c : shape->d;
         int rx = shape->r != 0 ? reach : shape->c;
@@ -2705,7 +2719,9 @@ static void ctrl_labels(const PipboyCallout* callouts, int count)
 }
 
 // An Xbox-shaped pad: what Windows reports for nearly every controller, and how the pages name them.
-// Proportioned on the real thing (about 3 wide to 2 tall), grips angled out.
+// The silhouette is the Xbox one: a top slab with round shoulders, sides that flare out into grips
+// angled away from each other, and an arch cut between the grips ("udělej je víc xbox like" -- two
+// tilted ellipses hanging off a slab read as legs).
 static void ctrl_draw_xbox()
 {
     // Triggers and bumpers first: the body covers their lower edge.
@@ -2715,19 +2731,23 @@ static void ctrl_draw_xbox()
     ctrl_rrect(216, 63, 260, 72, 4);
 
     static const PipboyShape body[] = {
-        { CTRL_RRECT, 106, 70, 268, 128, 24 },
-        { CTRL_ELLIPSE, 134, 146, 25, 40, 18 },
-        { CTRL_ELLIPSE, 240, 146, 25, 40, -18 },
+        { CTRL_RRECT, 112, 68, 262, 110, 28 },
+        { CTRL_ELLIPSE, 187, 106, 78, 36, 0 },
+        { CTRL_ELLIPSE, 128, 114, 22, 28, 24 },
+        { CTRL_ELLIPSE, 246, 114, 22, 28, -24 },
+        { CTRL_ELLIPSE, 128, 142, 26, 34, 26 },
+        { CTRL_ELLIPSE, 246, 142, 26, 34, -26 },
+        { CTRL_CUT, 187, 172, 40, 44, 0 },
     };
-    ctrl_draw_union(body, 3, ctrl_dark, ctrl_bright);
+    ctrl_draw_union(body, 7, ctrl_dark, ctrl_bright);
 
     // The lines over the body, under the buttons: every button covers the end of its own line.
     int count = (int)(sizeof(ctrl_xbox_callouts) / sizeof(ctrl_xbox_callouts[0]));
     ctrl_leader_lines(ctrl_xbox_callouts, count);
 
     ctrl_stick(136, 94, 12);
-    ctrl_stick(210, 122, 12);
-    ctrl_dpad(162, 122, 11);
+    ctrl_stick(212, 120, 12);
+    ctrl_dpad(160, 120, 11);
     ctrl_face_button(238, 81, 7, "Y");
     ctrl_face_button(225, 94, 7, "X");
     ctrl_face_button(251, 94, 7, "B");
