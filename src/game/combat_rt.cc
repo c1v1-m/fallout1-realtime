@@ -393,6 +393,7 @@ typedef struct RtActor {
     // loops forever (see the RT_IDLE re-aggro branch).
     int unreachable_tile;
     float unreachable_until;
+    float sealed_until; // no way to its target even through the doors, and no shot: a holding pen (rt_sealed_from)
     // Earliest rt_clock at which the in-combat FOLLOW may ask the pathfinder for a route to the dude
     // again after one failed. A follower is never told to give up on its leader (it is not fed to
     // the unreachable latch), so without this a follower with no way through re-ran a full path
@@ -6878,6 +6879,41 @@ static Object* rt_static_blocking_at(Object* obj, int tile, int elevation)
 // The route is asked for once, against static geometry only (rt_static_blocking_at). A critter that
 // fails it is latched exactly like one whose route vanished mid-chase, so it does not ask again
 // every frame -- and it stays where the map put it, which is what vanilla would have done.
+// Walls and scenery only: a door opens and a body moves (rt_sealed_from).
+static Object* rt_wall_blocking_at(Object* obj, int tile, int elevation)
+{
+    Object* blocker = obj_blocking_at(obj, tile, elevation);
+    if (blocker == NULL || FID_TYPE(blocker->fid) == OBJ_TYPE_CRITTER) {
+        return NULL;
+    }
+    if (FID_TYPE(blocker->fid) == OBJ_TYPE_SCENERY) {
+        Proto* proto;
+        if (proto_ptr(blocker->pid, &proto) == 0 && proto->scenery.type == SCENERY_TYPE_DOOR) {
+            return NULL;
+        }
+    }
+    return blocker;
+}
+
+// ⚠️ SEALED IN A HOLDING PEN (2026-10-21, trace_2026-10-21_190650: "když jsem je na konci vystřílel,
+// tak byl stále boj"). Mariposa's 2812 sits in a pen out in the black (offmap-holding-pens) with a
+// rocket launcher that reaches 40 tiles. It joined as a guard, and in range with no line it falls in
+// the CHASE branch that never gives up -- written for the Master, who cannot walk and whose target
+// steps back into his line sooner or later -- so it held the fight on for 95 s after the last enemy
+// he could see was dead. A critter that can walk but has no way to its target even with every door
+// open, and no shot from where it stands, will never get either: it is out of this fight.
+static bool rt_sealed_from(Object* npc, Object* tgt)
+{
+    if (!rt_can_walk(npc) || tgt == NULL || npc->elevation != tgt->elevation) {
+        return false;
+    }
+    int mode = rt_hit_mode(npc);
+    if (obj_dist(npc, tgt) <= item_w_range(npc, mode) && !rt_shot_blocked(npc, tgt, mode)) {
+        return false;
+    }
+    return make_path_func(npc, npc->tile, tgt->tile, NULL, 0, rt_wall_blocking_at) <= 0;
+}
+
 static bool rt_can_reach_or_shoot(Object* npc, Object* tgt)
 {
     int mode = rt_hit_mode(npc);
@@ -9415,6 +9451,7 @@ static void rt_refresh_registry()
             a->unperceived_since = prev->unperceived_since;
             a->unreachable_tile = prev->unreachable_tile;
             a->unreachable_until = prev->unreachable_until;
+            a->sealed_until = prev->sealed_until;
             a->follow_retry_at = prev->follow_retry_at;
             a->look_next_at = prev->look_next_at;
             a->look_noise_at = prev->look_noise_at;
@@ -9572,6 +9609,7 @@ static void rt_refresh_registry()
             a->unperceived_since = -1.0f;
             a->unreachable_tile = -1;
             a->unreachable_until = 0.0f;
+            a->sealed_until = 0.0f;
             a->follow_retry_at = 0.0f;
             // Staggered, so a camp that comes into the registry together does not turn in unison;
             // and the shot that is already in the air is not news to it.
@@ -13307,8 +13345,16 @@ static void rt_update_actor(RtActor* a, float dt)
         // Resolved ONCE into a local: the scan ends in a line-of-sight test, which is far too
         // expensive to run twice per idle guard per frame just to keep an else-if chain tidy.
         Object* guardThreat = NULL;
-        if (!a->hostile && !a->friendly && rt_is_guard_type(npc)) {
+        if (!a->hostile && !a->friendly && rt_is_guard_type(npc) && rt_clock >= a->sealed_until) {
             guardThreat = rt_guard_danger_source(npc);
+            // Not from a holding pen (rt_sealed_from): it would chase a fight it can never reach.
+            // Asked again in 5 s, the dude may have moved where it can shoot him.
+            if (guardThreat != NULL && rt_sealed_from(npc, guardThreat)) {
+                trace_event(TRACE_FLOW, "guard-join-sealed", "id=%d pid=%d tile=%d threat=%d t=%.2f", npc->id, npc->pid,
+                    npc->tile, guardThreat->id, rt_clock);
+                a->sealed_until = rt_clock + 5.0f;
+                guardThreat = NULL;
+            }
         }
 
         if (guardThreat != NULL) {
@@ -13674,11 +13720,26 @@ static void rt_update_actor(RtActor* a, float dt)
                 if (rt_clock >= a->follow_retry_at) {
                     if (rt_advance_to_target(npc, a->target)) {
                         a->detour_until = rt_clock + RT_DETOUR_COMMIT_SECONDS; // walk it through
+                        a->sealed_until = 0.0f;
                     } else {
                         a->follow_retry_at = rt_clock + 1.0f;
+                        // ...EXCEPT FROM A PEN (rt_sealed_from): there the give-up is armed after all.
+                        if (rt_sealed_from(npc, a->target)) {
+                            if (rt_clock >= a->sealed_until) {
+                                trace_event(TRACE_FLOW, "sealed-off", "id=%d pid=%d tile=%d tgt=%d dist=%d t=%.2f", npc->id,
+                                    npc->pid, npc->tile, a->target->tile, obj_dist(npc, a->target), rt_clock);
+                            }
+                            a->sealed_until = rt_clock + 5.0f;
+                        } else {
+                            a->sealed_until = 0.0f;
+                        }
                     }
                 }
-                a->no_path_since = -1.0f;
+                if (rt_clock < a->sealed_until) {
+                    rt_note_path_result(a, false);
+                } else {
+                    a->no_path_since = -1.0f;
+                }
             } else if (rt_tactical_ai && (rt_defend_holds(a, npc) || rt_squad_holds(a, npc))) {
                 // Holding: a defender out of reach keeps its ground, a chaser ahead waits for its squad
                 // (group tactics above). Holding is not failing to route.
