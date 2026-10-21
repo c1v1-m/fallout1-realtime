@@ -804,6 +804,37 @@ Object* ai_best_weapon(Object* weapon1, Object* weapon2)
     }
 }
 
+// ⚠️ A CRITTER REACHES FOR THE WEAPON IT IS GOOD WITH (2026-10-22, his "ať NPC vytáhne nejlepší zbraň, s
+// kterou umí nejlépe ... přeci NPC co má lepší small guns nebude vytahovat rotačák, když má heavy guns
+// 30 %"). Vanilla's ai_best_weapon looks only at the weapons -- ranged over thrown over melee, then the
+// price -- so a rifleman with a minigun in his pack swaps to it however badly he handles big guns.
+// Here the skill comes first: a weapon whose skill is more than AI_WEAPON_SKILL_MARGIN points above
+// the other's wins outright, and only near-equal skills fall back to vanilla's order. Not vanilla:
+// realtime only (combat_rt's weapon draw and dry-gun swap both go through ai_search_inven).
+#define AI_WEAPON_SKILL_MARGIN 10
+
+Object* ai_best_weapon_for(Object* critter, Object* weapon1, Object* weapon2)
+{
+    if (weapon1 == NULL) {
+        return weapon2;
+    }
+
+    if (weapon2 == NULL) {
+        return weapon1;
+    }
+
+    int skill1 = skill_level(critter, item_w_skill(weapon1, HIT_MODE_RIGHT_WEAPON_PRIMARY));
+    int skill2 = skill_level(critter, item_w_skill(weapon2, HIT_MODE_RIGHT_WEAPON_PRIMARY));
+    if (skill1 - skill2 > AI_WEAPON_SKILL_MARGIN) {
+        return weapon1;
+    }
+    if (skill2 - skill1 > AI_WEAPON_SKILL_MARGIN) {
+        return weapon2;
+    }
+
+    return ai_best_weapon(weapon1, weapon2);
+}
+
 // 0x425210
 static bool ai_can_use_weapon(Object* critter, Object* weapon, int hitMode)
 {
@@ -880,7 +911,7 @@ Object* ai_search_inven(Object* critter, int check_action_points)
             }
         }
 
-        best_weapon = ai_best_weapon(best_weapon, candidate);
+        best_weapon = ai_best_weapon_for(critter, best_weapon, candidate);
     }
 
     return best_weapon;

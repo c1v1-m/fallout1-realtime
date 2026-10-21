@@ -1,0 +1,23 @@
+# Which weapon an NPC fights with (2026-10-22, his "ať NPC vytáhne nejlepší zbraň, s kterou umí nejlépe
+# ... přeci NPC co má lepší small guns nebude vytahovat rotačák, když má heavy guns 30 %").
+# Raider A holds a 10mm pistol with a Minigun (+5mm ammo) in his pack: small guns 61 against big guns
+# 26, so he KEEPS the pistol. Raider B holds a knife with a 10mm SMG (+ammo) in the pack: melee 91 against
+# small guns 61, so he keeps the knife too. (Lorenzo, whose two skills are close, draws his SMG: see
+# hub-lorenzo.)
+name weapon-pick
+map DESERT1.MAP
+seed 1
+duration 25
+dude tile 20100 rot 2
+dude hp 400
+dude wield 8
+dude item 29 6
+
+spawn 16777291 22500 rot 5 wield 8 item 29 4 item 12 1 item 35 2 hostile
+spawn 16777291 22092 rot 5 wield 4 item 9 1 item 29 4 hostile
+
+at 0 idle
+
+expect-not draw-weapon\] npc pid=16777291
+expect keep-weapon\] id=\d+ pid=16777291 held=8 skill=\d+ cand=12
+expect keep-weapon\] id=\d+ pid=16777291 held=4 skill=\d+ cand=9

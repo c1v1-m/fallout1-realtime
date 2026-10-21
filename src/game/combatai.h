@@ -56,6 +56,9 @@ Object* ai_search_inven(Object* critter, int check_action_points);
 // Ranks two weapons the way the turn-based AI does: RANGED beats THROW beats melee, ties broken
 // by item cost. NULL-tolerant, so it doubles as "is the candidate better than what is held?".
 Object* ai_best_weapon(Object* weapon1, Object* weapon2);
+// The same, for THIS critter: the weapon whose skill it is clearly better at wins first (see
+// AI_WEAPON_SKILL_MARGIN), and only between near-equal skills does ai_best_weapon's order decide.
+Object* ai_best_weapon_for(Object* critter, Object* weapon1, Object* weapon2);
 void combat_ai_begin(int critters_count, Object** critters);
 void combat_ai_over();
 Object* combat_ai(Object* critter, Object* target);

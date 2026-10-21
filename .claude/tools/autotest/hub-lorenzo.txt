@@ -2,8 +2,9 @@
 # z obchodu?"): map vars 11 and 44 are 1 -- set when the player falls out with the Underground (Decker
 # declined or insulted, Kane hostile, or either killed). The dude talks to Lorenzo twice (wherever his
 # timer has walked him). Watch [STATE/float] for what Lorenzo says and what his men do.
-# 2026-10-22: he must fight with the KNIFE the map puts in his hand, as vanilla does ("kdybych hrál
-# čistou tak by lorenzo vytáhl nůž a bodal mě"), not the SMG in his pack.
+# 2026-10-22, HIS CALL ("vždy nejlepší zbraň", "s kterou umí nejlépe"): Lorenzo's small guns is close to
+# his melee, so he draws the 10mm SMG from his pack over the knife the map puts in his hand, and shoots
+# -- not vanilla, where he would close in and stab.
 name hub-lorenzo
 map HUBDWNTN.MAP
 mapscript on
@@ -21,6 +22,5 @@ note 28000 end
 
 expect float\] prog=scripts.lorenzo.int .*Okay boys
 expect \[FLOW/combat-enter\]
-expect COMBAT/hit\] att=2295 .* dist=1
-expect-not COMBAT/bullet\] att=2295
-expect-not draw-weapon\] npc pid=16777336
+expect draw-weapon\] npc pid=16777336 wpn=9 held=4
+expect COMBAT/bullet\] att=2295

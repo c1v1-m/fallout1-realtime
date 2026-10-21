@@ -2557,22 +2557,21 @@ static void rt_ensure_weapon_drawn(RtActor* a)
         return;
     }
 
-    // ⚠️ A WEAPON IN THE HAND IS KEPT, AS VANILLA KEEPS IT (2026-10-22, his "kdybych hrál čistou tak by
-    // lorenzo vytáhl nůž a bodal mě, to je vanilla chování, jedná se o bug"). Lorenzo (proto 120)
-    // carries a 10mm SMG and a Knife, and the map puts the KNIFE in his hand. This code used to
-    // "upgrade" any held weapon to ai_search_inven's best -- on the belief that every vanilla AI turn
-    // runs ai_switch_weapons. It does not: ai_try_attack switches only when the hand holds NO weapon,
-    // when the gun is dry (rt_swap_dry_weapon here) or for want of AP / a crippled arm; out of range
-    // with a weapon in hand it simply walks closer (combatai.cc, COMBAT_BAD_SHOT_OUT_OF_RANGE). So he
-    // shot you with the SMG where the original has him close in and stab.
-    //
-    // An EMPTY hand still draws the best weapon in the pack (ai_switch_weapons' job): Gizmo's assassin
-    // carries his gun stowed. check_action_points = 0: combat_rt runs its own AP pool, so the engine
-    // AP field must not veto the choice.
+    // ⚠️ AN NPC FIGHTS WITH THE BEST WEAPON IT CARRIES, NOT JUST THE ONE IN ITS HAND -- HIS CALL, AND NOT
+    // VANILLA (2026-10-22). Lorenzo (proto 120) carries a 10mm SMG and a Knife, and the map puts the
+    // KNIFE in his hand. Vanilla's ai_try_attack switches only when the hand holds no weapon, when the
+    // gun is dry or for want of AP / a crippled arm -- out of range with a weapon in hand it walks
+    // closer (combatai.cc, COMBAT_BAD_SHOT_OUT_OF_RANGE) -- so the original Lorenzo closes in and stabs.
+    // That was ported for one build (b98ed17, after "to je vanilla chování, jedná se o bug"); asked
+    // "proč nemá střílet, když má v inventáři lepší zbraň?", he picked "always the best weapon", and
+    // then defined best: "ta, se kterou umí nejlépe" -- the skill first (ai_best_weapon_for).
+    // ai_search_inven skips whatever is already held and returns the best OTHER weapon; the same
+    // comparison against the held one decides whether swapping is an upgrade. check_action_points = 0:
+    // combat_rt runs its own AP pool, so the engine AP field must not veto the choice.
     Object* held = rt_hand_holds_weapon(npc) ? inven_right_hand(npc) : NULL;
-    Object* candidate = held == NULL ? ai_search_inven(npc, 0) : NULL;
+    Object* candidate = ai_search_inven(npc, 0);
 
-    if (candidate != NULL) {
+    if (candidate != NULL && ai_best_weapon_for(npc, held, candidate) == candidate) {
         // Inside a transaction of our own: inven_wield stamps the new weapon POSE through
         // register_object_take_out, which is a registered animation and silently does nothing
         // when no transaction is open -- that leaves the item in the hand and the body still
@@ -2585,6 +2584,14 @@ static void rt_ensure_weapon_drawn(RtActor* a)
                 npc->pid, candidate->pid, held != NULL ? held->pid : -1, rt_clock);
         }
         return; // let the take-out play; the pose is re-checked next frame
+    }
+
+    // A weapon in the pack lost to the one in hand: say why once, so "why didn't he use the SMG" has
+    // its answer in the trace -- the two skills are what ai_best_weapon_for weighed.
+    if (candidate != NULL && held != NULL && !a->weapon_checked) {
+        trace_event(TRACE_FLOW, "keep-weapon", "id=%d pid=%d held=%d skill=%d cand=%d skill=%d t=%.2f",
+            npc->id, npc->pid, held->pid, skill_level(npc, item_w_skill(held, HIT_MODE_RIGHT_WEAPON_PRIMARY)),
+            candidate->pid, skill_level(npc, item_w_skill(candidate, HIT_MODE_RIGHT_WEAPON_PRIMARY)), rt_clock);
     }
 
     // Nothing better to switch to. The hand may still disagree with the BODY, though -- the pose
