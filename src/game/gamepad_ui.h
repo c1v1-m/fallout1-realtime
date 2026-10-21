@@ -157,6 +157,10 @@ bool gamepad_ui_skill_cursor_sticky();
 struct Object;
 Object* gamepad_ui_targeting_pick();
 
+// A lockpick was just used on target from the use-on crosshair (gmouse.cc): while the lock holds, the
+// crosshair comes back for it after the attempt (gpui_lockpick_retry_tick).
+void gamepad_ui_lockpick_used(int pid, Object* target, bool fromHand);
+
 // THE QUICK SLOTS (2026-10-15): 0 = LB, 1 = RB. A slot holds a bound item pid, or -1 = it picks by
 // itself (LB the best throwable, RB the best heal). Saved in combat_rt's save chunk; reset to auto on
 // a new game and on every load before the chunk is read.

@@ -1097,6 +1097,10 @@ void gmouse_handle_event(int mouseX, int mouseY, int mouseState)
                     } else {
                         action_use_an_item_on_object(obj_dude, target, weapon);
                     }
+                    // A lockpick on a lock: the pad arms it again once this attempt has played out.
+                    if (weapon != NULL) {
+                        gamepad_ui_lockpick_used(weapon->pid, target, overridePid == -1);
+                    }
                 }
             }
             gmouse_set_cursor(MOUSE_CURSOR_NONE);

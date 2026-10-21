@@ -1,0 +1,27 @@
+# "ať ho používám několikrát za sebou. Teď ho musím furt hledat z inventáře" (2026-10-21): a lockpick
+# used on a lock comes back armed on the same lock until it gives. The Vats foot locker (GenLock, elev 1,
+# tile 23265), lockpicks bound to LB: LB arms the crosshair on the nearest locked thing (the locker),
+# A uses it, and every later A is another attempt with no re-arming.
+name lockpick-retry
+map MBVATS12.MAP
+seed 3
+duration 30
+dude elevation 1
+dude tile 23267 rot 4
+dude skill lockpick 25
+dude item 84 1
+dude quickslot lb 84
+cleararea 40
+tap 1500 lb
+tap 3000 a
+tap 6000 a
+tap 9000 a
+tap 12000 a
+tap 15000 a
+tap 18000 a
+tap 21000 a
+tap 24000 a
+expect use-on\] item target=Locker
+expect lockpick-retry\] rearm pid=84
+expect deftly pick the lock
+expect lockpick-retry\] done pid=84 locked=0

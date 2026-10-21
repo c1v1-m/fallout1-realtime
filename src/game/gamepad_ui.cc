@@ -280,6 +280,13 @@ static bool gpui_useon_item_in_hand();
 static bool gpui_targeting_cursor_armed();
 // Puts the pointer a few tiles in front of the dude (the use-on crosshair's starting spot).
 static void gpui_useon_park_cursor();
+// ...or, for a lockpick, straight on the nearest locked thing, as the Lockpick skill parks.
+static void gpui_useon_park_for(int pid);
+
+static bool gpui_is_lockpick_pid(int pid)
+{
+    return pid == 84 || pid == 77; // Lockpicks, Electronic Lockpick
+}
 
 // A screen is running its OWN controller-driven navigation and reads the pad
 // directly in its own loop -- the main menu (highlight + A) and the load/save slot
@@ -4919,10 +4926,103 @@ static void gpui_quick_use_on_item(int pid)
         return;
     }
     gmouse_set_use_on_item(pid);
-    gpui_useon_park_cursor();
+    gpui_useon_park_for(pid);
     gpui_cursor_show_time = get_time();
     gsound_play_sfx_file("ib1p1xx1");
     trace_event(TRACE_ACTION, "quick-use-on", "pid=%d", pid);
+}
+
+// ⚠️ A LOCKPICK STAYS ARMED UNTIL THE LOCK GIVES (2026-10-21, "ať ho používám několikrát za sebou. Teď ho
+// musím furt hledat z inventáře"). Vanilla's use-on crosshair is spent by one click, so every failed
+// attempt sent him back to the quick inventory for the lockpick. Now, once the attempt has played out
+// (the dude's walk and hands are done), the crosshair comes back for the same lockpick, glued on the same
+// lock -- for as long as that lock is still locked and he still carries one. Success, a lockpick broken on
+// a critical failure, B, or anything else armed in the meantime ends it. The roll is vanilla's every
+// time (GenLock: +20 with the lockpicks, a critical failure jams the lock and breaks them).
+#define GPUI_PICK_RETRY_GIVE_UP_MS 15000
+#define GPUI_PICK_RETRY_MIN_MS 300
+
+static int gpui_pick_retry_pid = -1;
+static bool gpui_pick_retry_hand = false;
+static Object* gpui_pick_retry_target = NULL;
+static int gpui_pick_retry_target_id = -1;
+static int gpui_pick_retry_elevation = 0;
+static unsigned int gpui_pick_retry_since = 0;
+
+void gamepad_ui_lockpick_used(int pid, Object* target, bool fromHand)
+{
+    gpui_pick_retry_pid = -1;
+    if (target == NULL || !gpui_is_lockpick_pid(pid) || !obj_is_locked(target)) {
+        return;
+    }
+    // From the hand, only when the pad armed it: a mouse player's crosshair stays vanilla.
+    if (fromHand && gamepad_ui_mouse_in_use()) {
+        return;
+    }
+    gpui_pick_retry_pid = pid;
+    gpui_pick_retry_hand = fromHand;
+    gpui_pick_retry_target = target;
+    gpui_pick_retry_target_id = target->id;
+    gpui_pick_retry_elevation = target->elevation;
+    gpui_pick_retry_since = get_time();
+}
+
+static void gpui_lockpick_retry_tick()
+{
+    if (gpui_pick_retry_pid == -1 || obj_dude == NULL) {
+        return;
+    }
+
+    unsigned int age = elapsed_time(gpui_pick_retry_since);
+    if (age > GPUI_PICK_RETRY_GIVE_UP_MS) {
+        trace_event(TRACE_ACTION, "lockpick-retry", "give-up pid=%d", gpui_pick_retry_pid);
+        gpui_pick_retry_pid = -1;
+        return;
+    }
+
+    // Wait for the attempt to play out: the walk there, the hands, the script's roll.
+    if (age < GPUI_PICK_RETRY_MIN_MS || anim_busy(obj_dude) || radial_wheel_is_open() || gamepad_ui_menu_active()
+        || dialog_active() || inven_any_open() || !intface_is_enabled()) {
+        return;
+    }
+
+    int pid = gpui_pick_retry_pid;
+    gpui_pick_retry_pid = -1;
+
+    // Something else armed meanwhile (B put it away, another tool, a skill): that wins.
+    if (gmouse_3d_get_mode() != GAME_MOUSE_MODE_MOVE) {
+        return;
+    }
+
+    // The lock must still be on this map, as the very object it was.
+    Object* target = NULL;
+    for (Object* obj = obj_find_first_at(gpui_pick_retry_elevation); obj != NULL; obj = obj_find_next_at()) {
+        if (obj == gpui_pick_retry_target && obj->id == gpui_pick_retry_target_id) {
+            target = obj;
+            break;
+        }
+    }
+
+    bool locked = target != NULL && obj_is_locked(target);
+    bool carried = inven_pid_is_carried(obj_dude, pid) != 0;
+    if (!locked || !carried) {
+        trace_event(TRACE_ACTION, "lockpick-retry", "done pid=%d locked=%d carried=%d", pid, locked ? 1 : 0, carried ? 1 : 0);
+        return;
+    }
+
+    Object* hand = NULL;
+    if (gpui_pick_retry_hand && intface_get_current_item(&hand) != -1 && hand != NULL && hand->pid == pid) {
+        intface_use_item();
+        gsound_play_sfx_file("ib1p1xx1");
+    } else {
+        gpui_quick_use_on_item(pid);
+    }
+    if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
+        gpui_tpick_set(target);
+        gpui_cursor_show_time = get_time();
+    }
+    trace_event(TRACE_ACTION, "lockpick-retry", "rearm pid=%d target=%d armed=%d", pid, target->id,
+        gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR ? 1 : 0);
 }
 
 // The ammo objects the open wheel is showing -- one per distinct proto, pointing at the first stack
@@ -7676,6 +7776,18 @@ static void gpui_useon_park_cursor()
     gpui_park_cursor_at(sx + 16, sy + 15);
 }
 
+// A lockpick's crosshair opens ON the nearest locked door or container (the bed drawn over the Vats foot
+// locker took the click when it opened three tiles ahead), glued there so A means that lock.
+static void gpui_useon_park_for(int pid)
+{
+    Object* lock = gpui_is_lockpick_pid(pid) ? interact_prompt_skill_target(SKILL_LOCKPICK) : NULL;
+    if (lock != NULL) {
+        gpui_tpick_set(lock);
+    } else {
+        gpui_useon_park_cursor();
+    }
+}
+
 static void gpui_useon_arm(SDL_GameController* pad)
 {
     static bool prevA = false;
@@ -7776,7 +7888,8 @@ static void gpui_useon_arm(SDL_GameController* pad)
     // ...and put it in front of his eyes rather than wherever the pointer was abandoned. Only once
     // the mode is really up: intface_use_item() is the authority on whether this item arms anything.
     if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_USE_CROSSHAIR) {
-        gpui_useon_park_cursor();
+        Object* hand = NULL;
+        gpui_useon_park_for(intface_get_current_item(&hand) != -1 && hand != NULL ? hand->pid : -1);
     }
 
     // Show the cursor you just armed. It is also what makes the confirming A land at all: a world
@@ -8342,6 +8455,8 @@ static void gpui_drain_requests()
     gpui_ap_wait_tick();
     // ...and an explosive whose put-down was cut still lands.
     gpui_place_tick();
+    // A lockpick that failed comes back armed on the same lock.
+    gpui_lockpick_retry_tick();
 
     // A quick slot's drug (RB's stimpak, or whatever is bound), then the throw's state machine.
     if (gpui_qs_use_pending_slot != -1) {

@@ -70,6 +70,7 @@ namespace fallout {
 //   dude item <pid> [qty]
 //   dude wield <pid>                   added and put in the active hand, loaded
 //   dude armor <pid>
+//   dude quickslot <lb|rb> <pid>       bind that item to the quick slot (a tool, a drug, a grenade)
 //   dude curhp <n>                     start with n hit points (after the maximum is set)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
 //   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>] [empty]
@@ -242,6 +243,7 @@ static int at_dude_skills[SKILL_COUNT];
 static AtItem at_dude_items[AT_MAX_ITEMS];
 static int at_dude_item_count = 0;
 static int at_dude_wield = -1;
+static int at_dude_quickslot[2] = { -1, -1 }; // LB, RB: a bound pid
 static int at_dude_hp = -1;
 static int at_dude_curhp = -1; // "dude curhp": start wounded
 static int at_dude_armor = -1;
@@ -696,6 +698,8 @@ static bool at_parse(const char* path)
                 at_dude_wield = atoi(tok[2]);
             } else if (strcmp(tok[1], "armor") == 0) {
                 at_dude_armor = atoi(tok[2]);
+            } else if (strcmp(tok[1], "quickslot") == 0 && n >= 4) {
+                at_dude_quickslot[strcmp(tok[2], "rb") == 0 ? 1 : 0] = atoi(tok[3]);
             }
         } else if (strcmp(tok[0], "spawn") == 0 && n >= 3 && at_spawn_count < AT_MAX_SPAWNS) {
             AtSpawn* sp = &(at_spawns[at_spawn_count++]);
@@ -928,6 +932,11 @@ void autotest_setup_world()
     }
     if (at_dude_wield >= 0) {
         at_wield(obj_dude, at_dude_wield, intface_is_item_right_hand() ? HAND_RIGHT : HAND_LEFT);
+    }
+    for (int q = 0; q < 2; q++) {
+        if (at_dude_quickslot[q] >= 0) {
+            gamepad_ui_quick_slot_set(q, at_dude_quickslot[q]);
+        }
     }
     // Last: putting on the armour recalculates the derived stats, maximum HP among them.
     if (at_dude_hp > 0) {
