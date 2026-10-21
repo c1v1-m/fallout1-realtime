@@ -1,5 +1,6 @@
 #include "game/autotest.h"
 
+#include "game/actions.h"
 #include "game/anim.h"
 
 #include <ctype.h>
@@ -27,6 +28,7 @@
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
+#include "game/loadsave.h"
 #include "game/map.h"
 #include "game/scripts.h"
 #include "game/worldmap.h"
@@ -53,6 +55,9 @@ namespace fallout {
 //                                      script spawns its own critters into the arena)
 //   gvar <n> <value>                   a global variable set before the run (a quest part way, a code known)
 //   mapvar <n> <value>                 one of the loaded map's own variables (its scripts' map_var)
+//   loadslot <1-10>                    start from that save slot instead (data\SAVEGAME\SLOTnn, the
+//                                      master_patches folder: copy the player's save there), map scripts on; `map` still names
+//                                      a map to boot into first. The dude is the save's: no HP reset
 //   cleararea <tiles>                  every other critter within that many tiles of the dude is removed
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
@@ -131,6 +136,8 @@ namespace fallout {
 //                                      Opened by the game loop: the timeline waits until the world is
 //                                      back on top, and the lines after it are timed from the open.
 //   note <ms> <text...>                a marker in the trace
+//   talk <ms> <pid>                    the dude talks to the nearest critter of that pid wherever it stands
+//                                      (action_talk_to, the use prompt's TALK), for one that paces about
 //   walkto <ms> <tile>                 the dude runs there along the pathfinder's route (a click's walk),
 //                                      for the long way across a level; traced with its step count
 //
@@ -204,6 +211,7 @@ static char at_map_name[64] = "";
 static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
+static int at_load_slot = 0;
 static float at_projectile_speedup = -1.0f;
 static int at_tactical = -1;
 static int at_projectiles = -1;
@@ -254,6 +262,7 @@ enum {
     AT_STEP_OPEN, // index = AT_SCREEN_*: a screen the game loop opens itself (no pad route to it)
     AT_STEP_NOTE,
     AT_STEP_WALKTO, // index = tile: the dude is sent there along the pathfinder's route, as a click sends him
+    AT_STEP_TALK, // index = pid: the dude talks to the nearest critter of that pid, as the use prompt does
 };
 
 enum {
@@ -533,7 +542,8 @@ static bool at_parse_step(char** tok, int n)
     bool open = strcmp(tok[0], "open") == 0;
     bool note = strcmp(tok[0], "note") == 0;
     bool walkto = strcmp(tok[0], "walkto") == 0;
-    if (!button && !tap && !axis && !open && !note && !walkto) {
+    bool talk = strcmp(tok[0], "talk") == 0;
+    if (!button && !tap && !axis && !open && !note && !walkto && !talk) {
         return false;
     }
     if (n < 3 || ((button || axis) && n < 4)) {
@@ -544,6 +554,10 @@ static bool at_parse_step(char** tok, int n)
     int ms = at_step_time(tok[1]);
     if (walkto) {
         at_add_step(ms, AT_STEP_WALKTO, atoi(tok[2]), 0);
+        return true;
+    }
+    if (talk) {
+        at_add_step(ms, AT_STEP_TALK, atoi(tok[2]), 0);
         return true;
     }
     if (button || tap) {
@@ -635,6 +649,9 @@ static bool at_parse(const char* path)
             at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
+        } else if (strcmp(tok[0], "loadslot") == 0 && n >= 2) {
+            at_load_slot = atoi(tok[1]);
+            at_map_script = true;
         } else if (strcmp(tok[0], "cleararea") == 0 && n >= 2) {
             at_clear_radius = atoi(tok[1]);
         } else if (strcmp(tok[0], "mapvar") == 0 && n >= 3 && at_mvar_count < AT_MAX_GVARS) {
@@ -839,6 +856,12 @@ void autotest_setup_world()
         trace_event(TRACE_ERR, "autotest", "virtual pad failed: %s", SDL_GetError());
     }
 
+    if (at_load_slot > 0) {
+        int rc = LoadGameSlot(at_load_slot - 1);
+        trace_event(rc == -1 ? TRACE_ERR : TRACE_FLOW, "autotest", "loadslot %d rc=%d map=%s dude=%d hp=%d maneuver=0x%x results=0x%x",
+            at_load_slot, rc, map_data.name, obj_dude->tile, obj_dude->data.critter.hp, obj_dude->data.critter.combat.maneuver, obj_dude->data.critter.combat.results);
+    }
+
     if (at_dude_elevation >= 0 && at_dude_elevation != map_elevation) {
         map_set_elevation(at_dude_elevation);
     }
@@ -912,7 +935,9 @@ void autotest_setup_world()
         int now = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
         stat_set_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS, stat_get_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS) + at_dude_hp - now);
     }
-    obj_dude->data.critter.hp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+    if (at_load_slot <= 0) {
+        obj_dude->data.critter.hp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+    }
     if (at_dude_curhp > 0 && at_dude_curhp < obj_dude->data.critter.hp) {
         obj_dude->data.critter.hp = at_dude_curhp;
     }
@@ -1290,6 +1315,23 @@ static void at_tl_bk()
             int open = make_path_func(obj_dude, obj_dude->tile, st->index, NULL, 0, at_block_but_doors);
             trace_event(TRACE_FLOW, "autotest", "walkto t=%d from=%d to=%d elev=%d steps=%d ok=%d doorsOpen=%d", t,
                 obj_dude->tile, st->index, obj_dude->elevation, steps, ok ? 1 : 0, open);
+            break;
+        }
+        case AT_STEP_TALK: {
+            Object* who = NULL;
+            Object** list = NULL;
+            int count = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_CRITTER, &list);
+            for (int i = 0; i < count; i++) {
+                if (list[i]->pid == st->index && (who == NULL || obj_dist(obj_dude, list[i]) < obj_dist(obj_dude, who))) {
+                    who = list[i];
+                }
+            }
+            if (list != NULL) {
+                obj_delete_list(list);
+            }
+            int rc = who != NULL ? action_talk_to(obj_dude, who) : -1;
+            trace_event(TRACE_FLOW, "autotest", "talk t=%d pid=%d id=%d dist=%d rc=%d", t, st->index,
+                who != NULL ? who->id : -1, who != NULL ? obj_dist(obj_dude, who) : -1, rc);
             break;
         }
         }

@@ -28,6 +28,7 @@ int SaveGameSlot(int slot, const char* description);
 // Resume the most recent save with no load screen (main menu CONTINUE). 1 = loaded,
 // 0 = nothing to resume, -1 = failed.
 int LoadGameNewest();
+int LoadGameSlot(int slot);
 int AutoSaveLocation();
 int AutoSaveQuest();
 int QuickSaveGame();

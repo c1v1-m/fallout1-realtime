@@ -1589,6 +1589,14 @@ static void op_attack(Program* program)
         return;
     }
 
+    // A script's attack() that comes to nothing used to leave no mark at all: Lorenzo said "Okay boys,
+    // you know what to do!" five times in his save and nobody moved (2026-10-21).
+    trace_event(TRACE_FLOW, "script-attack", "prog=%s self=%d pid=%d target=%d active=%d/%d fleeing=%d dialog=%d combat=%d",
+        program->name != NULL ? program->name : "?", self->id, self->pid, target->id,
+        critter_is_active(self) ? 1 : 0, critter_is_active(target) ? 1 : 0,
+        (target->data.critter.combat.maneuver & CRITTER_MANUEVER_FLEEING) != 0 ? 1 : 0,
+        dialog_active() ? 1 : 0, isInCombat() ? 1 : 0);
+
     if (!critter_is_active(self)) {
         dbg_print_com_data(self, target);
         debug_printf("\n   But is already Inactive (Dead/Stunned)");

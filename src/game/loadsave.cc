@@ -616,6 +616,27 @@ int LoadGameNewest()
     return rc != -1 ? 1 : -1;
 }
 
+// One given slot (0-based), with no screen: the self-played tests (autotest `loadslot`) start from a
+// copy of the player's own save, so a report is reproduced in HIS state -- map variables, the dude's
+// saved combat bits, the party -- not in a scenario's approximation of it.
+int LoadGameSlot(int slot)
+{
+    ls_error_code = 0;
+
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    if (slot < 0 || slot >= 10 || GetSlotList() == -1 || LSstatus[slot] != SLOT_STATE_OCCUPIED) {
+        return -1;
+    }
+
+    slot_cursor = slot;
+    int rc = LoadSlot(slot_cursor);
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    return rc;
+}
+
 // Save-slot layout for the auto/quick save scheme (0-based; shown as SLOT01.. on the
 // load screen). The location autosave is a ROTATING RING of 3 slots so the last three
 // visited locations are kept ("Autosave 1/2/3"), not one overwritten slot.

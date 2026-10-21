@@ -17491,10 +17491,38 @@ static void rt_shot_dodge_tick()
     }
 }
 
+// ⚠️ A LOST TURN THAT NEVER ENDED (2026-10-21). A critical that "stuns you for a moment" -- or a critical
+// miss -- sets DAM_LOSE_TURN, and vanilla clears it at the start of that critter's next turn
+// (combat_turn). Realtime has no turns, so outside a knockdown (whose standup clears it, rt_stand_up)
+// nothing ever did, and critter_is_active() is false for as long as the bit stands. His dude took one in
+// the left arm at Mariposa (trace_2026-10-21_190650 s=871) and carried it to the Hub: every script's
+// attack(dude) was refused as "target is already dead" -- Lorenzo said "Okay boys, you know what to do!"
+// five times and nobody moved -- and an NPC carrying it cannot be talked to (obj_action_can_talk_to).
+// The bit is saved with the critter, so it outlived every reload. Realtime gives such a stun no time of
+// its own (no AI here reads it), so it is simply put down again; a knockdown or knockout keeps it until
+// the critter is up.
+static void rt_clear_lost_turn(Object* critter)
+{
+    if (critter == NULL) {
+        return;
+    }
+    int results = critter->data.critter.combat.results;
+    if ((results & DAM_LOSE_TURN) != 0 && (results & (DAM_KNOCKED_DOWN | DAM_KNOCKED_OUT | DAM_DEAD)) == 0) {
+        critter->data.critter.combat.results &= ~DAM_LOSE_TURN;
+        trace_event(TRACE_STATE, "lose-turn-cleared", "id=%d pid=%d results=0x%x t=%.2f",
+            critter->id, critter->pid, results, rt_clock);
+    }
+}
+
 void combat_rt_update(float dt)
 {
     if (obj_dude == NULL) {
         return;
+    }
+
+    rt_clear_lost_turn(obj_dude);
+    for (int i = 0; i < rt_actor_count; i++) {
+        rt_clear_lost_turn(rt_actors[i].obj);
     }
 
     // A RADIAL WHEEL FREEZES COMBAT. Picking a stimpak, a weapon or an ammo type is a decision, not

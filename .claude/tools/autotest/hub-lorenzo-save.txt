@@ -1,0 +1,24 @@
+# His own save (Steam SLOT01, 2026-10-21 19:43, Hub Downtown, just before he kept talking to Lorenzo):
+# "furt ho oslovuji abych ho vyprovokoval a nic se neděje". The dude carried DAM_LOSE_TURN (results 0x8000)
+# from a critical in the left arm at Mariposa, so every script's attack(dude) was refused and Lorenzo's
+# "Okay boys" came to nothing. Fixed by rt_clear_lost_turn.
+#
+# Run it with --exe from a clean Steam-like folder whose data\SAVEGAME\SLOT01 is that save: the dev data
+# carries the TeamX patch, whose global variables do not line up with a clean save (load handler 3 fails).
+# Lorenzo paces between his spots on his own 5-20 s timer, so the dude is sent to talk to HIM (pid
+# 16777336) wherever he stands, as the use prompt's TALK would.
+name hub-lorenzo-save
+map HUBDWNTN.MAP
+loadslot 1
+duration 40
+walkto 500 22512
+note 4000 talk to Lorenzo
+talk 4000 16777336
+talk +3000 16777336
+talk +3000 16777336
+expect loadslot 1 rc=0
+expect lose-turn-cleared\] id=18000
+expect-count >=2 autotest\] talk t=\d+ pid=16777336 id=2295 .* rc=0
+expect \[STATE/float\] prog=scripts.lorenzo.int .*Okay boys
+expect script-attack\] prog=scripts.lorenzo.int .* active=1/1
+expect \[FLOW/combat-enter\]
