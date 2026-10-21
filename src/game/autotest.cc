@@ -55,6 +55,8 @@ namespace fallout {
 //                                      script spawns its own critters into the arena)
 //   gvar <n> <value>                   a global variable set before the run (a quest part way, a code known)
 //   mapvar <n> <value>                 one of the loaded map's own variables (its scripts' map_var)
+//   reload                             load the map again once the gvars are set, so its scripts' map_enter
+//                                      sees them (gvar 32 12 = brought to the Master by Morpheus)
 //   loadslot <1-10>                    start from that save slot instead (data\SAVEGAME\SLOTnn, the
 //                                      master_patches folder: copy the player's save there), map scripts on; `map` still names
 //                                      a map to boot into first. The dude is the save's: no HP reset
@@ -214,6 +216,7 @@ static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
 static int at_load_slot = 0;
+static bool at_reload = false;
 static float at_projectile_speedup = -1.0f;
 static int at_tactical = -1;
 static int at_projectiles = -1;
@@ -658,6 +661,8 @@ static bool at_parse(const char* path)
             at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
+        } else if (strcmp(tok[0], "reload") == 0) {
+            at_reload = true;
         } else if (strcmp(tok[0], "loadslot") == 0 && n >= 2) {
             at_load_slot = atoi(tok[1]);
             at_map_script = true;
@@ -909,6 +914,10 @@ void autotest_setup_world()
     for (int g = 0; g < at_gvar_count; g++) {
         game_set_global_var(at_gvar_index[g], at_gvar_value[g]);
         trace_event(TRACE_FLOW, "autotest", "gvar %d=%d", at_gvar_index[g], at_gvar_value[g]);
+    }
+    if (at_reload) {
+        int rc = map_load(at_map_name);
+        trace_event(TRACE_FLOW, "autotest", "reload map=%s rc=%d dude=%d", at_map_name, rc, obj_dude->tile);
     }
     for (int m = 0; m < at_mvar_count; m++) {
         ProgramValue value;

@@ -1360,6 +1360,15 @@ static bool rt_tactical_ai = true;
 // MODS "Projectiles" (cfg projectiles): bullets fly as tracers and commit on arrival, and every shot that
 // flies checks its line on arrival (rt_projectile_dodge). Default ON, his design (2026-10-18).
 static bool rt_projectiles = true;
+
+// ⚠️ THE MASTER'S BODYGUARDS FIGHT FOR HIM (2026-10-22, his "jo ať bodyguardi útočí ... ať tam jen nestojí",
+// then "žádný mods prostě je tam naper" -- so always, with no switch). When Morpheus leads you in,
+// MASTER2.INT stands two Nightkin beside you (pid 16777409, GenMutan.int). They are the vault's team (34),
+// not the Master's (55), and vanilla's AI only ever joins its own team, so in the original they watch the
+// whole fight. Here the moment the Master turns on you every one of them near him does too.
+#define RT_PID_MASTER 16777266
+#define RT_PID_MASTER_NIGHTKIN 16777409
+#define RT_MASTER_GUARD_REACH 30
 static RtActor* rt_actor_of(Object* obj);
 static void rt_tracers_render(Rect* rect, int elevation);
 static void rt_tracers_reset();
@@ -17514,6 +17523,34 @@ static void rt_clear_lost_turn(Object* critter)
     }
 }
 
+// See RT_PID_MASTER_NIGHTKIN. Cheap enough for every frame: one pass to find a hostile Master, and the
+// escort is only looked for once he is.
+static void rt_master_guards_tick()
+{
+    Object* master = NULL;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* obj = rt_actors[i].obj;
+        if (obj != NULL && obj->pid == RT_PID_MASTER && rt_actors[i].hostile && !critter_is_dead(obj)) {
+            master = obj;
+            break;
+        }
+    }
+    if (master == NULL) {
+        return;
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* guard = rt_actors[i].obj;
+        if (guard == NULL || guard->pid != RT_PID_MASTER_NIGHTKIN || rt_actors[i].hostile || critter_is_dead(guard)
+            || guard->elevation != master->elevation || obj_dist(guard, master) > RT_MASTER_GUARD_REACH) {
+            continue;
+        }
+        trace_event(TRACE_FLOW, "bodyguard-join", "id=%d pid=%d tile=%d master=%d dist=%d t=%.2f",
+            guard->id, guard->pid, guard->tile, master->id, obj_dist(guard, master), rt_clock);
+        combat_rt_notify_attack(guard, obj_dude);
+    }
+}
+
 void combat_rt_update(float dt)
 {
     if (obj_dude == NULL) {
@@ -17524,6 +17561,7 @@ void combat_rt_update(float dt)
     for (int i = 0; i < rt_actor_count; i++) {
         rt_clear_lost_turn(rt_actors[i].obj);
     }
+    rt_master_guards_tick();
 
     // A RADIAL WHEEL FREEZES COMBAT. Picking a stimpak, a weapon or an ammo type is a decision, not
     // an action -- in a pausable tactical game you make it with the world held still. Returning

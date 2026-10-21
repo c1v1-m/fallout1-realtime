@@ -1,0 +1,22 @@
+# The Master's bodyguards (2026-10-22, "jo ať bodyguardi útočí ... ať tam jen nestojí"). Morpheus's
+# escort: MASTER2.INT stands two Nightkin (pid 16777409) by the dude when LOAD_MAP_INDEX (gvar 32) is 12,
+# which is how Morpheus brings you in (`reload` lets the map script see it). The Master talks at once;
+# A through every reply ends in his attack (and his last line's [Done]). Both Nightkin must join.
+name master-guards
+map MSTRLR34.MAP
+mapscript on
+gvar 32 12
+reload
+seed 1
+duration 30
+dude hp 999
+
+tap 4600 A
+tap 6500 A
+tap 8500 A
+tap 10500 A
+tap 12500 A
+tap 14500 A
+
+expect \[FLOW/dialog-start\] pid=16777266
+expect-count 2 \[FLOW/bodyguard-join\] .* pid=16777409
