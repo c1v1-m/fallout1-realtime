@@ -1,0 +1,16 @@
+# The Cathedral tower's ground floor (2026-10-22, "chtěl jsem dojít ze schodů a dostával jsem you see
+# staircase"). Its flight is two pieces side by side: 0x2000163 (tile 19094) has no script and goes
+# nowhere, 0x2000164 (tile 18894, Tow2Chid.int) takes you to the Cathedral's main floor. The dude stands
+# where he did (19293), nearest the dead piece; one A must take him down. (The working piece says "You
+# see: Staircase" too -- its script does not override the look -- that is vanilla.)
+name tower-stairs
+map CHILDRN2.MAP
+mapscript on
+seed 1
+duration 12
+dude tile 19293 rot 5
+tap 2500 a
+
+expect-count 1 interact-do] kind=1 pid=33554788
+expect-not interact-do] kind=1 pid=33554787
+expect \[FLOW/map-load-stage\] done name=CHILDRN1

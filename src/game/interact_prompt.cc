@@ -288,8 +288,18 @@ static int ip_classify(Object* obj)
         // 14x `interact-do kind=6` on pid 33555016, a SCENERY_TYPE_LADDER_DOWN, plus 2x on the
         // LADDER_UP pid 33554571). Left obj_is_locked itself alone: it is a vanilla function and
         // script opcodes can reach it.
-        Proto* proto;
-        bool isDoor = proto_ptr(obj->pid, &proto) != -1 && proto->scenery.type == SCENERY_TYPE_DOOR;
+        Proto* proto = NULL;
+        bool hasProto = proto_ptr(obj->pid, &proto) != -1;
+        bool isDoor = hasProto && proto->scenery.type == SCENERY_TYPE_DOOR;
+
+        // ⚠️ A STAIRCASE WITH NO SCRIPT GOES NOWHERE (2026-10-22, "chtěl jsem dojít ze schodů a dostával
+        // jsem you see staircase"). Stairs move you only through their script (the Cathedral tower's
+        // Tow2Chid / CTower*); obj_use on a bare one just says "You see: Staircase". The tower's flight
+        // is two pieces side by side and only one carries the script -- the nearer, dead one took A
+        // four times running. Not offered, so A lands on the half that works.
+        if (hasProto && proto->scenery.type == SCENERY_TYPE_STAIRS && obj->sid == -1) {
+            return IP_NONE;
+        }
         return (isDoor && obj_is_locked(obj)) ? IP_LOCKPICK : IP_USE;
     }
     case OBJ_TYPE_CRITTER:
