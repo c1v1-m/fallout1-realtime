@@ -1,9 +1,9 @@
-# The Master's eyebots join ANY fight in his hall (2026-10-22, "ať útočí rovnou, je to final boss konec
-# konců", then his pick "k jakémukoli boji v sále"), not only once the Master has turned. The dude stands
-# 13 tiles from the Master (his script talks under 10, so no dialogue) and 10/14 from the two Floating
-# Eyes (ids 249/257, team 1); a raider on a team of its own (77, so the eyebots' team-1 vanilla defence
-# cannot be the reason) attacks him. Both eyebots must join with why=hall-fight; the Master stays out.
-# Run it in a clean Steam-like folder (vanilla MSTRLR34).
+# A fight in the Master's hall pulls in his eyebots AND him (2026-10-22, "ať útočí rovnou, je to final
+# boss konec konců" -> "k jakémukoli boji v sále"; then "zabil jsem eyebots a master nic nedělal" -> "ano,
+# ať se přidá"). The dude stands 13 tiles from the Master (his script talks under 10, so no dialogue) and
+# 10/14 from the two Floating Eyes (ids 249/257, team 1); a raider on a team of its own (77, so the
+# eyebots' team-1 vanilla defence cannot be the reason) attacks him. The Master must join (why=hall-fight)
+# and shoot, both eyebots must join; no dialogue. Run it in a clean Steam-like folder (vanilla MSTRLR34).
 name master-eyebots-hall
 map MSTRLR34.MAP
 mapscript on
@@ -19,6 +19,7 @@ spawn 16777291 14855 rot 5 wield 8 item 29 6 hostile team 77
 
 at 0 fight
 
-expect-count 2 \[FLOW/bodyguard-join\] .* pid=16777293 .*why=hall-fight
-expect-not \[FLOW/bodyguard-join\] .*why=master
+expect \[FLOW/master-join\] id=174 why=hall-fight
+expect-count 2 \[FLOW/bodyguard-join\] .* pid=16777293
+expect \[COMBAT/attack\] NPC aid=174 
 expect-not \[FLOW/dialog-start\] pid=16777266

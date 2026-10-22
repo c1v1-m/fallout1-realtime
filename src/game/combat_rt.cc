@@ -17874,6 +17874,19 @@ static void rt_master_guards_tick()
         return;
     }
 
+    // ⚠️ ...AND NEITHER DOES HE (2026-10-22, "zabil jsem eyebots a master nic nedělal" -> his pick "ano, ať
+    // se přidá"). The eyebots are not his team, so vanilla's Master sat through their deaths and only
+    // turned when shot himself (trace_2026-10-22_211637 s=21-41, then s=44.6). Now a fight within
+    // RT_EYEBOT_HALL_REACH of him turns him too -- and, being in the fight, he gets his script turns,
+    // which is what calls his Horde (rt_script_turn_tick, Hord.int). A Master talked into his end, with
+    // no fight in the hall, is untouched; his script's own talk is refused while anyone is after you.
+    if (!masterHostile && rt_fight_near(master, RT_EYEBOT_HALL_REACH)) {
+        trace_event(TRACE_FLOW, "master-join", "id=%d why=hall-fight dude=%d t=%.2f",
+            master->id, obj_dist(master, obj_dude), rt_clock);
+        combat_rt_notify_attack(master, obj_dude);
+        masterHostile = true;
+    }
+
     for (int i = 0; i < rt_actor_count; i++) {
         Object* guard = rt_actors[i].obj;
         bool eye = guard != NULL && guard->pid == RT_PID_FLOATING_EYE;
