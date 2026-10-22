@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <SDL.h>
 
@@ -31,6 +32,7 @@
 #include "game/loadsave.h" // isLoadingGame, for the heal pool at a map teardown
 #include "game/map.h"
 #include "game/object.h"
+#include "game/palette.h"
 #include "game/party.h"
 #include "game/perk.h"
 #include "game/perk_defs.h"
@@ -1266,6 +1268,97 @@ static int rt_lock_reach(Object* critter);
 static bool rt_cam_lean_on = false;
 static float rt_cam_lean_x = 0.0f;
 static float rt_cam_lean_y = 0.0f;
+
+// ⚠️ THE MASTER'S PSYCHIC SCREAM IS SEEN AND FELT (2026-10-22, "ale žádnej efekt u toho psychic, co si
+// myslíš" -> his picks "záblesk obrazovky" + "otřes kamery", and "ano, slabší" with the Nullifier). The
+// moment the wave lands (rt_master_scream_tick) the whole screen pulses toward violet and the camera
+// shakes; a Psychic Nullifier halves both, so a shielded dude still sees that something happened.
+// The pulse is a palette tint, the way Fallout fades: entries 0..RT_PSY_FLASH_LAST eased toward
+// RT_PSY_FLASH_R/G/B (0..63, the VGA range) from a copy taken at the start, then put back. 229..255
+// are colour cycling's (cycle.cc rewrites them every tick), so they are left alone. If anything else
+// sets the palette meanwhile (a fade, a map change, death), the pulse lets go without restoring.
+#define RT_PSY_FLASH_SECONDS 0.6f
+#define RT_PSY_FLASH_RISE 0.08f
+#define RT_PSY_FLASH_PEAK 0.45f // how far toward the tint at full strength
+#define RT_PSY_FLASH_R 44
+#define RT_PSY_FLASH_G 8
+#define RT_PSY_FLASH_B 56
+#define RT_PSY_FLASH_LAST 228
+#define RT_PSY_SHAKE_SECONDS 0.4f
+#define RT_PSY_SHAKE_PX 5.0f // at full strength, fading to 0 over the shake
+static float rt_psy_fx_t = -1.0f; // seconds into the effect, -1 = none
+static float rt_psy_fx_strength = 0.0f; // 1 = took the hit, 0.5 = shielded
+static bool rt_psy_flash_on = false;
+static unsigned char rt_psy_flash_base[3 * (RT_PSY_FLASH_LAST + 1)];
+static unsigned char rt_psy_flash_last[3 * (RT_PSY_FLASH_LAST + 1)]; // what we last wrote
+static float rt_psy_shake_x = 0.0f; // px added to the camera offset (rt_follow_cam)
+static float rt_psy_shake_y = 0.0f;
+
+static void rt_psy_fx_stop()
+{
+    bool restored = rt_psy_flash_on && memcmp(getSystemPalette(), rt_psy_flash_last, sizeof(rt_psy_flash_last)) == 0;
+    if (restored) {
+        palette_set_entries(rt_psy_flash_base, 0, RT_PSY_FLASH_LAST);
+    }
+    if (rt_psy_fx_t >= 0.0f) {
+        trace_event(TRACE_COMBAT, "psy-fx", "end after=%.2f restored=%d", rt_psy_fx_t, restored ? 1 : 0);
+    }
+    rt_psy_flash_on = false;
+    rt_psy_fx_t = -1.0f;
+    rt_psy_shake_x = 0.0f;
+    rt_psy_shake_y = 0.0f;
+}
+
+static void rt_psy_fx_start(float strength)
+{
+    rt_psy_fx_stop();
+    memcpy(rt_psy_flash_base, getSystemPalette(), sizeof(rt_psy_flash_base));
+    memcpy(rt_psy_flash_last, rt_psy_flash_base, sizeof(rt_psy_flash_last));
+    rt_psy_flash_on = true;
+    rt_psy_fx_t = 0.0f;
+    rt_psy_fx_strength = strength;
+}
+
+// Once a frame from combat_rt_update, in frame time.
+static void rt_psy_fx_tick(float dt)
+{
+    if (rt_psy_fx_t < 0.0f) {
+        return;
+    }
+    if (rt_psy_flash_on && memcmp(getSystemPalette(), rt_psy_flash_last, sizeof(rt_psy_flash_last)) != 0) {
+        rt_psy_flash_on = false; // someone else owns the palette now
+    }
+
+    rt_psy_fx_t += dt;
+    float t = rt_psy_fx_t;
+    if (t >= RT_PSY_FLASH_SECONDS && t >= RT_PSY_SHAKE_SECONDS) {
+        rt_psy_fx_stop();
+        return;
+    }
+
+    if (rt_psy_flash_on) {
+        float k = 0.0f;
+        if (t < RT_PSY_FLASH_RISE) {
+            k = t / RT_PSY_FLASH_RISE;
+        } else if (t < RT_PSY_FLASH_SECONDS) {
+            k = 1.0f - (t - RT_PSY_FLASH_RISE) / (RT_PSY_FLASH_SECONDS - RT_PSY_FLASH_RISE);
+        }
+        k *= RT_PSY_FLASH_PEAK * rt_psy_fx_strength;
+        static const int tint[3] = { RT_PSY_FLASH_R, RT_PSY_FLASH_G, RT_PSY_FLASH_B };
+        for (int i = 0; i < (int)sizeof(rt_psy_flash_last); i++) {
+            int c = rt_psy_flash_base[i];
+            rt_psy_flash_last[i] = (unsigned char)(c + (int)lroundf((tint[i % 3] - c) * k));
+        }
+        palette_set_entries(rt_psy_flash_last, 0, RT_PSY_FLASH_LAST);
+    }
+
+    // Two sines a little apart, so the shake wanders instead of buzzing, and the same at any frame rate.
+    float amp = t < RT_PSY_SHAKE_SECONDS
+        ? RT_PSY_SHAKE_PX * rt_psy_fx_strength * (1.0f - t / RT_PSY_SHAKE_SECONDS)
+        : 0.0f;
+    rt_psy_shake_x = amp * sinf(t * 2.0f * 3.14159265f * 17.0f);
+    rt_psy_shake_y = amp * sinf(t * 2.0f * 3.14159265f * 23.0f + 1.3f);
+}
 
 // How far the view must lean (px, capped) for `t` to be on screen, and whether that cap is enough
 // to show it at all. False = no lean applies (off, no target, other elevation, no view).
@@ -16704,6 +16797,10 @@ static void rt_follow_cam(float dt)
     offX -= (int)lroundf(rt_cam_lean_x);
     offY -= (int)lroundf(rt_cam_lean_y);
 
+    // The psychic scream's shake (rt_psy_fx_tick).
+    offX += (int)lroundf(rt_psy_shake_x);
+    offY += (int)lroundf(rt_psy_shake_y);
+
     // DIAG (the "jumpy / big distance" hunt, 2026-09-24): the world moving by more than a few
     // pixels in ONE frame WITHOUT a tile change is the symptom itself, measured rather than
     // guessed at -- and the line says what the body was doing when it happened, so a swing, a
@@ -17877,7 +17974,8 @@ static bool rt_horde_phase_done = false;
 // over him and in the message window), and RT_MASTER_SCREAM_DELAY later a psychic wave hits the dude and
 // his party within RT_EYEBOT_HALL_REACH of him, cover or not: RT_MASTER_SCREAM_DMG_PCT of each one's
 // maximum hit points, armour bypassed, and knocked down. The Psychic Nullifier (item 123) carried shields
-// its bearer. Under it at map entry: counts as done, as the 50 % phase does.
+// its bearer, with a line in the message window. Under it at map entry: counts as done, as the 50 %
+// phase does. The screen pulse and the shake that go with it: rt_psy_fx_tick.
 #define RT_MASTER_SCREAM_PCT 25
 #define RT_MASTER_SCREAM_MSG 2711
 #define RT_MASTER_SCREAM_DELAY 1.2f
@@ -17899,6 +17997,7 @@ static void rt_horde_reset()
     rt_scream_init = false;
     rt_scream_done = false;
     rt_scream_at = -1.0f;
+    rt_psy_fx_stop();
 }
 
 static int rt_map_var_get(int var)
@@ -18111,6 +18210,7 @@ static void rt_master_scream_tick(Object* master, bool masterHostile)
             victims[n++] = rt_actors[i].obj;
         }
     }
+    float fx = 0.0f; // what the dude feels (rt_psy_fx_start): 1 hit, 0.5 shielded, 0 out of reach
     for (int i = 0; i < n; i++) {
         Object* v = victims[i];
         if (v == NULL || critter_is_dead(v) || v->elevation != master->elevation
@@ -18118,11 +18218,28 @@ static void rt_master_scream_tick(Object* master, bool masterHostile)
             continue;
         }
         if (inven_pid_is_carried(v, RT_PID_PSYCHIC_NULLIFIER)) {
+            // ...and say so: a shield that works in silence looked like a scream that never came
+            // (trace_2026-10-22_225537, "zase žádná vlna").
+            char note[160];
+            if (v == obj_dude) {
+                fx = 0.5f;
+                snprintf(note, sizeof(note), "Your Psychic Nullifier absorbs the Master's scream.");
+            } else {
+                snprintf(note, sizeof(note), "%s's Psychic Nullifier absorbs the Master's scream.", critter_name(v));
+            }
+            display_print(note);
             trace_event(TRACE_COMBAT, "psy-scream", "shielded id=%d pid=%d t=%.2f", v->id, v->pid, rt_clock);
             continue;
         }
+        if (v == obj_dude) {
+            fx = 1.0f;
+        }
         int damage = stat_level(v, STAT_MAXIMUM_HIT_POINTS) * RT_MASTER_SCREAM_DMG_PCT / 100;
         rt_psychic_hit(master, v, damage > 0 ? damage : 1);
+    }
+    if (fx > 0.0f) {
+        rt_psy_fx_start(fx);
+        trace_event(TRACE_COMBAT, "psy-scream", "fx strength=%.1f t=%.2f", fx, rt_clock);
     }
 }
 
@@ -18195,6 +18312,7 @@ void combat_rt_update(float dt)
         rt_clear_lost_turn(rt_actors[i].obj);
     }
     rt_master_guards_tick();
+    rt_psy_fx_tick(dt); // before the wheel freeze below: a pulse must not hang violet behind a wheel
 
     // A RADIAL WHEEL FREEZES COMBAT. Picking a stimpak, a weapon or an ammo type is a decision, not
     // an action -- in a pausable tactical game you make it with the world held still. Returning

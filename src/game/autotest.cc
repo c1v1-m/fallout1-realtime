@@ -1462,6 +1462,22 @@ void autotest_tick(float dt)
     }
     at_elapsed += dt;
 
+    // Before the screen-test return: a screen test may photograph what a hit-point change starts.
+    for (int i = 0; i < at_sethp_count; i++) {
+        if (at_sethp[i].done || at_elapsed < at_sethp[i].at) {
+            continue;
+        }
+        at_sethp[i].done = true;
+        for (Object* o = obj_find_first_at(obj_dude->elevation); o != NULL; o = obj_find_next_at()) {
+            if (o->pid == at_sethp[i].pid && !critter_is_dead(o)) {
+                int maxHp = stat_level(o, STAT_MAXIMUM_HIT_POINTS);
+                o->data.critter.hp = maxHp * at_sethp[i].pct / 100;
+                trace_event(TRACE_FLOW, "autotest", "sethp id=%d pid=%d hp=%d/%d", o->id, o->pid, o->data.critter.hp, maxHp);
+                break;
+            }
+        }
+    }
+
     // A screen test: the timeline owns the pad (and ends the run); the game loop only opens the screens
     // it asks for.
     if (at_step_count > 0) {
@@ -1487,20 +1503,6 @@ void autotest_tick(float dt)
     if (at_ipdump_at >= 0.0f && at_elapsed >= at_ipdump_at) {
         at_ipdump_at = -1.0f;
         interact_prompt_trace_candidates();
-    }
-    for (int i = 0; i < at_sethp_count; i++) {
-        if (at_sethp[i].done || at_elapsed < at_sethp[i].at) {
-            continue;
-        }
-        at_sethp[i].done = true;
-        for (Object* o = obj_find_first_at(obj_dude->elevation); o != NULL; o = obj_find_next_at()) {
-            if (o->pid == at_sethp[i].pid && !critter_is_dead(o)) {
-                int maxHp = stat_level(o, STAT_MAXIMUM_HIT_POINTS);
-                o->data.critter.hp = maxHp * at_sethp[i].pct / 100;
-                trace_event(TRACE_FLOW, "autotest", "sethp id=%d pid=%d hp=%d/%d", o->id, o->pid, o->data.critter.hp, maxHp);
-                break;
-            }
-        }
     }
     int policy = at_phase >= 0 ? at_phases[at_phase].policy : AT_IDLE;
     int phaseTile = at_phase >= 0 ? at_phases[at_phase].tile : -1;

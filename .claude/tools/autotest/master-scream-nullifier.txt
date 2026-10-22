@@ -21,3 +21,6 @@ at 0 idle
 expect-count 1 \[COMBAT/psy-scream\] warn
 expect \[COMBAT/psy-scream\] shielded id=18000
 expect-not \[COMBAT/psy-scream\] hit id=18000
+expect \[STATE/msg\] Your Psychic Nullifier absorbs the Master's scream\.
+expect \[COMBAT/psy-scream\] fx strength=0\.5
+expect \[COMBAT/psy-fx\] end after=0\.[6-9][0-9] restored=1

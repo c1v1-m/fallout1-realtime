@@ -32,4 +32,6 @@ expect \[STATE/msg\] Master: My servants will protect me!
 expect \[STATE/msg\] Master: Give me Unity, or give me Death! Death!
 expect-count 1 \[COMBAT/psy-scream\] warn
 expect \[COMBAT/psy-scream\] hit id=18000
+expect \[COMBAT/psy-scream\] fx strength=1\.0
+expect \[COMBAT/psy-fx\] end after=0\.[6-9][0-9] restored=1
 expect \[COMBAT/react\] pid=16777216 id=18000 [a-z]+->falling why=knockdown
