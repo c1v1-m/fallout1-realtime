@@ -17846,12 +17846,15 @@ static void rt_clear_lost_turn(Object* critter)
 // GROUPS: his signal is banked, not passed on, and every RT_HORDE_WAVE_MIN-MAX signals the bank goes
 // out together, so the rate over a minute is his own; the first group of a visit goes at once. Each
 // member is let out by raising the var again and waiting until one Hord.int has taken it.
-// PHASES: when his hit points first fall through 75, 50 and 25 %, he shouts his own "My servants will
-// protect me!" (combatai.msg 2704) and RT_HORDE_PHASE_MIN-MAX more come out at once, on top. Thresholds
-// he is already under when the map is entered (a save made mid-fight) count as done.
+// THE PHASE: when his hit points first fall through RT_HORDE_PHASE_PCT, he shouts his own "My servants
+// will protect me!" (combatai.msg 2704) and RT_HORDE_PHASE_MIN-MAX more come out at once, on top. ONCE:
+// it was 75/50/25 for an hour and he cut it to "stačí jednou, třeba když má 50%" (25 % is to be
+// something else, not decided yet). Already under it when the map is entered (a save made mid-fight):
+// it counts as done.
 #define RT_HORDE_MAP_VAR 4
 #define RT_HORDE_WAVE_MIN 2
 #define RT_HORDE_WAVE_MAX 3
+#define RT_HORDE_PHASE_PCT 50
 #define RT_HORDE_PHASE_MIN 3
 #define RT_HORDE_PHASE_MAX 4
 #define RT_MASTER_SERVANTS_MSG 2704
@@ -17865,8 +17868,8 @@ static int rt_horde_release = 0; // members still to let out
 static bool rt_horde_raised = false; // map var 4 is up because WE raised it
 static float rt_horde_raised_at = 0.0f;
 static bool rt_horde_first_done = false; // the first group of this visit is out
-static bool rt_horde_phase_init = false; // thresholds already crossed at entry were marked done
-static int rt_horde_phases_done = 0; // bit 0: 75 %, bit 1: 50 %, bit 2: 25 %
+static bool rt_horde_phase_init = false; // a threshold already crossed at entry was marked done
+static bool rt_horde_phase_done = false;
 
 static void rt_horde_reset()
 {
@@ -17876,7 +17879,7 @@ static void rt_horde_reset()
     rt_horde_raised = false;
     rt_horde_first_done = false;
     rt_horde_phase_init = false;
-    rt_horde_phases_done = 0;
+    rt_horde_phase_done = false;
 }
 
 static int rt_map_var_get(int var)
@@ -17899,32 +17902,20 @@ static void rt_map_var_set(int var, int v)
 // Once a frame while the Master lives: his phases, his banked signals, and letting the members out.
 static void rt_horde_tick(Object* master, bool masterHostile)
 {
-    // PHASES.
-    static const int pcts[3] = { 75, 50, 25 };
+    // THE PHASE.
     int maxHp = stat_level(master, STAT_MAXIMUM_HIT_POINTS);
     int hp = master->data.critter.hp;
+    bool under = maxHp > 0 && hp * 100 <= maxHp * RT_HORDE_PHASE_PCT;
     if (!rt_horde_phase_init) {
         rt_horde_phase_init = true;
-        for (int i = 0; i < 3; i++) {
-            if (maxHp > 0 && hp * 100 <= maxHp * pcts[i]) {
-                rt_horde_phases_done |= 1 << i;
-            }
-        }
+        rt_horde_phase_done = under;
     }
-    if (masterHostile && maxHp > 0) {
-        int extra = 0;
-        for (int i = 0; i < 3; i++) {
-            if ((rt_horde_phases_done & (1 << i)) == 0 && hp * 100 <= maxHp * pcts[i]) {
-                rt_horde_phases_done |= 1 << i;
-                int n = roll_random(RT_HORDE_PHASE_MIN, RT_HORDE_PHASE_MAX);
-                extra += n;
-                trace_event(TRACE_FLOW, "horde", "phase pct=%d hp=%d/%d size=%d t=%.2f", pcts[i], hp, maxHp, n, rt_clock);
-            }
-        }
-        if (extra > 0) {
-            rt_horde_release += extra;
-            combatai_float_msg(master, RT_MASTER_SERVANTS_MSG);
-        }
+    if (masterHostile && under && !rt_horde_phase_done) {
+        rt_horde_phase_done = true;
+        int n = roll_random(RT_HORDE_PHASE_MIN, RT_HORDE_PHASE_MAX);
+        rt_horde_release += n;
+        combatai_float_msg(master, RT_MASTER_SERVANTS_MSG);
+        trace_event(TRACE_FLOW, "horde", "phase pct=%d hp=%d/%d size=%d t=%.2f", RT_HORDE_PHASE_PCT, hp, maxHp, n, rt_clock);
     }
 
     // His own signal and the members on their way out.
