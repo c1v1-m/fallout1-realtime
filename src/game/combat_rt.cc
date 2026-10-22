@@ -17976,14 +17976,23 @@ static bool rt_horde_phase_done = false;
 // maximum hit points, armour bypassed, and knocked down. The Psychic Nullifier (item 123) carried shields
 // its bearer, with a line in the message window. Under it at map entry: counts as done, as the 50 %
 // phase does. The screen pulse and the shake that go with it: rt_psy_fx_tick.
+// ⚠️ HE SAYS IT ALOUD (2026-10-22, "nemá master křik nějaký?" -> his pick "Destroy me!"): the game has no
+// psychic sound, but his dialogue is voiced, and line 215 of his own dialogue file -- "You think you can
+// destroy me!? Destroy! Me?", speech MAST203, in his many-voiced echo -- is spoken instead of the silent
+// combatai line, its text shown the same way, and the wave lands as the voice ends (at most
+// RT_MASTER_SCREAM_SPEECH_MAX later). Speech off or the file missing: the old line and delay.
 #define RT_MASTER_SCREAM_PCT 25
 #define RT_MASTER_SCREAM_MSG 2711
 #define RT_MASTER_SCREAM_DELAY 1.2f
+#define RT_MASTER_SCREAM_LINE 215
+#define RT_MASTER_SCREAM_SPEECH "mastr\\mast203"
+#define RT_MASTER_SCREAM_SPEECH_MAX 10.0f
 #define RT_MASTER_SCREAM_DMG_PCT 25
 #define RT_PID_PSYCHIC_NULLIFIER 123
 static bool rt_scream_init = false;
 static bool rt_scream_done = false;
 static float rt_scream_at = -1.0f; // when the wave lands, -1 = none on its way
+static bool rt_scream_speaking = false; // his line is being spoken (RT_MASTER_SCREAM_SPEECH)
 
 static void rt_horde_reset()
 {
@@ -17997,6 +18006,7 @@ static void rt_horde_reset()
     rt_scream_init = false;
     rt_scream_done = false;
     rt_scream_at = -1.0f;
+    rt_scream_speaking = false;
     rt_psy_fx_stop();
 }
 
@@ -18009,18 +18019,37 @@ static int rt_map_var_get(int var)
     return value.integerValue;
 }
 
-// A line of the Master's (combatai.msg), floated over him AND printed in the message window: he is
-// often off the screen when he says it, and "ať je vidět i text" (2026-10-22).
-static void rt_master_say(Object* master, int num)
+// A line of the Master's, floated over him AND printed in the message window: he is often off the
+// screen when he says it, and "ať je vidět i text" (2026-10-22).
+static void rt_master_say_text(Object* master, const char* text)
 {
-    char text[200];
-    if (!combatai_msg_text(num, text, sizeof(text))) {
-        return;
-    }
     combatai_float_line(master, text);
     char line[260];
     snprintf(line, sizeof(line), "%s: %s", object_name(master), text);
     display_print(line);
+}
+
+// ...one of combatai.msg.
+static void rt_master_say(Object* master, int num)
+{
+    char text[200];
+    if (combatai_msg_text(num, text, sizeof(text))) {
+        rt_master_say_text(master, text);
+    }
+}
+
+// ...one of his own dialogue file (dialog\master.msg, his script's message list), or NULL.
+static const char* rt_master_dialog_line(Object* master, int num)
+{
+    Script* script;
+    if (master->sid == -1 || scr_ptr(master->sid, &script) == -1) {
+        return NULL;
+    }
+    const char* text = scr_get_msg_str(script->scr_script_idx + 1, num);
+    if (text == NULL || text[0] == '\0' || strcmp(text, "Error") == 0) {
+        return NULL;
+    }
+    return text;
 }
 
 static void rt_map_var_set(int var, int v)
@@ -18192,14 +18221,31 @@ static void rt_master_scream_tick(Object* master, bool masterHostile)
     }
     if (masterHostile && under && !rt_scream_done) {
         rt_scream_done = true;
-        rt_scream_at = rt_clock + RT_MASTER_SCREAM_DELAY;
-        rt_master_say(master, RT_MASTER_SCREAM_MSG);
-        trace_event(TRACE_COMBAT, "psy-scream", "warn hp=%d/%d lands=%.2f t=%.2f", hp, maxHp, rt_scream_at, rt_clock);
+        const char* spoken = rt_master_dialog_line(master, RT_MASTER_SCREAM_LINE);
+        rt_scream_speaking = spoken != NULL && gsound_speech_play(RT_MASTER_SCREAM_SPEECH, 12, 13, 15) == 0;
+        if (rt_scream_speaking) {
+            rt_master_say_text(master, spoken);
+            rt_scream_at = rt_clock + RT_MASTER_SCREAM_SPEECH_MAX;
+        } else {
+            rt_master_say(master, RT_MASTER_SCREAM_MSG);
+            rt_scream_at = rt_clock + RT_MASTER_SCREAM_DELAY;
+        }
+        trace_event(TRACE_COMBAT, "psy-scream", "warn hp=%d/%d spoken=%d lands=%.2f t=%.2f",
+            hp, maxHp, rt_scream_speaking ? 1 : 0, rt_scream_at, rt_clock);
     }
-    if (rt_scream_at < 0.0f || rt_clock < rt_scream_at) {
+    if (rt_scream_at < 0.0f) {
+        return;
+    }
+    if (rt_scream_speaking) {
+        // As his line ends, but never later than rt_scream_at, and not while a wheel holds the world.
+        if ((gsound_speech_playing() && rt_clock < rt_scream_at) || radial_wheel_is_open()) {
+            return;
+        }
+    } else if (rt_clock < rt_scream_at) {
         return;
     }
     rt_scream_at = -1.0f;
+    rt_scream_speaking = false;
 
     // The dude and his party, within reach of him, cover or not.
     Object* victims[1 + RT_MAX_ACTORS];

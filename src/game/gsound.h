@@ -79,6 +79,7 @@ void gsound_speech_callback_set(SoundEndCallback* callback);
 SoundEndCallback* gsound_speech_callback_get();
 SoundEndCallback* gsound_speech_callback_get_set(SoundEndCallback* callback);
 int gsound_speech_length_get();
+bool gsound_speech_playing();
 int gsound_speech_play(const char* fname, int a2, int a3, int a4);
 int gsound_speech_play_preloaded();
 void gsound_speech_stop();

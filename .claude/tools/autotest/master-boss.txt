@@ -29,8 +29,9 @@ expect-count 1 \[FLOW/horde\] phase pct=
 expect \[FLOW/horde\] phase pct=50 hp=225/500
 expect-count >=7 \[FLOW/script-attack\] prog=scripts.Hord\.int
 expect \[STATE/msg\] Master: My servants will protect me!
-expect \[STATE/msg\] Master: Give me Unity, or give me Death! Death!
+expect \[STATE/msg\] Master: You think you can destroy me!\? Destroy! Me\?
 expect-count 1 \[COMBAT/psy-scream\] warn
+expect \[COMBAT/psy-scream\] warn hp=[0-9]+/500 spoken=1
 expect \[COMBAT/psy-scream\] hit id=18000
 expect \[COMBAT/psy-scream\] fx strength=1\.0
 expect \[COMBAT/psy-fx\] end after=0\.[6-9][0-9] restored=1

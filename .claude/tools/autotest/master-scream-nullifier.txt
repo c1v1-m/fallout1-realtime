@@ -4,7 +4,7 @@ name master-scream-nullifier
 map MSTRLR34.MAP
 mapscript on
 seed 1
-duration 30
+duration 36
 dude tile 14455 rot 2
 dude hp 30000
 dude item 123

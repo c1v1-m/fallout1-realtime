@@ -1333,6 +1333,13 @@ int gsound_speech_length_get()
     return soundLength(gsound_speech_tag);
 }
 
+// The speech callback clears the tag when the file ends, so this is "still talking" -- for a line
+// spoken outside a dialogue (combat_rt's Master scream waits for it).
+bool gsound_speech_playing()
+{
+    return gsound_speech_tag != NULL;
+}
+
 // 0x4485D0
 int gsound_speech_play(const char* fname, int a2, int a3, int a4)
 {
