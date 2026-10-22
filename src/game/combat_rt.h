@@ -233,10 +233,6 @@ bool combat_rt_try_world_loot();
 // player" signal (genuine hostiles request combat; peaceful NPCs never do).
 void combat_rt_notify_attack(Object* attacker, Object* defender);
 
-// Hook from op_attack: the Master's Hord.int has just placed its Nightkin in the alley (tile 18859) and
-// ordered it at the dude. combat_rt moves it to a hidden entry of its own (rt_horde_place_arrivals).
-void combat_rt_horde_arrived(Object* critter);
-
 // Hook from the realtime damage committer (combat_commit_pending_attack) for a critter that the
 // hit KILLED or knocked out. Vanilla's combatai_notify_onlookers ran on dying defenders too;
 // combat_rt's aggro spread cannot, because it needs a live seed hostile -- so without this a

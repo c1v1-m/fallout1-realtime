@@ -1,6 +1,5 @@
 #include "int/support/intextra.h"
 
-#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -1597,25 +1596,6 @@ static void op_attack(Program* program)
         critter_is_active(self) ? 1 : 0, critter_is_active(target) ? 1 : 0,
         (target->data.critter.combat.maneuver & CRITTER_MANUEVER_FLEEING) != 0 ? 1 : 0,
         dialog_active() ? 1 : 0, isInCombat() ? 1 : 0);
-
-    // The Master's Horde (Hord.int) placing a Nightkin in its alley: combat_rt gives it an entry of its
-    // own, out of the dude's sight (2026-10-22, his "víc vchodů mimo výhled").
-    if (program->name != NULL) {
-        const char* base = program->name;
-        for (const char* p = program->name; *p != '\0'; p++) {
-            if (*p == '\\' || *p == '/') {
-                base = p + 1;
-            }
-        }
-        const char* want = "hord.int";
-        bool hord = true;
-        for (int i = 0; hord && (want[i] != '\0' || base[i] != '\0'); i++) {
-            hord = tolower((unsigned char)base[i]) == want[i];
-        }
-        if (hord) {
-            combat_rt_horde_arrived(self);
-        }
-    }
 
     if (!critter_is_active(self)) {
         dbg_print_com_data(self, target);
