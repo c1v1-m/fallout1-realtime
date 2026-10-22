@@ -425,7 +425,9 @@ static float anim_projectile_speedup = -1.0f; // > 0: anim_set_projectile_speedu
 #define RT_ROCKET_SPEEDUP 1.0f
 // ⚠️ PLASMA 10 % FASTER (2026-10-19, his "Nedáme plasmu trochu rychlejší, když se teď dá uhýbat střelám a
 // raketám? Já bych dal tak 10% rychlejší"): ~11 tiles a second. Rockets stay at the art's pace.
-#define RT_PLASMA_SPEEDUP 1.1f
+// ...then 5 % SLOWER than that (2026-10-22, his "zpomal plazmové shoty o 5%"): 1.1 x 0.95 = 1.045,
+// ~10.5 tiles a second.
+#define RT_PLASMA_SPEEDUP 1.045f
 #define RT_LASER_SPEEDUP 100.0f // light: as fast as the frame allows (2026-10-18, "jako v realu")
 
 // The projectile art of the rocket (misc proto 1), the plasma ball (2) and the laser bolt (9), looked

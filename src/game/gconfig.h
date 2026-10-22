@@ -97,6 +97,10 @@ namespace fallout {
 // The body part the weapon slot's AIMED mode fires at (gamepad_ui, gpui_aim_last_part): written
 // whenever a part is bound in the called-shot window, read back at start. HIT_LOCATION_* (0-7).
 #define GAME_CONFIG_AIM_PART_KEY "aim_part"
+// The weapon slot's firing mode the player last picked (intface, intface_fire_mode_store): an
+// INTERFACE_ITEM_ACTION_* value, 1 plain .. 4 aimed secondary. Every weapon that lands in a hand starts
+// on it when it has it. Absent = vanilla's plain primary.
+#define GAME_CONFIG_FIRE_MODE_KEY "fire_mode"
 // FREE MOVEMENT: the body is integrated from a velocity and obj->tile is re-anchored to whichever
 // cell it has moved into, instead of the body following a chain of whole tile steps. The engine
 // goes on reading obj->tile, which never stops being a real walkable tile, so nothing else in the

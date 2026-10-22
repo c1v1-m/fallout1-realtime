@@ -2667,6 +2667,8 @@ int intface_get_attack(int* hitMode, bool* aiming)
     return -1;
 }
 
+static int intface_fire_mode_for(InterfaceItemState* itemState, int hand);
+
 // 0x454918
 int intface_update_items(bool animated)
 {
@@ -2691,7 +2693,7 @@ int intface_update_items(bool animated)
             leftItemState->secondaryHitMode = HIT_MODE_LEFT_WEAPON_SECONDARY;
             leftItemState->isWeapon = item_get_type(item1) == ITEM_TYPE_WEAPON;
             leftItemState->action = leftItemState->isWeapon != 0
-                ? INTERFACE_ITEM_ACTION_PRIMARY
+                ? intface_fire_mode_for(leftItemState, HAND_LEFT)
                 : INTERFACE_ITEM_ACTION_USE;
             leftItemState->itemFid = item_inv_fid(item1);
         } else {
@@ -2699,7 +2701,7 @@ int intface_update_items(bool animated)
             leftItemState->isWeapon = 1;
             leftItemState->primaryHitMode = HIT_MODE_PUNCH;
             leftItemState->secondaryHitMode = HIT_MODE_PUNCH;
-            leftItemState->action = INTERFACE_ITEM_ACTION_PRIMARY;
+            leftItemState->action = intface_fire_mode_for(leftItemState, HAND_LEFT);
             leftItemState->itemFid = -1;
         }
     }
@@ -2721,7 +2723,7 @@ int intface_update_items(bool animated)
             rightItemState->secondaryHitMode = HIT_MODE_RIGHT_WEAPON_SECONDARY;
             rightItemState->isWeapon = item_get_type(item2) == ITEM_TYPE_WEAPON;
             rightItemState->action = rightItemState->isWeapon != 0
-                ? INTERFACE_ITEM_ACTION_PRIMARY
+                ? intface_fire_mode_for(rightItemState, HAND_RIGHT)
                 : INTERFACE_ITEM_ACTION_USE;
             rightItemState->itemFid = item_inv_fid(item2);
         } else {
@@ -2729,7 +2731,7 @@ int intface_update_items(bool animated)
             rightItemState->isWeapon = 1;
             rightItemState->primaryHitMode = HIT_MODE_PUNCH;
             rightItemState->secondaryHitMode = HIT_MODE_PUNCH;
-            rightItemState->action = INTERFACE_ITEM_ACTION_PRIMARY;
+            rightItemState->action = intface_fire_mode_for(rightItemState, HAND_RIGHT);
             rightItemState->itemFid = -1;
         }
     }
@@ -2823,6 +2825,59 @@ static bool intface_item_action_available(InterfaceItemState* itemState, int act
     }
 }
 
+// ⚠️ THE FIRING MODE IS REMEMBERED (2026-10-22, "když spawnu nebo loadnu save tak míření je vždycky
+// defaultně na normal hit, ale já jsem tam měl posledně míření do očí ... ať si to pamatuje to
+// míření"). Vanilla puts a weapon slot back on its plain primary mode whenever a different item lands
+// in it -- and after a load or a new game every item is a different object, so the aimed mode (or a
+// burst) was gone every time. The bound PART was already remembered (aim_part, gamepad_ui); the MODE
+// now is too: the one the player last picked is written to fallout.cfg (fire_mode) on the spot, and
+// every weapon that lands in a hand -- a load, a new game, a swap -- starts on it when it has it.
+// Aimed falls back to plain for a weapon that cannot aim, a burst to plain for one with no burst.
+static int intface_fire_mode_pref = -2; // -2: not read from the cfg yet
+
+static int intface_fire_mode_get()
+{
+    if (intface_fire_mode_pref == -2) {
+        int value = INTERFACE_ITEM_ACTION_PRIMARY;
+        config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FIRE_MODE_KEY, &value);
+        intface_fire_mode_pref = value >= INTERFACE_ITEM_ACTION_PRIMARY && value <= INTERFACE_ITEM_ACTION_SECONDARY_AIMING
+            ? value
+            : INTERFACE_ITEM_ACTION_PRIMARY;
+    }
+    return intface_fire_mode_pref;
+}
+
+// Only the player's own choices come here: a cycle (LT+Y, N, a right-click) and binding a part.
+static void intface_fire_mode_store(int action)
+{
+    if (action < INTERFACE_ITEM_ACTION_PRIMARY || action > INTERFACE_ITEM_ACTION_SECONDARY_AIMING
+        || action == intface_fire_mode_get()) {
+        return;
+    }
+    intface_fire_mode_pref = action;
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_FIRE_MODE_KEY, action);
+    gconfig_save(); // at once: a crash must not lose it
+    trace_event(TRACE_INPUT, "fire-mode-pref", "action=%d", action);
+}
+
+// The mode a weapon (or the bare fist) that has just landed in `hand` starts on.
+static int intface_fire_mode_for(InterfaceItemState* itemState, int hand)
+{
+    int want = intface_fire_mode_get();
+    int got = INTERFACE_ITEM_ACTION_PRIMARY;
+    if (intface_item_action_available(itemState, want)) {
+        got = want;
+    } else if (want == INTERFACE_ITEM_ACTION_SECONDARY_AIMING
+        && intface_item_action_available(itemState, INTERFACE_ITEM_ACTION_PRIMARY_AIMING)) {
+        got = INTERFACE_ITEM_ACTION_PRIMARY_AIMING;
+    }
+    if (got != INTERFACE_ITEM_ACTION_PRIMARY) {
+        trace_event(TRACE_INPUT, "fire-mode-apply", "hand=%d pid=%d want=%d got=%d",
+            hand, itemState->item != NULL ? itemState->item->pid : -1, want, got);
+    }
+    return got;
+}
+
 // Would a toggle actually land on a DIFFERENT mode? Realtime drops the reload entry, so a weapon with
 // one mode and no called shot (a flamer, Fast Shot) has nothing to switch to -- the caller can refuse audibly instead of
 // playing a confirmation for a cycle that changes nothing.
@@ -2871,6 +2926,11 @@ int intface_toggle_item_state()
 
     if (oldAction != itemState->action) {
         intface_redraw_items();
+        // Remembered (intface_fire_mode_store) -- except the step OFF reload that the turn-based
+        // reload path (intface_item_reload) takes, which is not a choice.
+        if (itemState->isWeapon != 0 && oldAction != INTERFACE_ITEM_ACTION_RELOAD) {
+            intface_fire_mode_store(itemState->action);
+        }
     }
 
     return 0;
@@ -2894,6 +2954,7 @@ bool intface_item_set_aiming()
     switch (itemState->action) {
     case INTERFACE_ITEM_ACTION_PRIMARY_AIMING:
     case INTERFACE_ITEM_ACTION_SECONDARY_AIMING:
+        intface_fire_mode_store(itemState->action); // binding a part is choosing to aim
         return true;
     case INTERFACE_ITEM_ACTION_PRIMARY:
         want = INTERFACE_ITEM_ACTION_PRIMARY_AIMING;
@@ -2911,6 +2972,7 @@ bool intface_item_set_aiming()
 
     itemState->action = want;
     intface_redraw_items();
+    intface_fire_mode_store(want);
     return true;
 }
 
