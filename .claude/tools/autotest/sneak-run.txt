@@ -1,0 +1,22 @@
+# A run ends Sneak under free movement too (2026-10-22, "jo oprav to"): rt_fm_drive used to play the
+# run at full speed with Sneak still on. The dude starts sneaking, WALKS for 3 s (Sneak must stay on),
+# then runs on X (strafe) -- Sneak must drop the moment he runs, once.
+# Good: [FLOW/autotest] sneak on, then ONE [ACTION/sneak-off] why=run mover=free with s= after the
+# strafe phase starts, none while walking.
+name sneak-run
+map DESERT1.MAP
+seed 1
+duration 7
+
+dude tile 20100 rot 2
+dude skill sneak 100
+dude sneak
+dude hp 400
+
+spawn 16777291 13100 rot 2 hostile
+
+at 0 goto 20106
+at 3 strafe
+
+expect \[FLOW/autotest\] sneak on
+expect-count 1 \[ACTION/sneak-off\] why=run mover=free

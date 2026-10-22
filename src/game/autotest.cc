@@ -74,6 +74,7 @@ namespace fallout {
 //   dude armor <pid>
 //   dude quickslot <lb|rb> <pid>       bind that item to the quick slot (a tool, a drug, a grenade)
 //   dude curhp <n>                     start with n hit points (after the maximum is set)
+//   dude sneak                         start sneaking (the Sneak toggle; the skill roll is the game's)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
 //   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>] [empty]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
@@ -250,6 +251,7 @@ static int at_dude_wield = -1;
 static int at_dude_quickslot[2] = { -1, -1 }; // LB, RB: a bound pid
 static int at_dude_hp = -1;
 static int at_dude_curhp = -1; // "dude curhp": start wounded
+static bool at_dude_sneak = false; // "dude sneak": start sneaking
 static int at_dude_armor = -1;
 static AtSpawn at_spawns[AT_MAX_SPAWNS];
 static int at_spawn_count = 0;
@@ -680,6 +682,8 @@ static bool at_parse(const char* path)
             at_seed = atoi(tok[1]);
         } else if (strcmp(tok[0], "duration") == 0 && n >= 2) {
             at_duration = (float)atof(tok[1]);
+        } else if (strcmp(tok[0], "dude") == 0 && n == 2 && strcmp(tok[1], "sneak") == 0) {
+            at_dude_sneak = true; // the one dude command with no value
         } else if (strcmp(tok[0], "dude") == 0 && n >= 3) {
             if (strcmp(tok[1], "elevation") == 0) {
                 at_dude_elevation = atoi(tok[2]);
@@ -965,6 +969,10 @@ void autotest_setup_world()
     }
     if (at_dude_curhp > 0 && at_dude_curhp < obj_dude->data.critter.hp) {
         obj_dude->data.critter.hp = at_dude_curhp;
+    }
+    if (at_dude_sneak) {
+        pc_flag_on(PC_FLAG_SNEAKING); // rolls the skill at once, as the Skilldex toggle does
+        trace_event(TRACE_FLOW, "autotest", "sneak on working=%d", is_pc_sneak_working() ? 1 : 0);
     }
     if (at_dude_tile >= 0) {
         obj_move_to_tile(obj_dude, at_dude_tile, elevation, NULL);

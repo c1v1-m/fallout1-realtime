@@ -7727,6 +7727,19 @@ static void rt_player_move(int rotation)
     register_end();
 }
 
+// A run ends Sneak, as vanilla's dude_run does -- unless he has Silent Running. Both movers call it.
+// ⚠️ FREE MOVEMENT NEVER DID (found 2026-10-22, his "jak funguje sneak v real time?"): rt_fm_drive plays
+// the run itself and never went through dude_run or the step mover below, so with free_move on he could
+// sprint on X at full speed with Sneak still quartering every perception check. Another engine side
+// effect free movement bypassed, like the spatial scripts. `mover` names which one dropped it.
+static void rt_run_drops_sneak(const char* mover)
+{
+    if (is_pc_flag(PC_FLAG_SNEAKING) && !perk_level(PERK_SILENT_RUNNING)) {
+        pc_flag_off(PC_FLAG_SNEAKING);
+        trace_event(TRACE_ACTION, "sneak-off", "why=run mover=%s t=%.2f", mover, rt_clock);
+    }
+}
+
 // Registers a fresh stick-move segment of up to RT_STICK_SEGMENT_TILES tiles
 // toward `rotation`, running if `run` else walking. make_path runs when the
 // sequence STARTS (register_end -> anim_set_continue, same frame), so a blocked
@@ -7742,8 +7755,8 @@ static bool rt_stick_segment_start(int rotation, bool run)
     // Running while sneaking would silently fall back to walk (see
     // register_object_run_to_tile); drop sneak first so LT actually runs, same
     // as the engine's dude_run.
-    if (run && !perk_level(PERK_SILENT_RUNNING)) {
-        pc_flag_off(PC_FLAG_SNEAKING);
+    if (run) {
+        rt_run_drops_sneak("step");
     }
 
     // Straight directional walk: step along `rotation` only as far as the tiles are actually
@@ -8258,6 +8271,9 @@ static void rt_fm_drive(float angle, bool run, float dt)
     rt_move_input_age = 0.0f;
 
     int anim = run ? ANIM_RUNNING : ANIM_WALK;
+    if (run) {
+        rt_run_drops_sneak("free"); // vanilla: a run ends Sneak (Silent Running excepted)
+    }
 
     float tps = 0.0f;
     float fps = 0.0f;
