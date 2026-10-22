@@ -1648,6 +1648,19 @@ static int ai_print_msg(Object* critter, int type)
     return 0;
 }
 
+// CE: one line of combatai.msg, by number, floated over the critter as combatai_float_line does --
+// for a line the realtime layer wants said for sure (the Master's "My servants will protect me!" when
+// he calls a phase of his Horde), where combatai_msg_at would roll the packet's taunt chance.
+int combatai_float_msg(Object* critter, int num)
+{
+    MessageListItem messageListItem;
+    messageListItem.num = num;
+    if (critter == NULL || !message_search(&ai_message_file, &messageListItem)) {
+        return -1;
+    }
+    return combatai_float_line(critter, messageListItem.text);
+}
+
 // CE: a script's line floated over the speaker in the same font and colours as that critter's combat
 // taunts (its AI packet), for gDialogSayMessage's "message with no conversation open" case.
 //

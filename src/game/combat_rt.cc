@@ -1406,6 +1406,7 @@ static void rt_tracers_render(Rect* rect, int elevation);
 static void rt_tracers_reset();
 static void rt_offscreen_shooters_reset();
 static void rt_offscreen_shooters_tick();
+static void rt_horde_reset();
 static bool rt_offscreen_crosshair_at(Object* obj, int* x, int* y);
 
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
@@ -14504,6 +14505,7 @@ static void rt_abandon_encounter()
     rt_injecting = NULL;
     rt_shooter_count = 0; // who shot at him on the map being left (rt_note_shot_at_dude)
     rt_offscreen_shooters_reset();
+    rt_horde_reset(); // the Master's banked signals and phases (rt_horde_tick)
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
@@ -17828,6 +17830,146 @@ static void rt_clear_lost_turn(Object* critter)
     }
 }
 
+// ⚠️ THE MASTER'S BOSS FIGHT: HIS HORDE IN GROUPS, AND PHASES BY HIS HEALTH (2026-10-22, "no jak to
+// uděláme ten boss fight?", his picks "horda ve skupinách z uličky" + "fáze podle zdraví").
+//
+// Vanilla: every other turn of his (every fourth on Easy) Master.int raises map var 4, and the first of
+// the 24 Nightkin parked in the sealed pen (tile 0) whose Hord.int sees it clears it and is placed on
+// tile 18859, in the alley, with attack(dude). Realtime gives him a turn about every 5 s, so one Nightkin
+// walked out of the alley every ~10 s and was shot before the next came (trace_2026-10-22_213815).
+//
+// ⛔ THEY STILL COME OUT OF THE ALLEY. An earlier take moved each one to a tile "behind a wall" near the
+// dude (f32a207) and he threw it out the same evening: "oni se prostě objevují" -- Fallout draws every
+// sprite on the screen whatever the walls, so they popped up in front of him. The alley is off his
+// screen; nothing here moves anybody.
+//
+// GROUPS: his signal is banked, not passed on, and every RT_HORDE_WAVE_MIN-MAX signals the bank goes
+// out together, so the rate over a minute is his own; the first group of a visit goes at once. Each
+// member is let out by raising the var again and waiting until one Hord.int has taken it.
+// PHASES: when his hit points first fall through 75, 50 and 25 %, he shouts his own "My servants will
+// protect me!" (combatai.msg 2704) and RT_HORDE_PHASE_MIN-MAX more come out at once, on top. Thresholds
+// he is already under when the map is entered (a save made mid-fight) count as done.
+#define RT_HORDE_MAP_VAR 4
+#define RT_HORDE_WAVE_MIN 2
+#define RT_HORDE_WAVE_MAX 3
+#define RT_HORDE_PHASE_MIN 3
+#define RT_HORDE_PHASE_MAX 4
+#define RT_MASTER_SERVANTS_MSG 2704
+// How long a raised signal may wait for a Hord.int to take it before the pen counts as empty. The pen's
+// scripts run on the critter heartbeat, not every frame: master-boss saw answers up to ~2.8 s after the
+// raise, and a 3 s wait called the pen empty with a Nightkin still in it. There are 12 in all.
+#define RT_HORDE_PEN_WAIT 10.0f
+static int rt_horde_bank = 0; // the Master's signals saved toward the next group
+static int rt_horde_wave_size = 0; // the size the next group was rolled at (0 = not rolled yet)
+static int rt_horde_release = 0; // members still to let out
+static bool rt_horde_raised = false; // map var 4 is up because WE raised it
+static float rt_horde_raised_at = 0.0f;
+static bool rt_horde_first_done = false; // the first group of this visit is out
+static bool rt_horde_phase_init = false; // thresholds already crossed at entry were marked done
+static int rt_horde_phases_done = 0; // bit 0: 75 %, bit 1: 50 %, bit 2: 25 %
+
+static void rt_horde_reset()
+{
+    rt_horde_bank = 0;
+    rt_horde_wave_size = 0;
+    rt_horde_release = 0;
+    rt_horde_raised = false;
+    rt_horde_first_done = false;
+    rt_horde_phase_init = false;
+    rt_horde_phases_done = 0;
+}
+
+static int rt_map_var_get(int var)
+{
+    ProgramValue value;
+    if (map_get_global_var(var, value) == -1 || value.opcode == VALUE_TYPE_PTR) {
+        return 0;
+    }
+    return value.integerValue;
+}
+
+static void rt_map_var_set(int var, int v)
+{
+    ProgramValue value;
+    value.opcode = VALUE_TYPE_INT;
+    value.integerValue = v;
+    map_set_global_var(var, value);
+}
+
+// Once a frame while the Master lives: his phases, his banked signals, and letting the members out.
+static void rt_horde_tick(Object* master, bool masterHostile)
+{
+    // PHASES.
+    static const int pcts[3] = { 75, 50, 25 };
+    int maxHp = stat_level(master, STAT_MAXIMUM_HIT_POINTS);
+    int hp = master->data.critter.hp;
+    if (!rt_horde_phase_init) {
+        rt_horde_phase_init = true;
+        for (int i = 0; i < 3; i++) {
+            if (maxHp > 0 && hp * 100 <= maxHp * pcts[i]) {
+                rt_horde_phases_done |= 1 << i;
+            }
+        }
+    }
+    if (masterHostile && maxHp > 0) {
+        int extra = 0;
+        for (int i = 0; i < 3; i++) {
+            if ((rt_horde_phases_done & (1 << i)) == 0 && hp * 100 <= maxHp * pcts[i]) {
+                rt_horde_phases_done |= 1 << i;
+                int n = roll_random(RT_HORDE_PHASE_MIN, RT_HORDE_PHASE_MAX);
+                extra += n;
+                trace_event(TRACE_FLOW, "horde", "phase pct=%d hp=%d/%d size=%d t=%.2f", pcts[i], hp, maxHp, n, rt_clock);
+            }
+        }
+        if (extra > 0) {
+            rt_horde_release += extra;
+            combatai_float_msg(master, RT_MASTER_SERVANTS_MSG);
+        }
+    }
+
+    // His own signal and the members on their way out.
+    int signal = rt_map_var_get(RT_HORDE_MAP_VAR);
+    if (rt_horde_raised) {
+        if (signal == 0) {
+            rt_horde_raised = false; // one Hord.int took it
+        } else if (rt_clock - rt_horde_raised_at > RT_HORDE_PEN_WAIT) {
+            // Nobody answers: the pen is empty. Take it back so his own next signal is seen as his.
+            rt_map_var_set(RT_HORDE_MAP_VAR, 0);
+            rt_horde_raised = false;
+            rt_horde_release = 0;
+            trace_event(TRACE_FLOW, "horde", "pen-empty t=%.2f", rt_clock);
+        }
+        return; // one member per raise
+    }
+
+    if (signal != 0) {
+        // His own signal (every other turn of his): banked, not passed on.
+        rt_map_var_set(RT_HORDE_MAP_VAR, 0);
+        rt_horde_bank++;
+        if (rt_horde_wave_size == 0) {
+            rt_horde_wave_size = roll_random(RT_HORDE_WAVE_MIN, RT_HORDE_WAVE_MAX);
+        }
+        bool first = !rt_horde_first_done;
+        if (first || rt_horde_bank >= rt_horde_wave_size) {
+            rt_horde_release += rt_horde_wave_size;
+            trace_event(TRACE_FLOW, "horde", "group size=%d bank=%d first=%d t=%.2f",
+                rt_horde_wave_size, rt_horde_bank, first ? 1 : 0, rt_clock);
+            rt_horde_bank = 0;
+            rt_horde_wave_size = 0;
+            rt_horde_first_done = true;
+        } else {
+            trace_event(TRACE_FLOW, "horde", "bank %d/%d t=%.2f", rt_horde_bank, rt_horde_wave_size, rt_clock);
+        }
+    }
+
+    if (rt_horde_release > 0) {
+        rt_map_var_set(RT_HORDE_MAP_VAR, 1);
+        rt_horde_raised = true;
+        rt_horde_raised_at = rt_clock;
+        rt_horde_release--;
+    }
+}
+
 // ⚠️ THE EYEBOTS DO NOT WAIT FOR HIM (2026-10-22, "ať útočí rovnou, je to final boss konec konců", then
 // his pick "k jakémukoli boji v sále"). An eyebot of the Master's (within RT_MASTER_GUARD_REACH of him,
 // living) joins ANY fight within this many tiles of itself -- the dude fighting there, or something
@@ -17909,6 +18051,8 @@ static void rt_master_guards_tick()
             obj_dist(guard, obj_dude), rt_clock);
         combat_rt_notify_attack(guard, obj_dude);
     }
+
+    rt_horde_tick(master, masterHostile);
 }
 
 void combat_rt_update(float dt)

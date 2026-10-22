@@ -61,6 +61,8 @@ namespace fallout {
 //                                      master_patches folder: copy the player's save there), map scripts on; `map` still names
 //                                      a map to boot into first. The dude is the save's: no HP reset
 //   cleararea <tiles>                  every other critter within that many tiles of the dude is removed
+//   sethp <pid> <percent> <seconds>    at that time the first living critter of that pid on the dude's floor
+//                                      drops to that percent of its maximum HP (a boss's phases)
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
 //   dude elevation <0-2>               the floor of the map (default: the map's entrance floor); the
@@ -243,6 +245,18 @@ static int at_mvar_count = 0;
 // (a quest step tested on its own: the guards at a door are a fight, not the door).
 static int at_clear_radius = -1;
 static bool at_provoke = false;
+
+// "sethp <pid> <percent> <seconds>": at that time, the first living critter of that pid on the dude's
+// floor drops to that percent of its maximum (a boss's health phases without fighting it down).
+#define AT_MAX_SETHP 8
+typedef struct AtSetHp {
+    int pid;
+    int pct;
+    float at;
+    bool done;
+} AtSetHp;
+static AtSetHp at_sethp[AT_MAX_SETHP];
+static int at_sethp_count = 0;
 static int at_dude_stats[7] = { -1, -1, -1, -1, -1, -1, -1 };
 static int at_dude_skills[SKILL_COUNT];
 static AtItem at_dude_items[AT_MAX_ITEMS];
@@ -670,6 +684,12 @@ static bool at_parse(const char* path)
             at_map_script = true;
         } else if (strcmp(tok[0], "cleararea") == 0 && n >= 2) {
             at_clear_radius = atoi(tok[1]);
+        } else if (strcmp(tok[0], "sethp") == 0 && n >= 4 && at_sethp_count < AT_MAX_SETHP) {
+            at_sethp[at_sethp_count].pid = atoi(tok[1]);
+            at_sethp[at_sethp_count].pct = atoi(tok[2]);
+            at_sethp[at_sethp_count].at = (float)atof(tok[3]);
+            at_sethp[at_sethp_count].done = false;
+            at_sethp_count++;
         } else if (strcmp(tok[0], "mapvar") == 0 && n >= 3 && at_mvar_count < AT_MAX_GVARS) {
             at_mvar_index[at_mvar_count] = atoi(tok[1]);
             at_mvar_value[at_mvar_count] = atoi(tok[2]);
@@ -1467,6 +1487,20 @@ void autotest_tick(float dt)
     if (at_ipdump_at >= 0.0f && at_elapsed >= at_ipdump_at) {
         at_ipdump_at = -1.0f;
         interact_prompt_trace_candidates();
+    }
+    for (int i = 0; i < at_sethp_count; i++) {
+        if (at_sethp[i].done || at_elapsed < at_sethp[i].at) {
+            continue;
+        }
+        at_sethp[i].done = true;
+        for (Object* o = obj_find_first_at(obj_dude->elevation); o != NULL; o = obj_find_next_at()) {
+            if (o->pid == at_sethp[i].pid && !critter_is_dead(o)) {
+                int maxHp = stat_level(o, STAT_MAXIMUM_HIT_POINTS);
+                o->data.critter.hp = maxHp * at_sethp[i].pct / 100;
+                trace_event(TRACE_FLOW, "autotest", "sethp id=%d pid=%d hp=%d/%d", o->id, o->pid, o->data.critter.hp, maxHp);
+                break;
+            }
+        }
     }
     int policy = at_phase >= 0 ? at_phases[at_phase].policy : AT_IDLE;
     int phaseTile = at_phase >= 0 ? at_phases[at_phase].tile : -1;

@@ -1,0 +1,29 @@
+# The Master's boss fight (2026-10-22, "no jak to uděláme ten boss fight?" -> his picks "horda ve
+# skupinách z uličky" + "fáze podle zdraví"). A raider (team 77) attacks the dude 13 tiles from the
+# Master, which turns him (hall fight); the dude only stands. His Horde must come out of vanilla's alley
+# (18859, off the screen) in groups of 2-3, the first at once; when his HP drop through 75/50/25 %
+# (sethp, at 8/16/24 s) he shouts and 3-4 more come out on top. Nobody is moved anywhere.
+# A second raider far off keeps the run from ending when the first dies. The pen holds 12: with the
+# phases they are all out before the end, so the last raise must end in pen-empty, never earlier.
+# Run it in a clean Steam-like folder (vanilla MSTRLR34).
+name master-boss
+map MSTRLR34.MAP
+mapscript on
+seed 1
+duration 45
+dude tile 14455 rot 2
+dude hp 30000
+
+spawn 16777291 14855 rot 5 wield 8 item 29 60 hostile team 77
+spawn 16777291 25694 rot 5 hostile team 77
+
+sethp 16777266 70 8
+sethp 16777266 45 16
+sethp 16777266 20 24
+
+at 0 idle
+
+expect \[FLOW/master-join\] id=174
+expect \[FLOW/horde\] group size=[23] .*first=1
+expect-count 3 \[FLOW/horde\] phase pct=
+expect-count 12 \[FLOW/script-attack\] prog=scripts.Hord\.int
