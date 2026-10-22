@@ -204,9 +204,6 @@ static int PrintAMList(int a1);
 static void PipArchives(int a1);
 static int ListArchive(int a1);
 static void ShowControls();
-static void ShowControls2();
-static void ShowControls3();
-static void ShowControls4();
 static void ShowControlsPage(const char* title, const PipboyControl* lines, int count);
 static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
@@ -454,13 +451,14 @@ static PipboyRenderProc* PipFnctn[5] = {
 // ⚠️ EACH PAGE HAS A HARD 40-LINE BUDGET, and it is not a style preference -- pip_ctrl_line piles
 // every row past `bottom_line` onto the bottom line, so an overlong table does not scroll, it
 // smears. The budget is 1 (title) + as many entries as fit; blank spacers are dropped wholesale
-// first (`spacious` in ShowControlsPage), which buys back one line per section boundary. That is
-// why there are THREE pages: the world/combat table alone spends its whole 40.
-// THE WORLD PAGE IS HIS LIST, WORD FOR WORD (2026-10-23): "fakt jako robot jsi to napsal. nastavení dej
-// jenom tohle" -- a plain button list, the actions as the game names them, no drawn pad (the picture
-// of 2026-10-21 is in git history if it is ever wanted back). BACK and START were not on his list but
-// are the only way to the inventory and the quick save, so they close it. On a Steam Deck the names
-// are spelled the Deck's way on the way out (ctrl_deck_names).
+// first (`spacious` in ShowControlsPage), which buys back one line per section boundary.
+// ⚠️ ONE PAGE, "CONTROLS", AND IT IS HIS LIST (2026-10-23). He dictated it ("nastavení dej jenom tohle"),
+// then, when the first cut said "X Reload" and kept three more pages: "TY CONTROLS MAJÍ BÝT JEN JEDNY A
+// TO CONTROLS NIC VÍC ... LT+Y JE ZMĚNA MODU A LT+X JE RELOAD". So: one archive entry, his words,
+// LT + X for the reload (X's tap reloads with or without LT; he wants it written as the combo). BACK,
+// START and the quick save hold were his additions or the only way to those screens. No drawn pad, no
+// SCREENS / MENUS / KEYBOARD pages (git history has them). On a Steam Deck the names are spelled the
+// Deck's way on the way out (ctrl_deck_names).
 static const PipboyControl ctrl_lines[] = {
     { "Left stick", "Walk" },
     { "Right stick", "Look, aim" },
@@ -472,17 +470,17 @@ static const PipboyControl ctrl_lines[] = {
     { NULL, NULL },
     { "LB / RB", "Quick slots" },
     { "LT", "Aim" },
-    { "RT", "Attack" },
+    { "RT", "Shoot" },
     { "L3", "Skills" },
     { "R3", "Called shot" },
     { NULL, NULL },
     { "A", "Confirm, action" },
     { "B", "Cancel" },
     { "B hold", "Drugs, items" },
-    { "X", "Reload" },
     { "X hold", "Run" },
     { "Y", "Swap hands" },
     { "Y hold", "Weapons, ammo" },
+    { "LT + X", "Reload" },
     { "LT + Y", "Firing mode" },
     { NULL, NULL },
     { "BACK", "Inventory" },
@@ -490,146 +488,9 @@ static const PipboyControl ctrl_lines[] = {
     { "START hold", "Quick save" },
 };
 
-// SECOND CONTROLS PAGE: the screens you act IN -- talking, the character sheet, inventory, barter.
-//
-// ⚠️ A CONTROL THAT IS NOT WRITTEN DOWN DOES NOT EXIST. Barter's "even out with caps" and the
-// split-stack picker sat unused for weeks for exactly this reason, and the end-combat hold was
-// pressed once and never found again. The inventory's A -- a tap uses or equips, a hold opens the
-// whole Use / Drop / Look menu -- was the last big one still missing.
-// Moving the cursor is on the MENUS page once (ELSEWHERE), not repeated in every section.
-static const PipboyControl ctrl2_lines[] = {
-    { NULL, "TALKING" },
-    { "A", "Say" },
-    { "X", "Ask about" },
-    { "Y", "Barter" },
-    { "B", "Leave" },
-    { NULL, NULL },
-    { NULL, "CHARACTER SHEET" },
-    // The shoulders hop to the next GROUP of rows (stats, traits, skills...): ce_focus_jump.
-    { "LB / RB", "Next section" },
-    { "A", "Add point" },
-    { "X", "Remove point" },
-    { "Y", "Spend all" },
-    { "START", "Done" },
-    // The name box (2026-10-11): it took only Enter until a Deck player got stuck in it.
-    { "Name", "Steam+X keyboard" },
-    { NULL, NULL },
-    { NULL, "INVENTORY" },
-    { "A", "Use, equip, take off" },
-    { "A hold", "Menu" },
-    { "X", "Left hand" },
-    { "B", "Right hand" },
-    { "LB / RB", "Quick slot" },
-    { "BACK", "Close" },
-    { NULL, NULL },
-    { NULL, "LOOT" },
-    { "A", "Take one" },
-    { "Y", "Take stack" },
-    { "X", "Take all" },
-    { "LB / RB", "Other body" },
-    { "B", "Close" },
-    { NULL, NULL },
-    { NULL, "BARTER" },
-    { "LB / RB", "Column" },
-    { "A", "Move one" },
-    { "LT + A", "Move stack" },
-    { "RT", "How many" },
-    { "A hold", "Look" },
-    { "X", "Even out with caps" },
-    { "Y", "Offer" },
-    { "B", "Leave" },
-};
-
-// THIRD CONTROLS PAGE: the screens you only LOOK at or pick from. Split off the screens page
-// because that one had filled up, and for the same reason the second page exists at all -- a page
-// that overflows does not scroll, it stacks every extra row onto the bottom line.
-static const PipboyControl ctrl3_lines[] = {
-    { NULL, "PIP-BOY AND AUTOMAP" },
-    { "A", "Press" },
-    { "B / BACK", "Close" },
-    { "Up / Left", "Close" },
-    { NULL, NULL },
-    { NULL, "WORLD MAP" },
-    { "Up / Down", "Destination" },
-    { "A", "Travel, enter" },
-    { NULL, NULL },
-    { NULL, "TOWN MAP" },
-    { "A", "Enter" },
-    { "B", "World map" },
-    { NULL, NULL },
-    { NULL, "SAVE AND LOAD" },
-    { "A", "Confirm" },
-    { "B", "Cancel" },
-    { NULL, NULL },
-    { NULL, "PREFERENCES" },
-    { "X or M", "MODS" },
-    { "LB / RB", "Change value" },
-    { "A", "Press" },
-    { "Y", "Done" },
-    { "B", "Cancel" },
-    // 2026-10-16: PLACE on the timer window, and an armed explosive picked again on a wheel goes on
-    // the ground (gpui_place_explosive).
-    { NULL, NULL },
-    { NULL, "EXPLOSIVE TIMER" },
-    { "D-pad", "Time" },
-    { "Y", "Longest" },
-    { "A", "Set" },
-    { "X", "Set and drop" },
-    { "B", "Cancel" },
-    { "Wheel, armed", "Drop" },
-    { NULL, NULL },
-    { NULL, "ELSEWHERE" },
-    { "Stick / D-pad", "Move" },
-    { "A", "Pick, yes" },
-    { "B", "Back, no" },
-    { "RT", "Click" },
-    { "A / B / START", "Skip death scene" },
-};
-
-// FOURTH CONTROLS PAGE: the keyboard (2026-10-10). The keyboard is a controller -- his design,
-// *"chůze šipkami, akce mezerníkem, ctrl útok, alt běh ... prostě myš vůbec"* -- so this page is the
-// world page again with a key where each pad button was (gamepad_ui_handle_key, combat_rt_poll_gamepad).
-// The vanilla keys that still work are listed too, because a keyboard player has no other way to find
-// them, and so is the optional mouse aim.
-static const PipboyControl ctrl4_lines[] = {
-    { NULL, "MOVE AND FIGHT" },
-    { "Arrows", "Walk" },
-    { "Alt hold", "Run" },
-    { "Ctrl hold", "Attack" },
-    { "Shift hold", "Aim lock" },
-    { "Q / E", "Next target" },
-    { "F", "Firing mode" },
-    { "V", "Called shot" },
-    { "R", "Reload" },
-    { "T", "Throw grenade" },
-    { "H", "Quick slot" },
-    { "B", "Swap hand" },
-    { NULL, NULL },
-    { NULL, "AROUND YOU" },
-    { "Space", "Action" },
-    { "G", "Run to exit" },
-    { "S", "Skilldex" },
-    { "1 - 8", "Skills" },
-    { "P (timer)", "Set and drop" },
-    { "Mouse right", "Cursor mode" },
-    { "Mouse left hold", "Walk, attack" },
-    { NULL, NULL },
-    { NULL, "SCREENS" },
-    { "I", "Inventory" },
-    { "C", "Character" },
-    { "P", "Pip-Boy" },
-    { "Tab", "Automap" },
-    { "Esc", "Pause" },
-    { "Enter", "End combat" },
-    { "F6 / F7", "Quick save / load" },
-};
-
-// Titles of the CONTROLS pages, and the archive entries that open them -- one string each so the
-// list and the page it leads to can never drift apart.
-static const char* ctrl_entry = "CONTROLS - WORLD";
-static const char* ctrl2_entry = "CONTROLS - SCREENS";
-static const char* ctrl3_entry = "CONTROLS - MENUS";
-static const char* ctrl4_entry = "CONTROLS - KEYBOARD";
+// The CONTROLS page's title, and the archive entry that opens it -- one string so the list and the
+// page it leads to can never drift apart.
+static const char* ctrl_entry = "CONTROLS";
 
 // 0x662A70
 static Size ginfo[PIPBOY_FRM_COUNT];
@@ -2234,22 +2095,12 @@ static void PipArchives(int a1)
 
         ListArchive(a1);
 
-        // The four CONTROLS pages are the last entries of the list, and none of them is a movie.
-        // view_page is the line count ListArchive returned, so KEYBOARD sits at view_page, MENUS one
-        // line above it, SCREENS one above that and WORLD above SCREENS -- the same order ListArchive
-        // prints them in.
-        if (a1 >= view_page - 3) {
+        // CONTROLS is the last entry of the list and not a movie: view_page is the line count
+        // ListArchive returned, so it sits at view_page.
+        if (a1 == view_page) {
             pause_for_tocks(200);
             NixHotLines();
-            if (a1 == view_page) {
-                ShowControls4();
-            } else if (a1 == view_page - 1) {
-                ShowControls3();
-            } else if (a1 == view_page - 2) {
-                ShowControls2();
-            } else {
-                ShowControls();
-            }
+            ShowControls();
             AddHotLines(0, 0, true);
             // ⚠️ Vanilla never sets this, so its own BACK button (the holodisk reader) leaks
             // one registered button per open. Ours is claimed properly, so NixHotLines takes
@@ -2338,37 +2189,6 @@ static int ListArchive(int a1)
     pip_print(ctrl_entry, 0, color);
     cursor_line++;
 
-    // ...and the screens page right behind it, so the two read as one pair in the list.
-    if (line++ == a1 - 1) {
-        color = colorTable[32747];
-    } else {
-        color = colorTable[992];
-    }
-
-    pip_print(ctrl2_entry, 0, color);
-    cursor_line++;
-
-    // ...and the menus page last. The order here IS the dispatch order in PipArchives (which reads
-    // them off the end of the list as view_page, -1, -2), so the two must be changed together.
-    if (line++ == a1 - 1) {
-        color = colorTable[32747];
-    } else {
-        color = colorTable[992];
-    }
-
-    pip_print(ctrl3_entry, 0, color);
-    cursor_line++;
-
-    // ...and the keyboard page after it (2026-10-10). Same rule: this order is PipArchives' dispatch.
-    if (line++ == a1 - 1) {
-        color = colorTable[32747];
-    } else {
-        color = colorTable[992];
-    }
-
-    pip_print(ctrl4_entry, 0, color);
-    cursor_line++;
-
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
@@ -2455,22 +2275,7 @@ static void ShowControls()
     ShowControlsPage(ctrl_entry, ctrl_lines, (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0])));
 }
 
-static void ShowControls2()
-{
-    ShowControlsPage(ctrl2_entry, ctrl2_lines, (int)(sizeof(ctrl2_lines) / sizeof(ctrl2_lines[0])));
-}
-
-static void ShowControls3()
-{
-    ShowControlsPage(ctrl3_entry, ctrl3_lines, (int)(sizeof(ctrl3_lines) / sizeof(ctrl3_lines[0])));
-}
-
-static void ShowControls4()
-{
-    ShowControlsPage(ctrl4_entry, ctrl4_lines, (int)(sizeof(ctrl4_lines) / sizeof(ctrl4_lines[0])));
-}
-
-// All three pages render through here: same layout, only the title and the table differ.
+// The CONTROLS page's layout: the title, then button | action rows.
 static void ShowControlsPage(const char* title, const PipboyControl* lines, int count)
 {
     buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
