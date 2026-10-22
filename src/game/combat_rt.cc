@@ -17046,7 +17046,9 @@ static RtBulletLook rt_bullet_look(Object* weapon)
     case 6: // 5mm (minigun, assault rifle)
         return rt_look(900.0f, 0.45f, 1, RT_BRASS, 1);
     case 11: // 12 ga. buckshot
-        return rt_look(400.0f, 0.0f, 2, RT_RGB(29, 29, 27), 6); // 2x2 and light: 1-px grey shot vanished on the sand
+        // 1 px now, with a dark pixel under it (rt_tracers_render) -- 2x2 was "moc velké" (2026-10-22);
+        // the shadow is what keeps one pixel from vanishing on the sand, the reason it had been 2x2.
+        return rt_look(400.0f, 0.0f, 1, RT_RGB(29, 29, 27), 6);
     }
     return fallback;
 }
@@ -17159,6 +17161,11 @@ static void rt_tracers_render(Rect* rect, int elevation)
         if (rt_tracer_underline) {
             int edge = colorTable[(((tr->rgb >> 10) & 31) * 2 / 3 << 10) | (((tr->rgb >> 5) & 31) * 2 / 3 << 5) | ((tr->rgb & 31) * 2 / 3)];
             tile_overlay_line(rect, x0, y0 + tr->thick, x1, y1 + tr->thick, edge);
+        }
+        // A one-pixel pellet (buckshot) gets a dark pixel under it, so it reads on light ground
+        // without being drawn any bigger.
+        if (tr->length <= 0.0f && tr->thick == 1) {
+            tile_overlay_line(rect, x1, y1 + 1, x1, y1 + 1, colorTable[RT_RGB(4, 3, 2)]);
         }
         for (int t = 0; t < tr->thick; t++) {
             // A round pellet of thickness n is an n x n dot; a streak is n lines one under the other.
