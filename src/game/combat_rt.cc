@@ -17821,15 +17821,45 @@ static void rt_clear_lost_turn(Object* critter)
     }
 }
 
-// See RT_PID_MASTER_NIGHTKIN (and RT_PID_FLOATING_EYE). Cheap enough for every frame: one pass to find a
-// hostile Master, and the escort is only looked for once he is.
+// ⚠️ THE EYEBOTS DO NOT WAIT FOR HIM (2026-10-22, "ať útočí rovnou, je to final boss konec konců", then
+// his pick "k jakémukoli boji v sále"). An eyebot of the Master's (within RT_MASTER_GUARD_REACH of him,
+// living) joins ANY fight within this many tiles of itself -- the dude fighting there, or something
+// fighting him there -- not only once the Master has turned. The fights in the corridors of his trace
+// were 74-85 tiles off and do not pull them; a Master talked into his end, with no fight, keeps them out.
+#define RT_EYEBOT_HALL_REACH 20
+
+// Is there a fight within `reach` tiles of `who`: the dude in one there, or a hostile after him or his
+// party there?
+static bool rt_fight_near(Object* who, int reach)
+{
+    if (rt_dude_in_fight() && obj_dude->elevation == who->elevation && obj_dist(who, obj_dude) <= reach) {
+        return true;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        RtActor* a = &rt_actors[i];
+        Object* o = a->obj;
+        if (o == NULL || o == who || !a->hostile || a->state == RT_IDLE || !rt_is_combatant(o)
+            || o->elevation != who->elevation || obj_dist(who, o) > reach) {
+            continue;
+        }
+        if (a->target == obj_dude || (a->target != NULL && isPartyMember(a->target))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// See RT_PID_MASTER_NIGHTKIN, RT_PID_FLOATING_EYE and RT_EYEBOT_HALL_REACH. Cheap enough for every
+// frame: one pass to find the Master, and his guards are only looked at while he lives.
 static void rt_master_guards_tick()
 {
     Object* master = NULL;
+    bool masterHostile = false;
     for (int i = 0; i < rt_actor_count; i++) {
         Object* obj = rt_actors[i].obj;
-        if (obj != NULL && obj->pid == RT_PID_MASTER && rt_actors[i].hostile && !critter_is_dead(obj)) {
+        if (obj != NULL && obj->pid == RT_PID_MASTER && !critter_is_dead(obj)) {
             master = obj;
+            masterHostile = rt_actors[i].hostile;
             break;
         }
     }
@@ -17839,13 +17869,24 @@ static void rt_master_guards_tick()
 
     for (int i = 0; i < rt_actor_count; i++) {
         Object* guard = rt_actors[i].obj;
-        if (guard == NULL || (guard->pid != RT_PID_MASTER_NIGHTKIN && guard->pid != RT_PID_FLOATING_EYE)
+        bool eye = guard != NULL && guard->pid == RT_PID_FLOATING_EYE;
+        if (guard == NULL || (guard->pid != RT_PID_MASTER_NIGHTKIN && !eye)
             || rt_actors[i].hostile || critter_is_dead(guard)
             || guard->elevation != master->elevation || obj_dist(guard, master) > RT_MASTER_GUARD_REACH) {
             continue;
         }
-        trace_event(TRACE_FLOW, "bodyguard-join", "id=%d pid=%d tile=%d master=%d dist=%d t=%.2f",
-            guard->id, guard->pid, guard->tile, master->id, obj_dist(guard, master), rt_clock);
+        const char* why = NULL;
+        if (masterHostile) {
+            why = "master";
+        } else if (eye && rt_fight_near(guard, RT_EYEBOT_HALL_REACH)) {
+            why = "hall-fight";
+        }
+        if (why == NULL) {
+            continue;
+        }
+        trace_event(TRACE_FLOW, "bodyguard-join", "id=%d pid=%d tile=%d master=%d dist=%d why=%s dude=%d t=%.2f",
+            guard->id, guard->pid, guard->tile, master->id, obj_dist(guard, master), why,
+            obj_dist(guard, obj_dude), rt_clock);
         combat_rt_notify_attack(guard, obj_dude);
     }
 }
