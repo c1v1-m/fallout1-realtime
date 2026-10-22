@@ -1,0 +1,21 @@
+# The Master's Horde in waves from several sides (2026-10-22, "mutants se spawnují takhle do uličky ...
+# jak to uděláme my", his picks "vlny po 2-3" and "víc vchodů mimo výhled"). A raider (team 77) attacks
+# the dude 13 tiles from the Master, which turns the Master (hall fight); the dude only stands, so the
+# Master lives and keeps calling. His signals must go out as waves (the first at once), and each member
+# Hord.int puts in the alley must be moved to an entry of its own out of the dude's sight.
+# Run it in a clean Steam-like folder (vanilla MSTRLR34).
+name master-horde
+map MSTRLR34.MAP
+mapscript on
+seed 1
+duration 50
+dude tile 14455 rot 2
+dude hp 30000
+
+spawn 16777291 14855 rot 5 wield 8 item 29 60 hostile team 77 hp 99999
+
+at 0 idle
+
+expect \[FLOW/master-join\] id=174
+expect \[FLOW/horde\] wave size=[23] .*first=1
+expect-count >=3 \[FLOW/horde\] entry id=[0-9]+ pid=[0-9]+ from=[0-9]+ to=[1-9]

@@ -1406,6 +1406,7 @@ static void rt_tracers_render(Rect* rect, int elevation);
 static void rt_tracers_reset();
 static void rt_offscreen_shooters_reset();
 static void rt_offscreen_shooters_tick();
+static void rt_horde_reset();
 static bool rt_offscreen_crosshair_at(Object* obj, int* x, int* y);
 
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
@@ -14504,6 +14505,7 @@ static void rt_abandon_encounter()
     rt_injecting = NULL;
     rt_shooter_count = 0; // who shot at him on the map being left (rt_note_shot_at_dude)
     rt_offscreen_shooters_reset();
+    rt_horde_reset(); // the Master's banked signals and the arrivals waiting for an entry
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
@@ -17828,6 +17830,248 @@ static void rt_clear_lost_turn(Object* critter)
     }
 }
 
+// ⚠️ THE MASTER'S HORDE COMES IN WAVES, FROM SEVERAL SIDES (2026-10-22, "takže mutants se spawnují takhle
+// do uličky ... jak to uděláme my", his picks "vlny po 2-3" and "víc vchodů mimo výhled"). Vanilla:
+// every other turn of his (every fourth on Easy) Master.int raises map var 4, and the first of the 24
+// Nightkin parked in the sealed pen (tile 0) whose Hord.int sees it clears it and is placed on tile 18859,
+// in the alley, with attack(dude). Realtime gives him a turn about every 5 s, so one Nightkin walked out
+// of the same alley every ~10 s and was shot before the next came (trace_2026-10-22_213815: ids 29, 27,
+// 25 at s=36, 47, 58, each dead within four seconds).
+//
+// WAVES: his signal is banked, not passed on, and every RT_HORDE_WAVE_MIN-MAX signals the bank goes out
+// as one group, so the rate over a minute is his own. The first wave of a fight goes at once. Each member
+// is let out by raising the var again and waiting until one Hord.int has taken it.
+// ENTRIES: every member Hord.int puts in the alley is moved (rt_horde_place_arrivals) to a free tile
+// RT_HORDE_ENTRY_MIN-MAX tiles from the dude that he cannot see (a wall on the line, or off the view),
+// with a route to him, spread round him away from the rest of its wave. No such tile: it stays in the
+// alley, as vanilla.
+#define RT_HORDE_MAP_VAR 4
+#define RT_HORDE_WAVE_MIN 2
+#define RT_HORDE_WAVE_MAX 3
+#define RT_HORDE_ENTRY_MIN 10
+#define RT_HORDE_ENTRY_MAX 18
+#define RT_HORDE_ENTRY_APART 4 // tiles between two members of one wave
+#define RT_HORDE_MAX_ARRIVALS 8
+static int rt_horde_bank = 0; // the Master's signals saved toward the next wave
+static int rt_horde_wave_size = 0; // the size the next wave was rolled at (0 = not rolled yet)
+static int rt_horde_release = 0; // members of the current wave still to let out
+static bool rt_horde_raised = false; // map var 4 is up because WE raised it
+static float rt_horde_raised_at = 0.0f;
+static bool rt_horde_first_done = false; // the first wave of this visit is out
+static Object* rt_horde_arrivals[RT_HORDE_MAX_ARRIVALS];
+static int rt_horde_arrival_count = 0;
+static int rt_horde_wave_entries[RT_HORDE_MAX_ARRIVALS];
+static int rt_horde_wave_entry_count = 0;
+
+static void rt_horde_reset()
+{
+    rt_horde_bank = 0;
+    rt_horde_wave_size = 0;
+    rt_horde_release = 0;
+    rt_horde_raised = false;
+    rt_horde_first_done = false;
+    rt_horde_arrival_count = 0;
+    rt_horde_wave_entry_count = 0;
+}
+
+static int rt_map_var_get(int var)
+{
+    ProgramValue value;
+    if (map_get_global_var(var, value) == -1 || value.opcode == VALUE_TYPE_PTR) {
+        return 0;
+    }
+    return value.integerValue;
+}
+
+static void rt_map_var_set(int var, int v)
+{
+    ProgramValue value;
+    value.opcode = VALUE_TYPE_INT;
+    value.integerValue = v;
+    map_set_global_var(var, value);
+}
+
+// intextra op_attack, when Hord.int has just placed its critter in the alley and ordered it at him.
+void combat_rt_horde_arrived(Object* critter)
+{
+    if (!rt_enabled || critter == NULL || rt_horde_arrival_count >= RT_HORDE_MAX_ARRIVALS) {
+        return;
+    }
+    rt_horde_arrivals[rt_horde_arrival_count++] = critter;
+}
+
+// The smallest angle at the dude between `tile` and the entries this wave already took (180 if none).
+static float rt_horde_spread(int tile)
+{
+    float least = 180.0f;
+    for (int i = 0; i < rt_horde_wave_entry_count; i++) {
+        float a = rt_angle_at(obj_dude->tile, tile, rt_horde_wave_entries[i]);
+        if (a < least) {
+            least = a;
+        }
+    }
+    return least;
+}
+
+// A hidden, free, reachable tile round the dude for `critter`, or -1.
+//
+// ONE FLOOD FROM THE DUDE, NOT A ROUTE PER CANDIDATE. The first version scored the ring first and asked
+// make_path of the best sixteen: the hidden tiles are mostly behind walls, i.e. in the NEXT room, and in
+// the Master's hall all sixteen of the first member's were a long way round, so it stayed in the alley
+// (master-horde, 2026-10-22). Walking the floor outward from him (free tiles only, as a walker would)
+// says at once which tiles are close by the way they would really come -- and a tile in the black or in
+// a sealed pen is simply never reached.
+#define RT_HORDE_FLOOD_STEPS 36
+static int rt_horde_pick_entry(Object* critter, const char** hiddenBy)
+{
+    int elev = obj_dude->elevation;
+    int dudeTile = obj_dude->tile;
+    Rect win;
+    bool haveWin = display_win != -1 && win_get_rect(display_win, &win) != -1;
+
+    static short steps[40000];
+    static int queue[40000];
+    memset(steps, 0xff, sizeof(steps)); // -1 = not reached
+    int head = 0;
+    int tail = 0;
+    steps[dudeTile] = 0;
+    queue[tail++] = dudeTile;
+
+    int best = -1;
+    float bestScore = -1.0f;
+    bool bestWall = false;
+    while (head < tail) {
+        int t = queue[head++];
+        int s = steps[t];
+        if (s > 0) {
+            int d = tile_dist(dudeTile, t);
+            bool tooClose = false;
+            for (int i = 0; i < rt_horde_wave_entry_count; i++) {
+                tooClose = tooClose || tile_dist(t, rt_horde_wave_entries[i]) < RT_HORDE_ENTRY_APART;
+            }
+            // In the ring, and reached about the straight way (a long way round would bring it in from
+            // nowhere, through the next room's door).
+            if (!tooClose && d >= RT_HORDE_ENTRY_MIN && d <= RT_HORDE_ENTRY_MAX && s <= d * 2 + 8) {
+                bool wall = combat_is_shot_blocked(obj_dude, dudeTile, t, NULL, NULL);
+                bool offView = false;
+                if (!wall && haveWin) {
+                    int x;
+                    int y;
+                    if (tile_coord(t, &x, &y, elev) == 0) {
+                        offView = x + 32 < 0 || x > win.lrx - win.ulx || y + 16 < 0 || y - 60 > win.lry - win.uly;
+                    }
+                }
+                if (wall || offView) { // otherwise he would watch it appear
+                    // Far round from the rest of its wave first, then a wall over the view's edge, and a
+                    // little dice so two visits do not use the same spots.
+                    float score = rt_horde_spread(t) + (wall ? 20.0f : 0.0f) + roll_random(0, 20);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = t;
+                        bestWall = wall;
+                    }
+                }
+            }
+        }
+        if (s >= RT_HORDE_FLOOD_STEPS) {
+            continue;
+        }
+        for (int dir = 0; dir < ROTATION_COUNT; dir++) {
+            int n = tile_num_in_direction(t, dir, 1);
+            if (n < 0 || n >= 40000 || steps[n] != -1) {
+                continue;
+            }
+            if (obj_blocking_at(critter, n, elev) != NULL) {
+                continue;
+            }
+            steps[n] = (short)(s + 1);
+            queue[tail++] = n;
+        }
+    }
+
+    if (best != -1) {
+        *hiddenBy = bestWall ? "wall" : "view";
+    }
+    return best;
+}
+
+// Every member Hord.int put in the alley since the last frame goes to its own entry.
+static void rt_horde_place_arrivals()
+{
+    for (int i = 0; i < rt_horde_arrival_count; i++) {
+        Object* critter = rt_horde_arrivals[i];
+        if (critter == NULL || obj_dude == NULL || critter_is_dead(critter) || critter->tile == -1
+            || critter->elevation != obj_dude->elevation) {
+            continue;
+        }
+        const char* hiddenBy = "-";
+        int from = critter->tile;
+        int to = rt_horde_pick_entry(critter, &hiddenBy);
+        float spread = to != -1 ? rt_horde_spread(to) : 180.0f; // from the rest of its wave, before joining it
+        if (to != -1 && rt_horde_wave_entry_count < RT_HORDE_MAX_ARRIVALS) {
+            Rect rect;
+            if (obj_move_to_tile(critter, to, critter->elevation, &rect) == 0) {
+                tile_refresh_rect(&rect, critter->elevation);
+                obj_set_rotation(critter, tile_dir(to, obj_dude->tile), &rect);
+                tile_refresh_rect(&rect, critter->elevation);
+                rt_horde_wave_entries[rt_horde_wave_entry_count++] = to;
+            } else {
+                to = -1;
+            }
+        }
+        trace_event(TRACE_FLOW, "horde", "entry id=%d pid=%d from=%d to=%d dist=%d hidden=%s spread=%.0f t=%.2f",
+            critter->id, critter->pid, from, to, to != -1 ? tile_dist(obj_dude->tile, to) : -1, hiddenBy,
+            spread, rt_clock);
+    }
+    rt_horde_arrival_count = 0;
+}
+
+// Once a frame while the Master lives: bank his signals and let the waves out.
+static void rt_horde_tick()
+{
+    int signal = rt_map_var_get(RT_HORDE_MAP_VAR);
+    if (rt_horde_raised) {
+        if (signal == 0) {
+            rt_horde_raised = false; // one Hord.int took it
+        } else if (rt_clock - rt_horde_raised_at > 3.0f) {
+            // Nobody answers: the pen is empty. Take it back so his own next signal is seen as his.
+            rt_map_var_set(RT_HORDE_MAP_VAR, 0);
+            rt_horde_raised = false;
+            rt_horde_release = 0;
+            trace_event(TRACE_FLOW, "horde", "pen-empty t=%.2f", rt_clock);
+        }
+        return; // one member per raise
+    }
+
+    if (signal != 0) {
+        // His own signal (every other turn of his): banked, not passed on.
+        rt_map_var_set(RT_HORDE_MAP_VAR, 0);
+        rt_horde_bank++;
+        if (rt_horde_wave_size == 0) {
+            rt_horde_wave_size = roll_random(RT_HORDE_WAVE_MIN, RT_HORDE_WAVE_MAX);
+        }
+        bool first = !rt_horde_first_done;
+        if (first || rt_horde_bank >= rt_horde_wave_size) {
+            rt_horde_release += rt_horde_wave_size;
+            trace_event(TRACE_FLOW, "horde", "wave size=%d bank=%d first=%d t=%.2f",
+                rt_horde_wave_size, rt_horde_bank, first ? 1 : 0, rt_clock);
+            rt_horde_bank = 0;
+            rt_horde_wave_size = 0;
+            rt_horde_first_done = true;
+            rt_horde_wave_entry_count = 0;
+        } else {
+            trace_event(TRACE_FLOW, "horde", "bank %d/%d t=%.2f", rt_horde_bank, rt_horde_wave_size, rt_clock);
+        }
+    }
+
+    if (rt_horde_release > 0) {
+        rt_map_var_set(RT_HORDE_MAP_VAR, 1);
+        rt_horde_raised = true;
+        rt_horde_raised_at = rt_clock;
+        rt_horde_release--;
+    }
+}
+
 // ⚠️ THE EYEBOTS DO NOT WAIT FOR HIM (2026-10-22, "ať útočí rovnou, je to final boss konec konců", then
 // his pick "k jakémukoli boji v sále"). An eyebot of the Master's (within RT_MASTER_GUARD_REACH of him,
 // living) joins ANY fight within this many tiles of itself -- the dude fighting there, or something
@@ -17860,6 +18104,8 @@ static bool rt_fight_near(Object* who, int reach)
 // frame: one pass to find the Master, and his guards are only looked at while he lives.
 static void rt_master_guards_tick()
 {
+    rt_horde_place_arrivals(); // whatever Hord.int placed since the last frame, Master alive or not
+
     Object* master = NULL;
     bool masterHostile = false;
     for (int i = 0; i < rt_actor_count; i++) {
@@ -17909,6 +18155,8 @@ static void rt_master_guards_tick()
             obj_dist(guard, obj_dude), rt_clock);
         combat_rt_notify_attack(guard, obj_dude);
     }
+
+    rt_horde_tick();
 }
 
 void combat_rt_update(float dt)
