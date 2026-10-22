@@ -1393,8 +1393,13 @@ static bool rt_projectiles = true;
 // MASTER2.INT stands two Nightkin beside you (pid 16777409, GenMutan.int). They are the vault's team (34),
 // not the Master's (55), and vanilla's AI only ever joins its own team, so in the original they watch the
 // whole fight. Here the moment the Master turns on you every one of them near him does too.
+// ...AND HIS EYEBOTS (2026-10-22, "eyeboti nebrání mastera" -> "jj"). The two Floating Eyes beside him in
+// MSTRLR34 (pid 16777293, no script) are TEAM 1, so vanilla leaves them hovering until you shoot one of
+// them (trace_2026-10-22_205144: idle through three Master fights, joined only at s=478.8 when he hit
+// one). Same rule as the Nightkin, same reach.
 #define RT_PID_MASTER 16777266
 #define RT_PID_MASTER_NIGHTKIN 16777409
+#define RT_PID_FLOATING_EYE 16777293
 #define RT_MASTER_GUARD_REACH 30
 static RtActor* rt_actor_of(Object* obj);
 static void rt_tracers_render(Rect* rect, int elevation);
@@ -17816,8 +17821,8 @@ static void rt_clear_lost_turn(Object* critter)
     }
 }
 
-// See RT_PID_MASTER_NIGHTKIN. Cheap enough for every frame: one pass to find a hostile Master, and the
-// escort is only looked for once he is.
+// See RT_PID_MASTER_NIGHTKIN (and RT_PID_FLOATING_EYE). Cheap enough for every frame: one pass to find a
+// hostile Master, and the escort is only looked for once he is.
 static void rt_master_guards_tick()
 {
     Object* master = NULL;
@@ -17834,7 +17839,8 @@ static void rt_master_guards_tick()
 
     for (int i = 0; i < rt_actor_count; i++) {
         Object* guard = rt_actors[i].obj;
-        if (guard == NULL || guard->pid != RT_PID_MASTER_NIGHTKIN || rt_actors[i].hostile || critter_is_dead(guard)
+        if (guard == NULL || (guard->pid != RT_PID_MASTER_NIGHTKIN && guard->pid != RT_PID_FLOATING_EYE)
+            || rt_actors[i].hostile || critter_is_dead(guard)
             || guard->elevation != master->elevation || obj_dist(guard, master) > RT_MASTER_GUARD_REACH) {
             continue;
         }

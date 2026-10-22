@@ -1,7 +1,9 @@
 # The Master's bodyguards (2026-10-22, "jo ať bodyguardi útočí ... ať tam jen nestojí"). Morpheus's
 # escort: MASTER2.INT stands two Nightkin (pid 16777409) by the dude when LOAD_MAP_INDEX (gvar 32) is 12,
 # which is how Morpheus brings you in (`reload` lets the map script see it). The Master talks at once;
-# A through every reply ends in his attack (and his last line's [Done]). Both Nightkin must join.
+# A through every reply ends in his attack (and his last line's [Done]). Both Nightkin must join, and
+# (same day, "eyeboti nebrání mastera" -> "jj") the two Floating Eyes beside him (pid 16777293, team 1).
+# Run it in a clean Steam-like folder: the dev data's TeamX MASTER2.INT never spawns the escort.
 name master-guards
 map MSTRLR34.MAP
 mapscript on
@@ -20,3 +22,4 @@ tap 14500 A
 
 expect \[FLOW/dialog-start\] pid=16777266
 expect-count 2 \[FLOW/bodyguard-join\] .* pid=16777409
+expect-count 2 \[FLOW/bodyguard-join\] .* pid=16777293
