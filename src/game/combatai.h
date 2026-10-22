@@ -80,7 +80,7 @@ int combatai_msg(Object* critter, Attack* attack, int message_type, int delay);
 int combatai_msg_at(Object* critter, int hitLocation, int message_type, int delay);
 // Floats `text` over `critter` in its AI packet's font and colours -- the look of a combat taunt.
 int combatai_float_line(Object* critter, const char* text);
-int combatai_float_msg(Object* critter, int num);
+bool combatai_msg_text(int num, char* out, size_t size);
 Object* combat_ai_random_target(Attack* attack);
 void combatai_check_retaliation(Object* critter, Object* candidate);
 bool is_within_perception(Object* critter1, Object* critter2);

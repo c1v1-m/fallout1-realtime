@@ -3,7 +3,8 @@
 # attacks the dude 13 tiles from the Master, which turns him (hall fight); the dude only stands. His
 # Horde must come out of vanilla's alley (18859, off the screen) in groups of 2-3, the first at once;
 # the one phase (his HP through 50 %) makes him shout and 3-4 more come out on top. 70 % and 20 % must
-# not start one. Nobody is moved anywhere. A second raider far off keeps the run from ending when the
+# not start one; 20 % sets off his psychic scream (25 %): his line in the message window, then the wave
+# knocks the dude down. Nobody is moved anywhere. A second raider far off keeps the run from ending when the
 # first dies. Run it in a clean Steam-like folder (vanilla MSTRLR34).
 name master-boss
 map MSTRLR34.MAP
@@ -27,3 +28,8 @@ expect \[FLOW/horde\] group size=[23] .*first=1
 expect-count 1 \[FLOW/horde\] phase pct=
 expect \[FLOW/horde\] phase pct=50 hp=225/500
 expect-count >=7 \[FLOW/script-attack\] prog=scripts.Hord\.int
+expect \[STATE/msg\] Master: My servants will protect me!
+expect \[STATE/msg\] Master: Give me Unity, or give me Death! Death!
+expect-count 1 \[COMBAT/psy-scream\] warn
+expect \[COMBAT/psy-scream\] hit id=18000
+expect \[COMBAT/react\] pid=16777216 id=18000 [a-z]+->falling why=knockdown

@@ -1648,17 +1648,18 @@ static int ai_print_msg(Object* critter, int type)
     return 0;
 }
 
-// CE: one line of combatai.msg, by number, floated over the critter as combatai_float_line does --
-// for a line the realtime layer wants said for sure (the Master's "My servants will protect me!" when
-// he calls a phase of his Horde), where combatai_msg_at would roll the packet's taunt chance.
-int combatai_float_msg(Object* critter, int num)
+// CE: the text of one line of combatai.msg, by number (in the game's language) -- for a line the
+// realtime layer wants said for sure (the Master's boss-fight lines), where combatai_msg_at would roll
+// the packet's taunt chance.
+bool combatai_msg_text(int num, char* out, size_t size)
 {
     MessageListItem messageListItem;
     messageListItem.num = num;
-    if (critter == NULL || !message_search(&ai_message_file, &messageListItem)) {
-        return -1;
+    if (out == NULL || size == 0 || !message_search(&ai_message_file, &messageListItem)) {
+        return false;
     }
-    return combatai_float_line(critter, messageListItem.text);
+    snprintf(out, size, "%s", messageListItem.text);
+    return true;
 }
 
 // CE: a script's line floated over the speaker in the same font and colours as that critter's combat

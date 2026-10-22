@@ -17871,6 +17871,22 @@ static bool rt_horde_first_done = false; // the first group of this visit is out
 static bool rt_horde_phase_init = false; // a threshold already crossed at entry was marked done
 static bool rt_horde_phase_done = false;
 
+// ⚠️ HIS PSYCHIC SCREAM AT 25 % (2026-10-22, "k 25% můžeme vymyslet něco jiného" -> his pick "psychický
+// výkřik (jednou)", then "křik a asi ať je vidět i text"). Once, when his hit points first fall through
+// RT_MASTER_SCREAM_PCT: he cries his own "Give me Unity, or give me Death! Death!" (combatai.msg 2711,
+// over him and in the message window), and RT_MASTER_SCREAM_DELAY later a psychic wave hits the dude and
+// his party within RT_EYEBOT_HALL_REACH of him, cover or not: RT_MASTER_SCREAM_DMG_PCT of each one's
+// maximum hit points, armour bypassed, and knocked down. The Psychic Nullifier (item 123) carried shields
+// its bearer. Under it at map entry: counts as done, as the 50 % phase does.
+#define RT_MASTER_SCREAM_PCT 25
+#define RT_MASTER_SCREAM_MSG 2711
+#define RT_MASTER_SCREAM_DELAY 1.2f
+#define RT_MASTER_SCREAM_DMG_PCT 25
+#define RT_PID_PSYCHIC_NULLIFIER 123
+static bool rt_scream_init = false;
+static bool rt_scream_done = false;
+static float rt_scream_at = -1.0f; // when the wave lands, -1 = none on its way
+
 static void rt_horde_reset()
 {
     rt_horde_bank = 0;
@@ -17880,6 +17896,9 @@ static void rt_horde_reset()
     rt_horde_first_done = false;
     rt_horde_phase_init = false;
     rt_horde_phase_done = false;
+    rt_scream_init = false;
+    rt_scream_done = false;
+    rt_scream_at = -1.0f;
 }
 
 static int rt_map_var_get(int var)
@@ -17889,6 +17908,20 @@ static int rt_map_var_get(int var)
         return 0;
     }
     return value.integerValue;
+}
+
+// A line of the Master's (combatai.msg), floated over him AND printed in the message window: he is
+// often off the screen when he says it, and "ať je vidět i text" (2026-10-22).
+static void rt_master_say(Object* master, int num)
+{
+    char text[200];
+    if (!combatai_msg_text(num, text, sizeof(text))) {
+        return;
+    }
+    combatai_float_line(master, text);
+    char line[260];
+    snprintf(line, sizeof(line), "%s: %s", object_name(master), text);
+    display_print(line);
 }
 
 static void rt_map_var_set(int var, int v)
@@ -17954,7 +17987,7 @@ static void rt_horde_tick(Object* master, bool masterHostile)
         rt_horde_phase_done = true;
         int n = roll_random(RT_HORDE_PHASE_MIN, RT_HORDE_PHASE_MAX);
         rt_horde_release += n;
-        combatai_float_msg(master, RT_MASTER_SERVANTS_MSG);
+        rt_master_say(master, RT_MASTER_SERVANTS_MSG);
         trace_event(TRACE_FLOW, "horde", "phase pct=%d hp=%d/%d size=%d t=%.2f", RT_HORDE_PHASE_PCT, hp, maxHp, n, rt_clock);
     }
 
@@ -18030,6 +18063,69 @@ static bool rt_fight_near(Object* who, int reach)
     return false;
 }
 
+// The scream's wave on one body: the way a heavy hit lands (reaction layer, then the fall, then the
+// damage), with the Master as its source.
+static void rt_psychic_hit(Object* master, Object* victim, int damage)
+{
+    Attack attack;
+    combat_ctd_init(&attack, master, victim, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+    attack.attackerFlags = DAM_HIT;
+    attack.defenderDamage = damage;
+    attack.defenderFlags = DAM_KNOCKED_DOWN;
+    death_checks(&attack);
+    rt_reaction_heavy(victim, attack.defenderFlags);
+    action_defender_reaction(&attack);
+    combat_display(&attack);
+    apply_damage(&attack, true);
+    trace_event(TRACE_COMBAT, "psy-scream", "hit id=%d pid=%d dmg=%d flags=0x%x hp=%d t=%.2f",
+        victim->id, victim->pid, damage, attack.defenderFlags, victim->data.critter.hp, rt_clock);
+}
+
+// See RT_MASTER_SCREAM_PCT. Once a frame while he lives.
+static void rt_master_scream_tick(Object* master, bool masterHostile)
+{
+    int maxHp = stat_level(master, STAT_MAXIMUM_HIT_POINTS);
+    int hp = master->data.critter.hp;
+    bool under = maxHp > 0 && hp * 100 <= maxHp * RT_MASTER_SCREAM_PCT;
+    if (!rt_scream_init) {
+        rt_scream_init = true;
+        rt_scream_done = under;
+    }
+    if (masterHostile && under && !rt_scream_done) {
+        rt_scream_done = true;
+        rt_scream_at = rt_clock + RT_MASTER_SCREAM_DELAY;
+        rt_master_say(master, RT_MASTER_SCREAM_MSG);
+        trace_event(TRACE_COMBAT, "psy-scream", "warn hp=%d/%d lands=%.2f t=%.2f", hp, maxHp, rt_scream_at, rt_clock);
+    }
+    if (rt_scream_at < 0.0f || rt_clock < rt_scream_at) {
+        return;
+    }
+    rt_scream_at = -1.0f;
+
+    // The dude and his party, within reach of him, cover or not.
+    Object* victims[1 + RT_MAX_ACTORS];
+    int n = 0;
+    victims[n++] = obj_dude;
+    for (int i = 0; i < rt_actor_count && n < 1 + RT_MAX_ACTORS; i++) {
+        if (rt_actors[i].obj != NULL && isPartyMember(rt_actors[i].obj)) {
+            victims[n++] = rt_actors[i].obj;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        Object* v = victims[i];
+        if (v == NULL || critter_is_dead(v) || v->elevation != master->elevation
+            || obj_dist(v, master) > RT_EYEBOT_HALL_REACH) {
+            continue;
+        }
+        if (inven_pid_is_carried(v, RT_PID_PSYCHIC_NULLIFIER)) {
+            trace_event(TRACE_COMBAT, "psy-scream", "shielded id=%d pid=%d t=%.2f", v->id, v->pid, rt_clock);
+            continue;
+        }
+        int damage = stat_level(v, STAT_MAXIMUM_HIT_POINTS) * RT_MASTER_SCREAM_DMG_PCT / 100;
+        rt_psychic_hit(master, v, damage > 0 ? damage : 1);
+    }
+}
+
 // See RT_PID_MASTER_NIGHTKIN, RT_PID_FLOATING_EYE and RT_EYEBOT_HALL_REACH. Cheap enough for every
 // frame: one pass to find the Master, and his guards are only looked at while he lives.
 static void rt_master_guards_tick()
@@ -18085,6 +18181,7 @@ static void rt_master_guards_tick()
     }
 
     rt_horde_tick(master, masterHostile);
+    rt_master_scream_tick(master, masterHostile);
 }
 
 void combat_rt_update(float dt)

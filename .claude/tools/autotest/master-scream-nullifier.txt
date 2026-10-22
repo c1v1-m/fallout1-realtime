@@ -1,0 +1,23 @@
+# The Master's psychic scream (25 %) with the Psychic Nullifier (item 123) in the dude's pack: the wave
+# must not touch him. Same set-up as master-boss. Run it in a clean Steam-like folder.
+name master-scream-nullifier
+map MSTRLR34.MAP
+mapscript on
+seed 1
+duration 30
+dude tile 14455 rot 2
+dude hp 30000
+dude item 123
+
+spawn 16777291 14855 rot 5 wield 8 item 29 60 hostile team 77
+spawn 16777291 25694 rot 5 hostile team 77
+
+sethp 16777266 70 8
+sethp 16777266 45 16
+sethp 16777266 20 24
+
+at 0 idle
+
+expect-count 1 \[COMBAT/psy-scream\] warn
+expect \[COMBAT/psy-scream\] shielded id=18000
+expect-not \[COMBAT/psy-scream\] hit id=18000
