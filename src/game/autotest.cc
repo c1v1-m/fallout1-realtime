@@ -78,8 +78,9 @@ namespace fallout {
 //   dude curhp <n>                     start with n hit points (after the maximum is set)
 //   dude sneak                         start sneaking (the Sneak toggle; the skill roll is the game's)
 //   team <n>                           the team every hostile spawn joins (default: the first one's)
-//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>] [empty]
+//   spawn <pid> <tile> [rot <r>] [wield <pid>] [item <pid> <qty>]... [hostile] [team <n>] [hp <n>] [empty] [dead]
 //                                      `hostile` = an enemy that still has to SEE you before it comes
+//                                      `dead` = a body on the floor with its items (a looting test)
 //   at <seconds> <policy> [tile]       the bot's plan; policies:
 //        idle                          do nothing
 //        fight                         hold LT, attack the locked enemy when it is in weapon range,
@@ -198,6 +199,7 @@ typedef struct AtSpawn {
     int team;
     int curhp; // "hp <n>": start wounded (0 = full)
     bool empty; // "empty": the wielded gun starts with no rounds in it
+    bool dead; // "dead": killed where it stands, a body to loot
     // "stat <ST..LK> <n>": ⚠️ sets the PROTO's base stat (stat_set_base on a critter writes its proto),
     // so every critter of that pid gets it -- give the one under test a pid of its own.
     int statIndex[4];
@@ -761,6 +763,8 @@ static bool at_parse(const char* path)
                     sp->team = atoi(tok[++i]);
                 } else if (strcmp(tok[i], "hp") == 0 && i + 1 < n) {
                     sp->curhp = atoi(tok[++i]);
+                } else if (strcmp(tok[i], "dead") == 0) {
+                    sp->dead = true;
                 } else if (strcmp(tok[i], "empty") == 0) {
                     sp->empty = true;
                 } else if (strcmp(tok[i], "stat") == 0 && i + 2 < n && sp->statCount < 4) {
@@ -1065,6 +1069,9 @@ void autotest_setup_world()
         if (sp->hostile) {
             // As a script's "attack the player" does: hostile, but it still has to perceive you.
             combat_rt_notify_attack(critter, obj_dude);
+        }
+        if (sp->dead) {
+            critter_kill(critter, -1, true);
         }
         trace_event(TRACE_FLOW, "autotest-spawn", "id=%d pid=%d tile=%d wield=%d hostile=%d team=%d hp=%d",
             critter->id, critter->pid, critter->tile, sp->wield, sp->hostile ? 1 : 0, critter->data.critter.combat.team,

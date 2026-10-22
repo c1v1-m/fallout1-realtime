@@ -959,6 +959,11 @@ Object* interact_prompt_skill_target(int skill)
 // every critter, and any item, scenery or wall that is interactable or carries a SCRIPT -- a script
 // is what answers "use rope on me"; an unscripted rock would only say nothing happens. HIDDEN staged
 // content is never one (see ip_classify).
+bool interact_prompt_sees(Object* obj)
+{
+    return ip_sees(obj);
+}
+
 // Anything the prompt would offer an action on -- a door, a container, an item, a person -- reach
 // aside. The arrow cursor's walk (combat_rt, the Diablo mouse) leaves a click on one of these to
 // vanilla, so it still opens, talks and picks up.

@@ -1,0 +1,19 @@
+# SCREEN TEST: X (take all) on a body heavier than the dude can carry takes what fits (2026-10-22).
+# Vanilla took all or nothing; here the caps and stimpaks come along and one Minigun stays.
+name screen-loot-heavy
+map DESERT1.MAP
+seed 1
+duration 12
+dude tile 20100 rot 2
+dude stat ST 1
+
+spawn 16777291 20101 rot 5 item 12 3 item 41 100 item 40 3 dead
+
+tap 1500 A
+tap 3000 X
+shot 4200
+tap 5000 A
+tap 6500 B
+
+expect \[ACTION/loot-open\] .*items=3
+expect \[ACTION/loot-take-all\] .*left=1

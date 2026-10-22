@@ -24,6 +24,7 @@
 #include "game/gdialog.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
+#include "game/interact_prompt.h"
 #include "game/intface.h"
 #include "game/item.h"
 #include "game/light.h"
@@ -1872,6 +1873,10 @@ static void display_inventory_info(Object* item, int quantity, unsigned char* de
 }
 
 // 0x463EB0
+// CE: set to draw the next display_body at once, past its rotation throttle -- the loot window's
+// switch to another body must show that body even when the last one was drawn a moment ago.
+static bool display_body_force = false;
+
 void display_body(int fid, int inventoryWindowType)
 {
     // 0x5056CC
@@ -1880,9 +1885,10 @@ void display_body(int fid, int inventoryWindowType)
     // 0x5056D0
     static int curr_rot = 0;
 
-    if (elapsed_time(ticker) < INVENTORY_NORMAL_WINDOW_PC_ROTATION_DELAY) {
+    if (!display_body_force && elapsed_time(ticker) < INVENTORY_NORMAL_WINDOW_PC_ROTATION_DELAY) {
         return;
     }
+    display_body_force = false;
 
     curr_rot += 1;
 
@@ -4301,6 +4307,123 @@ static void loot_gamepad_panel_jump(int i_wid)
     prevR = rNow;
 }
 
+// CE: A PILE OF BODIES IS LOOTED FROM ONE WINDOW (2026-10-22, "jak vymyslíme lootování mnoho mrtvých
+// postav na jednom místě?" -> his pick "vzít vše + další mrtvola"). Vanilla's arrows beside the body
+// (KEY_PAGE_UP / KEY_PAGE_DOWN, LB / RB on the pad) only stepped through critters dead or out cold on
+// the SAME TILE as the one opened. They now also reach every dead body that still carries something
+// within INVENTORY_LOOT_NEARBY_TILES of the dude and in his sight (interact_prompt_sees: nothing
+// behind a wall), nearest first, and skip the ones already emptied. Under the body, "2/5" says
+// where you are. Each body is still its own inventory, as in vanilla.
+#define INVENTORY_LOOT_NEARBY_TILES 3
+#define INVENTORY_LOOT_BODIES_MAX 16
+static int loot_body_index = 0;
+static int loot_body_count = 0; // under 2: no counter
+
+// The body opened first, then vanilla's same-tile ones and the nearby ones, nearest first.
+static int loot_collect_bodies(Object* first, Object** out, int max)
+{
+    int count = 0;
+    out[count++] = first;
+
+    for (Object* obj = obj_find_first_at(first->elevation); obj != NULL && count < max; obj = obj_find_next_at()) {
+        if (obj == first || PID_TYPE(obj->pid) != OBJ_TYPE_CRITTER || (obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
+        int results = obj->data.critter.combat.results;
+        bool sameTile = obj->tile == first->tile && (results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0;
+        bool nearby = (results & DAM_DEAD) != 0
+            && obj->data.inventory.length > 0
+            && obj_dist(inven_dude, obj) <= INVENTORY_LOOT_NEARBY_TILES
+            && interact_prompt_sees(obj);
+        if (sameTile || nearby) {
+            out[count++] = obj;
+        }
+    }
+
+    for (int i = 2; i < count; i++) {
+        Object* body = out[i];
+        int dist = obj_dist(inven_dude, body);
+        int j = i;
+        while (j > 1 && obj_dist(inven_dude, out[j - 1]) > dist) {
+            out[j] = out[j - 1];
+            j--;
+        }
+        out[j] = body;
+    }
+
+    return count;
+}
+
+// From `from` toward `dir`, the next body that still carries something. The first time a body is
+// met its pickup procedure runs, as opening it would have run it, and one whose script overrides
+// that is passed over from then on (state 2). Returns `from` when there is no other.
+static int loot_next_body(Object** bodies, signed char* state, int count, int from, int dir)
+{
+    for (int step = 1; step < count; step++) {
+        int index = ((from + dir * step) % count + count) % count;
+        Object* body = bodies[index];
+        if (state[index] == 0) {
+            state[index] = 1;
+            int sid;
+            if (obj_sid(body, &sid) != -1) {
+                scr_set_objs(sid, inven_dude, NULL);
+                exec_script_proc(sid, SCRIPT_PROC_PICKUP);
+                Script* script;
+                if (scr_ptr(sid, &script) != -1 && script->scriptOverrides) {
+                    state[index] = 2;
+                }
+            }
+        }
+        if (state[index] == 1 && body->data.inventory.length > 0) {
+            return index;
+        }
+    }
+    return from;
+}
+
+// "2/5" along the bottom of the body's picture (where a lying body never reaches).
+static void loot_draw_body_counter()
+{
+    if (loot_body_count < 2) {
+        return;
+    }
+
+    unsigned char* windowBuffer = win_get_buf(i_wid);
+    int pitch = win_width(i_wid);
+
+    int oldFont = text_curr();
+    text_font(101);
+
+    int x = INVENTORY_LOOT_RIGHT_BODY_VIEW_X;
+    int y = INVENTORY_LOOT_RIGHT_BODY_VIEW_Y + INVENTORY_BODY_VIEW_HEIGHT - text_height() - 1;
+
+    CacheEntry* key;
+    unsigned char* data = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 114, 0, 0, 0), 0, 0, &key);
+    if (data != NULL) {
+        buf_to_buf(data + INVENTORY_LOOT_WINDOW_WIDTH * y + x,
+            INVENTORY_BODY_VIEW_WIDTH,
+            text_height(),
+            INVENTORY_LOOT_WINDOW_WIDTH,
+            windowBuffer + pitch * y + x,
+            pitch);
+        art_ptr_unlock(key);
+    }
+
+    char text[16];
+    snprintf(text, sizeof(text), "%d/%d", loot_body_index + 1, loot_body_count);
+    int width = text_width(text);
+    text_to_buf(windowBuffer + pitch * y + x + (INVENTORY_BODY_VIEW_WIDTH - width) / 2, text, width, pitch, colorTable[992]);
+
+    Rect rect;
+    rect.ulx = x;
+    rect.uly = y;
+    rect.lrx = x + INVENTORY_BODY_VIEW_WIDTH - 1;
+    rect.lry = y + text_height() - 1;
+    win_draw_rect(i_wid, &rect);
+
+    text_font(oldFont);
+}
+
 // 0x466B10
 int loot_container(Object* a1, Object* a2)
 {
@@ -4387,28 +4510,19 @@ int loot_container(Object* a1, Object* a2)
 
     bool isoWasEnabled = setup_inventory(INVENTORY_WINDOW_TYPE_LOOT);
 
-    Object** critters = NULL;
+    // CE: the bodies the arrows step through -- see loot_collect_bodies. The one opened is first.
+    Object* critters[INVENTORY_LOOT_BODIES_MAX];
+    signed char critterState[INVENTORY_LOOT_BODIES_MAX]; // see loot_next_body
     int critterCount = 0;
     int critterIndex = 0;
     if (!gIsSteal) {
         if (FID_TYPE(a2->fid) == OBJ_TYPE_CRITTER) {
-            critterCount = obj_create_list(a2->tile, a2->elevation, OBJ_TYPE_CRITTER, &critters);
-            int endIndex = critterCount - 1;
+            critterCount = loot_collect_bodies(a2, critters, INVENTORY_LOOT_BODIES_MAX);
             for (int index = 0; index < critterCount; index++) {
-                Object* critter = critters[index];
-                if ((critter->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) == 0) {
-                    critters[index] = critters[endIndex];
-                    critters[endIndex] = critter;
-                    critterCount--;
-                    index--;
-                    endIndex--;
-                } else {
-                    critterIndex++;
-                }
+                critterState[index] = index == 0 ? 1 : 0; // its pickup procedure ran above
             }
 
             if (critterCount == 1) {
-                obj_delete_list(critters);
                 critterCount = 0;
             }
 
@@ -4474,18 +4588,18 @@ int loot_container(Object* a1, Object* a2)
                     }
                 }
 
-                for (int index = 0; index < critterCount; index++) {
-                    if (a2 == critters[index]) {
-                        critterIndex = index;
-                    }
-                }
             }
         }
     }
 
     display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
     display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+    display_body_force = true;
     display_body(a2->fid, INVENTORY_WINDOW_TYPE_LOOT);
+    loot_body_index = 0;
+    loot_body_count = critterCount;
+    loot_draw_body_counter();
+    trace_event(TRACE_ACTION, "loot-open", "id=%d pid=%d bodies=%d items=%d", a2->id, a2->pid, critterCount, target_pud->length);
     inven_set_mouse(INVENTORY_WINDOW_CURSOR_HAND);
 
     // CE: ON A CONTROLLER, START ON THE LOOT ITSELF. The window used to open with the pointer
@@ -4655,25 +4769,53 @@ int loot_container(Object* a1, Object* a2)
                     display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
                     display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
                 } else {
+                    // CE: TAKE WHAT FITS (X on the pad, see loot_collect_bodies). Vanilla took all or
+                    // nothing, so one heavy gun left the caps and the stimpaks behind as well. Down the
+                    // list, as many of each as the weight left allows; then the same message.
+                    int room = maxCarryWeight - currentWeight;
+                    int index = 0;
+                    while (index < target_pud->length) {
+                        InventoryItem* inventoryItem = &(target_pud->items[index]);
+                        int unitWeight = item_weight(inventoryItem->item);
+                        int quantity = inventoryItem->quantity;
+                        if (unitWeight > 0 && quantity > room / unitWeight) {
+                            quantity = room / unitWeight;
+                        }
+                        int lengthBefore = target_pud->length;
+                        if (quantity <= 0 || item_move(a2, a1, inventoryItem->item, quantity) != 0) {
+                            index++;
+                            continue;
+                        }
+                        room -= unitWeight * quantity;
+                        if (target_pud->length == lengthBefore) {
+                            index++; // part of a stack stayed where it was
+                        }
+                    }
+                    display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
+                    display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+
                     // Sorry, you cannot carry that much.
                     messageListItem.num = 31;
                     if (message_search(&inventry_message_file, &messageListItem)) {
                         dialog_out(messageListItem.text, NULL, 0, 169, 117, colorTable[32328], NULL, colorTable[32328], 0);
                     }
                 }
+                trace_event(TRACE_ACTION, "loot-take-all", "id=%d left=%d weight=%d/%d",
+                    a2->id, target_pud->length, item_total_weight(a1), maxCarryWeight);
             }
         } else if (keyCode == KEY_ARROW_UP) {
             if (stack_offset[curr_stack] > 0) {
                 stack_offset[curr_stack] -= 1;
                 display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
             }
-        } else if (keyCode == KEY_PAGE_UP) {
-            if (critterCount != 0) {
-                if (critterIndex > 0) {
-                    critterIndex -= 1;
-                } else {
-                    critterIndex = critterCount - 1;
-                }
+        } else if (keyCode == KEY_PAGE_UP || keyCode == KEY_PAGE_DOWN) {
+            // CE: vanilla stepped to the next index whatever it held; now to the next body with
+            // something on it (loot_next_body), and the counter follows.
+            int next = critterCount != 0
+                ? loot_next_body(critters, critterState, critterCount, critterIndex, keyCode == KEY_PAGE_UP ? -1 : 1)
+                : critterIndex;
+            if (next != critterIndex) {
+                critterIndex = next;
 
                 a2 = critters[critterIndex];
                 target_pud = &(a2->data.inventory);
@@ -4682,29 +4824,17 @@ int loot_container(Object* a1, Object* a2)
                 target_stack_offset[0] = 0;
                 display_target_inventory(0, -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
                 display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+                display_body_force = true;
                 display_body(a2->fid, INVENTORY_WINDOW_TYPE_LOOT);
+                loot_body_index = critterIndex;
+                loot_draw_body_counter();
+                trace_event(TRACE_ACTION, "loot-body", "id=%d pid=%d index=%d of=%d items=%d",
+                    a2->id, a2->pid, critterIndex + 1, critterCount, target_pud->length);
             }
         } else if (keyCode == KEY_ARROW_DOWN) {
             if (stack_offset[curr_stack] + inven_cur_disp < pud->length) {
                 stack_offset[curr_stack] += 1;
                 display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
-            }
-        } else if (keyCode == KEY_PAGE_DOWN) {
-            if (critterCount != 0) {
-                if (critterIndex < critterCount - 1) {
-                    critterIndex += 1;
-                } else {
-                    critterIndex = 0;
-                }
-
-                a2 = critters[critterIndex];
-                target_pud = &(a2->data.inventory);
-                target_stack[0] = a2;
-                target_curr_stack = 0;
-                target_stack_offset[0] = 0;
-                display_target_inventory(0, -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
-                display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
-                display_body(a2->fid, INVENTORY_WINDOW_TYPE_LOOT);
             }
         } else if (keyCode == KEY_CTRL_ARROW_UP) {
             if (target_stack_offset[target_curr_stack] > 0) {
@@ -4821,12 +4951,11 @@ int loot_container(Object* a1, Object* a2)
     }
 
     if (critterCount != 0) {
-        obj_delete_list(critters);
-
         for (int index = 0; index < INVENTORY_ARROW_FRM_COUNT; index++) {
             art_ptr_unlock(arrowFrmHandles[index]);
         }
     }
+    loot_body_count = 0;
 
     if (gIsSteal) {
         if (item1 != NULL) {

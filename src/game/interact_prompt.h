@@ -48,6 +48,9 @@ Object* interact_prompt_skill_target(int skill);
 // returns the ones on screen within the picker's reach.
 bool interact_prompt_is_use_target(Object* obj);
 bool interact_prompt_object_interactable(Object* obj);
+// The prompt's "nothing behind a wall" test: the straight line from the dude to `obj` crosses no
+// wall or closed door. The loot window's nearby bodies use it too (inventry.cc).
+bool interact_prompt_sees(Object* obj);
 int interact_prompt_use_targets(Object** out, int max);
 
 // Move the prompt to the interactable lying in screen direction (dirX, dirY) from the CURRENT one

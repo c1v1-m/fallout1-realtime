@@ -1173,10 +1173,12 @@ static void gpui_action_buttons(SDL_GameController* pad, int* dx, int* dy, int* 
     // THE QUICK SLOTS ARE BOUND HERE (2026-10-15): in your own inventory, LB / RB over an item binds
     // it to that slot. RB's right-click there only switched the hand/arrow cursor, which the pad never
     // needed -- a held A opens the action menu.
+    // ...and in a loot window RB steps to the next body (gpui_button_shortcuts), so no right-click there.
     bool invNormal = invOpen && inven_current_window_type() == INVENTORY_WINDOW_TYPE_NORMAL;
+    bool invLoot = invOpen && inven_current_window_type() == INVENTORY_WINDOW_TYPE_LOOT;
     if (invNormal && (lbEdge || rbEdge)) {
         gpui_qs_bind_under_cursor(lbEdge ? GPUI_QS_LB : GPUI_QS_RB);
-    } else if (rbEdge && !radial_wheel_is_open()
+    } else if (rbEdge && !invLoot && !radial_wheel_is_open()
         && (gamepad_ui_menu_active() || inven_any_open() || dialog_active())) {
         *buttons |= MOUSE_STATE_RIGHT_BUTTON_DOWN;
         gpui_cursor_show_time = get_time();
@@ -1768,9 +1770,18 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // A loot/container window is modal (so inven_is_open(), which is the normal
     // inventory only, is false here). B closes it: its Done button emits
     // KEY_ESCAPE, which the loot loop breaks on -- same as the BACK escape hatch.
+    // X takes everything you can carry and LB / RB step to the previous / next body nearby (2026-10-22,
+    // his pick "vzít vše + další mrtvola"): the loot window's own Shift+A and arrow keys, see
+    // loot_collect_bodies in inventry.cc.
     if (inven_any_open() && inven_current_window_type() == INVENTORY_WINDOW_TYPE_LOOT) {
         if (bPressed) {
             GNW_add_input_buffer(KEY_ESCAPE);
+        } else if (xPressed) {
+            GNW_add_input_buffer(KEY_UPPERCASE_A);
+        } else if (lbPressed) {
+            GNW_add_input_buffer(KEY_PAGE_UP);
+        } else if (rbPressed) {
+            GNW_add_input_buffer(KEY_PAGE_DOWN);
         }
         return;
     }

@@ -1,0 +1,32 @@
+# SCREEN TEST: a pile of bodies looted from one window (2026-10-22, "jak vymyslíme lootování mnoho
+# mrtvých postav na jednom místě?" -> his pick "vzít vše + další mrtvola"). Four bodies within 3 tiles
+# of the dude and one far off; A opens the nearest, X takes everything, RB steps to the next body
+# with something on it, LB back. The far one must not be in the list.
+name screen-loot-pile
+map DESERT1.MAP
+seed 1
+duration 16
+dude tile 20100 rot 2
+
+spawn 16777291 20101 rot 5 wield 8 item 41 25 item 40 1 dead
+spawn 16777291 20102 rot 5 wield 4 item 41 10 dead
+spawn 16777291 20300 rot 5 item 40 2 dead
+spawn 16777291 19902 rot 5 wield 8 item 29 12 dead
+spawn 16777291 20112 rot 5 item 41 99 dead
+
+tap 1500 A
+shot 3000
+tap 3600 X
+shot 4600
+tap 5200 RB
+shot 6200
+tap 6800 RB
+shot 7800
+tap 8400 LB
+shot 9400
+tap 10200 B
+
+expect \[ACTION/loot-open\] .*bodies=4
+expect \[ACTION/loot-take-all\] .*left=0
+expect-count 3 \[ACTION/loot-body\]
+expect \[ACTION/loot-body\] .*index=2 of=4
