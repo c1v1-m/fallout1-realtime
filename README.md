@@ -6,7 +6,7 @@
 
 Fallout 1 where nobody waits for their turn. You walk with the stick, hold the left trigger to lock onto an enemy and pull the right one to shoot, while the raiders and mutants come at you at the same time. Action points are still there. They refill as you fight, faster when the enemy is close, so standing back and kiting does not pay.
 
-It is made for a controller, from the first screen to the ending, and you can play it from start to finish. On a PC the keyboard works the same way, no mouse needed: arrows to walk, Ctrl to attack.
+It is made for a controller, from the first screen to the ending, and you can play it from start to finish.
 
 You need your own copy of Fallout from [Steam](https://store.steampowered.com/app/38400) or [GOG](https://www.gog.com/game/fallout).
 
@@ -21,7 +21,6 @@ You need your own copy of Fallout from [Steam](https://store.steampowered.com/ap
 - Your stats decide how fast you swing, aim and reload. Agility brings your action points back faster.
 - A stimpack heals over the next few seconds in a fight, so hits still hurt while it works. Hold the button and you inject one after another.
 - The whole game plays on a gamepad: fighting, looting, barter, dialogue, the Pip-Boy, the character screen.
-- Or on a keyboard laid out like the controller, without touching the mouse.
 - Two quick slots: LB for a stimpack or any drug or tool, RB for a grenade. Radial menus for skills, weapons, ammo and drugs.
 - Autosaves when you reach a new place or a quest moves on, and a quick save on the controller.
 - On the Steam Deck it starts straight from the Steam library, in Game Mode.
@@ -54,49 +53,33 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 
 ## Controls
 
-### Controller
-
 | Button | What it does |
 |---|---|
 | Left stick | Walk |
-| X | Reload, hold to run |
-| Right stick | Move the cursor, pick a target |
-| LT (hold) | Lock onto the nearest enemy |
-| RT | Attack, hold to keep attacking |
-| LT + Y | Firing mode: single, aimed, burst |
-| R3 | Called shot: pick a body part |
-| LB | Quick slot: stimpack, or the drug or tool you put there. Hold to keep healing |
-| RB | Quick slot: grenade. Hold to draw, let go to throw |
-| A | Use what is lit up |
-| Y | Swap the active hand, hold for the weapon and ammo wheel |
-| B | Cancel, hold for the drug and item wheel |
-| L3 | Skill wheel |
-| D-pad (hold) | Pip-Boy, character, automap, end combat |
-| BACK | Inventory, hold to run to the nearest exit |
-| START | Pause menu, hold to quick save |
+| Right stick | Look, aim |
+| D-pad | Next action, scroll |
+| Hold Up | Pip-Boy |
+| Hold Down | Character |
+| Hold Left | Automap |
+| Hold Right | End combat |
+| LB / RB | Quick slots |
+| LT | Aim |
+| RT | Shoot |
+| L3 | Skills |
+| R3 | Called shot |
+| A | Confirm, action |
+| B | Cancel |
+| B hold | Drugs, items |
+| X hold | Run |
+| Y | Swap hands |
+| Y hold | Weapons, ammo |
+| LT + X | Reload |
+| LT + Y | Firing mode |
+| BACK | Inventory |
+| START | Pause |
+| START hold | Quick save |
 
-### Keyboard
-
-| Key | What it does |
-|---|---|
-| Arrows | Walk, hold Alt to run |
-| Ctrl (hold) | Attack, keeps attacking |
-| Shift (hold) | Lock onto the enemy in front |
-| Q / E | Lock the next enemy left / right |
-| F | Firing mode: single, aimed, burst |
-| V | Called shot |
-| R | Reload |
-| H | Quick slot LB: stimpack |
-| T | Quick slot RB: throw the grenade |
-| B | Swap the active hand |
-| Space | Use what is lit up |
-| G | Run to the nearest exit |
-| I, C, P, S, Tab | Inventory, character, Pip-Boy, Skilldex, automap |
-| F6 / F7 | Quick save / quick load |
-
-The mouse still works as in the original, and you can aim with it too: point at an enemy and click to attack.
-
-Every screen has its own list in the game: Pip-Boy, Archives, CONTROLS.
+The same list is in the game: Pip-Boy, Archives, CONTROLS.
 
 ## Saves
 
@@ -125,7 +108,6 @@ Known: on some PCs (seen with an AMD graphics card) the Steam overlay does not s
 
 - Polish, everywhere it still feels rough.
 - New hand-made animations, starting with reloading.
-- Choosing your own keys on the MODS page.
 - The Steam overlay on the PCs where it does not show yet.
 
 ## Building
