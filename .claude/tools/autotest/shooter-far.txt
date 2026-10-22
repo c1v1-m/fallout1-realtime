@@ -1,11 +1,11 @@
-# A shooter out past the lock and out of view (2026-10-22, his pick "B + C"). trace_2026-10-22_181351
-# s=162-166: a Super Mutant Guard with a plasma rifle (range 25) hit him twice from 23 tiles, 21 rows up
-# and 5 columns left (282 px above him on a 480-line view that shows 190); his LT reached only PE 10 x 2
-# = 20 tiles. Same geometry here: the dude PE 10 with a 10mm SMG (range 25), a mutant with a plasma rifle
-# 23 tiles up-left, PE 9 so it sees him from there. The dude stands until it has fired, then holds LT
-# and fights.
-# Good: [FLOW/threat-arrow] on (it is off the view), [ACTION/lock-pick] ... dist>20 ... shooter=1, and
-# the dude's own [COMBAT/attack] DUDE at it. Before the fix: no lock-pick until it walks within 20.
+# A shooter out past the lock and out of view (2026-10-22, his pick "B + C"; the C arrow was dropped
+# on sight). trace_2026-10-22_181351 s=162-166: a Super Mutant Guard with a plasma rifle (range 25) hit
+# him twice from 23 tiles, 21 rows up and 5 columns left (282 px above him on a 480-line view that shows
+# 190); his LT reached only PE 10 x 2 = 20 tiles. Same geometry here: the dude PE 10 with a 10mm SMG
+# (range 25), a mutant with a plasma rifle 23 tiles up-left, PE 9 so it sees him from there. The dude
+# stands until it has fired, then holds LT and fights.
+# Good: [FLOW/offscreen-shooter] on (it is off the view), [ACTION/lock-pick] ... dist>20 ... shooter=1,
+# and the dude's own [COMBAT/attack] DUDE at it. Before the fix: no lock-pick until it walks within 20.
 name shooter-far
 map DESERT1.MAP
 seed 1
@@ -24,6 +24,6 @@ at 0 idle
 at 4 fight
 
 expect \[COMBAT/attack\] NPC .*->pid=16777216
-expect \[FLOW/threat-arrow\] on
+expect \[FLOW/offscreen-shooter\] on
 expect \[ACTION/lock-pick\] .*shooter=1
 expect \[COMBAT/attack\] DUDE

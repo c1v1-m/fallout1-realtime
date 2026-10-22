@@ -1237,8 +1237,8 @@ static int rt_cam_prev_x = 0;
 static int rt_cam_prev_y = 0;
 static bool rt_cam_have_prev = false;
 
-// WHO IS SHOOTING AT YOU -- defined with rt_note_shot_at_dude, used by the lock, the lean and the
-// edge arrows long before that.
+// WHO IS SHOOTING AT YOU -- defined with rt_note_shot_at_dude, used by the lock and the lean long
+// before that.
 static void rt_note_shot_at_dude(Object* attacker);
 static bool rt_shooting_at_dude(Object* critter);
 static bool rt_lock_shooter_in_reach(Object* critter);
@@ -1399,10 +1399,9 @@ static bool rt_projectiles = true;
 static RtActor* rt_actor_of(Object* obj);
 static void rt_tracers_render(Rect* rect, int elevation);
 static void rt_tracers_reset();
-static void rt_overlay_render(Rect* rect, int elevation);
-static void rt_threat_arrows_reset();
-static void rt_threat_arrows_tick();
-static bool rt_threat_arrow_anchor(Object* obj, int* x, int* y);
+static void rt_offscreen_shooters_reset();
+static void rt_offscreen_shooters_tick();
+static bool rt_offscreen_crosshair_at(Object* obj, int* x, int* y);
 
 // ⚠️ NOBODY ASKS YOU TO PUT YOUR GUN AWAY WHILE YOU ARE USING IT (2026-10-15, "nemůže u toho eventu
 // prostě vypnout to s tou zbraní, ať se mě neptají při tom konfliktu? zabiju assassina a ještě se jim
@@ -7503,7 +7502,7 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
                 shooter->hint_until = 0.0f; // the step it took is over: this is an attack ([FLOW/intent])
             }
             if (defender == obj_dude) {
-                rt_note_shot_at_dude(attacker); // answerable now: rt_lock_reach, the edge arrow
+                rt_note_shot_at_dude(attacker); // answerable now: rt_lock_reach
             }
         }
 
@@ -10049,8 +10048,9 @@ static RtActor* rt_actor_of(Object* obj)
 // So a critter that attacked the dude within RT_SHOOTER_MEMORY seconds is answerable: it can be locked
 // out to the dude's WEAPON range (rt_lock_reach), a lock on it is not dropped for being off screen
 // while it stays in that range (rt_lock_shooter_in_reach), the camera leans as far as it takes
-// (RT_CAM_LEAN_SHOOTER_KEEP_*), and an arrow at the view's edge points at it while it is out of view
-// (rt_threat_arrows_tick). Everyone else keeps the Perception reach -- that stays the stat it was.
+// (RT_CAM_LEAN_SHOOTER_KEEP_*), and while it is still out of view the crosshair waits on the view's
+// edge in its direction (rt_offscreen_crosshair_at). The edge ARROW that came with it is gone, he
+// rejected it on sight. Everyone else keeps the Perception reach -- that stays the stat it was.
 //
 // Pointers plus the clock only, cleared with the encounter (rt_abandon_encounter); every reader checks
 // rt_in_registry before it touches one.
@@ -10116,7 +10116,7 @@ static int rt_lock_reach(Object* critter)
     return reach;
 }
 
-// A lock on a shooter you can answer stays up off screen: the edge arrow shows where it is.
+// A lock on a shooter you can answer stays up off screen: its crosshair waits on the view's edge.
 static bool rt_lock_shooter_in_reach(Object* critter)
 {
     return rt_shooting_at_dude(critter)
@@ -14482,7 +14482,7 @@ static void rt_abandon_encounter()
     rt_reloading_count = 0; // pointers only -- the bodies are being freed by the caller
     rt_injecting = NULL;
     rt_shooter_count = 0; // who shot at him on the map being left (rt_note_shot_at_dude)
-    rt_threat_arrows_reset();
+    rt_offscreen_shooters_reset();
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
@@ -14623,7 +14623,7 @@ void combat_rt_init()
     int projectiles = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROJECTILES_KEY, &projectiles);
     rt_projectiles = projectiles != 0;
-    tile_set_overlay(rt_overlay_render); // tracers + the edge arrows (rt_threat_arrows_render)
+    tile_set_overlay(rt_tracers_render);
     rt_tracers_reset();
 
     // The realtime tactics on top of vanilla's rules (MODS "Tactical AI"). Default ON: his call, 2026-10-17.
@@ -15892,8 +15892,8 @@ void combat_rt_poll_gamepad()
     bool leanFits = false;
     rt_cam_lean_want(rt_lock_target, &leanWantX, &leanWantY, &leanFits);
     // ...and never for one shooting at you from within your weapon's reach (2026-10-22, "B + C"):
-    // dropping it is what left him unable to answer a mutant out of view. The edge arrow
-    // (rt_threat_arrows_tick) shows where it is when even the lean cannot.
+    // dropping it is what left him unable to answer a mutant out of view. When even the lean cannot
+    // show it, its crosshair waits on the view's edge (rt_offscreen_crosshair_at).
     if (rt_lock_target != NULL && !leanFits && !OnScreen::test(rt_lock_target)
         && !rt_lock_shooter_in_reach(rt_lock_target)) {
         if (rt_lock_offscreen_since < 0.0f) {
@@ -16043,16 +16043,16 @@ void combat_rt_poll_gamepad()
         // Glue the cursor to the target's centre -- but NOT while it is off screen, or we would be
         // parking the mouse outside the world window during the brief grace before the lock drops.
         // A shooter locked off screen (rt_lock_shooter_in_reach) keeps its lock, so its crosshair and
-        // to-hit % go just behind its edge arrow instead: left where they were, they sat on the dude
-        // himself and read as HIS chance (photographed in scenario shooter-far, 2026-10-22).
-        int arrowX;
-        int arrowY;
+        // to-hit % go to the view's edge in its direction instead: left where they were, they sat on
+        // the dude himself and read as HIS chance (photographed in scenario shooter-far, 2026-10-22).
+        int edgeX;
+        int edgeY;
         if (OnScreen::test(rt_lock_target)) {
             Rect bounds;
             obj_bound(rt_lock_target, &bounds);
             mouse_set_position((bounds.ulx + bounds.lrx) / 2, (bounds.uly + bounds.lry) / 2);
-        } else if (rt_threat_arrow_anchor(rt_lock_target, &arrowX, &arrowY)) {
-            mouse_set_position(arrowX, arrowY);
+        } else if (rt_offscreen_crosshair_at(rt_lock_target, &edgeX, &edgeY)) {
+            mouse_set_position(edgeX, edgeY);
         }
 
         // Put the game mouse in CROSSHAIR mode so left-click attacks and hostiles
@@ -17186,264 +17186,140 @@ static void rt_tracers_tick()
     }
 }
 
-// ⚠️ AN ARROW AT THE EDGE OF THE VIEW TOWARD WHOEVER IS SHOOTING AT YOU FROM OUT OF IT (2026-10-22,
-// his pick "B + C"). The C half of rt_note_shot_at_dude: a critter that attacked him in the last
-// RT_SHOOTER_MEMORY seconds and whose sprite is entirely off the world window gets a triangle on the
-// window's edge, on the line from the dude to it. Red; yellow when it is the one LT is locked on; it
-// flashes pale for RT_ARROW_FLASH after each trigger pull of that shooter -- the pull, not the hit, so
-// it is a warning while the shot is still on its way. Nothing changes any rule.
-//
-// Drawn by the world overlay (rt_overlay_render, tile.cc refresh_game) and rebuilt from the CURRENT
-// view on every repaint, so a scrolling camera never leaves an arrow where the view used to be. The
-// once-a-frame tick only repaints what moved and writes the trace.
-// A slender head with a short tail: a plain triangle this small read as a "play" button, its tip lost
-// in the outline -- photographed pointing up-left, it looked like it pointed right.
-#define RT_ARROW_MAX 8
-#define RT_ARROW_INSET 5.0f // px from the window edge to the tip
-#define RT_ARROW_HEAD_LEN 11.0f
-#define RT_ARROW_HEAD_HALF 7.0f
-#define RT_ARROW_TAIL_LEN 8.0f
-#define RT_ARROW_TAIL_HALF 2.0f
-#define RT_ARROW_BODY_LIFT 30 // aim from body to body, not feet to feet
-#define RT_ARROW_FLASH 0.35f
+// WHERE A SHOOTER OUT OF VIEW IS (2026-10-22). His pick "B + C" first drew an arrow on the view's
+// edge toward every shooter off the screen; he rejected it at first sight ("ne šipku ne to je
+// strašný"), so NOTHING IS DRAWN. What is left is the point on the edge, for one job: a lock on a
+// shooter off screen (rt_lock_shooter_in_reach keeps it) puts its crosshair and to-hit % there, in the
+// shooter's direction. Left where they were, they sat on the dude himself and read as HIS chance
+// (photographed in scenario shooter-far). And the trace says when a shooter is out of view.
+#define RT_OFFSCREEN_MAX 8
+#define RT_OFFSCREEN_INSET_X 40.0f // px inside the window edge: room for the crosshair and its %
+#define RT_OFFSCREEN_INSET_Y 28.0f
+#define RT_OFFSCREEN_BODY_LIFT 30 // aim from body to body, not feet to feet
 
-typedef struct RtArrow {
-    Object* obj;
-    int id;
-    float tx, ty; // the tip (window px)
-    float vx, vy; // unit vector the arrow points along, out toward the shooter
-    int look; // 0 red, 1 locked (yellow), 2 flash
-    Rect r;
-} RtArrow;
-
-static RtArrow rt_arrows_painted[RT_ARROW_MAX];
-static int rt_arrows_painted_count = 0;
-
-static void rt_threat_arrows_reset()
+// The point on the inset window edge on the line from the dude to `o`, in screen px; false while any of
+// o's sprite is in view, or when there is no view to speak of.
+static bool rt_offscreen_edge_point(Object* o, float* x, float* y)
 {
-    rt_arrows_painted_count = 0;
-}
-
-static int rt_threat_arrows_build(RtArrow* out)
-{
-    if (!rt_enabled || obj_dude == NULL || display_win == -1 || obj_dude->tile == -1) {
-        return 0;
+    if (!rt_enabled || o == NULL || obj_dude == NULL || display_win == -1 || obj_dude->tile == -1
+        || o->tile == -1 || o->elevation != obj_dude->elevation) {
+        return false;
     }
     Rect win;
     if (win_get_rect(display_win, &win) == -1) {
-        return 0;
+        return false;
     }
-    float w = (float)(win.lrx - win.ulx + 1);
-    float h = (float)(win.lry - win.uly + 1);
+    Rect b;
+    obj_bound(o, &b);
+    if (!(b.lrx < win.ulx || b.ulx > win.lrx || b.lry < win.uly || b.uly > win.lry)) {
+        return false; // some of it is in view: the player can see it
+    }
     int dx;
     int dy;
-    if (tile_coord(obj_dude->tile, &dx, &dy, obj_dude->elevation) != 0) {
-        return 0;
+    int ox;
+    int oy;
+    if (tile_coord(obj_dude->tile, &dx, &dy, obj_dude->elevation) != 0
+        || tile_coord(o->tile, &ox, &oy, obj_dude->elevation) != 0) {
+        return false;
     }
     float px = (float)(dx + 16 + obj_dude->x);
-    float py = (float)(dy + 8 + obj_dude->y - RT_ARROW_BODY_LIFT);
-    float minX = RT_ARROW_INSET;
-    float maxX = w - 1.0f - RT_ARROW_INSET;
-    float minY = RT_ARROW_INSET;
-    float maxY = h - 1.0f - RT_ARROW_INSET;
+    float py = (float)(dy + 8 + obj_dude->y - RT_OFFSCREEN_BODY_LIFT);
+    float vx = (float)(ox + 16 + o->x) - px;
+    float vy = (float)(oy + 8 + o->y - RT_OFFSCREEN_BODY_LIFT) - py;
+    float len = sqrtf(vx * vx + vy * vy);
+    if (len < 1.0f) {
+        return false;
+    }
+    vx /= len;
+    vy /= len;
 
+    // Where the line from the dude leaves the inset window.
+    float minX = RT_OFFSCREEN_INSET_X;
+    float maxX = (float)(win.lrx - win.ulx) - RT_OFFSCREEN_INSET_X;
+    float minY = RT_OFFSCREEN_INSET_Y;
+    float maxY = (float)(win.lry - win.uly) - RT_OFFSCREEN_INSET_Y;
+    float t = 1.0e9f;
+    if (vx > 0.0f) {
+        t = fminf(t, (maxX - px) / vx);
+    } else if (vx < 0.0f) {
+        t = fminf(t, (minX - px) / vx);
+    }
+    if (vy > 0.0f) {
+        t = fminf(t, (maxY - py) / vy);
+    } else if (vy < 0.0f) {
+        t = fminf(t, (minY - py) / vy);
+    }
+    if (t < 0.0f) {
+        t = 0.0f;
+    }
+    *x = win.ulx + fminf(fmaxf(px + vx * t, minX), maxX);
+    *y = win.uly + fminf(fmaxf(py + vy * t, minY), maxY);
+    return true;
+}
+
+// Where the crosshair of a lock on `obj` goes while obj is out of view; false unless obj is a shooter
+// off the screen.
+static bool rt_offscreen_crosshair_at(Object* obj, int* x, int* y)
+{
+    float fx;
+    float fy;
+    if (!rt_shooting_at_dude(obj) || !rt_offscreen_edge_point(obj, &fx, &fy)) {
+        return false;
+    }
+    *x = (int)fx;
+    *y = (int)fy;
+    return true;
+}
+
+static Object* rt_offscreen_seen[RT_OFFSCREEN_MAX];
+static int rt_offscreen_seen_id[RT_OFFSCREEN_MAX];
+static int rt_offscreen_seen_count = 0;
+
+static void rt_offscreen_shooters_reset()
+{
+    rt_offscreen_seen_count = 0;
+}
+
+// Once a frame, after the camera moved: say when a shooter goes out of view, and when it comes back
+// (or stops shooting). Pointers are compared, never followed, for the ones that left.
+static void rt_offscreen_shooters_tick()
+{
+    Object* now[RT_OFFSCREEN_MAX];
     int n = 0;
-    for (int i = 0; i < rt_shooter_count && n < RT_ARROW_MAX; i++) {
+    for (int i = 0; i < rt_shooter_count && n < RT_OFFSCREEN_MAX; i++) {
         Object* o = rt_shooters[i].obj;
-        if (!rt_shooting_at_dude(o) || o->elevation != obj_dude->elevation || o->tile == -1) {
-            continue;
+        float x;
+        float y;
+        if (rt_shooting_at_dude(o) && rt_offscreen_edge_point(o, &x, &y)) {
+            now[n++] = o;
         }
-        Rect b;
-        obj_bound(o, &b);
-        if (!(b.lrx < win.ulx || b.ulx > win.lrx || b.lry < win.uly || b.uly > win.lry)) {
-            continue; // some of it is in view: the player can see it
-        }
-        int ox;
-        int oy;
-        if (tile_coord(o->tile, &ox, &oy, obj_dude->elevation) != 0) {
-            continue;
-        }
-        float vx = (float)(ox + 16 + o->x) - px;
-        float vy = (float)(oy + 8 + o->y - RT_ARROW_BODY_LIFT) - py;
-        float len = sqrtf(vx * vx + vy * vy);
-        if (len < 1.0f) {
-            continue;
-        }
-        vx /= len;
-        vy /= len;
-
-        // Where the line from the dude leaves the inset window.
-        float t = 1.0e9f;
-        if (vx > 0.0f) {
-            t = fminf(t, (maxX - px) / vx);
-        } else if (vx < 0.0f) {
-            t = fminf(t, (minX - px) / vx);
-        }
-        if (vy > 0.0f) {
-            t = fminf(t, (maxY - py) / vy);
-        } else if (vy < 0.0f) {
-            t = fminf(t, (minY - py) / vy);
-        }
-        if (t < 0.0f) {
-            t = 0.0f;
-        }
-        RtArrow* a = &out[n];
-        a->obj = o;
-        a->id = o->id;
-        a->tx = fminf(fmaxf(px + vx * t, minX), maxX);
-        a->ty = fminf(fmaxf(py + vy * t, minY), maxY);
-        a->vx = vx;
-        a->vy = vy;
-        a->look = rt_clock - rt_shooters[i].at < RT_ARROW_FLASH ? 2 : (o == rt_lock_target ? 1 : 0);
-        // Bounds: the tip, the head's two barbs, the tail's two back corners.
-        float hb = RT_ARROW_HEAD_LEN;
-        float tb = RT_ARROW_HEAD_LEN + RT_ARROW_TAIL_LEN;
-        float xs[5] = { a->tx, a->tx - vx * hb - vy * RT_ARROW_HEAD_HALF, a->tx - vx * hb + vy * RT_ARROW_HEAD_HALF,
-            a->tx - vx * tb - vy * RT_ARROW_TAIL_HALF, a->tx - vx * tb + vy * RT_ARROW_TAIL_HALF };
-        float ys[5] = { a->ty, a->ty - vy * hb + vx * RT_ARROW_HEAD_HALF, a->ty - vy * hb - vx * RT_ARROW_HEAD_HALF,
-            a->ty - vy * tb + vx * RT_ARROW_TAIL_HALF, a->ty - vy * tb - vx * RT_ARROW_TAIL_HALF };
-        float x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
-        for (int k = 1; k < 5; k++) {
-            x0 = fminf(x0, xs[k]);
-            x1 = fmaxf(x1, xs[k]);
-            y0 = fminf(y0, ys[k]);
-            y1 = fmaxf(y1, ys[k]);
-        }
-        a->r.ulx = (int)floorf(x0) - 2;
-        a->r.uly = (int)floorf(y0) - 2;
-        a->r.lrx = (int)ceilf(x1) + 2;
-        a->r.lry = (int)ceilf(y1) + 2;
-        n++;
-    }
-    return n;
-}
-
-// Is pixel (x, y) inside the arrow? Measured in the arrow's own frame: u back from the tip along the
-// shaft, w across it.
-static bool rt_arrow_covers(const RtArrow* a, int x, int y)
-{
-    float dx = x + 0.5f - a->tx;
-    float dy = y + 0.5f - a->ty;
-    float u = -(dx * a->vx + dy * a->vy);
-    float w = fabsf(dy * a->vx - dx * a->vy);
-    if (u < 0.0f) {
-        return false;
-    }
-    if (u <= RT_ARROW_HEAD_LEN) {
-        return w <= RT_ARROW_HEAD_HALF * u / RT_ARROW_HEAD_LEN + 0.5f;
-    }
-    return u <= RT_ARROW_HEAD_LEN + RT_ARROW_TAIL_LEN && w <= RT_ARROW_TAIL_HALF;
-}
-
-static void rt_threat_arrows_render(Rect* rect, int elevation)
-{
-    if (obj_dude == NULL || elevation != obj_dude->elevation) {
-        return;
-    }
-    RtArrow arrows[RT_ARROW_MAX];
-    int n = rt_threat_arrows_build(arrows);
-    static const int fills[3] = { RT_RGB(31, 3, 2), RT_RGB(31, 27, 4), RT_RGB(31, 31, 26) };
-    int outline = colorTable[RT_RGB(3, 1, 1)];
-    for (int i = 0; i < n; i++) {
-        RtArrow* a = &arrows[i];
-        int fill = colorTable[fills[a->look]];
-        int y0 = a->r.uly > rect->uly ? a->r.uly : rect->uly;
-        int y1 = a->r.lry < rect->lry ? a->r.lry : rect->lry;
-        int x0 = a->r.ulx > rect->ulx ? a->r.ulx : rect->ulx;
-        int x1 = a->r.lrx < rect->lrx ? a->r.lrx : rect->lrx;
-        for (int y = y0; y <= y1; y++) {
-            for (int x = x0; x <= x1; x++) {
-                if (rt_arrow_covers(a, x, y)) {
-                    tile_overlay_line(rect, x, y, x, y, fill);
-                } else if (rt_arrow_covers(a, x - 1, y) || rt_arrow_covers(a, x + 1, y)
-                    || rt_arrow_covers(a, x, y - 1) || rt_arrow_covers(a, x, y + 1)) {
-                    // A one-pixel dark rim just outside the fill: it reads on sand and on dark
-                    // floors alike, and keeps the sharp tip coloured.
-                    tile_overlay_line(rect, x, y, x, y, outline);
-                }
-            }
-        }
-    }
-}
-
-// The world overlay: bullet tracers, then the arrows on top.
-static void rt_overlay_render(Rect* rect, int elevation)
-{
-    rt_tracers_render(rect, elevation);
-    rt_threat_arrows_render(rect, elevation);
-}
-
-// Where the crosshair of a lock that is off screen goes: a little behind obj's edge arrow, toward
-// the middle, so the to-hit % beside it stays on the screen. False when obj has no arrow.
-#define RT_ARROW_CROSSHAIR_BACK 14.0f
-static bool rt_threat_arrow_anchor(Object* obj, int* x, int* y)
-{
-    RtArrow arrows[RT_ARROW_MAX];
-    int n = rt_threat_arrows_build(arrows);
-    Rect win;
-    if (obj == NULL || win_get_rect(display_win, &win) == -1) {
-        return false;
-    }
-    for (int i = 0; i < n; i++) {
-        if (arrows[i].obj == obj) {
-            float back = RT_ARROW_HEAD_LEN + RT_ARROW_TAIL_LEN + RT_ARROW_CROSSHAIR_BACK;
-            *x = win.ulx + (int)(arrows[i].tx - arrows[i].vx * back);
-            *y = win.uly + (int)(arrows[i].ty - arrows[i].vy * back);
-            return true;
-        }
-    }
-    return false;
-}
-
-// Once a frame, after the camera moved: repaint where the arrows were and where they are now when
-// anything changed, and say when one appears or goes.
-static void rt_threat_arrows_tick()
-{
-    RtArrow now[RT_ARROW_MAX];
-    int n = rt_threat_arrows_build(now);
-
-    bool changed = n != rt_arrows_painted_count;
-    for (int i = 0; i < n && !changed; i++) {
-        RtArrow* a = &now[i];
-        RtArrow* p = &rt_arrows_painted[i];
-        changed = a->obj != p->obj || a->look != p->look
-            || (int)a->tx != (int)p->tx || (int)a->ty != (int)p->ty
-            || (int)(a->vx * 64.0f) != (int)(p->vx * 64.0f) || (int)(a->vy * 64.0f) != (int)(p->vy * 64.0f);
-    }
-    if (!changed) {
-        return;
     }
 
     for (int i = 0; i < n; i++) {
         bool was = false;
-        for (int j = 0; j < rt_arrows_painted_count; j++) {
-            was = was || rt_arrows_painted[j].obj == now[i].obj;
+        for (int j = 0; j < rt_offscreen_seen_count; j++) {
+            was = was || rt_offscreen_seen[j] == now[i];
         }
         if (!was) {
-            trace_event(TRACE_FLOW, "threat-arrow", "on id=%d pid=%d dist=%d tip=%.0f,%.0f locked=%d t=%.2f",
-                now[i].id, now[i].obj->pid, obj_dist(obj_dude, now[i].obj), now[i].tx, now[i].ty,
-                now[i].obj == rt_lock_target ? 1 : 0, rt_clock);
+            trace_event(TRACE_FLOW, "offscreen-shooter", "on id=%d pid=%d dist=%d locked=%d t=%.2f",
+                now[i]->id, now[i]->pid, obj_dist(obj_dude, now[i]), now[i] == rt_lock_target ? 1 : 0, rt_clock);
         }
     }
-    for (int j = 0; j < rt_arrows_painted_count; j++) {
+    for (int j = 0; j < rt_offscreen_seen_count; j++) {
         bool still = false;
         for (int i = 0; i < n; i++) {
-            still = still || now[i].obj == rt_arrows_painted[j].obj;
+            still = still || now[i] == rt_offscreen_seen[j];
         }
         if (!still) {
-            trace_event(TRACE_FLOW, "threat-arrow", "off id=%d t=%.2f", rt_arrows_painted[j].id, rt_clock);
+            trace_event(TRACE_FLOW, "offscreen-shooter", "off id=%d t=%.2f", rt_offscreen_seen_id[j], rt_clock);
         }
     }
 
-    int elevation = obj_dude != NULL ? obj_dude->elevation : map_elevation;
-    for (int j = 0; j < rt_arrows_painted_count; j++) {
-        tile_refresh_rect(&rt_arrows_painted[j].r, elevation);
-    }
     for (int i = 0; i < n; i++) {
-        tile_refresh_rect(&now[i].r, elevation);
-        rt_arrows_painted[i] = now[i];
+        rt_offscreen_seen[i] = now[i];
+        rt_offscreen_seen_id[i] = now[i]->id;
     }
-    rt_arrows_painted_count = n;
+    rt_offscreen_seen_count = n;
 }
 
 // The action frame: the bullet leaves the gun. Its flight time, and a tracer per round.
@@ -18100,7 +17976,7 @@ void combat_rt_update(float dt)
 
     if (rt_enabled) {
         rt_follow_cam(dt);
-        rt_threat_arrows_tick(); // after the camera: the arrows sit on the view's edge
+        rt_offscreen_shooters_tick(); // after the camera: "out of view" is a question about the view
     }
 
     rt_refresh_timer -= dt;
