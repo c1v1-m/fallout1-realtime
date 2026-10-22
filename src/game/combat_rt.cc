@@ -1284,8 +1284,9 @@ static float rt_cam_lean_y = 0.0f;
 #define RT_PSY_FLASH_G 8
 #define RT_PSY_FLASH_B 56
 #define RT_PSY_FLASH_LAST 228
-#define RT_PSY_SHAKE_SECONDS 0.4f
-#define RT_PSY_SHAKE_PX 5.0f // at full strength, fading to 0 over the shake
+// "víc shaking" (2026-10-22, after the first build at 5 px / 0.4 s): 12 px over 0.7 s.
+#define RT_PSY_SHAKE_SECONDS 0.7f
+#define RT_PSY_SHAKE_PX 12.0f // at full strength, fading to 0 over the shake
 static float rt_psy_fx_t = -1.0f; // seconds into the effect, -1 = none
 static float rt_psy_fx_strength = 0.0f; // 1 = took the hit, 0.5 = shielded
 static bool rt_psy_flash_on = false;
