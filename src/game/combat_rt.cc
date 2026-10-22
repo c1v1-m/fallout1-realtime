@@ -17899,6 +17899,46 @@ static void rt_map_var_set(int var, int v)
     map_set_global_var(var, value);
 }
 
+// ⚠️ A NIGHTKIN BACK IN THE PEN WITH ITS "SUMMONED" MARK SET NEVER COMES OUT AGAIN -- a vanilla Hord.int
+// quirk that a save made mid-fight turns on (trace_2026-10-22_223039: a quick save at s=278, while 37, 42
+// and 46 had just been summoned; after the load all three stood on tile 0 for the rest of the fight, the
+// 50 % phase found nobody to send). Hord.int marks itself summoned in LOCAL var 0, which the save keeps,
+// but the "go to the pen" at the top of its start runs on its script GLOBAL, which a load resets -- so on
+// the first run after a load every Nightkin that was out walks itself back into the pen, marked as having
+// come out already. Standing in the pen means it has not come out: the mark is cleared, and it answers
+// the next call like the rest.
+#define RT_HORDE_PEN_TILE 0
+static void rt_horde_unstick_pen()
+{
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* o = rt_actors[i].obj;
+        if (o == NULL || o->tile != RT_HORDE_PEN_TILE || o->sid == -1 || critter_is_dead(o)) {
+            continue;
+        }
+        Script* script;
+        if (scr_ptr(o->sid, &script) == -1 || script->program == NULL || script->program->name == NULL) {
+            continue;
+        }
+        const char* base = script->program->name;
+        for (const char* p = script->program->name; *p != '\0'; p++) {
+            if (*p == '\\' || *p == '/') {
+                base = p + 1;
+            }
+        }
+        if (SDL_strcasecmp(base, "hord.int") != 0) {
+            continue;
+        }
+        ProgramValue v;
+        if (scr_get_local_var(o->sid, 0, v) == -1 || v.opcode == VALUE_TYPE_PTR || v.integerValue == 0) {
+            continue;
+        }
+        v.opcode = VALUE_TYPE_INT;
+        v.integerValue = 0;
+        scr_set_local_var(o->sid, 0, v);
+        trace_event(TRACE_FLOW, "horde", "unstick id=%d pid=%d t=%.2f", o->id, o->pid, rt_clock);
+    }
+}
+
 // Once a frame while the Master lives: his phases, his banked signals, and letting the members out.
 static void rt_horde_tick(Object* master, bool masterHostile)
 {
@@ -17954,6 +17994,7 @@ static void rt_horde_tick(Object* master, bool masterHostile)
     }
 
     if (rt_horde_release > 0) {
+        rt_horde_unstick_pen();
         rt_map_var_set(RT_HORDE_MAP_VAR, 1);
         rt_horde_raised = true;
         rt_horde_raised_at = rt_clock;

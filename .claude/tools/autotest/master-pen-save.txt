@@ -1,0 +1,17 @@
+# His own save (Steam SLOT01, 2026-10-22 22:36, the Master's hall, mid-fight): a quick save at 22:35, made
+# while Nightkin 37, 42 and 46 had just been summoned, and the load that followed, left all three on the
+# pen tile with Hord.int's "summoned" mark set, so they never came again and the 50 % phase found nobody
+# ("na 50% ani 25% se nic nestalo"). rt_horde_unstick_pen clears the mark of whoever stands in the pen.
+# The dude stands; at 6 s the Master drops to 45 % (the phase). The three must be unstuck and come out.
+# Run it with --exe from a clean Steam-like folder whose data\SAVEGAME\SLOT01 is that save.
+name master-pen-save
+map MSTRLR34.MAP
+loadslot 1
+duration 30
+
+sethp 16777266 45 6
+
+expect loadslot 1 rc=0
+expect \[FLOW/horde\] phase pct=50
+expect-count >=1 \[FLOW/horde\] unstick id=
+expect \[FLOW/script-attack\] prog=scripts.Hord\.int self=(37|42|46) 
