@@ -487,6 +487,7 @@ static const PipboyControl ctrl_lines[] = {
     { NULL, NULL },
     { "BACK", "Inventory" },
     { "START", "Pause" },
+    { "START hold", "Quick save" },
 };
 
 // SECOND CONTROLS PAGE: the screens you act IN -- talking, the character sheet, inventory, barter.
