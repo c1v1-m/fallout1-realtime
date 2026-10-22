@@ -742,6 +742,14 @@ static bool rt_map_update_on_exit = false;
 #define RT_DUDE_FIGHT_GRACE 5.0f
 static float rt_dude_last_attack = -1000.0f;
 static bool rt_dude_in_fight();
+
+// When the dry-fire click last played (rt_do_attack, once a second at most). ⚠️ FILE SCOPE SO THE
+// SESSION RESET CAN CLEAR IT. It used to be a function-local static, stamped with rt_clock -- and
+// rt_clock restarts at 0 on every load, so after dying and loading the throttle still held the old
+// fight's stamp and the click stayed SILENT until the new clock caught up. trace_2026-10-22_181351:
+// last click at t=61.03, he died, loaded, emptied the SMG at t=9.75 and pulled RT 104 times from
+// t=20.71 with not one click -- "předemnou je mutant a může na mě střílet, já na něho ne".
+static float rt_last_no_ammo_click = -1000.0f;
 static float rt_refresh_timer = 0.0f;
 
 // Flinch-immunity (anti-stunlock) for the dude -- the RtActor.flinch_accum/immune_until
@@ -7370,9 +7378,8 @@ static bool rt_do_attack(Object* attacker, Object* defender, int hitMode, int hi
         // tell why their shots do nothing (the target never reacts because nothing is
         // actually fired). Nudge them to reload -- throttled so it doesn't spam.
         if (attacker == obj_dude && badShot == COMBAT_BAD_SHOT_NO_AMMO) {
-            static float rt_last_no_ammo_msg = -1000.0f;
-            if (rt_clock - rt_last_no_ammo_msg >= 1.0f) {
-                rt_last_no_ammo_msg = rt_clock;
+            if (rt_clock - rt_last_no_ammo_click >= 1.0f) {
+                rt_last_no_ammo_click = rt_clock;
                 // Play the weapon's empty "click" so the player HEARS they're dry --
                 // a combat-log line alone is easy to miss mid-fight.
                 // ⚠️ NO CONSOLE LINE HERE. The dry-fire SOUND is the signal -- it is vanilla's own,
@@ -14405,6 +14412,7 @@ static void rt_reset_session_state()
 {
     rt_map_update_on_exit = false;
     rt_dude_last_attack = -1000.0f;
+    rt_last_no_ammo_click = -1000.0f;
     // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
     rt_forgiven_count = 0;
     rt_last_fight_clock = -1000.0f;
