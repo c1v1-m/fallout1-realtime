@@ -935,6 +935,7 @@ static int StartPipboy(int intent)
     bottom_line = PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / text_height() - 1;
     hot_line_start = 0;
     hot_back_line = 0;
+    HotLines[BACK_BUTTON_INDEX] = -1;
     ctrl_flag = 0;
 
     if (!message_init(&pipboy_message_file)) {
@@ -2563,6 +2564,13 @@ static void NixHotLines()
     if (hot_back_line) {
         win_delete_button(HotLines[BACK_BUTTON_INDEX]);
     }
+
+    // ⚠️ The pad's B reads this slot to tell a sub-page (a back line is up: B = BACK) from a top
+    // page (B = close), so it must read -1 once the page that owned the line is gone. Vanilla left
+    // the stale id here -- 0 before any back line existed -- so B was always BACK and never closed
+    // the Pip-Boy. Only the id is forgotten: a back button vanilla leaks stays registered, so the
+    // mouse sees exactly what it always did.
+    HotLines[BACK_BUTTON_INDEX] = -1;
 
     hot_line_count = 0;
     hot_back_line = 0;
