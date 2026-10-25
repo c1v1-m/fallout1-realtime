@@ -1116,6 +1116,24 @@ typedef struct ActionFlight {
 #define ACTION_RT_FLIGHT_MAX 16
 static ActionFlight action_rt_flights[ACTION_RT_FLIGHT_MAX];
 
+// The projectiles launched and not yet freed (action_rt_launch_flight adds, action_notify_object_freed
+// drops); the flight record itself is let go at the launch.
+static Object* action_rt_flying[ACTION_RT_FLIGHT_MAX];
+
+// How many thrown or fired projectiles (a rocket, a plasma ball, a grenade, a knife) are visible in the
+// air right now -- the self-played runs photograph them, as they do the bullet tracers.
+int action_rt_flights_in_air()
+{
+    int n = 0;
+    for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {
+        Object* projectile = action_rt_flying[index];
+        if (projectile != NULL && (projectile->flags & OBJECT_HIDDEN) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
 // NULL when all are in the air -- action_ranged then flies it inline, the vanilla way.
 static ActionFlight* action_rt_flight_alloc()
 {
@@ -1235,6 +1253,8 @@ static int action_rt_launch_flight(void* a1, void* a2)
 {
     (void)a2;
     ActionFlight* fl = (ActionFlight*)a1;
+    // The projectile, before the flight's registration takes it over (see action_rt_flying).
+    Object* launched = fl->projectile;
 
     // Aimed where the target is NOW: the raise before the release is not a free sidestep any more.
     if (fl->hit && fl->target != NULL && fl->target->elevation == fl->elevation && fl->target->tile >= 0
@@ -1259,6 +1279,13 @@ static int action_rt_launch_flight(void* a1, void* a2)
 
     if (!flying) {
         action_flight_put_away(fl);
+    } else {
+        for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {
+            if (action_rt_flying[index] == NULL || action_rt_flying[index] == launched) {
+                action_rt_flying[index] = launched;
+                break;
+            }
+        }
     }
 
     fl->used = false;
@@ -1271,6 +1298,12 @@ void action_notify_object_freed(Object* obj)
 {
     if (obj == NULL) {
         return;
+    }
+
+    for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {
+        if (action_rt_flying[index] == obj) {
+            action_rt_flying[index] = NULL;
+        }
     }
 
     for (int index = 0; index < ACTION_RT_FLIGHT_MAX; index++) {

@@ -1778,15 +1778,24 @@ void autotest_tick(float dt)
     // A photograph of the bullets (scenario "shots"): EVERY frame a tracer is in the air, up to six, so
     // a real-speed bullet (on screen ~0.05 s) is caught all the way across -- a single photo missed the
     // .223 and the buckshot (2026-10-19).
+    // A rocket, a plasma ball or a grenade (action_rt_flights_in_air) flies for a second or so: those are
+    // photographed every 0.12 s instead, so the six frames span the whole flight.
     static int at_seq_frames = 0;
-    if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && combat_rt_tracers_in_air() > 0) {
-        dump_screen();
-        at_seq_frames++;
-        trace_event(TRACE_FLOW, "autotest", "shot n=%d frame=%d at=%.3f tracers=%d", at_shots_taken, at_seq_frames, at_elapsed, combat_rt_tracers_in_air());
-        if (at_seq_frames >= 6) {
-            at_shots_taken++;
-            at_shot_next = at_elapsed + 1.0f;
-            at_seq_frames = 0;
+    static float at_seq_frame_next = 0.0f;
+    bool tracers = combat_rt_tracers_in_air() > 0;
+    bool flights = action_rt_flights_in_air() > 0;
+    if (at_shots_taken < at_shots_wanted && at_elapsed >= at_shot_next && (tracers || flights)) {
+        if (tracers || at_elapsed >= at_seq_frame_next) {
+            dump_screen();
+            at_seq_frames++;
+            at_seq_frame_next = at_elapsed + 0.12f;
+            trace_event(TRACE_FLOW, "autotest", "shot n=%d frame=%d at=%.3f tracers=%d flights=%d", at_shots_taken, at_seq_frames,
+                at_elapsed, combat_rt_tracers_in_air(), action_rt_flights_in_air());
+            if (at_seq_frames >= 6) {
+                at_shots_taken++;
+                at_shot_next = at_elapsed + 1.0f;
+                at_seq_frames = 0;
+            }
         }
     } else if (at_seq_frames > 0) {
         at_shots_taken++;
