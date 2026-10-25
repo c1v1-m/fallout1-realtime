@@ -17100,7 +17100,9 @@ static void rt_flame_filter(RtInFlight* f)
 // whole screen inside one frame and never be drawn. Three frames -- too short for any sidestep.
 #define RT_TRACER_MIN_SHOW 0.05f
 #define RT_TRACER_STAGGER 0.05f      // seconds between the rounds of a burst
-#define RT_TRACER_LIFT 30            // pixels: from the feet to the gun
+#define RT_TRACER_LIFT 30            // pixels: from the feet to the gun, when there is no body to measure
+#define RT_TRACER_GUN_HEIGHT 0.40f   // of the shooter's sprite, from its top: where the gun is held
+#define RT_TRACER_BODY_HEIGHT 0.50f  // of the target's sprite: the middle of the body
 #define RT_TRACER_FLY_ON 8.0f        // hexes a dodged bullet flies on past where its target stood
 #define RT_MAX_TRACERS 64
 
@@ -17112,6 +17114,10 @@ typedef struct RtTracer {
     int toTile;
     int jitterX; // a burst's rounds fan out a little at the far end
     int jitterY;
+    int fromOffX; // pixels from the from-tile's centre to the gun (rt_tracer_body_point)
+    int fromOffY;
+    int toOffX; // ...and from the to-tile's centre to where the streak ends on the body
+    int toOffY;
     float t0;
     float speed;
     float dist;
@@ -17204,8 +17210,36 @@ static RtBulletLook rt_bullet_look(Object* weapon)
     return fallback;
 }
 
+// ⚠️ A STREAK RUNS FROM THE GUN TO THE BODY (2026-10-25, his "přišla mi ta střela dala dmg ale nezasáhla
+// tu potvoru, nebo to bylo moc divné ta kulka"). Both ends used to be tile centres lifted a fixed
+// RT_TRACER_LIFT: free movement stands a body anywhere on its tile, so the shot left from beside the dude
+// at knee height, and the far end sat 30 px over the target's tile -- over a rat or a radscorpion, which
+// is lower than that, the bullet visibly flew above the creature it hurt. Now each end is measured on the
+// sprite itself (obj_bound, the drawn picture): the gun RT_TRACER_GUN_HEIGHT down the shooter, the middle
+// of the target. Kept as an offset from the tile, so a screen scroll mid-flight carries it along.
+static void rt_tracer_body_point(Object* who, int tile, int elevation, float heightFrac, int* ox, int* oy)
+{
+    *ox = 0;
+    *oy = -RT_TRACER_LIFT;
+    if (who == NULL || tile < 0) {
+        return;
+    }
+    int tx;
+    int ty;
+    if (tile_coord(tile, &tx, &ty, elevation) == -1) {
+        return;
+    }
+    Rect bounds;
+    obj_bound(who, &bounds);
+    if (bounds.lrx <= bounds.ulx || bounds.lry <= bounds.uly) {
+        return;
+    }
+    *ox = (bounds.ulx + bounds.lrx) / 2 - (tx + 16);
+    *oy = bounds.uly + (int)((bounds.lry - bounds.uly) * heightFrac) - (ty + 8);
+}
+
 static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation, float t0, float speed, int jx, int jy,
-    float length, int thick, int rgb)
+    float length, int thick, int rgb, int fromOffX, int fromOffY, int toOffX, int toOffY)
 {
     for (int i = 0; i < RT_MAX_TRACERS; i++) {
         RtTracer* tr = &rt_tracers[i];
@@ -17220,6 +17254,10 @@ static void rt_tracer_spawn(int serial, int fromTile, int toTile, int elevation,
         tr->toTile = toTile;
         tr->jitterX = jx;
         tr->jitterY = jy;
+        tr->fromOffX = fromOffX;
+        tr->fromOffY = fromOffY;
+        tr->toOffX = toOffX;
+        tr->toOffY = toOffY;
         tr->t0 = t0;
         tr->speed = speed;
         tr->length = length;
@@ -17282,10 +17320,10 @@ static bool rt_tracer_segment(RtTracer* tr, int* x0, int* y0, int* x1, int* y1, 
         *gone = true;
         return false;
     }
-    ax += 16;
-    ay += 8 - RT_TRACER_LIFT;
-    bx += 16 + tr->jitterX;
-    by += 8 - RT_TRACER_LIFT + tr->jitterY;
+    ax += 16 + tr->fromOffX;
+    ay += 8 + tr->fromOffY;
+    bx += 16 + tr->toOffX + tr->jitterX;
+    by += 8 + tr->toOffY + tr->jitterY;
     float h = head / tr->dist;
     float t = tail / tr->dist;
     *x0 = ax + (int)((bx - ax) * t);
@@ -17595,6 +17633,25 @@ static void rt_bullet_discharge(RtInFlight* f)
         rounds = 12;
     }
     int elevation = f->ctd.attacker != NULL ? f->ctd.attacker->elevation : map_elevation;
+
+    // The two ends on the bodies (rt_tracer_body_point). A hit ends in the middle of the target; a miss
+    // flies on at the height of the target's middle, past it.
+    int fromOffX;
+    int fromOffY;
+    rt_tracer_body_point(f->ctd.attacker, f->originTile, elevation, RT_TRACER_GUN_HEIGHT, &fromOffX, &fromOffY);
+    int toOffX = 0;
+    int toOffY = fromOffY;
+    Object* body = f->ctd.defender;
+    if (body != NULL && FID_TYPE(body->fid) == OBJ_TYPE_CRITTER) {
+        int bodyOffX;
+        int bodyOffY;
+        rt_tracer_body_point(body, body->tile, elevation, RT_TRACER_BODY_HEIGHT, &bodyOffX, &bodyOffY);
+        toOffY = bodyOffY;
+        if (f->aimTile == body->tile) {
+            toOffX = bodyOffX;
+        }
+    }
+
     // Every round drawn again, each in its caliber's look (rt_bullet_look) -- superseding the
     // tracer-rounds-only rule of the same night (10f5315), his pick "kreslit každou střelu podle ráže".
     for (int r = 0; r < rounds; r++) {
@@ -17609,7 +17666,7 @@ static void rt_bullet_discharge(RtInFlight* f)
                 jy = r == 0 ? 0 : roll_random(-4, 4);
             }
             rt_tracer_spawn(f->serial, f->originTile, f->aimTile, elevation, rt_clock + r * RT_TRACER_STAGGER, speed, jx, jy,
-                look.length, look.thick, look.rgb);
+                look.length, look.thick, look.rgb, fromOffX, fromOffY, toOffX, toOffY);
         }
     }
     trace_event(TRACE_COMBAT, "bullet", "att=%d def=%d dist=%d speed=%.0f flight=%.2f rounds=%d hit=%d t=%.2f",
