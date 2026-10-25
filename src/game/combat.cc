@@ -5129,6 +5129,14 @@ bool combat_to_hit(Object* target, int* accuracy)
         return false;
     }
 
+    // Realtime: a held LB / RB quick throw goes out on its own THROW mode, not the hand slot's, so the %
+    // over its target is that throw's (brought from Fallout 2 Realtime, 2026-10-25).
+    int throwMode;
+    if (combat_rt_enabled() && combat_rt_quick_throw_hit_mode(&throwMode)) {
+        hitMode = throwMode;
+        aiming = false;
+    }
+
     if (combat_check_bad_shot(obj_dude, target, hitMode, aiming) != COMBAT_BAD_SHOT_OK) {
         return false;
     }

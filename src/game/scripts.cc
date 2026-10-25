@@ -603,7 +603,15 @@ static void script_chk_critters()
     // starts (fixed_param 4, rt_script_turn_tick) that would have re-run them on every heartbeat:
     // the Master calling his horde as fast as the heartbeat reached him. Combat events come from
     // combat_rt now, and only from there.
-    if (!dialog_active() && !combat_rt_under_threat()) {
+    //
+    // ⚠️ ...EXCEPT ON A RANDOM ENCOUNTER MAP (Fallout 2 Realtime 2026-10-24, the Deck: "radškorpioni jen
+    // koukají a kytky mě koušou"; brought to Fallout 1 2026-10-25). An encounter's critters may attack by
+    // their own heartbeat ("if I see the dude, attack him"), and the first group that did made the fight
+    // that stopped every other heartbeat -- the rest stood off for as long as it lasted. On a map that is
+    // nothing but its encounter the bystanders' scripts keep running, so whoever sees him joins the way
+    // its script says; towns keep the rule above.
+    bool encounterMap = combat_rt_enabled() && worldmap_on_encounter_map();
+    if (!dialog_active() && (encounterMap || !combat_rt_under_threat())) {
         ScriptList* scriptList;
         ScriptListExtent* scriptListExtent;
 

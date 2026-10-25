@@ -4115,6 +4115,11 @@ static bool gpui_qs_drawn(int slot)
     return gpui_qt_state != GPUI_QT_IDLE && gpui_qt_slot == slot;
 }
 
+bool gamepad_ui_quick_throw_held()
+{
+    return gpui_qt_state == GPUI_QT_DRAWING || gpui_qt_state == GPUI_QT_READY;
+}
+
 // From the hook (no animation here): a press of a slot's button, or its hold for LB.
 static void gpui_qs_press(int slot, bool throwOnDraw)
 {
@@ -4261,7 +4266,12 @@ static void gpui_qt_tick()
         // put-away of the gun was ~0.6 s of nothing between the press and the throw. The grenade is
         // in the hand at once; the gun comes back with its own take-out after the throw (RESTORE).
         inven_wield_instant(obj_dude, item, gpui_qt_hand);
-        intface_update_items(true);
+        // ⚠️ ...AND NO DRAW EITHER (Fallout 2 Realtime 2026-10-24, his pick "Bez vytahování"; brought to
+        // Fallout 1 2026-10-25): the bar's animated update plays the item's TAKE-OUT whenever the hand
+        // changes, and the throw waited for it. The item is in the hand at once (inven_wield_instant set
+        // the pose) and the throw goes straight out; its wind-up is the throw's own (RT_THROW_WINDUP_*
+        // in anim.cc).
+        intface_update_items(false);
         trace_event(TRACE_ACTION, "quick-draw", "slot=%d pid=%d prev=%d ap=%d", gpui_qt_slot, gpui_qt_pid,
             gpui_qt_prev_pid, combat_rt_player_ap());
         gpui_qt_set(GPUI_QT_DRAWING);

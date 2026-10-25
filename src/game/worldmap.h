@@ -158,6 +158,9 @@ WorldMapContext town_map(WorldMapContext ctx);
 void KillWorldWin();
 int worldmap_script_jump(int city, int a2);
 int xlate_mapidx_to_town(int map_idx);
+// True while the loaded map is the random encounter (or random terrain, or special encounter) the world map
+// last sent the party into. Keyed by the map's NAME, so a town loaded from a save is never taken for one.
+bool worldmap_on_encounter_map();
 int PlayCityMapMusic();
 
 } // namespace fallout

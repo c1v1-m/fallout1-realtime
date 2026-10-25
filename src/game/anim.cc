@@ -414,6 +414,16 @@ static float anim_attack_stat_factor = 0.09f;
 #define RT_PROJECTILE_SPEEDUP 4.0f
 // ...and how much SLOWER a thrown weapon flies (a grenade: 10 -> 5 tiles a second), 2026-10-16.
 #define RT_THROWN_SLOWDOWN 2.0f
+// A THROW WITH A WIND-UP AND A SNAP (Fallout 2 Realtime 2026-10-24, his "ať to vypadá moc usekle ten hod,
+// ať tam je nějaké napřáhnutí z té animace. Ať ten hod má punch. To samé udělej i pro granáty to
+// natahování"; brought to Fallout 1 2026-10-25). The throw art paces itself evenly -- Agility speeds the
+// whole of it (compute_tpf) -- so at a good Agility the arm went back and came through in the same quick
+// beat. The frames BEFORE the art's action frame (the release) now hold RT_THROW_WINDUP_SCALE times longer
+// and the release and its follow-through run at RT_THROW_RELEASE_SCALE: about the same length in all, the
+// arm visibly drawn back, the throw itself a snap. Every ANIM_THROW_ANIM in realtime -- grenade, knife,
+// rock; the dude's and everyone's.
+#define RT_THROW_WINDUP_SCALE 1.4f
+#define RT_THROW_RELEASE_SCALE 0.6f
 static float anim_attack_stat_high_bias = ANIM_ATTACK_STAT_HIGH_BIAS;
 static float anim_projectile_speedup = -1.0f; // > 0: anim_set_projectile_speedup (autotest) overrides the table
 
@@ -3822,6 +3832,31 @@ static int anim_animate(Object* obj, int anim, int animationSequenceIndex, int f
     return 0;
 }
 
+// How long the frame on screen holds before the next one (the throw's wind-up and snap -- see
+// RT_THROW_WINDUP_SCALE). ⚠️ The sad's ticksPerFrame itself is never touched (see anim-tpf-is-state): this
+// only reads it. ⚠️ The animation comes from the sad's FID: an ANIMATE sad never fills ->anim (only
+// anim_move does), so that field holds whatever the slot last held.
+static unsigned int anim_frame_ticks(AnimationSad* sad_entry, Object* object)
+{
+    unsigned int tpf = sad_entry->ticksPerFrame;
+    if (FID_ANIM_TYPE(sad_entry->fid) != ANIM_THROW_ANIM || object == NULL || object->fid != sad_entry->fid
+        || (sad_entry->flags & ANIM_SAD_REVERSE) != 0 || !combat_rt_enabled()) {
+        return tpf;
+    }
+
+    CacheEntry* cacheHandle;
+    Art* art = art_ptr_lock(object->fid, &cacheHandle);
+    if (art == NULL) {
+        return tpf;
+    }
+    int actionFrame = art_frame_action_frame(art);
+    art_ptr_unlock(cacheHandle);
+
+    float scale = object->frame < actionFrame ? RT_THROW_WINDUP_SCALE : RT_THROW_RELEASE_SCALE;
+    unsigned int ticks = (unsigned int)(tpf * scale + 0.5f);
+    return ticks > 0 ? ticks : 1;
+}
+
 // 0x417498
 void object_animate()
 {
@@ -3844,7 +3879,7 @@ void object_animate()
         Object* object = sad_entry->obj;
 
         unsigned int time = get_time();
-        if (elapsed_tocks(time, sad_entry->animationTimestamp) < sad_entry->ticksPerFrame) {
+        if (elapsed_tocks(time, sad_entry->animationTimestamp) < anim_frame_ticks(sad_entry, object)) {
             continue;
         }
 

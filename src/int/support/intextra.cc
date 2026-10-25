@@ -1212,7 +1212,13 @@ static void op_animate_move_obj_to_tile(Program* program)
         return;
     }
 
-    if (isInCombat()) {
+    // ⚠️ IN REALTIME ONLY A FIGHTER'S LEGS BELONG TO THE FIGHT (Fallout 2 Realtime 2026-10-24, the Deck:
+    // "radškorpioni jen koukají"; brought to Fallout 1 2026-10-25). Vanilla refuses a scripted walk in
+    // combat because combat is a mode in which nobody else moves; realtime keeps the combat bit warm while
+    // anyone anywhere chases, so every scripted walk on the map was refused for as long as that lasted --
+    // errands, patrols, a wanderer that attacks once it sees you. A critter combat_rt is not fighting
+    // walks as its script says; a fighter stays combat_rt's.
+    if (isInCombat() && !(combat_rt_enabled() && !combat_rt_critter_fighting(object))) {
         return;
     }
 

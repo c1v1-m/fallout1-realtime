@@ -23,6 +23,7 @@
 #include "game/gmouse.h"
 #include "game/gmovie.h"
 #include "game/graphlib.h"
+#include "game/editor.h"
 #include "game/gsound.h"
 #include "game/intface.h"
 #include "game/game_trace.h"
@@ -107,6 +108,7 @@ typedef struct TownHotSpotEntry {
 static void UpdVisualArea();
 static int CheckEvents();
 static int LoadTownMap(const char* filename, int map_idx);
+static int LoadEncounterMap(const char* filename, int map_idx);
 static void TargetTown(int city);
 static int InitWorldMapData();
 static void UnInitWorldMapData();
@@ -2572,7 +2574,7 @@ int world_map(WorldMapContext ctx)
 
             win_disable_button(WrldToggle);
 
-            if (LoadTownMap(RandEnctNames[terrain][map_index], 1) == -1) {
+            if (LoadEncounterMap(RandEnctNames[terrain][map_index], 1) == -1) {
                 return -1;
             }
         } else if (is_entering_random_encounter) {
@@ -2587,7 +2589,7 @@ int world_map(WorldMapContext ctx)
 
                 win_disable_button(WrldToggle);
 
-                if (LoadTownMap(spcl_map_name[special_enc_num - 1], 0) == -1) {
+                if (LoadEncounterMap(spcl_map_name[special_enc_num - 1], 0) == -1) {
                     return -1;
                 }
             } else {
@@ -2611,7 +2613,7 @@ int world_map(WorldMapContext ctx)
 
                 win_disable_button(WrldToggle);
 
-                if (LoadTownMap(RandEnctNames[terrain][map_index], 2) == -1) {
+                if (LoadEncounterMap(RandEnctNames[terrain][map_index], 2) == -1) {
                     return -1;
                 }
             }
@@ -2975,9 +2977,34 @@ static int CheckEvents()
     return rc;
 }
 
+// The map the world map last loaded as an encounter (see worldmap_on_encounter_map). Every town load clears
+// it, an encounter load sets it.
+static char wmap_encounter_map[16] = "";
+
+bool worldmap_on_encounter_map()
+{
+    if (wmap_encounter_map[0] == '\0') {
+        return false;
+    }
+    char current[16];
+    strmfe(current, map_data.name, "MAP");
+    return compat_stricmp(current, wmap_encounter_map) == 0;
+}
+
+static int LoadEncounterMap(const char* filename, int map_idx)
+{
+    int rc = LoadTownMap(filename, map_idx);
+    if (rc != -1) {
+        strmfe(wmap_encounter_map, filename, "MAP");
+    }
+    return rc;
+}
+
 // 0x4ACC94
 static int LoadTownMap(const char* filename, int map_idx)
 {
+    wmap_encounter_map[0] = '\0';
+
     char filename_copy[16];
     char childead_map_filename[16];
     char mbdead_map_filename[16];

@@ -7028,31 +7028,60 @@ static bool mt_pad_arm = true;
 // not even asked then). All three of his tries in trace_2026-10-17_150325 ended "a down / a up": the
 // stick had walked the cursor onto PLACE and A still set the timer with DONE. With the cursor where it
 // was when the window opened, A stays the quick DONE it always was; once he has moved it onto a
-// button, A leaves the press to that button -- PLACE, DONE, CANCEL, + or -.
+// button, A presses that button -- PLACE, DONE, CANCEL, + or -.
+//
+// ⚠️ ...BY ITS OWN KEY, NOT BY A CLICK (Fallout 2 Realtime 2026-10-24, brought back 2026-10-25). It used
+// to leave the press to the mouse hook's A-as-left-click, and that click is what leaked: opened from the
+// WORLD (the wheel, a quick slot) the window is no self-nav screen, so the hook's world A router clicked
+// through it, the window closed on its own A edge with the button still down, and the release walked the
+// dude to the cursor -- off the explosive he was putting down (Fallout 2's f2_trace_2026-10-24_113000
+// s=315.91). Now the window owns A (gamepad_ui_set_suppress_a_click for its whole life, a real mouse click
+// still passes) and answers it with the button's own code; its close bumps the input epoch so the
+// still-held A is nobody's press.
 static int mt_window_type = -1;
 static int mt_open_mx = -1;
 static int mt_open_my = -1;
 
-static bool mt_cursor_on_button()
+// The key of the button under the cursor, -1 when it is on none.
+static int mt_button_under_cursor()
 {
     if (mt_wid == -1) {
-        return false;
+        return -1;
     }
     bool timer = mt_window_type == INVENTORY_WINDOW_TYPE_SET_TIMER;
     int px = timer ? 194 : 200;
     int py = timer ? 64 : 46;
-    if (mouseHitTestInWindow(mt_wid, px, py, px + 16 - 1, py + 24 - 1)) {
-        return true; // + and - stacked
+    if (mouseHitTestInWindow(mt_wid, px, py, px + 16 - 1, py + 12 - 1)) {
+        return 6000; // +
     }
-    if (mouseHitTestInWindow(mt_wid, 98, 128, 98 + 15 - 1, 128 + 16 - 1)
-        || mouseHitTestInWindow(mt_wid, 148, 128, 148 + 15 - 1, 128 + 16 - 1)) {
-        return true; // DONE, CANCEL
+    if (mouseHitTestInWindow(mt_wid, px, py + 12, px + 17 - 1, py + 24 - 1)) {
+        return 7000; // -
+    }
+    if (mouseHitTestInWindow(mt_wid, 98, 128, 98 + 15 - 1, 128 + 16 - 1)) {
+        return KEY_RETURN; // DONE
+    }
+    if (mouseHitTestInWindow(mt_wid, 148, 128, 148 + 15 - 1, 128 + 16 - 1)) {
+        return KEY_ESCAPE; // CANCEL
     }
     if (timer) {
-        return mouseHitTestInWindow(mt_wid, 120, 86, 120 + MT_PLACE_W - 1, 86 + MT_PLACE_H - 1); // PLACE
+        return mouseHitTestInWindow(mt_wid, 120, 86, 120 + MT_PLACE_W - 1, 86 + MT_PLACE_H - 1) ? MT_KEY_PLACE : -1;
     }
-    return mouseHitTestInWindow(mt_wid, 120, 80, 120 + 94 - 1, 80 + 33 - 1); // ALL
+    return mouseHitTestInWindow(mt_wid, 120, 80, 120 + 94 - 1, 80 + 33 - 1) ? 5000 : -1; // ALL
 }
+
+// The window's hold on A, for as long as it is up (see mt_button_under_cursor).
+struct MtPadOwner {
+    bool previous;
+    MtPadOwner()
+        : previous(gamepad_ui_set_suppress_a_click(true))
+    {
+    }
+    ~MtPadOwner()
+    {
+        gamepad_ui_set_suppress_a_click(previous);
+        gamepad_ui_bump_input_epoch();
+    }
+};
 
 // Re-arm the picker's gamepad edge detection so a button still held from whatever opened
 // the picker (e.g. LT+A in barter) doesn't instantly fire on the first frame.
@@ -7112,8 +7141,11 @@ static int move_timer_gamepad_keycode()
         int my;
         mouse_get_position(&mx, &my);
         bool moved = mx != mt_open_mx || my != mt_open_my;
-        // On a button the click itself presses it (see mt_open_mx); anywhere else A is DONE.
-        keyCode = moved && mt_cursor_on_button() ? -1 : KEY_RETURN;
+        // On a button A presses it (see mt_open_mx); anywhere else A is DONE.
+        keyCode = moved ? mt_button_under_cursor() : -1;
+        if (keyCode == -1) {
+            keyCode = KEY_RETURN;
+        }
     } else if (bNow && !prevB) {
         keyCode = KEY_ESCAPE;
     } else if (yNow && !prevY) {
@@ -7140,6 +7172,8 @@ static int move_timer_gamepad_keycode()
 // 0x469458
 static int do_move_timer(int inventoryWindowType, Object* item, int max)
 {
+    MtPadOwner padOwner;
+
     mt_window_type = inventoryWindowType;
     setup_move_timer_win(inventoryWindowType, item);
     move_timer_gamepad_reset();

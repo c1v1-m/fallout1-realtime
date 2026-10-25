@@ -1,0 +1,27 @@
+# (2026-10-25, brought from Fallout 2 Realtime, where the Deck said "při hodu se neukazuje procento
+# úspěchu"): RB held with a throwable shows the THROW's chance over whom the release throws at -- with
+# no LT lock (it used to show nothing) and with the lock. Photographed while held.
+name screen-throw-pct
+map DESERT1.MAP
+seed 1
+duration 14
+dude tile 20100 rot 2
+dude hp 300
+dude skill throwing 80
+dude wield 8
+dude item 29 1
+dude item 45 3
+dude quickslot rb 45
+
+spawn 16777291 20504 rot 5 wield 4 hostile hp 300
+
+pad 2000 RB 1
+shot 2900
+pad 3500 RB 0
+axis 6000 LT 32767
+pad 6600 RB 1
+shot 7500
+pad 8100 RB 0
+axis 9000 LT -32768
+
+expect-count 2 \[ACTION/quick-throw\]

@@ -1947,6 +1947,11 @@ static float rt_move_input_age = 1000.0f;
 static Object* rt_player_intent_target = NULL;
 static int rt_player_intent_mode = 0;
 static float rt_player_intent_ttl = 0.0f;
+// A SCRIPT ENDED THE FIGHT (combat_rt_terminate_from_script): RT does nothing until it has been let go
+// and RT_SCRIPT_END_RT_HOLD has passed. See there.
+#define RT_SCRIPT_END_RT_HOLD 1.0f
+static bool rt_script_end_rt_gate = false;
+static float rt_script_end_rt_until = 0.0f;
 // The quick throw is waiting for AP (combat_rt_request_throw): a move cancels it, the throw or the
 // end of its wait clears it. Read only while rt_player_intent_target is set.
 static bool rt_throw_waiting = false;
@@ -2752,6 +2757,15 @@ static int rt_ap_cost(Object* actor, int hitMode, bool aiming = false)
         Object* weapon = item_hit_with(actor, hitMode);
         if (weapon != NULL && item_get_type(weapon) == ITEM_TYPE_WEAPON
             && item_w_subtype(weapon, hitMode) == ATTACK_TYPE_THROW) {
+            // ⚠️ ...BUT NEVER LESS THAN THE WEAPON'S OWN PRICE ABOVE THE PACK'S (2026-10-24, Fallout 2's
+            // spear: its throw is 6 AP on the card, and from the RB slot it went for the pack's 4 -- his
+            // "hod z RB ať stojí cenu té zbraně, když je vyšší než cena z batohu"). A weapon dearer than
+            // the pack's full price (4, before Quick Pockets) throws at its own card price, Fast Shot
+            // included; a grenade or a knife (4) keeps the pack price and its Quick Pockets discount.
+            int ownCost = item_w_mp_cost(actor, hitMode, false);
+            if (ownCost > rt_quick_throw_cost + perk_level(PERK_QUICK_POCKETS)) {
+                return ownCost;
+            }
             return rt_quick_throw_cost > 0 ? rt_quick_throw_cost : 1;
         }
     }
@@ -14600,6 +14614,7 @@ static void rt_abandon_encounter()
     rt_shooter_count = 0; // who shot at him on the map being left (rt_note_shot_at_dude)
     rt_offscreen_shooters_reset();
     rt_horde_reset(); // the Master's banked signals and phases (rt_horde_tick)
+    rt_script_end_rt_gate = false; // keyed off an rt_clock that may restart
     rt_lock_target = NULL;
     rt_lock_push_anchor = NULL;
     rt_lock_last_target = NULL;
@@ -15482,6 +15497,20 @@ static Object* rt_nearest_visible_hostile()
     return best;
 }
 
+bool combat_rt_quick_throw_hit_mode(int* hitMode)
+{
+    if (!rt_enabled || obj_dude == NULL || !gamepad_ui_quick_throw_held()) {
+        return false;
+    }
+    int mode = rt_quick_throw_mode();
+    Object* weapon = item_hit_with(obj_dude, mode);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON || item_w_subtype(weapon, mode) != ATTACK_TYPE_THROW) {
+        return false;
+    }
+    *hitMode = mode;
+    return true;
+}
+
 Object* combat_rt_quick_throw_target()
 {
     if (!rt_enabled || obj_dude == NULL) {
@@ -16196,7 +16225,23 @@ void combat_rt_poll_gamepad()
         // No lock, no push to measure from -- whatever the stick does next starts fresh.
         rt_lock_push_anchor = NULL;
 
-        if (rt_lock_set_crosshair) {
+        // ⚠️ A HELD QUICK THROW SHOWS ITS CHANCE WITHOUT A LOCK TOO (2026-10-24, the Deck: "při hodu se
+        // neukazuje procento úspěchu u oštěpu"). RB held with nobody locked drew no % at all -- it
+        // only ever came with the LT lock, and then for the spear's THRUST (an X past one tile). While
+        // the throwable is out, the crosshair sits on whom the release will throw at
+        // (combat_rt_quick_throw_target) and the % is the THROW's (_combat_to_hit asks
+        // combat_rt_quick_throw_hit_mode), exactly as the lock shows it.
+        Object* throwTarget = gamepad_ui_quick_throw_held() ? combat_rt_quick_throw_target() : NULL;
+        if (throwTarget != NULL && OnScreen::test(throwTarget)) {
+            Rect bounds;
+            obj_bound(throwTarget, &bounds);
+            mouse_set_position((bounds.ulx + bounds.lrx) / 2, (bounds.uly + bounds.lry) / 2);
+            if (gmouse_3d_get_mode() != GAME_MOUSE_MODE_CROSSHAIR) {
+                gmouse_3d_set_mode(GAME_MOUSE_MODE_CROSSHAIR);
+                rt_lock_set_crosshair = true;
+            }
+            gmouse_3d_show_to_hit(throwTarget);
+        } else if (rt_lock_set_crosshair) {
             if (gmouse_3d_get_mode() == GAME_MOUSE_MODE_CROSSHAIR) {
                 gmouse_3d_set_mode(GAME_MOUSE_MODE_MOVE);
             }
@@ -16238,6 +16283,12 @@ void combat_rt_poll_gamepad()
     bool attack = (gamepad_ui_attack_held() && !gamepad_ui_aim_gesture_active())
         // ...or Ctrl held on the keyboard, which is RT there.
         || rt_kb_mod_held(KMOD_CTRL);
+    if (rt_script_end_rt_gate) {
+        if (!attack && rt_clock >= rt_script_end_rt_until) {
+            rt_script_end_rt_gate = false;
+        }
+        attack = false;
+    }
     // Only trace the attack intent on the RT PRESS EDGE, not every held frame -- each actual fire
     // is already logged as [COMBAT/attack], so a per-frame ACTION line would be pure spam.
     static bool rt_prev_attack_btn = false;
@@ -19849,6 +19900,27 @@ void combat_rt_terminate_from_script()
 
     rt_engaged = false;
     combat_state &= ~COMBAT_STATE_0x01;
+
+    // ⚠️ VANILLA'S combat_over RUNS THE MAP SCRIPTS (Fallout 2 Realtime 2026-10-24, the Temple of Trials:
+    // "po poražení warriora trvalo než se odemknou dveře"). terminate_combat ends a fight through
+    // combat_over, which runs every map_update_p_proc -- and the door out of Cameron's room (AITemDor,
+    // tile 13528) unlocks itself in exactly that proc once his script has set "passed the fight". The
+    // natural end of a realtime fight asks for the same pass (rt_map_update_on_exit); this end cleared
+    // rt_engaged itself, so that edge was never seen and the door waited for the next 30 s update.
+    rt_map_update_on_exit = true;
+
+    // ...AND THE PLAYER'S FIGHT ENDS WITH IT. In vanilla nothing of his turn survives combat_over; here a
+    // held or mashed RT with LT's lock still on swung again at whom the script had just made peaceful
+    // (Deck trace_2026-10-24_134317 s=53.76: a punch 0.2 s after "You have defeated me"; the self-played
+    // run beat Cameron to death). The lock and the latched intent go, and RT does nothing until it has
+    // been let go and a second has passed -- a fresh pull after that is a decision.
+    rt_lock_target = NULL;
+    rt_lock_push_anchor = NULL;
+    rt_lock_preaim_target = NULL;
+    rt_player_intent_target = NULL;
+    rt_player_intent_ttl = 0.0f;
+    rt_script_end_rt_gate = true;
+    rt_script_end_rt_until = rt_clock + RT_SCRIPT_END_RT_HOLD;
 
     trace_event(TRACE_FLOW, "end-combat", "script actors=%d t=%.2f", rt_actor_count, rt_clock);
 }

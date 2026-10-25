@@ -300,6 +300,16 @@ static int ip_classify(Object* obj)
         if (hasProto && proto->scenery.type == SCENERY_TYPE_STAIRS && obj->sid == -1) {
             return IP_NONE;
         }
+        // ⚠️ WHAT LIES FLAT ON THE FLOOR IS STEPPED ON, NOT USED (Fallout 2 Realtime 2026-10-24, the
+        // Temple of Trials: "na začátku jsou pressure plates a je u nich ruka... ať se to neukazuje";
+        // brought to Fallout 1 2026-10-25). Trap plates are generic scenery with the proto's "can use"
+        // bit and OBJECT_FLAT; their script answers stepping on them and the Traps skill, and A on one did
+        // nothing a player could want while the hand sat over every plate on the way. Doors, ladders,
+        // stairs and lifts have types of their own and are untouched; the right stick's cursor still
+        // looks at a plate and the skill wheel still reaches it.
+        if (hasProto && proto->scenery.type == SCENERY_TYPE_GENERIC && (obj->flags & OBJECT_FLAT) != 0) {
+            return IP_NONE;
+        }
         return (isDoor && obj_is_locked(obj)) ? IP_LOCKPICK : IP_USE;
     }
     case OBJ_TYPE_CRITTER:

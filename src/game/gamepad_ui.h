@@ -152,6 +152,9 @@ bool gamepad_ui_get_left_stick(float* x, float* y);
 // it (gpui_button_shortcuts), so a sticky cursor is never a state you are stuck in.
 bool gamepad_ui_skill_cursor_sticky();
 
+// True while a LB / RB quick throw is out in the hand and its button still held (drawn or ready).
+bool gamepad_ui_quick_throw_held();
+
 // The object the pad has the armed use-on / skill crosshair glued on, or NULL to let the pixel under
 // the pointer decide (gmouse reads it on the click). See gpui_tpick_stick.
 struct Object;

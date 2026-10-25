@@ -1,0 +1,20 @@
+# (2026-10-25, brought from Fallout 2 Realtime): the plastic explosive's timer window opened from the RB
+# quick slot, confirmed with A (DONE -- Fallout 1 keeps the armed explosive in the pack). The window owns
+# A now: its release must not reach the world as a walk-click (it used to walk the dude to the cursor).
+name screen-timer-leak
+map DESERT1.MAP
+seed 1
+duration 10
+dude tile 20100 rot 2
+dude hp 300
+dude skill traps 100
+dude item 85 2
+dude quickslot rb 85
+
+tap 1500 RB
+note 2500 timer window up
+tap 3000 A 300
+note 5000 after
+
+expect \[ACTION/quick-use-item\] pid=85
+expect-not make-path\] id=18000

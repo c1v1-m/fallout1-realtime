@@ -88,6 +88,9 @@ bool combat_rt_is_hostile(Object* obj);
 // falling through to a world click.
 bool combat_rt_has_lock();
 void combat_rt_set_quick_throw_cost(int cost);
+// The THROW mode a held quick throw will use, for the to-hit % over its target (combat_to_hit); false
+// when no quick throw is held or the hand does not throw.
+bool combat_rt_quick_throw_hit_mode(int* hitMode);
 Object* combat_rt_lock_target();
 // True while the player is walking under left-stick control (not standing, not walking out a
 // click-to-move path).
