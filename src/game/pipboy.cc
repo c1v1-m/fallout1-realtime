@@ -809,8 +809,10 @@ int pipboy(int intent)
                     int next = pip_pad_sel + step;
                     if (next >= 0 && next < hot_line_count) {
                         pip_pad_sel = next;
-                        pip_pad_point(pip_pad_sel);
                     }
+                    // Parked even when the step hit the end of the list: on a ONE-entry list no step
+                    // ever moves, and the pointer was left wherever it was, so A clicked nothing.
+                    pip_pad_point(pip_pad_sel);
                 }
 
                 // LB / RB step between the PAGES, which is the other half of "blbě se to ovládá":
@@ -2527,6 +2529,14 @@ static void AddHotLines(int start, int count, bool add_back_button)
                 BUTTON_FLAG_TRANSPARENT);
             y += height * 2;
             eventCode += 1;
+        }
+
+        // ...and the POINTER goes there too, or the highlight sits on the first entry while A clicks
+        // wherever the pointer was left (the splash logo, the tab you came from) -- on a one-entry
+        // list there was no step that could ever bring it. Only while the pad is what is being
+        // played: a mouse or trackpad in use keeps its pointer exactly where its player put it.
+        if (!gamepad_ui_mouse_in_use()) {
+            pip_pad_point(0);
         }
     }
 
