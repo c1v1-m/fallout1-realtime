@@ -1,0 +1,32 @@
+# Lost sight, then the search (2026-10-29, ported from Fallout 2 Realtime: "geckon fakt běžel až za roh ...
+# prostě věděl"; his picks "Jen volný výhled" + "30 sekund"): city-hide's three super mutants south of the
+# ruined wall in CITY1. The dude fires once from the side and walks off behind the wall to 19516, further than
+# city-hide's 23908, out of their sight (19908 left him in their view and they killed him). They must run to where they last saw him (lost-sight-move),
+# disengage, search there and roam round it (search-roam) -- and never come straight at him on the old
+# whoHitMe (an engage line with why=hurt-by and lost=1 is the bug). Whether they roam (search-roam) or find
+# him by sight first varies from run to run, so only the search itself is required; the roam is checked by
+# Fallout 2 Realtime's search-roam on the same code.
+name lose-sight-search
+map CITY1.MAP
+seed 1
+duration 50
+
+dude tile 23916 rot 3
+dude stat PE 8
+dude stat AG 8
+dude stat EN 8
+dude hp 5000
+dude skill small_guns 110
+dude armor 17
+dude wield 8
+dude item 29 6
+
+spawn 16777225 26508 rot 0 wield 12 item 36 2 hostile
+spawn 16777225 26704 rot 0 wield 13 item 14 3 hostile
+spawn 16777225 26712 rot 0 wield 11 item 32 2 hostile
+
+at 0 shoot
+at 3 goto 19516
+
+expect search-start\] id=\d+ pid=16777225
+expect-not FLOW/engage\] .*why=hurt-by lost=1

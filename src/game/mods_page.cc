@@ -360,11 +360,11 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         { "Off", "On" },
         {
             "Fighters follow only the original game's rules.",
-            "Fighters dodge grenades, reload in cover, search where they last",
+            "Fighters see you only in the open, hunt for you where they lost",
         },
         {
             NULL,
-            "saw you, take nearer foes and try not to shoot their friends.",
+            "you, dodge grenades, reload in cover and spare their friends.",
         },
         2,
     },

@@ -293,6 +293,7 @@ static int rt_lock_min_tiles = RT_LOCK_MIN_TILES;
 // proximity-regen multiplier) several times a second.
 #define RT_STOP_CHECK_SECONDS 0.5f // interval between perception tests for one actor
 #define RT_STOP_GRACE_SECONDS 3.0f // how long it must perceive nobody before it disengages
+#define RT_HOLD_BEAT_SECONDS 1.5f // a Tactical AI hold that held this recently keeps the grace from starting
 
 // How long an actor that gave up on an UNREACHABLE target refuses to engage again, while it is
 // still standing on the tile it gave up from. See RtActor::unreachable_tile.
@@ -617,6 +618,19 @@ typedef struct RtActor {
     int search_tile;
     float search_until;
     float search_look_at;
+    int search_center; // the last-seen tile the search roams around (rt_search_tick)
+    float search_pause_until; // looking around at a roam point until this; 0 = not arrived yet
+    // It LOST its foe (disengaged for perceiving nobody, or the fight was ended): whoHitMe pointing at
+    // someone no longer brings it back by itself -- only seeing them, or a new hit. See the IDLE gate.
+    bool lost_track;
+    // At the last stop check it neither saw its target nor was hit by it since its turn: a chaser then runs
+    // for last_seen_tile, not for where the target is now (rt_lost_sight_leg). Apart from unperceived_since,
+    // which also stays -1 while it sees some OTHER danger.
+    bool target_unseen;
+    bool target_seen; // the same check, raw: it saw (or was hit by) its target, holding or not
+    float seen_at; // rt_clock of the last check that saw it (target_seen); < 0 = never
+    float lost_sight_retry_at; // only bodies on the way to last_seen_tile: try again after this
+    float hold_beat_at; // a Tactical AI hold last HELD at this rt_clock (RT_HOLD_BEAT_SECONDS); < 0 = never
     float retarget_check_at; // next look for a much nearer enemy (rt_retarget_nearer)
     float ff_check_until; // friendly-fire care: no new roll before this (rt_ff_care)
     float ff_hold_until; // a careful one holding its rocket/grenade while a friend is in the blast
@@ -2298,6 +2312,24 @@ static bool rt_is_combatant(Object* obj)
     return stat_level(obj, STAT_CURRENT_HIT_POINTS) > 0;
 }
 
+// The dude or a follower the registry knows -- by POINTER ONLY, never dereferencing `obj`, so it is safe on
+// a raw whoHitMe (an x64 union that can hold cid garbage) or on a target gone stale since the last build.
+static bool rt_is_player_side_ptr(Object* obj)
+{
+    if (obj == NULL) {
+        return false;
+    }
+    if (obj == obj_dude) {
+        return true;
+    }
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_actors[i].obj == obj) {
+            return rt_actors[i].friendly;
+        }
+    }
+    return false;
+}
+
 // Like rt_is_combatant but ALSO includes a KNOCKED-OUT (unconscious) critter. rt_is_combatant
 // excludes the knocked-out so the AI never acts while unconscious -- but the PLAYER must still be
 // able to lock onto and finish a downed enemy before it comes to (the "couldn't shoot Gizmo while
@@ -2350,10 +2382,40 @@ static int rt_chase_range(Object* npc)
 // turn-based artifact meaning "this critter spent nothing on its turn"; in realtime a full pool
 // is the normal resting state, so porting it would end essentially every fight on sight.
 //
-// Perception radius, for reference (is_within_perception): PE*5 tiles with line of sight (halved
-// through glass, quartered vs. a sneaking player), PE*2 without it while combat is warm, PE*1
-// once it has gone cold. So a PE 5 guard holds you at 25 tiles in the open and 10 through a wall.
-static bool rt_wants_to_stop(Object* npc, Object* target)
+// Perception radius, for reference (is_within_perception): PE*5 tiles inside its facing cone (halved
+// through glass, quartered vs. a sneaking player), PE*2 outside it while combat is warm, PE*1 once
+// it has gone cold. With the Tactical AI the line must also be clear (rt_sees).
+//
+// ⚠️ SIGHT HAS WALLS (2026-10-28, his pick "Jen volný výhled" after "geckon fakt běžel až za roh, to
+// mně nemohl tak najít ne přirozeně. Prostě věděl"). Vanilla's is_within_perception is a facing cone
+// and a distance and nothing else (can_see, actions.cc): a gecko turned his way "saw" him through
+// solid rock. The critter's own script asks obj_can_see_obj, which also wants a straight line; this
+// is that line with walls, closed doors and solid scenery in the way (obj_sight_blocking_at), but
+// not bodies -- a teammate stepping across it is no lost foe. Without the Tactical AI: vanilla's test.
+//
+// ⚠️ NOR WHAT A BULLET FLIES THROUGH (review 2026-10-29): chairs, tables, lamp posts, signs, hydrants,
+// trees are SHOOT_THRU scenery without LIGHT_THRU -- 90 blocking protos, over 2,000 placements in the
+// towns -- and at a6 = 16 each one was a wall: a thug across a bar table lost the man he was shooting.
+// a6 = 32 is the line-of-fire mode of the same walk (it skips SHOOT_THRU), so the eye sees exactly
+// what a shot can reach, and rocks, walls and closed doors still hide him.
+static bool rt_sees(Object* npc, Object* target, bool honorSneak)
+{
+    if (npc == NULL || target == NULL || npc->elevation != target->elevation || npc->tile == -1 || target->tile == -1) {
+        return false;
+    }
+    bool perceived = honorSneak ? is_within_perception(npc, target) : is_within_perception_unsneaked(npc, target);
+    if (!perceived || !rt_tactical_ai) {
+        return perceived;
+    }
+    Object* wall = NULL;
+    make_straight_path_func(npc, npc->tile, target->tile, NULL, &wall, 32, obj_sight_blocking_at);
+    return wall == NULL;
+}
+
+// `walls`: the wall-aware sight (rt_sees) for a critter hunting the player's side; companions, guards and
+// NPC-vs-NPC fighters keep vanilla's test on this side too, as they do where they decide to join -- a stop
+// rule stricter than the join rule only churns them in and out of the fight (review 2026-10-29).
+static bool rt_wants_to_stop(Object* npc, Object* target, bool walls)
 {
     int maneuver = npc->data.critter.combat.maneuver;
     if ((maneuver & (CRITTER_MANEUVER_DISENGAGING | CRITTER_MANUEVER_FLEEING)) != 0) {
@@ -2384,13 +2446,82 @@ static bool rt_wants_to_stop(Object* npc, Object* target)
     // and both robots disengaged at 50-51, the fight was over at 55.6), and the mutants simply
     // stopped. Sneak keeps you from being FOUND; a critter already fighting you keeps you at its
     // full perception and loses you by distance and walls, as anyone would.
-    if (rt_is_combatant(target) && is_within_perception_unsneaked(npc, target)) {
+    if (rt_is_combatant(target) && (walls ? rt_sees(npc, target, false) : is_within_perception_unsneaked(npc, target))) {
         return false;
     }
 
     // Otherwise ask vanilla's own question: is there ANY danger left that it can perceive?
     Object* danger = ai_danger_source(npc);
-    return danger == NULL || !is_within_perception_unsneaked(npc, danger);
+    return danger == NULL || !(walls ? rt_sees(npc, danger, false) : is_within_perception_unsneaked(npc, danger));
+}
+
+// A critter that hunts the player's side -- the one the wall-aware sight, the lost-sight run and the search
+// are for: hostile to him, not his companion, not busy with an NPC-vs-NPC fight of its own.
+static bool rt_hunts_player(const RtActor* a)
+{
+    return a->hostile && !a->friendly && a->engine_target == NULL;
+}
+
+// ...and one that was actually AFTER him: chasing or fighting now, has seen him, or has lost him already. The
+// ends of a fight mark only these as having lost him. ⚠️ Not a hostile that never went for him (review of the
+// F1 port, 2026-10-29): the Master's horde waits hostile and idle in its pen, and Hord.int's attack(dude) on
+// release brings each one into the hall through its fresh whoHitMe -- marked lost at an End combat or a ride
+// in the lift, they stood in the alley instead.
+static bool rt_was_after_player(const RtActor* a)
+{
+    return rt_hunts_player(a) && (a->state != RT_IDLE || a->seen_at >= 0.0f || a->lost_track);
+}
+
+// LOST TRACK OFF THE REGISTRY (review 2026-10-29). The registry holds this floor's critters only, so a floor
+// change drops a hunter that had lost him and builds it again fresh -- lost_track false, the old whoHitMe still
+// him, and the instant blind re-chase back. Remembered here until the map changes. The pointer is only ever
+// compared; the id is checked against the live object it matched (the erase hook forgets a freed one).
+#define RT_LOST_MEMORY_MAX 64
+
+typedef struct RtLostMemory {
+    Object* obj;
+    int id;
+} RtLostMemory;
+
+static RtLostMemory rt_lost_memory[RT_LOST_MEMORY_MAX];
+static int rt_lost_memory_count = 0;
+
+static void rt_lost_memory_add(Object* obj)
+{
+    for (int i = 0; i < rt_lost_memory_count; i++) {
+        if (rt_lost_memory[i].obj == obj) {
+            rt_lost_memory[i].id = obj->id;
+            return;
+        }
+    }
+    if (rt_lost_memory_count < RT_LOST_MEMORY_MAX) {
+        rt_lost_memory[rt_lost_memory_count].obj = obj;
+        rt_lost_memory[rt_lost_memory_count].id = obj->id;
+        rt_lost_memory_count++;
+    }
+}
+
+// Is this (live) critter one that left the registry having lost him? The entry goes either way.
+static bool rt_lost_memory_take(Object* obj)
+{
+    for (int i = 0; i < rt_lost_memory_count; i++) {
+        if (rt_lost_memory[i].obj == obj) {
+            bool same = rt_lost_memory[i].id == obj->id;
+            rt_lost_memory[i] = rt_lost_memory[--rt_lost_memory_count];
+            return same;
+        }
+    }
+    return false;
+}
+
+static void rt_lost_memory_forget(Object* obj)
+{
+    for (int i = 0; i < rt_lost_memory_count; i++) {
+        if (rt_lost_memory[i].obj == obj) {
+            rt_lost_memory[i] = rt_lost_memory[--rt_lost_memory_count];
+            return;
+        }
+    }
 }
 
 // True if `x` is ACTIVELY a threat to the player's side: it has hit the dude or a follower
@@ -2474,6 +2605,39 @@ static Object* rt_nearest_player_side(Object* npc)
         }
         int d = obj_dist(npc, rt_actors[i].obj);
         if (d <= range && d < bestDist) {
+            bestDist = d;
+            best = rt_actors[i].obj;
+        }
+    }
+    return best;
+}
+
+// The nearest of the player's side within `maxDist` (and the chase range) that it SEES (rt_sees), or NULL.
+// ⚠️ NOT "the nearest, if seen" (review 2026-10-29): with walls in the sight, Dogmeat behind a rock nearer
+// than the dude standing in the open in front of it kept a hostile idle.
+static Object* rt_nearest_seen_player_side(Object* npc, int maxDist)
+{
+    Object* best = NULL;
+    int bestDist = INT_MAX;
+    int range = rt_chase_range(npc);
+    if (maxDist < range) {
+        range = maxDist;
+    }
+
+    if (rt_is_combatant(obj_dude)) {
+        int d = obj_dist(npc, obj_dude);
+        if (d <= range && rt_sees(npc, obj_dude, true)) {
+            best = obj_dude;
+            bestDist = d;
+        }
+    }
+
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (!rt_actors[i].friendly || !rt_is_combatant(rt_actors[i].obj)) {
+            continue;
+        }
+        int d = obj_dist(npc, rt_actors[i].obj);
+        if (d <= range && d < bestDist && rt_sees(npc, rt_actors[i].obj, true)) {
             bestDist = d;
             best = rt_actors[i].obj;
         }
@@ -9791,6 +9955,14 @@ static void rt_refresh_registry()
             a->search_tile = prev->search_tile;
             a->search_until = prev->search_until;
             a->search_look_at = prev->search_look_at;
+            a->search_center = prev->search_center;
+            a->search_pause_until = prev->search_pause_until;
+            a->lost_track = prev->lost_track;
+            a->target_unseen = prev->target_unseen;
+            a->target_seen = prev->target_seen;
+            a->seen_at = prev->seen_at;
+            a->lost_sight_retry_at = prev->lost_sight_retry_at;
+            a->hold_beat_at = prev->hold_beat_at;
             a->retarget_check_at = prev->retarget_check_at;
             a->ff_check_until = prev->ff_check_until;
             a->ff_hold_until = prev->ff_hold_until;
@@ -9903,6 +10075,14 @@ static void rt_refresh_registry()
             a->search_tile = -1;
             a->search_until = 0.0f;
             a->search_look_at = 0.0f;
+            a->search_center = -1;
+            a->search_pause_until = 0.0f;
+            a->lost_track = rt_lost_memory_take(obj);
+            a->target_unseen = false;
+            a->target_seen = false;
+            a->seen_at = -1.0f;
+            a->lost_sight_retry_at = 0.0f;
+            a->hold_beat_at = -1.0f;
             a->retarget_check_at = 0.0f;
             a->ff_check_until = 0.0f;
             a->ff_hold_until = 0.0f;
@@ -10114,6 +10294,20 @@ static void rt_refresh_registry()
                         rt_hears_gunfire(onlooker, anchor) ? 1 : 0, rt_clock);
                 }
             }
+        }
+    }
+
+    // A hunter that had lost him and is not on this floor any more keeps that (rt_lost_memory_*).
+    for (int j = 0; j < rt_actor_count; j++) {
+        if (!rt_actors[j].lost_track) {
+            continue;
+        }
+        bool kept = false;
+        for (int i = 0; i < freshCount && !kept; i++) {
+            kept = fresh[i].obj == rt_actors[j].obj;
+        }
+        if (!kept) {
+            rt_lost_memory_add(rt_actors[j].obj);
         }
     }
 
@@ -10723,10 +10917,147 @@ static bool rt_reload_cover(RtActor* a, Object* npc, int hitMode)
 // A chaser that stops perceiving anyone to fight keeps after its target for RT_STOP_GRACE_SECONDS
 // and then disengages -- and used to forget the whole fight on the spot. Now a HOSTILE that
 // disengages that way walks (searching, not charging) to the tile where it last perceived its
-// target, then turns this way and that until RT_SEARCH_SECONDS are up. The IDLE branch's own
-// re-aggro runs every frame of it, so the moment it sees you again it is back in the chase.
-// Companions never search -- their IDLE is following the dude.
-#define RT_SEARCH_SECONDS 10.0f
+// target, then roams round that spot -- a few tiles this way, a look round, a few tiles that way --
+// until RT_SEARCH_SECONDS are up (2026-10-28, his "hledá mě ... chodí sem a tam, takovej alert mode",
+// 30 s his pick; it used to only turn on the spot for 10 s). The IDLE branch's own re-aggro runs
+// every frame of it, so the moment it sees you again it is back in the chase. After that it is left
+// to its script, as before. Companions never search -- their IDLE is following the dude.
+#define RT_SEARCH_SECONDS 30.0f
+// Roam points lie this far from the last-seen spot, and no further than this many steps of walking
+// from where it stands (a point behind a long wall is not "round the corner").
+#define RT_SEARCH_ROAM_MIN 2
+#define RT_SEARCH_ROAM_MAX 4
+#define RT_SEARCH_ROAM_MAX_STEPS 8
+
+// One short leg toward `tile` along the pathfinder's route: three steps at most, so the critter
+// looks again between legs (the AI does not run while a body animates, and one that walked a whole
+// route in one go would stroll straight past you before it could notice). 1 = it is walking,
+// 0 = the animation table is full (try again), -1 = no way there.
+//
+// ⚠️ THE LEG IS CUT HERE, NOT BY THE MOVE'S AP ARGUMENT: anim_move_to_tile honours that only when the
+// destination tile is blocked (vanilla), and out of combat no AP drain stops a walk either.
+// trace_2026-10-17_234728: id=3263 searched along a 126-step route in one go, 12 s of walking with
+// its eyes shut (the FSM waits out anim_busy), past RT_SEARCH_SECONDS. (a5 = 0: someone standing on
+// the spot itself does not cancel the walk.)
+static int rt_walk_leg(Object* npc, int tile, bool run, const char* why)
+{
+    unsigned char rotations[800];
+    int steps = make_path(npc, npc->tile, tile, rotations, 0);
+    if (steps <= 0) {
+        return -1;
+    }
+    int leg = tile;
+    if (steps > 3) {
+        leg = npc->tile;
+        for (int i = 0; i < 3; i++) {
+            leg = tile_num_in_direction(leg, rotations[i], 1);
+        }
+    }
+    npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
+    if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, why)) {
+        return 0;
+    }
+    anim_reset_last_path();
+    int rc = run && rt_npc_sprint_ok(npc)
+        ? register_object_run_to_tile(npc, leg, npc->elevation, -1, 0)
+        : register_object_move_to_tile(npc, leg, npc->elevation, -1, 0);
+    register_end();
+    return rc == 0 && anim_last_path_steps(npc) != 0 ? 1 : -1;
+}
+
+// A free tile RT_SEARCH_ROAM_MIN..MAX from the last-seen spot that it can walk to in a few steps, or
+// -1. Random, so two searchers do not walk in step and a search does not shuttle between two tiles.
+static int rt_search_roam_tile(RtActor* a, Object* npc)
+{
+    for (int attempt = 0; attempt < 12; attempt++) {
+        // Two random hops, so the points are not only on the six straight lines out of the centre.
+        int tile = tile_num_in_direction(a->search_center, roll_random(0, ROTATION_COUNT - 1),
+            roll_random(1, RT_SEARCH_ROAM_MAX));
+        if (tile < 0) {
+            continue;
+        }
+        tile = tile_num_in_direction(tile, roll_random(0, ROTATION_COUNT - 1), roll_random(0, 2));
+        if (tile < 0 || tile_dist(npc->tile, tile) < 2) {
+            continue; // a point next to it is no walk at all
+        }
+        int fromCenter = tile_dist(a->search_center, tile);
+        if (fromCenter < RT_SEARCH_ROAM_MIN || fromCenter > RT_SEARCH_ROAM_MAX) {
+            continue;
+        }
+        // Not out on the map's black background either (the same test combatai_flee_tile uses).
+        if (obj_blocking_at(npc, tile, npc->elevation) != NULL || map_tile_is_background(tile, npc->elevation)) {
+            continue;
+        }
+        // A route is never shorter than the hex distance; and a capped search (review 2026-10-29): a
+        // candidate behind a wall cost the full 12000-node budget, twelve times per pause, per searcher.
+        if (tile_dist(npc->tile, tile) > RT_SEARCH_ROAM_MAX_STEPS) {
+            continue;
+        }
+        int steps = make_path_capped(npc, npc->tile, tile, NULL, 1, 400);
+        if (steps > 0 && steps <= RT_SEARCH_ROAM_MAX_STEPS) {
+            return tile;
+        }
+    }
+    return -1;
+}
+
+static bool rt_is_defensive(RtActor* a, Object* npc);
+
+// Lost it, not beaten it: go and look where it was last seen (rt_search_tick). A hunter of the player's
+// side only, never one running away or holding its ground (rt_is_defensive). `why` goes to the trace.
+static void rt_search_begin(RtActor* a, Object* npc, const char* why)
+{
+    if (!rt_tactical_ai || !rt_hunts_player(a) || rt_is_defensive(a, npc) || a->last_seen_tile < 0
+        || a->fleeing || combatai_flee_reason(npc) != 0) {
+        return;
+    }
+    // Standing on the spot already is no reason not to: from there it roams.
+    a->search_tile = a->last_seen_tile;
+    a->search_center = a->last_seen_tile;
+    a->search_until = rt_clock + RT_SEARCH_SECONDS;
+    a->search_look_at = 0.0f;
+    a->search_pause_until = 0.0f;
+    trace_event(TRACE_FLOW, "search-start", "id=%d pid=%d tile=%d to=%d why=%s t=%.2f",
+        npc->id, npc->pid, npc->tile, a->search_tile, why, rt_clock);
+}
+
+// OUT OF SIGHT, A CHASER RUNS TO WHERE IT LAST SAW ITS TARGET (2026-10-28, "geckon fakt běžel až za roh,
+// to mně nemohl tak najít ne přirozeně. Prostě věděl"). It used to path to the target's own tile, wherever
+// he had gone, for the whole grace before the disengage. Called from the two places in RT_CHASE that walk
+// at the target -- the route round for a line, and the plain step -- so attacking, the Tactical AI holds
+// and the breather still come first (review 2026-10-29: in front of them it broke overwatch and the rest).
+// True when it has handled the move (a leg, or waiting for one); false = the target is in sight again, or
+// nothing to run to, and the chase goes on as before.
+static bool rt_lost_sight_leg(RtActor* a, Object* npc)
+{
+    if (!a->target_unseen || a->last_seen_tile < 0 || !rt_can_walk(npc) || a->fleeing
+        || (npc->data.critter.combat.maneuver & (CRITTER_MANEUVER_DISENGAGING | CRITTER_MANUEVER_FLEEING)) != 0) {
+        return false;
+    }
+    // Back in sight between two stop checks: the chase takes over again at once.
+    if (rt_sees(npc, a->target, false)) {
+        a->target_unseen = false;
+        a->last_seen_tile = a->target->tile;
+        return false;
+    }
+    if (npc->tile == a->last_seen_tile || anim_busy(npc) != 0 || rt_clock < a->lost_sight_retry_at) {
+        return true; // there, or walking, or waiting for bodies to clear: the disengage decides the rest
+    }
+    int walked = rt_walk_leg(npc, a->last_seen_tile, true, "lost-sight");
+    trace_event(TRACE_FLOW, "lost-sight-move", "id=%d pid=%d tile=%d to=%d walked=%d tgtDist=%d t=%.2f",
+        npc->id, npc->pid, npc->tile, a->last_seen_tile, walked, obj_dist(npc, a->target), rt_clock);
+    if (walked < 0) {
+        // ⚠️ BODIES ARE NO WALL (review 2026-10-29): the route search counts every critter as one, so a
+        // teammate in the doorway read as "no way there". Against walls and scenery only it is asked
+        // again; if that route exists it waits and retries, else it waits out the grace where it stands.
+        if (make_path_func(npc, npc->tile, a->last_seen_tile, NULL, 0, rt_static_blocking_at) > 0) {
+            a->lost_sight_retry_at = rt_clock + RT_ROUTE_PLUGGED_RETRY_SECONDS;
+        } else {
+            a->last_seen_tile = npc->tile;
+        }
+    }
+    return true;
+}
 
 static void rt_search_tick(RtActor* a, Object* npc)
 {
@@ -10743,35 +11074,8 @@ static void rt_search_tick(RtActor* a, Object* npc)
     }
 
     if (tile_dist(npc->tile, a->search_tile) > 1) {
-        // Three tiles a leg: the AI does not run while a body animates, and a searcher that walked
-        // the whole way in one go would stroll straight past you before it could notice.
-        //
-        // ⚠️ THE LEG IS CUT HERE, NOT BY THE MOVE'S AP ARGUMENT: anim_move_to_tile honours that only
-        // when the destination tile is blocked (vanilla), and out of combat no AP drain stops a
-        // walk either. trace_2026-10-17_234728: id=3263 searched along a 126-step route in one go,
-        // 12 s of walking with its eyes shut (the FSM waits out anim_busy), past RT_SEARCH_SECONDS.
-        // (a5 = 0: someone standing on the spot itself does not cancel the search.)
-        unsigned char rotations[800];
-        int steps = make_path(npc, npc->tile, a->search_tile, rotations, 0);
-        bool moved = false;
-        if (steps > 0) {
-            int leg = a->search_tile;
-            if (steps > 3) {
-                leg = npc->tile;
-                for (int i = 0; i < 3; i++) {
-                    leg = tile_num_in_direction(leg, rotations[i], 1);
-                }
-            }
-            npc->data.critter.combat.ap = stat_level(npc, STAT_MAXIMUM_ACTION_POINTS); // the engine's per-tile AP
-            if (!rt_register_begin(ANIMATION_REQUEST_RESERVED, "search")) {
-                return;
-            }
-            anim_reset_last_path();
-            int rc = register_object_move_to_tile(npc, leg, npc->elevation, -1, 0);
-            register_end();
-            moved = rc == 0 && anim_last_path_steps(npc) != 0;
-        }
-        if (!moved) {
+        int walked = rt_walk_leg(npc, a->search_tile, false, "search");
+        if (walked < 0) {
             // No way there (bodies, a door it cannot open): it looks from where it stands.
             trace_event(TRACE_FLOW, "search-blocked", "id=%d pid=%d tile=%d want=%d t=%.2f",
                 npc->id, npc->pid, npc->tile, a->search_tile, rt_clock);
@@ -10780,13 +11084,27 @@ static void rt_search_tick(RtActor* a, Object* npc)
         return;
     }
 
-    // There: look around.
+    // There: look around for a moment...
     a->search_tile = npc->tile;
+    if (a->search_pause_until <= 0.0f) {
+        a->search_pause_until = rt_clock + 1.5f + roll_random(0, 15) * 0.1f;
+    }
     if (rt_clock >= a->search_look_at) {
         static const int steps[4] = { -2, -1, 1, 2 };
         int rotation = (npc->rotation + steps[roll_random(0, 3)] + ROTATION_COUNT) % ROTATION_COUNT;
         rt_look_set_rotation(npc, rotation);
         a->search_look_at = rt_clock + 0.8f + roll_random(0, 6) * 0.1f;
+    }
+
+    // ...then on to another spot round the place it lost you. None to be had: it goes on looking here.
+    if (rt_clock >= a->search_pause_until && a->search_center >= 0) {
+        int roam = rt_search_roam_tile(a, npc);
+        if (roam >= 0) {
+            trace_event(TRACE_FLOW, "search-roam", "id=%d pid=%d tile=%d to=%d center=%d left=%.1f t=%.2f",
+                npc->id, npc->pid, npc->tile, roam, a->search_center, a->search_until - rt_clock, rt_clock);
+            a->search_tile = roam;
+        }
+        a->search_pause_until = 0.0f;
     }
 }
 
@@ -10828,7 +11146,7 @@ static void rt_retarget_nearer(RtActor* a, Object* npc)
     if (dist > RT_RETARGET_NEAR || dist + RT_RETARGET_GAIN > currentDist) {
         return;
     }
-    if (dist > 1 && !is_within_perception(npc, nearer)) {
+    if (dist > 1 && !rt_sees(npc, nearer, true)) {
         return;
     }
     if (!rt_can_reach_or_shoot(npc, nearer)) {
@@ -11363,6 +11681,9 @@ static bool rt_corner_holds(RtActor* a, Object* npc)
 #define RT_OW_MAX 8.0f
 #define RT_OW_WALK_MAX 6.0f
 #define RT_OW_TARGET_SLACK 2
+// How long after losing sight of him a NEW post may still be picked: RT_PREBREATH_MAX (5 s, defined further
+// down) plus RT_HOLD_BEAT_SECONDS -- the breath and the pre-breath run ahead of overwatch in RT_CHASE.
+#define RT_OW_LOST_WINDOW 6.5f
 
 static void rt_intent_hint(RtActor* a, int intent, const char* why, float seconds);
 
@@ -11504,7 +11825,10 @@ static bool rt_overwatch_holds(RtActor* a, Object* npc, int range)
     }
 
     if (a->ow_tile >= 0) {
-        if (tile_dist(target->tile, a->ow_target_tile) > RT_OW_TARGET_SLACK) {
+        // ⚠️ ONLY IF IT SEES HIM MOVE (review 3). Out of its sight it cannot know he went elsewhere: re-posting
+        // for "the door he is at now" walked a gecko behind rock along his route for as long as he kept moving.
+        // Unseen, it holds the door it chose until the hold ends, then looks where it last saw him.
+        if (a->target_seen && tile_dist(target->tile, a->ow_target_tile) > RT_OW_TARGET_SLACK) {
             rt_ow_drop(a, npc, "moved", false); // decides again next frame, for the door it is at now
             return false;
         }
@@ -11560,6 +11884,14 @@ static bool rt_overwatch_holds(RtActor* a, Object* npc, int range)
     }
 
     if (a->ow_done) {
+        return false;
+    }
+    // A new post is picked against his CURRENT tile (rt_ow_entry_tile, rt_ow_find_post): only for a target it
+    // sees, or has just lost -- it saw him go through the door. The window outlasts the breath and the
+    // pre-breath that run ahead of this in RT_CHASE; past it, the post would be read off his live tile
+    // (review 3; review 4: a plain target_seen gate was already false by the time the chain got here, and
+    // overwatch, his pick, almost never started).
+    if (!a->target_seen && (a->seen_at < 0.0f || rt_clock - a->seen_at > RT_OW_LOST_WINDOW)) {
         return false;
     }
     int dist = obj_dist(npc, target);
@@ -13123,16 +13455,81 @@ static void rt_update_actor(RtActor* a, float dt)
             if (a->last_seen_tile < 0 && a->target != NULL && a->target->elevation == npc->elevation) {
                 a->last_seen_tile = a->target->tile;
             }
-            if (rt_wants_to_stop(npc, a->target)) {
+            bool walls = rt_tactical_ai && rt_hunts_player(a);
+
+            // ⚠️ A HOLD IS NOT A LOST FOE (review 2026-10-29). Overwatch at a door, gathering at a corner, a
+            // breath before going round, a peek from cover, a firing position, a wait behind a teammate, a
+            // breather: each is a critter out of its target's sight ON PURPOSE, with its own timeout. With
+            // vanilla's wall-blind sight they mostly still "perceived" him; with walls they would all have
+            // disengaged three seconds into the hold. The grace starts once the hold is over -- read from
+            // when a hold last HELD (hold_beat_at), not from its fields, some of which outlive the hold.
+            // The walk to an overwatch post counts as well: the chain that stamps hold_beat_at does not run while
+            // the body walks, and a post a few seconds away would otherwise disengage it on the way (review 3).
+            bool owWalk = a->ow_tile >= 0 && a->ow_in_at < 0.0f && rt_clock - a->ow_since <= RT_OW_WALK_MAX;
+            bool holding = walls
+                && ((a->hold_beat_at >= 0.0f && rt_clock - a->hold_beat_at <= RT_HOLD_BEAT_SECONDS) || owWalk);
+
+            // What it knows of its TARGET itself (review 2026-10-29): seeing it, or a hit from it since its
+            // turn. Only that moves last_seen_tile -- seeing some other foe, or a hit from someone else, keeps
+            // rt_wants_to_stop quiet but says nothing about where its target has gone.
+            bool knowsTarget = a->target != NULL && a->target->elevation == npc->elevation
+                && ((walls ? rt_sees(npc, a->target, false) : is_within_perception_unsneaked(npc, a->target))
+                    || (npc->data.critter.combat.damageLastTurn > 0 && npc->data.critter.combat.whoHitMe == a->target));
+
+            // ⚠️ ITS TARGET GONE, ANOTHER OF HIS SIDE IN FRONT OF IT (review 2026-10-29): it turns on that one
+            // -- the one it sees, else the one that hit it since its turn. Otherwise that other foe kept the
+            // stop rule quiet, nothing ever disengaged it, and it stood on its target's last-seen tile for good.
+            if (walls && !knowsTarget) {
+                Object* other = rt_nearest_seen_player_side(npc, INT_MAX);
+                Object* hitBy = npc->data.critter.combat.whoHitMe;
+                if (other == NULL && npc->data.critter.combat.damageLastTurn > 0 && rt_is_player_side_ptr(hitBy)
+                    && rt_is_combatant(hitBy) && hitBy->elevation == npc->elevation) {
+                    other = hitBy;
+                }
+                // ...else the very danger that keeps rt_wants_to_stop quiet, tested as it tests it (Sneak left
+                // out): a sneaking dude in plain view is no stranger to one already fighting (review 3).
+                if (other == NULL) {
+                    Object* danger = ai_danger_source(npc);
+                    if (danger != NULL && danger != a->target && rt_is_player_side_ptr(danger) && rt_is_combatant(danger)
+                        && danger->elevation == npc->elevation && rt_sees(npc, danger, false)) {
+                        other = danger;
+                    }
+                }
+                if (other != NULL && other != a->target && rt_can_reach_or_shoot(npc, other)) {
+                    trace_event(TRACE_FLOW, "retarget", "id=%d pid=%d was=%d now=%d nowPid=%d why=lost-sight dist=%d t=%.2f",
+                        npc->id, npc->pid, a->target != NULL ? a->target->id : -1, other->id, other->pid,
+                        obj_dist(npc, other), rt_clock);
+                    a->target = other;
+                    a->plan_valid = false;
+                    a->no_path_since = -1.0f;
+                    a->route_plugged = false;
+                    knowsTarget = true;
+                }
+            }
+
+            a->target_seen = knowsTarget;
+            if (knowsTarget) {
+                a->seen_at = rt_clock;
+            }
+            // Not held off by a hold (review 3): the holds run ahead of both lost-sight legs in RT_CHASE, so this
+            // cannot cut one short -- and the frame a hold ends it heads for last_seen_tile, not his live tile.
+            a->target_unseen = walls && !knowsTarget;
+            if (knowsTarget) {
+                a->last_seen_tile = a->target->tile;
+            }
+
+            // ⚠️ NOTHING LEFT TO DO FOR ITS TARGET (review 3): it stands where it last saw him, or has nowhere to go,
+            // and nobody it could turn on (above). Something else -- an ally's attacker it cannot reach, a
+            // non-player foe -- still keeping the stop rule quiet must not keep it standing there for good.
+            bool spent = a->target_unseen && !holding
+                && (a->last_seen_tile < 0 || npc->tile == a->last_seen_tile);
+
+            if (!holding && (spent || rt_wants_to_stop(npc, a->target, walls))) {
                 if (a->unperceived_since < 0.0f) {
                     a->unperceived_since = rt_clock;
                 }
             } else {
                 a->unperceived_since = -1.0f;
-                // Still in sight: this is where it would go and look if it lost it (rt_search_tick).
-                if (a->target != NULL && a->target->elevation == npc->elevation) {
-                    a->last_seen_tile = a->target->tile;
-                }
             }
         }
 
@@ -13156,15 +13553,14 @@ static void rt_update_actor(RtActor* a, float dt)
             // ⚠️ NOT ONE THAT IS RUNNING AWAY (2026-10-18, self-played open-raiders: a knife raider at 3 HP
             // fled, ran dry at 12 tiles, lost sight of the dude -- and walked back to where it had last
             // seen him, saw him, fled again: a loop). Vanilla's flee reasons win over looking for him.
-            if (rt_tactical_ai && a->hostile && !a->friendly && !rt_is_defensive(a, npc) && a->last_seen_tile >= 0
-                && !a->fleeing && combatai_flee_reason(npc) == 0
-                && tile_dist(npc->tile, a->last_seen_tile) > 1) {
-                a->search_tile = a->last_seen_tile;
-                a->search_until = rt_clock + RT_SEARCH_SECONDS;
-                a->search_look_at = 0.0f;
-                trace_event(TRACE_FLOW, "search-start", "id=%d pid=%d tile=%d to=%d t=%.2f",
-                    npc->id, npc->pid, npc->tile, a->search_tile, rt_clock);
-            }
+            rt_search_begin(a, npc, "disengage");
+
+            // ⚠️ AND IT HAS LOST HIM (Fallout 2 Realtime 2026-10-28, a gecko in the Toxic Caves; ported 2026-10-29):
+            // this used to be a no-op. whoHitMe names him for any critter that has attacked him or been hit by him
+            // (combat_attack, ai_attack, combatai_check_retaliation), and the IDLE gate counts `hurtBy == tgt` as
+            // perceiving -- so on the very next frame it was back in the chase, pathing to wherever he stood, round
+            // a corner and out of any sight (F2 trace: three disengages and three instant re-chases in 6 s).
+            a->lost_track = true;
         }
 
         if (giveUp) {
@@ -13173,6 +13569,7 @@ static void rt_update_actor(RtActor* a, float dt)
             a->no_path_since = -1.0f;
             a->unperceived_since = -1.0f;
             a->last_seen_tile = -1; // the search above took its copy; the next chase starts fresh
+            a->target_unseen = false;
         } else if (rt_target_unreachable(a)) {
             // UNREACHABLE TARGET -- the third de-aggro condition, added once the trace proved
             // this was the frozen chaser's cause (3277 no-path failures, id=687 rooted on one
@@ -13607,17 +14004,14 @@ static void rt_update_actor(RtActor* a, float dt)
             // range with a clear line from going straight back to firing. Without this a critter
             // that cannot move at all (the Master) stayed silent for the full 30 s even with the
             // player standing in plain sight in front of it.
-            Object* near = a->hostile ? rt_nearest_player_side(npc) : NULL;
-            int nearMode = near != NULL ? rt_hit_mode(npc) : 0;
-            bool canShootNow = near != NULL
-                && obj_dist(npc, near) <= item_w_range(npc, nearMode)
-                && !rt_shot_blocked(npc, near, nearMode)
-                && is_within_perception(npc, near);
+            int nearMode = a->hostile ? rt_hit_mode(npc) : 0;
+            Object* near = a->hostile ? rt_nearest_seen_player_side(npc, item_w_range(npc, nearMode)) : NULL;
+            bool canShootNow = near != NULL && !rt_shot_blocked(npc, near, nearMode);
             // A defender that stood down from a standoff (rt_defend_holds) also wakes when you come
             // close or hurt it -- the two things that would have ended its hold.
             if (!canShootNow && rt_tactical_ai && rt_is_defensive(a, npc)
                 && (npc->data.critter.combat.damageLastTurn > 0
-                    || (near != NULL && obj_dist(npc, near) <= RT_DEFEND_RADIUS && is_within_perception(npc, near)))) {
+                    || (a->hostile && rt_nearest_seen_player_side(npc, RT_DEFEND_RADIUS) != NULL))) {
                 canShootNow = true;
             }
             if (!canShootNow) {
@@ -13733,16 +14127,36 @@ static void rt_update_actor(RtActor* a, float dt)
                 && combatai_flee_reason(npc) != 0
                 && obj_dist(npc, obj_dude) >= combatai_max_dist(npc);
 
-            if (tgt != NULL && !toldToStop && !wouldOnlyLeave && !restingAfterFlee
-                && (is_within_perception(npc, tgt) || hurtBy == tgt)) {
-                if (rt_can_reach_or_shoot(npc, tgt)) {
-                    a->target = tgt;
+            // ⚠️ ...BUT NOT ONCE IT HAS LOST YOU. whoHitMe is no record of a recent hit: its own attack on him
+            // aims it (combat_attack, ai_attack), so does a script's attack() and a hit it took -- and it stays.
+            // One that disengaged for perceiving nobody
+            // (lost_track) comes back on sight, or on a new hit since its last turn, never on the old pointer.
+            bool hurtByCounts = hurtBy != NULL && rt_is_player_side_ptr(hurtBy) && rt_is_combatant(hurtBy)
+                && hurtBy->elevation == npc->elevation && obj_dist(npc, hurtBy) <= rt_chase_range(npc)
+                && (!a->lost_track || hurtSinceItsTurn);
+
+            // WHOM: the nearest of his side it SEES -- not the nearest, if seen: Dogmeat behind a rock must
+            // not hide the dude standing in the open -- and with nobody seen, the one whoHitMe names, so the
+            // radscorpion rule follows the shooter, not whoever happens to stand nearest (review 2026-10-29).
+            Object* seen = rt_nearest_seen_player_side(npc, INT_MAX);
+            Object* engageTgt = seen != NULL ? seen : (hurtByCounts ? hurtBy : NULL);
+
+            if (engageTgt != NULL && !toldToStop && !wouldOnlyLeave && !restingAfterFlee) {
+                if (rt_can_reach_or_shoot(npc, engageTgt)) {
+                    trace_event(TRACE_FLOW, "engage", "id=%d pid=%d why=%s lost=%d hurt=%d dist=%d search=%d t=%.2f",
+                        npc->id, npc->pid, seen != NULL ? "sight" : "hurt-by", a->lost_track ? 1 : 0,
+                        hurtSinceItsTurn ? 1 : 0, obj_dist(npc, engageTgt), a->search_tile >= 0 ? 1 : 0, rt_clock);
+                    a->target = engageTgt;
                     a->state = RT_CHASE;
                     a->unperceived_since = -1.0f;
+                    a->target_unseen = false;
+                    a->target_seen = true;
+                    a->seen_at = rt_clock;
+                    a->lost_track = false;
                 } else {
                     // No way to it and no shot from here: hold, and do not re-ask every frame.
                     trace_event(TRACE_FLOW, "engage-unreachable", "id=%d pid=%d tile=%d tgt=%d dist=%d t=%.2f",
-                        npc->id, npc->pid, npc->tile, tgt->tile, obj_dist(npc, tgt), rt_clock);
+                        npc->id, npc->pid, npc->tile, engageTgt->tile, obj_dist(npc, engageTgt), rt_clock);
                     a->unreachable_tile = npc->tile;
                     a->unreachable_until = rt_clock + RT_UNREACHABLE_RETRY_SECONDS;
                 }
@@ -13945,6 +14359,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 rt_intent_hint(a, RT_INTENT_REPOSITION, "exposed", 1.5f);
                 a->no_path_since = -1.0f;
             } else if (a->breather) {
+                a->hold_beat_at = rt_clock; // a hold (see the stop check)
                 // STAND AND RECOVER. The latch lives in the drain block above; this is the only
                 // place it does anything, and what it suppresses is MOVEMENT ONLY.
                 //
@@ -13961,31 +14376,45 @@ static void rt_update_actor(RtActor* a, float dt)
             } else if (rt_tactical_ai && rt_prebreathe_holds(a, npc, mode)) {
                 // Topping up out of sight before going round (rt_prebreathe_holds).
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_peek_holds(a, npc, mode, range)) {
                 // Lean out of cover for one shot, or wait in it for the next (rt_peek_holds).
                 a->no_path_since = -1.0f;
-            } else if (inRange && !closeForHit && rt_tactical_ai && rt_firing_position(a, npc, mode, range)) {
-                // To a tile it can shoot from at range, instead of up to him round the corner.
+                a->hold_beat_at = rt_clock;
+            } else if (inRange && !closeForHit && rt_tactical_ai && a->target_seen && rt_firing_position(a, npc, mode, range)) {
+                // To a tile it can shoot from at range, instead of up to him round the corner. Only for a target
+                // it saw at the last check: the spot is picked against his CURRENT tile (review 2026-10-29).
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
                 rt_intent_hint(a, RT_INTENT_REPOSITION, "firing-position", 1.5f);
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_choke_waits(a, npc, mode)) {
                 // A teammate is already at him, right in front: wait behind it (rt_choke_waits).
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_overwatch_holds(a, npc, range)) {
                 // On its way to its post, or at it covering the door (rt_overwatch_holds). Holding is
                 // not failing to route.
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
             } else if (inRange && !closeForHit && rt_tactical_ai && rt_corner_holds(a, npc)) {
                 // Gathering at the corner before going round it (rt_corner_holds). Holding is not
                 // failing to route.
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
                 rt_intent_hint(a, RT_INTENT_HOLD, "gather-corner", 0.5f);
             } else if (!inRange && range <= 2 && rt_tactical_ai
                 && combat_is_shot_blocked(a->target, a->target->tile, npc->tile, npc, NULL)
                 && rt_overwatch_holds(a, npc, range)) {
                 // A melee fighter coming unseen waits beside the door instead (rt_overwatch_holds).
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
             } else if (inRange && !closeForHit) {
+                // Out of its sight: to where it last saw him, not round to where he is (rt_lost_sight_leg).
+                if (rt_lost_sight_leg(a, npc)) {
+                    a->no_path_since = -1.0f;
+                    break;
+                }
+
                 // In range but no LINE OF FIRE (target behind a wall/building): don't
                 // just stand -- path AROUND the obstacle to get an angle. A plain step
                 // toward can't route around a building, so a ranged NPC would otherwise
@@ -14030,6 +14459,7 @@ static void rt_update_actor(RtActor* a, float dt)
                 // Holding: a defender out of reach keeps its ground, a chaser ahead waits for its squad
                 // (group tactics above). Holding is not failing to route.
                 a->no_path_since = -1.0f;
+                a->hold_beat_at = rt_clock;
             } else if (rt_clock < a->room_yield_until) {
                 // It just stepped back to let a fresher ally in (rt_room_make). Walking now would
                 // take it straight back onto the spot it gave up, before the ally gets there.
@@ -14037,6 +14467,12 @@ static void rt_update_actor(RtActor* a, float dt)
                 rt_intent_hint(a, RT_INTENT_REPOSITION, "flank", 2.0f);
                 a->no_path_since = -1.0f;
             } else {
+                // Out of its sight: to where it last saw him, not to where he is (rt_lost_sight_leg).
+                if (rt_lost_sight_leg(a, npc)) {
+                    a->no_path_since = -1.0f;
+                    break;
+                }
+
                 // While the in-combat bit is set, anim.cc deducts the mover's engine
                 // combat.ap per tile and truncates the move at ap <= 0. That field is
                 // NOT combat_rt's AP pool (movement is free and never spends the
@@ -14170,6 +14606,7 @@ static void rt_update_actor(RtActor* a, float dt)
 
         // Leaned out for one shot: once it is gone, back behind the corner (rt_peek_back).
         if (rt_peek_back(a, npc)) {
+            a->hold_beat_at = rt_clock; // back into cover: a hold (see the stop check)
             break;
         }
 
@@ -14620,6 +15057,7 @@ static void rt_abandon_encounter()
     rt_lock_last_target = NULL;
     rt_lock_preaim_target = NULL;
     rt_aim_outlined_count = 0; // pointers only: the objects are being freed by the caller
+    rt_lost_memory_count = 0; // pointers only: the bodies are being freed by the caller
     rt_aim_outline_next = 0.0f;
     rt_lock_held = 0.0f;
     rt_player_intent_target = NULL;
@@ -14662,6 +15100,7 @@ static void rt_reset_session_state()
     // Stray-hit forgiveness is per map visit (rt_forgive_stray), and ids are only unique per map.
     rt_forgiven_count = 0;
     rt_last_fight_clock = -1000.0f;
+    rt_lost_memory_count = 0;
 
     // The reaction table is session state like everything else here: a load must not resurrect a
     // knockdown from the game that was running a second ago.
@@ -19904,15 +20343,41 @@ bool combat_rt_end_combat()
     for (int i = 0; i < rt_actor_count; i++) {
         RtActor* a = &rt_actors[i];
         Object* npc = a->obj;
-        if (!a->hostile || !rt_is_combatant(npc)) {
+        if (!rt_is_combatant(npc)) {
             continue;
         }
 
+        // ⚠️ NOR ONE THE RE-AGGRO WOULD BRING STRAIGHT BACK (review 2026-10-29). A "yes" here sets everyone idle,
+        // and the very next frame the IDLE branches ask their own question: a hostile engages the nearest of us it
+        // SEES, a companion the nearest hostile it perceives (vanilla's wall-blind test, as before). With walls in
+        // the hunters' sight those differ from rt_wants_to_stop below, and the fight closed and reopened at once.
+        if (a->friendly) {
+            bool ranAway = (npc->data.critter.combat.maneuver & CRITTER_MANEUVER_DISENGAGING) != 0;
+            Object* enemy = ranAway ? NULL : rt_nearest_hostile(npc);
+            if (enemy != NULL && is_within_perception(npc, enemy)) {
+                trace_event(TRACE_FLOW, "end-combat-refused", "id=%d pid=%d why=companion-sees foe=%d dist=%d t=%.2f",
+                    npc->id, npc->pid, enemy->id, obj_dist(npc, enemy), rt_clock);
+                combat_display_cant_end_message();
+                return false;
+            }
+            continue;
+        }
+        if (!a->hostile) {
+            continue;
+        }
+        bool toldToStop = (npc->data.critter.combat.maneuver & CRITTER_MANEUVER_DISENGAGING) != 0;
+        Object* seen = toldToStop || rt_clock < a->rejoin_after ? NULL : rt_nearest_seen_player_side(npc, INT_MAX);
+        if (seen != NULL) {
+            trace_event(TRACE_FLOW, "end-combat-refused", "id=%d pid=%d why=sees st=%d dist=%d t=%.2f",
+                npc->id, npc->pid, a->state, obj_dist(npc, seen), rt_clock);
+            combat_display_cant_end_message();
+            return false;
+        }
+
         // Ask about whatever it is actually after. With no target of its own, ask about the
-        // nearest of us -- the same object the re-aggro branch would pick -- so a "yes" here
-        // cannot be undone by that branch on the next frame.
+        // nearest of us -- the same object the re-aggro branch would fall back on.
         Object* tgt = a->target != NULL ? a->target : rt_nearest_player_side(npc);
-        if (!rt_wants_to_stop(npc, tgt)) {
+        if (!rt_wants_to_stop(npc, tgt, rt_tactical_ai && rt_hunts_player(a))) {
             trace_event(TRACE_FLOW, "end-combat-refused", "id=%d pid=%d st=%d dist=%d t=%.2f",
                 npc->id, npc->pid, a->state,
                 tgt != NULL ? obj_dist(npc, tgt) : -1, rt_clock);
@@ -19923,11 +20388,31 @@ bool combat_rt_end_combat()
 
     for (int i = 0; i < rt_actor_count; i++) {
         RtActor* a = &rt_actors[i];
+        // ...which the IDLE gate must honour: whoHitMe still names him, and without this the "yes" above
+        // was undone a second later (Fallout 2 Realtime, a gecko 19 tiles off, 1.6 s after End combat).
+        // Hunters only: a townsman's later scripted attack() must not wait for a sight it never needed.
+        if (rt_was_after_player(a)) {
+            a->lost_track = true;
+            // And one that was after him goes to look where it last saw him instead of freezing on the
+            // spot (review 2026-10-29) -- seeing him again starts the fight anew, as before.
+            if (a->state != RT_IDLE && a->search_tile < 0) {
+                rt_search_begin(a, a->obj, "end-combat");
+            }
+        }
         a->state = RT_IDLE;
         a->target = NULL;
         a->no_path_since = -1.0f;
         a->unperceived_since = -1.0f;
+        a->target_unseen = false;
+        a->last_seen_tile = -1;
         a->weapon_checked = false;
+        // Vanilla's combat_over bookend, which the engaged -> idle edge in combat_rt_update never runs for a
+        // fight ended here (rt_engaged is already false by then): without it a hit from just before the end
+        // still counted as "hurt since its turn" and walked the hunter straight back in (review 3).
+        if (a->obj != NULL) {
+            a->obj->data.critter.combat.maneuver = CRITTER_MANEUVER_NONE;
+            a->obj->data.critter.combat.damageLastTurn = 0;
+        }
     }
 
     rt_engaged = false;
@@ -19953,6 +20438,11 @@ void combat_rt_terminate_from_script()
         a->no_path_since = -1.0f;
         a->unperceived_since = -1.0f;
         a->weapon_checked = false;
+        // Hostility stays sticky, and so does whoHitMe: only SEEING you brings a hunter back (lost_track).
+        if (rt_was_after_player(a)) {
+            a->lost_track = true;
+        }
+        a->target_unseen = false;
     }
 
     rt_engaged = false;
@@ -20108,6 +20598,9 @@ void combat_rt_notify_attack(Object* attacker, Object* defender)
 
         if (tracked != NULL) {
             tracked->hostile = true;
+            // A fresh order to one that was at peace is a new fight, not a lost one (the repeated orders of an
+            // already hostile one returned above, so they never undo a disengage).
+            tracked->lost_track = false;
         }
         return;
     }
@@ -20221,6 +20714,7 @@ void combat_rt_notify_critter_removed(Object* removed)
 
     // ...and any held attack offset (rt_swing_keep_tick dereferences it every frame).
     rt_swing_keep_drop(removed);
+    rt_lost_memory_forget(removed);
     rt_shot_tail_drop(removed);
 
     // Drop combat_rt's own cached pointers.
@@ -20363,6 +20857,25 @@ void combat_rt_end_for_map_exit()
         rt_actor_count, rt_engaged ? 1 : 0, rt_clock);
 
     combat_state &= ~COMBAT_STATE_0x01;
+
+    // ⚠️ OFF THIS FLOOR, A HUNTER HAS LOST HIM (review 2026-10-29). The stairs end the fight here and empty the
+    // registry before any rebuild could remember who had lost him -- and coming back, each one was built fresh
+    // with the old whoHitMe and ran at him from wherever it was. Every hunter is remembered as lost: it cannot
+    // follow him up a ladder, it sees him again or not. (A real map exit frees them all; the per-map teardown
+    // then empties the memory.)
+    for (int i = 0; i < rt_actor_count; i++) {
+        if (rt_was_after_player(&rt_actors[i])) {
+            rt_lost_memory_add(rt_actors[i].obj);
+        }
+        // The fight is over for this floor: vanilla's combat_over bookend (see the engaged -> idle edge in
+        // combat_rt_update, which never runs for this end). A hit from just before the stairs must not count
+        // as "hurt since its turn" when he comes back and override the lost memory above (review 3).
+        Object* c = rt_actors[i].obj;
+        if (c != NULL) {
+            c->data.critter.combat.maneuver = CRITTER_MANEUVER_NONE;
+            c->data.critter.combat.damageLastTurn = 0;
+        }
+    }
 
     combat_clear_pending_attack();
     rt_inflight_count = 0;
