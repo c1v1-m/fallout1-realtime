@@ -734,6 +734,13 @@ int default_screendump(int width, int height, unsigned char* data, unsigned char
     snprintf(filteredName, sizeof(filteredName), "%s\\scr%.5d_crt.bmp", SCREENDUMP_DIR, index);
     crt_request_capture(filteredName);
 
+    // Likewise the first-person view, which only the GPU ever sees (no-op when it is off).
+    if (svga_fp_request_capture != NULL) {
+        char viewName[COMPAT_MAX_PATH];
+        snprintf(viewName, sizeof(viewName), "%s\\scr%.5d_fp.bmp", SCREENDUMP_DIR, index);
+        svga_fp_request_capture(viewName);
+    }
+
     return 0;
 }
 

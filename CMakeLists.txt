@@ -118,6 +118,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/game_trace.h"
     "src/game/gamepad_ui.cc"
     "src/game/gamepad_ui.h"
+    "src/game/fp_view.cc"
+    "src/game/fp_view.h"
     "src/game/interact_prompt.cc"
     "src/game/interact_prompt.h"
     "src/game/radial_wheel.cc"

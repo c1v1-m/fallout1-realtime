@@ -366,11 +366,19 @@ static bool createRenderer(int width, int height)
     return true;
 }
 
+SvgaFpPresentFunc* svga_fp_present = NULL;
+void (*svga_fp_invalidate)(bool contextGone) = NULL;
+void (*svga_fp_request_capture)(const char* path) = NULL;
+bool svga_fp_frame = false;
+
 static void destroyRenderer()
 {
     // The GL context dies with the renderer, and every CRT object with it -- so the
     // handles must be dropped WITHOUT calling back into GL.
     crt_invalidate(true);
+    if (svga_fp_invalidate != NULL) {
+        svga_fp_invalidate(true);
+    }
 
     if (gSdlTextureSurface != NULL) {
         SDL_FreeSurface(gSdlTextureSurface);
@@ -447,6 +455,12 @@ void renderPresent()
     trace_alive(); // the hang watchdog's pulse (game_trace.cc)
 
     SDL_UpdateTexture(gSdlTexture, NULL, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);
+
+    // The first-person view, at the main loop's present only: drawn into the texture just uploaded,
+    // so whatever puts the texture up below (the CRT pass or the plain copy) shows it.
+    if (svga_fp_frame && svga_fp_present != NULL) {
+        svga_fp_present(gSdlWindow, gSdlRenderer, gSdlTexture, screenGetWidth(), screenGetHeight());
+    }
 
     // With the CRT filter on the frame goes up through our own GL pass instead of SDL's
     // blit -- and then SDL must not draw anything else this frame, because its renderer

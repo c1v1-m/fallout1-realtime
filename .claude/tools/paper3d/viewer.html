@@ -328,6 +328,59 @@ function makeWalker(dude, models) {
   return { group, anims, state, show, place };
 }
 
+// The vault dweller as the game draws him (build.js --diablo): his own sprites, frame by frame, in the
+// direction nearest to where he faces. Each frame sits where the glide has got to (see build.js).
+function makeSpriteWalker(dude, pages) {
+  const quad = ([img, dx0, dy0]) => {
+    const [pg, ax, ay, w, h] = SC.images[img];
+    const x0 = dx0 / S, x1 = (dx0 + w) / S, top = -dy0 / KY, bot = -(dy0 + h) / KY;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute([x0, bot, 0, x1, bot, 0, x1, top, 0, x0, top, 0], 3));
+    g.setAttribute('aPix', new THREE.Float32BufferAttribute([0, h, w, h, w, 0, 0, 0], 2));
+    g.setIndex([0, 1, 2, 0, 2, 3]);
+    return { g, page: pages[pg], img: new THREE.Vector4(ax, ay, w, h) };
+  };
+  const stand = dude.dirs.map(quad);
+  const anims = {};
+  for (const kind of ['walk', 'run']) {
+    const a = dude.sprite && dude.sprite[kind];
+    if (a) anims[kind] = { fps: a.fps, speed: a.speed, frames: a.frames.map((dirs) => dirs.map(quad)) };
+  }
+  const first = stand[dude.b[2]];
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      uAtlas: { value: first.page.tex }, uPal: { value: palTex },
+      uAtlasSize: { value: new THREE.Vector2(first.page.w, first.page.h) },
+      uImg: { value: first.img.clone() },
+      ...fogUniforms,
+    },
+    vertexShader: BILL_VS, fragmentShader: BILL_FS, side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(first.g, mat);
+  mesh.frustumCulled = false;
+  const group = new THREE.Group();
+  group.add(mesh);
+  const p = W(dude.b[0], dude.b[1], 0);
+  const state = { x: p[0], z: p[2], facing: dude.facing * Math.PI / 180, anim: 'stand', t: 0 };
+  return {
+    group, state, anims,
+    // psi: the camera's heading (the billboard turns to it, as every other one does)
+    update(psi) {
+      group.position.set(state.x, 0, state.z);
+      group.rotation.y = -psi;
+      const r = (((Math.round((state.facing - psi) / (Math.PI / 3)) + 1) % 6) + 6) % 6;
+      const a = anims[state.anim];
+      const v = a ? a.frames[Math.floor(state.t * a.fps) % a.frames.length][r] : stand[r];
+      if (mesh.geometry !== v.g) {
+        mesh.geometry = v.g;
+        mat.uniforms.uImg.value.copy(v.img);
+        mat.uniforms.uAtlas.value = v.page.tex;
+        mat.uniforms.uAtlasSize.value.set(v.page.w, v.page.h);
+      }
+    },
+  };
+}
+
 function buildLevel(L, pages, elevation, models) {
   const group = new THREE.Group();
   const roofs = new THREE.Group();
@@ -336,7 +389,20 @@ function buildLevel(L, pages, elevation, models) {
   const B = perPage();
   const pageOf = (id) => SC.images[id][0];
 
-  G.levelQuads(L, SC.images, (kind, quad) => pushQuad(B[pageOf(quad.id)][kind], quad), { deepBoxes: !!SC.doom });
+  // --diablo: one roof per building (build.js: the squares tile_fill_roof would flood together), so
+  // the one over the dude can be lifted as the game lifts it. levelQuads emits a roof per L.roof entry,
+  // in order.
+  const roofParts = SC.diablo ? Array.from({ length: L.roofs || 0 }, () => pages.map(() => makeBatch())) : null;
+  let roofIndex = 0;
+  G.levelQuads(L, SC.images, (kind, quad) => {
+    if (kind === 'roof' && roofParts) pushQuad(roofParts[L.roof[roofIndex++][5]][pageOf(quad.id)], quad);
+    else pushQuad(B[pageOf(quad.id)][kind], quad);
+  }, SC.diablo
+    // --diablo: walls and scenery stay the sheets the game painted -- the camera never leaves its heading
+    // and turns at most a few degrees, and a box's top and ends (its front's edge pixels pulled across)
+    // smeared into stripes on the near walls
+    ? { boxWalls: false, boxCards: false }
+    : { deepBoxes: !!SC.doom });
   B.forEach((b, i) => {
     const page = pages[i];
     const add = (mesh, parent = group) => mesh && parent.add(mesh);
@@ -348,17 +414,25 @@ function buildLevel(L, pages, elevation, models) {
     add(batchMesh(b.trans, page, { transparent: true, opacity: 0.5 }));
   });
   group.add(roofs);
+  const roofGroups = (roofParts || []).map((part) => {
+    const rg = new THREE.Group();
+    part.forEach((b, i) => { const m = batchMesh(b, pages[i], { back: 1 }); if (m) rg.add(m); });
+    roofs.add(rg);
+    return rg;
+  });
+  const roofOfSquare = new Map(SC.diablo ? L.roof.map((r) => [r[4], r[5]]) : []);
   for (const b of L.bill) { const bb = makeBillboard(b, pages); bills.push(bb); group.add(bb.group); }
   for (const b of L.board || []) { const bb = makeBoard(b, pages); bills.push(bb); group.add(bb.group); }
   for (const [cx, cy, heading, id] of L.vox || []) group.add(placeBody(models[id], [cx, cy], heading));
   // the dude: walkable in 3D when his animations carved, else the old six-direction billboard
+  // (--diablo walks his sprites instead, see makeSpriteWalker)
   let dudeBill = null;
-  if (SC.dude && SC.dude.elevation === elevation && !(SC.dude.walk && SC.dude.stand)) {
+  if (SC.dude && SC.dude.elevation === elevation && !(SC.dude.walk && SC.dude.stand) && !SC.diablo) {
     dudeBill = makeBillboard([...SC.dude.b, SC.dude.dirs], pages);
     bills.push(dudeBill);
     group.add(dudeBill.group);
   }
-  return { group, roofs, bills, dudeBill, counts: L, blocked: new Set(L.blocked || []) };
+  return { group, roofs, roofGroups, roofOfSquare, bills, dudeBill, counts: L, blocked: new Set(L.blocked || []) };
 }
 
 // ------------------------------------------------------------------ scene
@@ -416,8 +490,13 @@ async function main() {
   });
   const walker = SC.dude && SC.dude.walk && SC.dude.stand && levels[SC.dude.elevation] ? makeWalker(SC.dude, models) : null;
   if (walker) levels[SC.dude.elevation].group.add(walker.group);
+  const spriteWalker = SC.diablo && SC.dude && levels[SC.dude.elevation] ? makeSpriteWalker(SC.dude, pages) : null;
+  if (spriteWalker) levels[SC.dude.elevation].group.add(spriteWalker.group);
   let walkMode = false;
   let fpMode = false, retro = true; // first person, and its low-resolution look (see setFpMode)
+  // Diablo II's perspective (--diablo, see setDiabloMode): fov = how strong the perspective is (vertical
+  // degrees), zoom = game pixels per screen pixel under the dude, flat = the original orthographic view
+  const dia = { on: false, flat: false, fov: 30, zoom: 2 };
 
   // A ground point -> the hex it stands in: tile_coord inverted on the even-column lattice, then
   // the nearest of the candidate centres, measured in world units (where hexes are regular).
@@ -522,8 +601,9 @@ async function main() {
     persp.aspect = innerWidth / innerHeight;
     // first person sees 90 deg across, as Doom did, whatever the window's shape (three.js takes
     // the vertical angle; a fixed 75 deg vertical was 106 deg across and shrank everyone)
-    persp.fov = fpMode ? 2 * Math.atan(1 / persp.aspect) * 180 / Math.PI : 32;
+    persp.fov = fpMode ? 2 * Math.atan(1 / persp.aspect) * 180 / Math.PI : dia.on ? dia.fov : 32;
     persp.updateProjectionMatrix();
+    if (dia.on) placeDiabloCamera(); // its distance follows the window's height
   }
   addEventListener('resize', resize);
   resize();
@@ -642,6 +722,97 @@ async function main() {
     persp.position.set(fp.x, EYE, fp.z);
     persp.lookAt(fp.x + Math.sin(fp.yaw) * cp, EYE + Math.sin(fp.pitch), fp.z - Math.cos(fp.yaw) * cp);
   }
+  // ---------------------------------------------------------------- Diablo II's perspective (--diablo)
+  // The game's own view -- the same heading, the same 25.7 deg down -- through a PERSPECTIVE camera
+  // instead of the orthographic one, as Diablo II's "Perspective" option drew its 2D world: near things
+  // grow, far ones shrink towards the top of the screen, walls lean as you pass them. The camera rides
+  // with the dude, and at the ground under him the scale is the original's at dia.zoom; P swaps to the
+  // flat original to compare. Everyone stays the game's own sprites; the roof he walks under lifts.
+  function placeDiabloCamera() {
+    if (!spriteWalker) return;
+    const st = spriteWalker.state, t = new THREE.Vector3(st.x, 0, st.z);
+    if (dia.flat) {
+      camera = ortho;
+      ortho.zoom = dia.zoom;
+      ortho.updateProjectionMatrix();
+      ortho.position.copy(t).addScaledVector(TO_CAMERA, 200);
+    } else {
+      camera = persp;
+      persp.fov = dia.fov;
+      persp.updateProjectionMatrix();
+      // the view's height at the distance d is 2 d tan(fov / 2); the original shows innerHeight / zoom
+      // game pixels there, S of them to a unit
+      const d = innerHeight / (2 * S * dia.zoom * Math.tan(dia.fov * Math.PI / 360));
+      persp.position.copy(t).addScaledVector(TO_CAMERA, d);
+    }
+    camera.lookAt(t);
+    controls.object = camera;
+    controls.target.copy(t);
+  }
+  function setDiabloMode(on) {
+    dia.on = on && !!spriteWalker;
+    controls.enabled = !dia.on;
+    if (!dia.on) return;
+    if (walkMode) setWalkMode(false);
+    if (fpMode) setFpMode(false);
+    elevation = SC.dude.elevation;
+    showLevel();
+    persp.near = 0.5;
+    resize();
+    liftRoof();
+  }
+  // tile_fill_roof: the roof over the dude's square -- tile % 200 / 2, tile / 200 / 2 (obj_move_to_tile)
+  // -- comes off with every roof square touching it, and goes back when he leaves.
+  let liftedRoof = -1;
+  function liftRoof() {
+    const lv = levels[SC.dude.elevation];
+    const tile = tileAt(spriteWalker.state.x, spriteWalker.state.z);
+    const square = tile < 0 ? -1 : ((tile % 200) >> 1) + 100 * ((Math.floor(tile / 200)) >> 1);
+    const roof = lv.roofOfSquare.has(square) ? lv.roofOfSquare.get(square) : -1;
+    if (roof === liftedRoof) return;
+    lv.roofGroups.forEach((g, i) => (g.visible = i !== roof));
+    liftedRoof = roof;
+  }
+  // WASD walks him across the screen (the camera never turns), Shift runs; he turns smoothly and shows
+  // the nearest of his six directions; what blocks a hex blocks him, and he slides along it.
+  function updateDiablo(dt) {
+    const st = spriteWalker.state;
+    let mx = 0, mz = 0;
+    if (held.has('w')) mz -= 1;
+    if (held.has('s')) mz += 1;
+    if (held.has('a')) mx -= 1;
+    if (held.has('d')) mx += 1;
+    const kind = held.has('shift') && spriteWalker.anims.run ? 'run' : 'walk';
+    if ((mx || mz) && spriteWalker.anims[kind]) {
+      const len = Math.hypot(mx, mz), dx = mx / len, dz = mz / len;
+      const want = Math.atan2(dz, dx);
+      st.facing += Math.atan2(Math.sin(want - st.facing), Math.cos(want - st.facing)) * Math.min(1, dt * 12);
+      const step = spriteWalker.anims[kind].speed * dt;
+      let nx = st.x + dx * step, nz = st.z + dz * step;
+      if (blockedAt(nx, nz)) {
+        if (!blockedAt(nx, st.z)) nz = st.z;
+        else if (!blockedAt(st.x, nz)) nx = st.x;
+        else { nx = st.x; nz = st.z; }
+      }
+      st.x = nx;
+      st.z = nz;
+      if (st.anim !== kind) { st.anim = kind; st.t = 0; }
+      st.t += dt;
+    } else if (st.anim !== 'stand') {
+      st.anim = 'stand';
+      st.t = 0;
+    }
+    liftRoof();
+    placeDiabloCamera();
+  }
+  renderer.domElement.addEventListener('wheel', (e) => {
+    if (!dia.on) return;
+    e.preventDefault();
+    dia.zoom = Math.max(0.5, Math.min(4, dia.zoom * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+    placeDiabloCamera();
+    drawHud();
+  }, { passive: false });
+
   renderer.domElement.addEventListener('click', () => {
     if (fpMode && document.pointerLockElement !== renderer.domElement) {
       try { renderer.domElement.requestPointerLock?.()?.catch?.(() => {}); } catch { /* not allowed here: drag to look */ }
@@ -658,6 +829,19 @@ async function main() {
     const k = e.key.toLowerCase();
     if ('wasd'.includes(k) || k === 'shift') { held.add(k); return; }
     if (fpMode && k.startsWith('arrow')) { held.add(k); e.preventDefault(); return; }
+    if (dia.on) {
+      if (k === '[' || k === ']') dia.fov = Math.max(10, Math.min(70, dia.fov + (k === ']' ? 5 : -5)));
+      else if (k === 'p') dia.flat = !dia.flat;
+      else if (k === '+' || k === '=' || k === '-') dia.zoom = Math.max(0.5, Math.min(4, dia.zoom * (k === '-' ? 1 / 1.25 : 1.25)));
+      else if (k === 'r') {
+        roofsOn = !roofsOn;
+        levels.forEach((lv) => lv && (lv.roofs.visible = roofsOn));
+      } else if (k === 'h') hud.hidden = !hud.hidden;
+      else return;
+      placeDiabloCamera();
+      drawHud();
+      return;
+    }
     if (k === 'f') setFpMode(!fpMode);
     else if (k === 'l' && fpMode) { retro = !retro; resize(); }
     else if (fpMode && 'cop123'.includes(k)) return; // the free camera's keys wait until F leaves
@@ -679,6 +863,14 @@ async function main() {
 
   function drawHud() {
     const lv = levels[elevation].counts;
+    if (dia.on) {
+      hud.innerHTML =
+        `<b>FALLOUT 3D — perspektiva jako Diablo II</b>  ${SC.map} <span class="d">(${SC.name})</span>\n` +
+        `kamera: <b>${dia.flat ? 'původní, plochá' : `perspektiva ${dia.fov}°`}</b>  <span class="d">zoom ${dia.zoom.toFixed(2)}×</span>\n` +
+        `<b>WASD</b> chůze  <b>Shift</b> běh  <b>P</b> perspektiva / původní  <b>[ ]</b> síla perspektivy  ` +
+        `<span class="d">kolečko, + -</span> zoom  <b>R</b> střechy ${roofsOn ? 'zap' : 'vyp'}  <b>H</b> skrýt`;
+      return;
+    }
     const cam = fpMode ? 'první osoba (Doom)' : walkMode ? 'za postavou' : camera === ortho ? (isOriginal() ? 'původní' : 'ortografická') : 'perspektiva';
     const bodies = (lv.vox || []).length + (walker && elevation === SC.dude.elevation ? 1 : 0);
     hud.innerHTML =
@@ -745,11 +937,33 @@ async function main() {
       return this.fpAt();
     },
     fpAt: () => ({ x: +fp.x.toFixed(2), z: +fp.z.toFixed(2), yaw: +(fp.yaw * 180 / Math.PI).toFixed(1), tile: tileAt(fp.x, fp.z) }),
+    // --diablo checks: paper.diablo({ fov: 30, zoom: 2, flat: false }); paper.dWalk(['d'], 2); paper.dAt()
+    diablo(opts = {}) { Object.assign(dia, opts); setDiabloMode(true); placeDiabloCamera(); drawHud(); return { ...dia }; },
+    dWalk(keys, seconds) {
+      keys.forEach((k) => held.add(k));
+      for (let t = 0; t < seconds; t += 1 / 60) updateDiablo(1 / 60);
+      keys.forEach((k) => held.delete(k));
+      return this.dAt();
+    },
+    // put him on hex `tile` (tileAt inverted), for checks away from the entrance
+    dGo(tile) {
+      const c = 199 - (tile % 200), r = Math.floor(tile / 200);
+      const X = 24 * c + (c & 1 ? 8 : 0) + 16 * r, Y = -6 * c + (c & 1 ? 6 : 0) + 12 * r;
+      spriteWalker.state.x = (X - SC.origin[0] + 16) / S;
+      spriteWalker.state.z = (Y - SC.origin[1] + 8) / KZ;
+      updateDiablo(0);
+      return this.dAt();
+    },
+    dAt: () => spriteWalker && {
+      x: +spriteWalker.state.x.toFixed(2), z: +spriteWalker.state.z.toFixed(2),
+      tile: tileAt(spriteWalker.state.x, spriteWalker.state.z), anim: spriteWalker.state.anim, roof: liftedRoof,
+    },
   };
 
   msg.remove();
   hud.hidden = false;
   if (SC.doom) setFpMode(true); // a --doom page opens in his eyes
+  if (SC.diablo) setDiabloMode(true); // a --diablo page opens behind him, in perspective
   drawHud();
 
   const fwd = new THREE.Vector3();
@@ -759,11 +973,17 @@ async function main() {
     camera.getWorldDirection(fwd);
     const dt = Math.min(0.05, (now - lastT) / 1000);
     if (fpMode) updateFp(dt);
+    else if (dia.on) updateDiablo(dt);
     else { slide(dt); updateWalker(dt); }
     lastT = now;
-    if (!fpMode) controls.update(); // the orbit camera would pull the eyes back to its target
+    if (!fpMode && !dia.on) controls.update(); // the orbit camera would pull the eyes back to its target
     cycleColors(now);
-    if (fpMode) { // a hazy wasteland: the far end of a street fades out
+    if (dia.on) { // as the game and Diablo: black past the edge of the map, no haze
+      fogUniforms.uFog.value.set(1e9, 2e9);
+      scene.fog = null;
+      renderer.setClearColor(0x0a0a09);
+      ground.material.color.set(0x050505);
+    } else if (fpMode) { // a hazy wasteland: the far end of a street fades out
       fogUniforms.uFog.value.set(18, 75);
       sceneFog.near = 18;
       sceneFog.far = 75;
@@ -795,6 +1015,7 @@ async function main() {
         else b.face(psi);
       }
     }
+    if (spriteWalker) spriteWalker.update(psi);
     renderer.render(scene, camera);
   });
 }

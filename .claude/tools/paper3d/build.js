@@ -661,8 +661,33 @@ function build(mapName, opts = {}) {
                 if ((roof & 0xFFF) !== 1 && (roof & 0xFFF) !== 0) {
                     const f = frm(artName((OBJ_TILE << 24) | (roof & 0xFFF)));
                     if (f) L.roof.push([...rel(tx, ty - 96), atlas.add('T' + (roof & 0xFFF), f.dirs[0][0])]);
+                    if (f && opts.sprites) L.roof[L.roof.length - 1].push(null, s); // its square, for the roof fill below
                 }
             }
+        }
+        // --diablo: the roofs as the game lifts them -- tile_fill_roof floods the roof squares touching
+        // the one over the dude (4 neighbours), so each connected roof is a building of its own.
+        if (opts.sprites) {
+            const roofSq = new Map(L.roof.map((r, i) => [r[4], i]));
+            const comp = new Map();
+            let next = 0;
+            for (const s0 of roofSq.keys()) {
+                if (comp.has(s0)) continue;
+                const todo = [s0];
+                comp.set(s0, next);
+                while (todo.length) {
+                    const s = todo.pop(), x = s % 100, y = Math.floor(s / 100);
+                    for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+                        const n = ny * 100 + nx;
+                        if (nx < 0 || nx > 99 || ny < 0 || ny > 99 || !roofSq.has(n) || comp.has(n)) continue;
+                        comp.set(n, next);
+                        todo.push(n);
+                    }
+                }
+                next++;
+            }
+            for (const r of L.roof) r.push(comp.get(r[4]));
+            L.roofs = next;
         }
 
         let decalOrder = 0;
@@ -701,7 +726,7 @@ function build(mapName, opts = {}) {
                 || (type === OBJ_ITEM && o.subtype !== 1) // items lie on the ground; containers stand
                 || (type === OBJ_CRITTER && lying);
 
-            if (type === OBJ_CRITTER && lying && !opts.billboards) {
+            if (type === OBJ_CRITTER && lying && !opts.billboards && !opts.sprites) {
                 // a body on the ground: its death animation has six directions too, so it carves
                 const model = voxelModel(name, fr, false, false);
                 if (model >= 0) {
@@ -720,7 +745,7 @@ function build(mapName, opts = {}) {
                 // a true 3D body carved from its six directions (hull.js), turned to its heading;
                 // the billboard below stays only as the fallback for art the carve can't hold
                 const [cx, cy] = rel(hx + 16, hy + 8);
-                const model = opts.billboards ? -1 : voxelModel(name, fr, false);
+                const model = opts.billboards || opts.sprites ? -1 : voxelModel(name, fr, false);
                 if (model >= 0) {
                     L.vox.push([cx, cy, +((rot - 1) * 60).toFixed(1), model, 'critter_' + label(name) + '_' + o.tile]);
                     continue;
@@ -855,8 +880,10 @@ function build(mapName, opts = {}) {
             standing = standing.filter((p) => !p.boarded);
         }
 
-        // lone, compact scenery standing as a card -> a solid of revolution (revolveModel)
+        // lone, compact scenery standing as a card -> a solid of revolution (revolveModel); --diablo keeps
+        // the game's picture on its card, which seen from the game's own heading is all there is to see
         for (const p of standing) {
+            if (opts.sprites) break;
             if (p.type !== OBJ_SCENERY || p.door || p.trans || p.groupSize !== 1 || p.w > 80) continue;
             if (p.segs.length !== 1 || p.segs[0].axis !== 0) continue;
             const model = revolveModel(p.name, p.fr, p.rot, p.ox, p.oy);
@@ -933,13 +960,37 @@ function build(mapName, opts = {}) {
         }
         const rot = Math.min(Math.max(map.hdr.enteringRotation, 0), 5);
         dude = { elevation: map.hdr.enteringElevation, b: [cx, cy, rot], facing: (rot - 1) * 60, dirs };
-        if (!opts.billboards) {
+        if (!opts.billboards && !opts.sprites) {
             // the same man in 3D: standing, walking, running -- carved from his own animations
             const crit = (code) => 'ART' + BS + 'CRITTERS' + BS + 'HMJMPS' + code + '.FRM';
             const still = voxelModel(crit('AA'), 0, false); // the idle fidget isn't a loop: frame 0 only
             dude.stand = still >= 0 ? { frames: [still], fps: 1, speed: 0 } : null;
             dude.walk = voxelAnim(crit('AB'), true);
             dude.run = voxelAnim(crit('AT'), true);
+        }
+        if (opts.sprites) {
+            // --diablo: the man as the game draws him, his own sprites frame by frame. The engine moves a
+            // walker by the running sum of its frames' offsets; here he glides, so each frame is drawn that
+            // far from where the glide has got to (hull.viewsOf: the sum, and one forward distance fitted
+            // to all six directions -- the leftover is each direction's rounding).
+            const S = 32, KZ = 32 * Math.sqrt(3) / 4;
+            const crit = (code) => 'ART' + BS + 'CRITTERS' + BS + 'HMJMPS' + code + '.FRM';
+            const spriteAnim = (code) => {
+                const buf = read(crit(code));
+                if (!buf) return null;
+                const f = hull.readFrm(buf);
+                const frames = [];
+                for (let fr = 0; fr < f.fpd; fr++) {
+                    frames.push(hull.viewsOf(f, fr, true).map((v) => [
+                        atlas.add('DUDE' + code + ':' + v.r + ':' + fr, v.fr),
+                        +(v.dx0 - v.fwd * S * Math.cos(v.a)).toFixed(2),
+                        +(v.dy0 - v.fwd * KZ * Math.sin(v.a)).toFixed(2),
+                    ]));
+                }
+                const travel = hull.viewsOf(f, f.fpd - 1, true)[0].fwd;
+                return { frames, fps: f.fps, speed: +(travel / (f.fpd / f.fps)).toFixed(3) };
+            };
+            dude.sprite = { walk: spriteAnim('AB'), run: spriteAnim('AT') };
         }
     }
 
@@ -966,6 +1017,7 @@ function build(mapName, opts = {}) {
             origin,
             models,
             doom: !!opts.billboards, // opens in first person, critters as billboards
+            diablo: !!opts.sprites, // opens behind the dude in perspective, everyone his own sprites
             replacements, // set pieces' models (setpieces.js)
         },
         debug: opts.debug ? { origin, levels: debugOut } : undefined,
@@ -981,14 +1033,16 @@ function build(mapName, opts = {}) {
 // ---------------------------------------------------------------- main
 if (require.main === module) {
     // --doom: first person, as Doom drew it -- every critter a billboard of its own six sprites
-    const args = process.argv.slice(2), doom = args.includes('--doom');
-    const [mapName, outArg] = args.filter((a) => a !== '--doom');
+    // --diablo: the game's own view through a perspective camera, as Diablo II's "Perspective" option
+    //           drew its 2D world -- critters and the walking dude stay the game's sprites
+    const args = process.argv.slice(2), doom = args.includes('--doom'), diablo = args.includes('--diablo');
+    const [mapName, outArg] = args.filter((a) => a !== '--doom' && a !== '--diablo');
     if (!mapName) {
-        console.error('usage: node build.js <MAPNAME> [out.html] [--doom]');
+        console.error('usage: node build.js <MAPNAME> [out.html] [--doom | --diablo]');
         process.exit(1);
     }
-    const out = outArg || path.join(ROOT, 'build', 'paper3d', mapName.toUpperCase() + (doom ? '_doom' : '') + '.html');
-    const { scene, stats } = build(mapName, { billboards: doom });
+    const out = outArg || path.join(ROOT, 'build', 'paper3d', mapName.toUpperCase() + (doom ? '_doom' : diablo ? '_diablo' : '') + '.html');
+    const { scene, stats } = build(mapName, { billboards: doom, sprites: diablo && !doom });
     const tpl = fs.readFileSync(path.join(__dirname, 'viewer.html'), 'utf8');
     const html = tpl.replace('/*SCENE*/null', () => JSON.stringify(scene))
         .replace('/*GEOMETRY*/', () => fs.readFileSync(path.join(__dirname, 'geometry.js'), 'utf8'));

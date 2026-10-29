@@ -26,6 +26,7 @@
 #include "game/combat.h"
 #include "game/fontmgr.h"
 #include "game/game.h"
+#include "game/fp_view.h"
 #include "game/game_trace.h"
 #include "game/gamepad_ui.h"
 #include "game/gconfig.h"
@@ -448,6 +449,9 @@ static void main_game_loop()
 
     scr_enable();
 
+    // The 3D views hook into the present (fp_view.cc); off unless F9 / F8 or FALLOUT_FP_VIEW.
+    fp_view_init();
+
     unsigned int rtLastTime = get_time();
 
     while (game_user_wants_to_quit == 0) {
@@ -478,6 +482,14 @@ static void main_game_loop()
             tile_debug_ring_set(tile_debug_ring_get() > 0 ? 0 : 15);
         }
 #endif
+
+        // The map in 3D (fp_view.cc), view only: F9 through his eyes, F8 the game's own camera through
+        // a perspective lens (Diablo II's "Perspective"). Free keys in every build so the Steam install
+        // has them too; G, which he asked for, is his keyboard's run to the nearest exit.
+        if (keyCode == KEY_F9 || keyCode == KEY_F8) {
+            fp_view_toggle(keyCode == KEY_F9 ? FP_VIEW_EYES : FP_VIEW_DIABLO);
+            keyCode = -1;
+        }
 
         // The keyboard as a controller (2026-10-10) first: arrows, Space, Q/E, H, R, F, V and G belong
         // to the pad layer (gamepad_ui_handle_key). Then realtime combat (the optional mouse aim and its
@@ -606,7 +618,9 @@ static void main_game_loop()
         }
 
         sectionStart = SDL_GetPerformanceCounter();
+        svga_fp_frame = true; // the one present the first-person view may draw into
         renderPresent();
+        svga_fp_frame = false;
         main_ms_present = main_ms_since(sectionStart);
         sharedFpsLimiter.throttle();
 

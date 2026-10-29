@@ -40,6 +40,16 @@ void svga_vsync_state(int* interval, int* refresh, bool* effective);
 // While a map loads: present without waiting for the display (map.cc brackets map_load_file).
 void svga_vsync_suspend(bool on);
 
+// The first-person view (game/fp_view.cc) hooks in here: the main loop sets svga_fp_frame around
+// its present, and svga_fp_present then draws the 3D view into the frame texture's map rows before
+// it goes up. svga_fp_invalidate drops its GL objects when the renderer (and its context) dies;
+// svga_fp_request_capture asks for the next 3D frame as a BMP (F12, next to the CRT capture).
+typedef bool(SvgaFpPresentFunc)(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* texture, int width, int height);
+extern SvgaFpPresentFunc* svga_fp_present;
+extern void (*svga_fp_invalidate)(bool contextGone);
+extern void (*svga_fp_request_capture)(const char* path);
+extern bool svga_fp_frame;
+
 } // namespace fallout
 
 #endif /* FALLOUT_PLIB_GNW_SVGA_H_ */

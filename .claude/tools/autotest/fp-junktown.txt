@@ -1,0 +1,21 @@
+# First-person view, step 1 (2026-10-29, "Ano, začni F1"): Junktown's entrance through the dude's eyes,
+# then through the gate into town. Run with FALLOUT_FP_VIEW=1 (his eyes) or =2 (Diablo II's perspective); every `shot` also
+# writes screenshots/scrNNNNN_fp.bmp (the 3D view; the plain scrNNNNN.bmp is the 2D frame under it).
+name fp-junktown
+map JUNKENT.MAP
+seed 1
+duration 24
+
+shot 1500
+walkto 2000 23106
+shot 3500
+shot 5000
+shot 7000
+shot 10000
+walkto 12000 22700
+shot 15000
+shot 19000
+
+expect fp-scene\] mode=[12] elev=0
+expect fp-view\] captured
+expect-not fp-view\] .*(failed|incomplete|not a GL|not usable)
