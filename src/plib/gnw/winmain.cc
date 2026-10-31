@@ -28,8 +28,9 @@ bool gnw_visible_override = false;
 #if _WIN32
 // 0x53A294
 HANDLE GNW95_mutex = NULL;
-bool GNW95_beside = false;
 #endif
+
+bool GNW95_beside = false;
 
 // 0x6B0760
 char GNW95_title[256];

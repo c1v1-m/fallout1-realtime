@@ -18,6 +18,7 @@
 #include "game/combat_defs.h"
 #include "game/combat_rt.h"
 #include "game/editor.h"
+#include "game/fp_view.h"
 #include "game/game_trace.h"
 #include "game/gdialog.h"
 #include "game/gconfig.h"
@@ -8382,6 +8383,46 @@ static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
     }
 }
 
+// The 3D editor (Shift+F8) holds the game still and is the mouse's and the keyboard's: while it is
+// on the pad does nothing at all -- no shortcut (a pause menu could load a save under it), no A
+// interaction queued for after it, no stick pointer, no RT click on the editor's picture. The edges
+// resolve on the first frame after through the input epoch, which fp_edit_set bumps as the editor
+// closes (as after a load). What is left: a D-pad hold in progress is forgotten; a spent press whose
+// button is let go inside the editor is not spent any more (its release, which clears it, is never
+// seen here); and a quick slot drawn when it opened goes back (its release would throw it later),
+// its clock held while the world stands.
+static void gpui_editor_hold()
+{
+    gpui_dpad_forget();
+    gpui_a_interacting = false;
+    if (gpui_qs_drawn(GPUI_QS_LB) || gpui_qs_drawn(GPUI_QS_RB)) {
+        gpui_qs_cancel();
+    }
+    if (gpui_qt_state != GPUI_QT_IDLE) {
+        gpui_qt_since = get_time(); // its waits (RESTORE's for the body to be free) start as the editor closes
+    }
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        return;
+    }
+    if (!SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B)) {
+        gpui_consumed_b = false;
+        gpui_aim_swallow_b = false;
+    }
+    if (!SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_X)) {
+        gpui_consumed_x = false;
+    }
+    if (!SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_Y)) {
+        gpui_consumed_y = false;
+    }
+    if (!SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) {
+        gpui_consumed_lb = false;
+    }
+    if (!SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) {
+        gpui_consumed_rb = false;
+    }
+}
+
 // REENTRANCY GUARD -- this hook must never run inside itself.
 //
 // The engine pumps the mouse from inside FILE I/O: db_fgetc calls gameMouseRefreshImmediately
@@ -8414,6 +8455,11 @@ static void gpui_mouse_hook(int* dx, int* dy, int* buttons)
     // controller being unplugged for a moment -- so no press survives the load to leak a
     // click into the map you just arrived on.
     if (map_is_loading()) {
+        return;
+    }
+
+    if (fp_view_editing()) {
+        gpui_editor_hold();
         return;
     }
 

@@ -483,6 +483,11 @@ static void main_game_loop()
         }
 #endif
 
+        // Whether the 3D editor was on as this frame began: the frame it closes on is still its own
+        // (no fight, pad tick or script runs), so the pad's hook takes in the editor's input epoch on
+        // the next get_input before anything of the game reads the pad again.
+        bool wasEditing3d = fp_view_editing();
+
         // The map in 3D (fp_view.cc), view only: F9 through his eyes, F8 the game's own camera through
         // a perspective lens (Diablo II's "Perspective"). Free keys in every build so the Steam install
         // has them too; G, which he asked for, is his keyboard's run to the nearest exit.
@@ -496,11 +501,13 @@ static void main_game_loop()
             fp_view_edit_toggle();
             keyCode = -1;
         }
+        fp_view_edit_check();
         bool editing3d = fp_view_editing();
         if (editing3d) {
             fp_view_edit_input(keyCode);
             keyCode = -1;
         }
+        bool editorFrame = editing3d || wasEditing3d;
 
         // The keyboard as a controller (2026-10-10) first: arrows, Space, Q/E, H, R, F, V and G belong
         // to the pad layer (gamepad_ui_handle_key). Then realtime combat (the optional mouse aim and its
@@ -514,7 +521,7 @@ static void main_game_loop()
         }
 
         sectionStart = SDL_GetPerformanceCounter();
-        if (!editing3d) {
+        if (!editorFrame) {
             combat_rt_update(rtDelta);
         }
         main_ms_rt = main_ms_since(sectionStart);
@@ -539,13 +546,13 @@ static void main_game_loop()
         // safe frame-tick point outside the input/mouse hook, to avoid re-entrant
         // windowing during win_check_all_buttons.
         sectionStart = SDL_GetPerformanceCounter();
-        if (!editing3d) {
+        if (!editorFrame) {
             gamepad_ui_tick();
         }
         main_ms_ui = main_ms_since(sectionStart);
 
         sectionStart = SDL_GetPerformanceCounter();
-        if (!editing3d) {
+        if (!editorFrame) {
             scripts_check_state();
         }
 

@@ -25,6 +25,7 @@
 #include "game/gdialog.h"
 #include "game/intface.h"
 #include "game/light.h"
+#include "game/loadsave.h"
 #include "game/map.h"
 #include "game/object.h"
 #include "game/proto.h"
@@ -771,6 +772,7 @@ struct FpSeg {
     double slope;
     double chainK;
     int chainRun;
+    int twinOf; // a twin: 1 + the index of its front part in the piece's segs (0 = no twin)
 };
 
 struct FpFit {
@@ -2421,6 +2423,7 @@ struct FpPick {
     int uly;
     FpQuad quad;
     bool hidden;
+    bool fore; // its piece stands off its chain (fp_snap_wall_runs): a front part and a twin
 };
 
 static std::vector<FpEdit> fp_edits;
@@ -2431,6 +2434,14 @@ static bool fp_edit_selected = false;
 static FpEdit fp_edit_sel; // the key of the picked piece (elevation, tile, fid, copy)
 static int fp_edit_view_w = 0;
 static int fp_edit_view_h = 0;
+// The egg round the dude as the last Diablo draw cut it (fp_present): its camera, its centre and radii
+// in the view's pixels (radii 0 = none) and its depth -- a click there goes through what it cut away.
+static float fp_edit_egg_mvp[16];
+static float fp_edit_egg[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+static float fp_edit_egg_depth = 0.0f;
+// What the editor stood on when it was switched on: a load or another map ends it.
+static unsigned int fp_edit_load_serial = 0;
+static char fp_edit_on_map[32] = "";
 
 static void fp_edits_path(const char* map, char* path, size_t size)
 {
@@ -2513,10 +2524,10 @@ static FpEdit* fp_edit_find(int elevation, int tile, int fid, int copy)
 static void fp_edit_shape(FpPiece& p, const FpEdit& e)
 {
     if (e.rot != 0.0 && !p.segs.empty()) {
-        const FpSeg& first = p.segs[0];
+        const FpSeg& first = p.segs[0]; // never a twin: the twins come after every line of their piece
         double m0 = first.sloped ? first.slope : FP_SLOPES[first.axis];
         // a corner: the next line starts where the first ends (a front part's twin lies over it instead)
-        bool corner = p.segs.size() >= 2 && fabs(p.segs[1].x0 - first.x1) < 1.0;
+        bool corner = p.segs.size() >= 2 && p.segs[1].twinOf == 0 && fabs(p.segs[1].x0 - first.x1) < 1.0;
         double px = corner ? first.x1 : (first.x0 + first.x1) / 2.0;
         double py = first.k + m0 * px;
         double a = e.rot * FP_PI / 180.0;
@@ -2527,7 +2538,25 @@ static void fp_edit_shape(FpPiece& p, const FpEdit& e)
             *ox = px + FP_S * (wx * cos(a) - wz * sin(a));
             *oy = py + FP_KZ * (wx * sin(a) + wz * cos(a));
         };
+        // how far a line rides above the lowest pixels of its own columns (0 = under them all)
+        auto above = [&](const FpSeg& s) {
+            double m = s.sloped ? s.slope : FP_SLOPES[s.axis];
+            double worst = 0.0;
+            for (int c = std::max(0, (int)floor(s.x0 - p.ulx)); c < std::min(p.w, (int)ceil(s.x1 - p.ulx)); c++) {
+                if (!std::isnan(p.bottom[c])) {
+                    worst = std::max(worst, p.bottom[c] - (s.k + m * (p.ulx + c + 0.5)));
+                }
+            }
+            return worst;
+        };
+        std::vector<double> before;
+        for (const FpSeg& s : p.segs) {
+            before.push_back(above(s));
+        }
         for (FpSeg& s : p.segs) {
+            if (s.twinOf > 0) {
+                continue; // follows its front part, below
+            }
             double m = s.sloped ? s.slope : FP_SLOPES[s.axis];
             double ax;
             double ay;
@@ -2544,13 +2573,11 @@ static void fp_edit_shape(FpPiece& p, const FpEdit& e)
             s.slope = m2;
             s.k = ay - m2 * ax;
         }
-        // under every pixel, as a fitted line is: the whole piece lifted by what its worst column needs
+        // under its pixels as before the turn: the whole piece lifted by what the turn made worst
         double lift = 0.0;
-        for (const FpSeg& s : p.segs) {
-            for (int c = std::max(0, (int)floor(s.x0 - p.ulx)); c < std::min(p.w, (int)ceil(s.x1 - p.ulx)); c++) {
-                if (!std::isnan(p.bottom[c])) {
-                    lift = std::max(lift, p.bottom[c] - (s.k + s.slope * (p.ulx + c + 0.5)));
-                }
+        for (size_t i = 0; i < p.segs.size(); i++) {
+            if (p.segs[i].twinOf == 0) {
+                lift = std::max(lift, above(p.segs[i]) - before[i]);
             }
         }
         for (FpSeg& s : p.segs) {
@@ -2559,6 +2586,17 @@ static void fp_edit_shape(FpPiece& p, const FpEdit& e)
     }
     for (FpSeg& s : p.segs) {
         s.k += e.push;
+    }
+    // A front part's twin keeps to it: on a line parallel to it, its cut higher, so the two still
+    // share the sprite's rows exactly (turned on its own it rode higher or lower above its pixels
+    // than the cut, and a band of the sprite went undrawn or was drawn twice).
+    for (FpSeg& s : p.segs) {
+        if (s.twinOf > 0 && s.twinOf <= (int)p.segs.size()) {
+            const FpSeg& fore = p.segs[s.twinOf - 1];
+            s.sloped = fore.sloped;
+            s.slope = fore.slope;
+            s.k = fore.k - fore.cut;
+        }
     }
 }
 
@@ -2910,6 +2948,7 @@ static bool fp_build_static(int mode, int elevation, const std::vector<Object*>&
             twin.fore = false;
             twin.k = twin.chainK;
             twin.run = twin.chainRun;
+            twin.twinOf = (int)i + 1;
             p.segs[i].cut = std::max(1.0, p.segs[i].k - p.segs[i].chainK);
             p.segs.push_back(twin);
         }
@@ -3040,8 +3079,10 @@ static bool fp_build_static(int mode, int elevation, const std::vector<Object*>&
                 double m = seg.sloped ? seg.slope : FP_SLOPES[seg.axis];
                 double b0 = seg.k + m * seg.x0;
                 double b1 = seg.k + m * seg.x1;
-                double t0 = b0 - p.uly;
-                double t1 = b1 - p.uly;
+                // as high as fp_emit_panel draws it: a front part (seg.cut) only up to its cut
+                double drawnCut = seg.axis == 0 ? 0.0 : (seg.cut > 0.0 ? seg.cut : cut);
+                double t0 = drawnCut > 0.0 ? std::min(drawnCut, b0 - p.uly) : b0 - p.uly;
+                double t1 = drawnCut > 0.0 ? std::min(drawnCut, b1 - p.uly) : b1 - p.uly;
                 pick.c[0] = fp_w(seg.x0, b0, 0.0);
                 pick.c[1] = fp_w(seg.x1, b1, 0.0);
                 pick.c[2] = fp_w(seg.x1, b1 - t1, t1 / FP_KY);
@@ -3051,6 +3092,7 @@ static bool fp_build_static(int mode, int elevation, const std::vector<Object*>&
                 pick.uly = p.uly;
                 pick.quad = quads[before];
                 pick.hidden = p.hiddenEdit;
+                pick.fore = std::any_of(p.segs.begin(), p.segs.end(), [](const FpSeg& s) { return s.fore; });
                 fp_picks.push_back(pick);
             }
             panels++;
@@ -4645,6 +4687,11 @@ static bool fp_present(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* 
             }
             gl.Uniform4f(fp_loc.egg, egg[0], egg[1], egg[2], egg[3]);
             gl.Uniform1f(fp_loc.eggDepth, eggDepth);
+            if (mode == FP_VIEW_DIABLO) {
+                memcpy(fp_edit_egg_mvp, mvp, sizeof(fp_edit_egg_mvp));
+                memcpy(fp_edit_egg, egg, sizeof(fp_edit_egg));
+                fp_edit_egg_depth = eggDepth;
+            }
             gl.Uniform1f(fp_loc.pass, 0.0f);
             gl.Uniform1f(fp_loc.fill, fill ? 1.0f : 0.0f);
             gl.Uniform1i(fp_loc.frame, 2);
@@ -4955,17 +5002,43 @@ static bool fp_edit_pick_at(int px, int py, FpEdit* key)
         }
     }
 
+    // where the egg cut a standing panel away (FP_FRAGMENT_SHADER: nearer than the dude, inside the
+    // ellipse; its dithered rim counted half way), a click goes through it
+    auto inEgg = [&](double d) {
+        if (fp_edit_egg[2] <= 0.0f) {
+            return false;
+        }
+        double x = eye[0] + dir[0] * d;
+        double y = eye[1] + dir[1] * d;
+        double z = eye[2] + dir[2] * d;
+        const float* m = fp_edit_egg_mvp;
+        double cx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        double cy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        double cw = m[3] * x + m[7] * y + m[11] * z + m[15];
+        if (cw <= 0.0 || cw >= fp_edit_egg_depth) {
+            return false;
+        }
+        double ex = ((cx / cw + 1.0) * 0.5 * viewW - fp_edit_egg[0]) / fp_edit_egg[2];
+        double ey = ((cy / cw + 1.0) * 0.5 * viewH - fp_edit_egg[1]) / fp_edit_egg[3];
+        return ex * ex + ey * ey < 0.82;
+    };
+
     double best = 1e18;
     bool found = false;
+    bool fore = false;
     for (const FpPick& pick : fp_picks) {
-        if (fp_ray_hits_picture(eye, dir, pick.c, pick.sprite, pick.ulx, pick.uly, best, &t)) {
+        if (fp_ray_hits_picture(eye, dir, pick.c, pick.sprite, pick.ulx, pick.uly, best, &t) && !inEgg(t)) {
             best = t;
             found = true;
             key->elevation = pick.elevation;
             key->tile = pick.tile;
             key->fid = pick.fid;
             key->copy = pick.copy;
+            fore = pick.fore;
         }
+    }
+    if (found) {
+        trace_event(TRACE_FLOW, "fp-edit", "hit fore=%d", fore ? 1 : 0);
     }
     return found;
 }
@@ -5007,8 +5080,11 @@ static void fp_edit_set(bool on)
     fp_editing = on;
     fp_edit_selected = false;
     fp_edit_rev++;
+    gamepad_ui_bump_input_epoch(); // the pad sat out the editor: its edges resolve afresh (gamepad_ui.cc)
     if (on) {
         fp_edit_bk_off = map_disable_bk_processes();
+        fp_edit_load_serial = LoadGameSerial();
+        snprintf(fp_edit_on_map, sizeof(fp_edit_on_map), "%s", map_data.name);
     } else if (fp_edit_bk_off) {
         map_enable_bk_processes();
         fp_edit_bk_off = false;
@@ -5035,14 +5111,28 @@ static void fp_edit_remember()
 
 bool fp_view_editing()
 {
-    if (fp_editing && (fp_mode != FP_VIEW_DIABLO || fp_failed)) {
-        fp_edit_set(false); // the 3D gave out under the editor: the world goes on again
-    }
     return fp_editing;
+}
+
+void fp_view_edit_check()
+{
+    if (!fp_editing) {
+        return;
+    }
+    // the 3D left Diablo's camera or gave out, the plain game is up (a menu, a dialog), a save was
+    // loaded or the map changed: the editor ends and the world goes on (a load has already started
+    // it again; map_enable_bk_processes then does nothing)
+    if (fp_mode != FP_VIEW_DIABLO || fp_failed || !fp_world_visible() || LoadGameSerial() != fp_edit_load_serial
+        || strcmp(map_data.name, fp_edit_on_map) != 0) {
+        fp_edit_set(false);
+    }
 }
 
 void fp_view_edit_toggle()
 {
+    if (!fp_editing && (fp_failed || !fp_world_visible())) {
+        return; // nothing of the 3D to edit (a menu, a dialog, the world map, a radial wheel)
+    }
     if (fp_mode != FP_VIEW_DIABLO) {
         fp_mode = FP_VIEW_DIABLO; // Shift+F8 from elsewhere: into Diablo's view, editing
         fp_yaw_set = false;
@@ -5072,6 +5162,29 @@ void fp_view_edit_input(int keyCode)
     if (!testPicked && testPick != NULL && sscanf(testPick, "%d,%d", &mx, &my) == 2) {
         testPicked = true;
         click = true;
+    }
+    // FALLOUT_FP_EDITPICK=offline: the first piece standing off its chain (a front part and its twin)
+    if (!testPicked && testPick != NULL && strcmp(testPick, "offline") == 0) {
+        const FpPick* nearest = NULL;
+        for (const FpPick& pick : fp_picks) {
+            if (pick.fore && (nearest == NULL || tile_dist(pick.tile, obj_dude->tile) < tile_dist(nearest->tile, obj_dude->tile))) {
+                nearest = &pick;
+            }
+        }
+        for (const FpPick& pick : fp_picks) {
+            if (&pick == nearest) {
+                testPicked = true;
+                fp_edit_selected = true;
+                fp_edit_sel = FpEdit {};
+                fp_edit_sel.elevation = pick.elevation;
+                fp_edit_sel.tile = pick.tile;
+                fp_edit_sel.fid = pick.fid;
+                fp_edit_sel.copy = pick.copy;
+                fp_edit_rev++;
+                trace_event(TRACE_FLOW, "fp-edit", "test pick offline tile=%d fid=%x", pick.tile, pick.fid);
+                break;
+            }
+        }
     }
 #endif
     if (click) {
@@ -5214,6 +5327,7 @@ void fp_view_init()
     svga_fp_present = fp_present;
     svga_fp_invalidate = fp_invalidate;
     svga_fp_request_capture = fp_request_capture;
+    fp_edit_set(false); // a game left from inside the editor does not take it into the next one
     const char* env = getenv("FALLOUT_FP_VIEW");
     if (env != NULL && (env[0] == '1' || env[0] == '2')) {
         fp_mode = env[0] == '1' ? FP_VIEW_EYES : FP_VIEW_DIABLO;

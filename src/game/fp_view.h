@@ -27,8 +27,11 @@ int fp_view_mode();
 bool fp_view_steer(float* x, float* y, float dt);
 
 // The 3D editor (Shift+F8, from Diablo's camera): while it is on the game stands still and every key
-// and the mouse are the editor's (fp_view_edit_input, from the main loop).
+// and the mouse are the editor's (fp_view_edit_input, from the main loop). fp_view_editing only asks
+// (safe from the input hooks); fp_view_edit_check, once a frame from the main loop before it, ends the
+// editor when what it stood on is gone (a load, another map, a menu over it, the 3D off or failed).
 bool fp_view_editing();
+void fp_view_edit_check();
 void fp_view_edit_toggle();
 void fp_view_edit_input(int keyCode);
 
