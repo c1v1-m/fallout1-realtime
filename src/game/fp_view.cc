@@ -5090,7 +5090,7 @@ static void fp_edit_set(bool on)
         fp_edit_bk_off = false;
     }
     trace_event(TRACE_FLOW, "fp-edit", "editing=%d", on ? 1 : 0);
-    char line[] = "3D EDIT: click pick, wheel push, Q/E turn, H hide, C copy, arrows move copy, R reset, Ctrl+Z undo, Esc done";
+    char line[] = "3D EDIT: click pick, wheel push, Q/E turn, H hide, C copy, arrows move copy, R reset, Shift+R with copies, Ctrl+Del whole map, Ctrl+Z undo, Esc done";
     char off[] = "3D EDIT: off, saved";
     display_print(on ? line : off);
 }
@@ -5197,7 +5197,9 @@ void fp_view_edit_input(int keyCode)
         }
         fp_edit_rev++; // the mark moves
     }
-    if (keyCode == KEY_CTRL_Z) {
+    // Ctrl+Z, and Ctrl+Y as well: the keys are read by their place on a US keyboard, so on a Czech
+    // (QWERTZ) one the key marked Z is the US Y
+    if (keyCode == KEY_CTRL_Z || keyCode == KEY_CTRL_Y) {
         if (!fp_edit_undo.empty()) {
             fp_edits = fp_edit_undo.back();
             fp_edit_undo.pop_back();
@@ -5207,6 +5209,18 @@ void fp_view_edit_input(int keyCode)
             }
             fp_edit_changed();
         }
+        return;
+    }
+    // Ctrl+Delete: every edit on this map gone, the map as the game has it (Ctrl+Z brings them back)
+    if (keyCode == KEY_CTRL_DELETE) {
+        if (!fp_edits.empty()) {
+            fp_edit_remember();
+            fp_edits.clear();
+            fp_edit_selected = false;
+            fp_edit_changed();
+        }
+        char line[] = "3D EDIT: this map reset (Ctrl+Z brings it back)";
+        display_print(line);
         return;
     }
     if (!fp_edit_selected) {
@@ -5287,12 +5301,17 @@ void fp_view_edit_input(int keyCode)
     case 'r':
     case 'R':
     case KEY_DELETE: {
+        // r / Delete: the picked piece as the game has it (a copy: gone); Shift+R: the piece and every
+        // copy of it
+        bool whole = keyCode == 'R';
         fp_edit_remember();
-        for (size_t i = 0; i < fp_edits.size(); i++) {
+        for (size_t i = 0; i < fp_edits.size();) {
             const FpEdit& e = fp_edits[i];
-            if (e.elevation == fp_edit_sel.elevation && e.tile == fp_edit_sel.tile && e.fid == fp_edit_sel.fid && e.copy == fp_edit_sel.copy) {
+            if (e.elevation == fp_edit_sel.elevation && e.tile == fp_edit_sel.tile && e.fid == fp_edit_sel.fid
+                && (whole || e.copy == fp_edit_sel.copy)) {
                 fp_edits.erase(fp_edits.begin() + i);
-                break;
+            } else {
+                i++;
             }
         }
         if (fp_edit_sel.copy >= 0) {
