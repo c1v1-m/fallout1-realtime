@@ -1,0 +1,36 @@
+# Ported from Fallout 2 (2026-10-30, the Deck: CAVE2 "docházelo ke chybám"): more than 16 critters walking at
+# once. The walk smoother had 16 slots handed out round-robin, so with a crowd every walker's slot was stolen,
+# its ramp restarted and it jogged on one hex. Twenty-two cave rats close on the dude from two sides at once;
+# each must reach him, none may stand on one tile with its walk playing (see crowdwalk.js).
+name m-crowd-walk
+map DESERT1.MAP
+seed 1
+duration 22
+dude tile 20100 rot 2
+dude hp 999
+spawn 16777264 18490 rot 2 hostile
+spawn 16777264 18492 rot 2 hostile
+spawn 16777264 18494 rot 2 hostile
+spawn 16777264 18496 rot 2 hostile
+spawn 16777264 18498 rot 2 hostile
+spawn 16777264 18500 rot 2 hostile
+spawn 16777264 18502 rot 2 hostile
+spawn 16777264 18504 rot 2 hostile
+spawn 16777264 18506 rot 2 hostile
+spawn 16777264 18508 rot 2 hostile
+spawn 16777264 18510 rot 2 hostile
+spawn 16777264 21690 rot 5 hostile
+spawn 16777264 21692 rot 5 hostile
+spawn 16777264 21694 rot 5 hostile
+spawn 16777264 21696 rot 5 hostile
+spawn 16777264 21698 rot 5 hostile
+spawn 16777264 21700 rot 5 hostile
+spawn 16777264 21702 rot 5 hostile
+spawn 16777264 21704 rot 5 hostile
+spawn 16777264 21706 rot 5 hostile
+spawn 16777264 21708 rot 5 hostile
+spawn 16777264 21710 rot 5 hostile
+
+at 0 idle
+
+expect COMBAT/attack\] NPC aid=\d+ ->pid=16777216

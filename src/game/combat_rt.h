@@ -242,6 +242,10 @@ void combat_rt_notify_attack(Object* attacker, Object* defender);
 // one-shot kill was invisible to the critter standing right next to the victim.
 void combat_rt_notify_victim(Object* attacker, Object* victim);
 
+// Hook from damage_object (combat.cc), where vanilla adds to damageLastTurn: `critter` took damage. combat_rt
+// remembers it until the fight ends, because damageLastTurn itself is zeroed at every script turn.
+void combat_rt_note_hurt(Object* critter);
+
 // Hook from obj_remove_all() (object.cc) right before a map teardown frees every object.
 // Abandons any in-flight realtime attack and drops all object pointers combat_rt holds
 // (rt_resolving, the actor registry, lock/intent/loot, the engine's pending main_ctd) so a

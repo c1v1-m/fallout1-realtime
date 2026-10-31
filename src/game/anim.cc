@@ -5159,8 +5159,29 @@ struct WalkSmoothState {
     // offset.
     bool crossed;
 };
-#define WALK_SMOOTH_SLOTS 16
+// ⚠️ ONE SLOT PER POSSIBLE WALK SAD, and a slot is only ever taken from an object that is no longer
+// walking. It was 16 slots handed out by a rotating cursor and never given back, so on a map with
+// more than 16 walkers at once every walker's slot was stolen within a few frames. A stolen slot
+// restarts the ramp from the tile centre, the body is pulled back to one increment past it, and the
+// step never reaches the tile edge: the critter jogs on one hex for as long as the crowd lasts. Found
+// in Fallout 2's CAVE2 encounter on the Deck (2026-10-30): 16 wandering mole rats plus seven
+// radscorpions and the caravan, with scorpions and guards running on the spot for 5-12 s.
+#define WALK_SMOOTH_SLOTS ANIMATION_SAD_LIST_CAPACITY
 static WalkSmoothState walk_smooth_state[WALK_SMOOTH_SLOTS];
+
+// Does `object` still have a walk or run sad in flight? A slot whose object has none holds nothing
+// that a later step could need: the next walk seeds itself from obj->x/y when it starts.
+static bool walk_smooth_walking(Object* object)
+{
+    for (int i = 0; i < curr_sad; i++) {
+        AnimationSad* sad_entry = &(sad[i]);
+        if (sad_entry->obj == object && sad_entry->field_20 != -1000
+            && (sad_entry->anim == ANIM_WALK || sad_entry->anim == ANIM_RUNNING)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static WalkSmoothState* walk_smooth_slot(Object* object)
 {
@@ -5169,22 +5190,43 @@ static WalkSmoothState* walk_smooth_slot(Object* object)
             return &walk_smooth_state[i];
         }
     }
-    for (int i = 0; i < WALK_SMOOTH_SLOTS; i++) {
+
+    WalkSmoothState* s = NULL;
+    for (int i = 0; i < WALK_SMOOTH_SLOTS && s == NULL; i++) {
         if (walk_smooth_state[i].obj == NULL) {
-            WalkSmoothState* s = &walk_smooth_state[i];
-            memset(s, 0, sizeof(*s));
-            s->obj = object;
-            s->rot = -1;
-            return s;
+            s = &walk_smooth_state[i];
         }
     }
-    static int ev = 0; // all slots busy: evict via a rotating cursor
-    WalkSmoothState* s = &walk_smooth_state[ev];
-    ev = (ev + 1) % WALK_SMOOTH_SLOTS;
+
+    // Every slot is taken: reuse one whose object has stopped walking. There are as many slots as
+    // sads and the caller is walking in one of them, so such a slot always exists.
+    for (int i = 0; i < WALK_SMOOTH_SLOTS && s == NULL; i++) {
+        if (!walk_smooth_walking(walk_smooth_state[i].obj)) {
+            s = &walk_smooth_state[i];
+        }
+    }
+
+    if (s == NULL) {
+        static int ev = 0; // cannot happen (see above); a rotating cursor as the last resort
+        s = &walk_smooth_state[ev];
+        ev = (ev + 1) % WALK_SMOOTH_SLOTS;
+    }
+
     memset(s, 0, sizeof(*s)); // ⚠️ a reused slot must not inherit the last object's ramp
     s->obj = object;
     s->rot = -1;
     return s;
+}
+
+// The object is being freed, or the map is going: a freed object's address can come back as a new
+// object, which must not find the old one's ramp.
+static void walk_smooth_forget(Object* object)
+{
+    for (int i = 0; i < WALK_SMOOTH_SLOTS; i++) {
+        if (walk_smooth_state[i].obj == object) {
+            memset(&walk_smooth_state[i], 0, sizeof(walk_smooth_state[i]));
+        }
+    }
 }
 
 // Tell the smoother where the body already is, before object_move re-centres it on its tile.
@@ -5236,6 +5278,14 @@ static int walk_smooth_offset(Object* object, int rotation, int anim, int* frame
     int oy = off_tile[1][rotation];
 
     WalkSmoothState* s = walk_smooth_slot(object);
+
+    // A fresh slot for a body already part-way across its tile (its walk began before it had one):
+    // the step goes on from where the body is instead of pulling it back to the tile centre.
+    if (s->rot == -1 && !s->hasSeed && (object->x != 0 || object->y != 0)) {
+        s->seedX = (float)object->x;
+        s->seedY = (float)object->y;
+        s->hasSeed = true;
+    }
 
     if (s->crossed || rotation != s->rot || (object->x == 0 && object->y == 0)) {
         // Where this step's ramp begins. Normally the tile centre; after a stop that left the body
@@ -6247,10 +6297,13 @@ static void anim_smooth_forget(Object* obj)
             break;
         }
     }
+
+    walk_smooth_forget(obj);
 }
 
 void anim_smooth_reset()
 {
+    memset(walk_smooth_state, 0, sizeof(walk_smooth_state));
     anim_smooth_count = 0;
     anim_smooth_owed_count = 0;
     anim_deferred_count = 0;

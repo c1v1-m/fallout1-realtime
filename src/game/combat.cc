@@ -3843,6 +3843,7 @@ static void damage_object(Object* obj, int damage, bool animated, bool a4)
     }
 
     obj->data.critter.combat.damageLastTurn += damage;
+    combat_rt_note_hurt(obj);
 
     if (!a4) {
         exec_script_proc(obj->sid, SCRIPT_PROC_DAMAGE);

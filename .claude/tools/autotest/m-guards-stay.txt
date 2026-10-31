@@ -1,0 +1,27 @@
+# Ported from Fallout 2 (2026-10-30, the Deck: CAVE2's caravan guards stood 12-16 s watching radscorpions maul
+# the player after their first kill). A target that dies hands the fight on (rt_next_danger_source): to the
+# dead one's team, or to someone of theirs this critter's team hurt. Both asked damageLastTurn for "hurt in
+# this fight", which every turn boundary zeroes, so a guard that had not just been hit stood down. Two armed
+# guards of their own team (5) are ordered at the rats (team 6) the way a script's attack() orders them; the
+# rats are after the dude. Each rat that dies must hand the guards on to the next (retarget nowPid=16777264),
+# never leave them standing while rats still bite (deaggro ... why=target-not-combatant before the last).
+name m-guards-stay
+map DESERT1.MAP
+seed 1
+duration 30
+dude tile 20100 rot 2
+dude hp 3000
+dude armor 17
+
+spawn 16777291 19299 rot 2 wield 8 item 29 6 team 5
+spawn 16777291 19301 rot 2 wield 8 item 29 6 team 5
+spawn 16777264 21298 rot 5 hostile team 6
+spawn 16777264 21300 rot 5 hostile team 6
+spawn 16777264 21302 rot 5 hostile team 6
+spawn 16777264 21304 rot 5 hostile team 6
+attack 5 6
+
+at 0 idle
+
+expect autotest\] attack id=\d+ pid=16777291 team=5 -> id=\d+ pid=16777264 team=6
+expect-count >=3 retarget\] id=\d+ pid=16777291 was=\d+ now=\d+ nowPid=16777264

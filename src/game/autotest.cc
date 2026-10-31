@@ -109,6 +109,10 @@ namespace fallout {
 //   reaction <seconds>                 the dodger's reaction time (default 0.3)
 //   provoke                            every critter already on the dude's floor turns hostile (as a
 //                                      base alarm does) -- it still has to see him before it comes
+//   attack <teamA> <teamB>             every spawned critter of team A attacks the nearest spawned one of
+//                                      team B, as a script's attack() does (Gizmo's raid, the Skum Pitt):
+//                                      the NPC-vs-NPC fight realtime plays through engine_target. One way
+//                                      only -- a two-sided fight is two lines. Up to 4.
 //   tactical on|off                    MODS "Tactical AI" for this run (default: as the cfg says)
 //   projectiles on|off                 MODS "Projectiles" for this run
 //   tracer <hexes> <r> <g> <b> [underline]   how a bullet looks (r g b 0-31) -- to photograph variants
@@ -247,6 +251,10 @@ static int at_mvar_count = 0;
 // (a quest step tested on its own: the guards at a door are a fight, not the door).
 static int at_clear_radius = -1;
 static bool at_provoke = false;
+// "attack <teamA> <teamB>": scripted NPC-vs-NPC orders, given once the spawns stand.
+#define AT_MAX_ATTACKS 4
+static int at_attack_team[AT_MAX_ATTACKS][2];
+static int at_attack_count = 0;
 
 // "sethp <pid> <percent> <seconds>": at that time, the first living critter of that pid on the dude's
 // floor drops to that percent of its maximum (a boss's health phases without fighting it down).
@@ -665,6 +673,10 @@ static bool at_parse(const char* path)
             at_reaction = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "provoke") == 0) {
             at_provoke = true;
+        } else if (strcmp(tok[0], "attack") == 0 && n >= 3 && at_attack_count < AT_MAX_ATTACKS) {
+            at_attack_team[at_attack_count][0] = atoi(tok[1]);
+            at_attack_team[at_attack_count][1] = atoi(tok[2]);
+            at_attack_count++;
         } else if (strcmp(tok[0], "tactical") == 0 && n >= 2) {
             at_tactical = strcmp(tok[1], "off") == 0 ? 0 : 1;
         } else if (strcmp(tok[0], "projectiles") == 0 && n >= 2) {
@@ -1094,6 +1106,35 @@ void autotest_setup_world()
             obj_delete_list(list);
         }
         trace_event(TRACE_FLOW, "autotest", "provoked %d critters", provoked);
+    }
+
+    // The scripted orders: each attacker at the nearest of the other team, through the hook a script's
+    // attack() reaches in realtime (op_attack -> combat_rt_notify_attack).
+    for (int k = 0; k < at_attack_count; k++) {
+        for (int i = 0; i < at_spawn_count; i++) {
+            Object* a = at_spawns[i].obj;
+            if (a == NULL || critter_is_dead(a) || a->data.critter.combat.team != at_attack_team[k][0]) {
+                continue;
+            }
+            Object* best = NULL;
+            int bestDist = INT_MAX;
+            for (int j = 0; j < at_spawn_count; j++) {
+                Object* d = at_spawns[j].obj;
+                if (d == NULL || d == a || critter_is_dead(d) || d->data.critter.combat.team != at_attack_team[k][1]) {
+                    continue;
+                }
+                int dist = obj_dist(a, d);
+                if (dist < bestDist) {
+                    best = d;
+                    bestDist = dist;
+                }
+            }
+            if (best != NULL) {
+                combat_rt_notify_attack(a, best);
+                trace_event(TRACE_FLOW, "autotest", "attack id=%d pid=%d team=%d -> id=%d pid=%d team=%d dist=%d",
+                    a->id, a->pid, at_attack_team[k][0], best->id, best->pid, at_attack_team[k][1], bestDist);
+            }
+        }
     }
 
     for (int i = 0; i < at_bad_line_count; i++) {
