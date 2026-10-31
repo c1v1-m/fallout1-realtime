@@ -21,6 +21,7 @@
 #include "game/game.h"
 #include "game/game_trace.h"
 #include "game/gdialog.h" // dialog_active, for the post-conversation NPC hold
+#include "game/fp_view.h" // fp_view_steer: the stick steers the 3D view through his eyes
 #include "game/gamepad_ui.h"
 #include "game/gconfig.h"
 #include "game/gmouse.h"
@@ -16307,6 +16308,13 @@ void combat_rt_poll_gamepad()
         }
     }
 
+    // THROUGH HIS EYES (the 3D view, F9) the stick and the arrows steer the view as in Doom -- his pick,
+    // 2026-10-29: left / right turn it, up / down walk along it. fp_view_steer turns the view and hands
+    // back the walk (nothing when it only turns); everything below walks it as ever.
+    if (!mouseWalk) {
+        fp_view_steer(&x, &y, rt_frame_dt);
+    }
+
     // RUN instead of walk. IN COMBAT running drains the AP
     // pool (rt_run_ap_cost), so when it's empty -- or recovering while rt_run_blocked
     // -- the dude drops to a free walk. Feeding this effective gait into rt_stick_move
@@ -16867,6 +16875,30 @@ bool combat_rt_has_lock()
 Object* combat_rt_lock_target()
 {
     return rt_lock_target;
+}
+
+// What the 3D view's eye looks at in a fight (fp_view.cc): the lock, else the nearest ACTIVE hostile
+// within `hexes`. Asked every frame, so it is the cheap and quiet one -- no lock search, no sight
+// lines, no trace -- and it never picks a bystander.
+Object* combat_rt_eye_target(int hexes)
+{
+    if (rt_lock_target != NULL) {
+        return rt_lock_target;
+    }
+    Object* best = NULL;
+    int bestDist = hexes + 1;
+    for (int i = 0; i < rt_actor_count; i++) {
+        Object* critter = rt_actors[i].obj;
+        if (!rt_is_combatant(critter) || !rt_actors[i].hostile) {
+            continue;
+        }
+        int dist = obj_dist(obj_dude, critter);
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = critter;
+        }
+    }
+    return best;
 }
 
 // Is the player currently walking under LEFT-STICK control (as opposed to standing, or walking out

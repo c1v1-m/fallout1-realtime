@@ -92,6 +92,8 @@ void combat_rt_set_quick_throw_cost(int cost);
 // when no quick throw is held or the hand does not throw.
 bool combat_rt_quick_throw_hit_mode(int* hitMode);
 Object* combat_rt_lock_target();
+// The 3D view's eye target: the lock, else the nearest active hostile within `hexes` (cheap, no trace).
+Object* combat_rt_eye_target(int hexes);
 // True while the player is walking under left-stick control (not standing, not walking out a
 // click-to-move path).
 bool combat_rt_stick_walking();

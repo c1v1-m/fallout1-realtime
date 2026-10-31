@@ -1,6 +1,7 @@
 #include "plib/gnw/winmain.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <SDL.h>
 
@@ -27,6 +28,7 @@ bool gnw_visible_override = false;
 #if _WIN32
 // 0x53A294
 HANDLE GNW95_mutex = NULL;
+bool GNW95_beside = false;
 #endif
 
 // 0x6B0760
@@ -36,10 +38,18 @@ int main(int argc, char* argv[])
 {
     int rc;
 
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--autotest") == 0) {
+            GNW95_beside = true;
+        }
+    }
+
 #if _WIN32
-    GNW95_mutex = CreateMutexA(0, TRUE, "GNW95MUTEX");
-    if (GetLastError() != ERROR_SUCCESS) {
-        return 0;
+    if (!GNW95_beside) {
+        GNW95_mutex = CreateMutexA(0, TRUE, "GNW95MUTEX");
+        if (GetLastError() != ERROR_SUCCESS) {
+            return 0;
+        }
     }
 #endif
 

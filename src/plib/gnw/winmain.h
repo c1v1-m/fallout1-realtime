@@ -18,6 +18,10 @@ extern bool gnw_visible_override;
 extern HANDLE GNW95_mutex;
 #endif
 
+// A self-played test (--autotest) runs beside a game that is already open: it takes neither
+// single-instance mutex (gnw.cc names its window mutex apart for it).
+extern bool GNW95_beside;
+
 extern char GNW95_title[256];
 
 } // namespace fallout

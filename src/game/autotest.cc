@@ -296,6 +296,7 @@ enum {
     AT_STEP_WALKTO, // index = tile: the dude is sent there along the pathfinder's route, as a click sends him
     AT_STEP_TALK, // index = pid: the dude talks to the nearest critter of that pid, as the use prompt does
     AT_STEP_SHOT, // a screenshot of whatever is up, a modal screen included
+    AT_STEP_KEY, // index = a key code, as if typed (GNW_add_input_buffer): the keyboard's own keys
 };
 
 enum {
@@ -577,8 +578,13 @@ static bool at_parse_step(char** tok, int n)
     bool walkto = strcmp(tok[0], "walkto") == 0;
     bool talk = strcmp(tok[0], "talk") == 0;
     bool shot = strcmp(tok[0], "shot") == 0;
-    if (!button && !tap && !axis && !open && !note && !walkto && !talk && !shot) {
+    bool key = strcmp(tok[0], "key") == 0;
+    if (!button && !tap && !axis && !open && !note && !walkto && !talk && !shot && !key) {
         return false;
+    }
+    if (key && n >= 3) {
+        at_add_step(at_step_time(tok[1]), AT_STEP_KEY, atoi(tok[2]), 0); // key <ms> <code>
+        return true;
     }
     if (shot && n >= 2) {
         at_add_step(at_step_time(tok[1]), AT_STEP_SHOT, 0, 0);
@@ -1418,6 +1424,10 @@ static void at_tl_bk()
                 obj_dude->tile, st->index, obj_dude->elevation, steps, ok ? 1 : 0, open);
             break;
         }
+        case AT_STEP_KEY:
+            GNW_add_input_buffer(st->index);
+            trace_event(TRACE_FLOW, "autotest", "key t=%d code=%d", t, st->index);
+            break;
         case AT_STEP_SHOT:
             dump_screen();
             trace_event(TRACE_FLOW, "autotest", "shot t=%d", t);

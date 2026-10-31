@@ -1309,7 +1309,13 @@ void win_set_minimized_title(const char* title)
 
 #ifdef _WIN32
     if (GNW95_title_mutex == INVALID_HANDLE_VALUE) {
-        GNW95_title_mutex = CreateMutexA(NULL, TRUE, title);
+        char name[300];
+        if (GNW95_beside) {
+            snprintf(name, sizeof(name), "%s-autotest-%lu", title, (unsigned long)GetCurrentProcessId());
+        } else {
+            snprintf(name, sizeof(name), "%s", title);
+        }
+        GNW95_title_mutex = CreateMutexA(NULL, TRUE, name);
         if (GetLastError() != ERROR_SUCCESS) {
             GNW95_already_running = true;
             return;

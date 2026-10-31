@@ -21,6 +21,16 @@ void fp_view_init();
 // The view's key: switches to `mode`, or back to the plain game when it is already on.
 void fp_view_toggle(int mode);
 int fp_view_mode();
+// Through his eyes the stick steers the view as in Doom: x turns it, y walks along it. Rewrites x / y
+// into the walk to make (screen terms, x right, y down; zero when it only turns) and returns true;
+// false when the view is not his to steer, and x / y are untouched.
+bool fp_view_steer(float* x, float* y, float dt);
+
+// The 3D editor (Shift+F8, from Diablo's camera): while it is on the game stands still and every key
+// and the mouse are the editor's (fp_view_edit_input, from the main loop).
+bool fp_view_editing();
+void fp_view_edit_toggle();
+void fp_view_edit_input(int keyCode);
 
 } // namespace fallout
 

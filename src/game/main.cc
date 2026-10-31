@@ -490,11 +490,22 @@ static void main_game_loop()
             fp_view_toggle(keyCode == KEY_F9 ? FP_VIEW_EYES : FP_VIEW_DIABLO);
             keyCode = -1;
         }
+        // Shift+F8: the 3D editor (his "zkusíme udělat editor", 2026-10-31). While it is on the game
+        // stands still -- no input reaches it, no fight or script runs -- and only the picture is drawn.
+        if (keyCode == KEY_SHIFT_F8) {
+            fp_view_edit_toggle();
+            keyCode = -1;
+        }
+        bool editing3d = fp_view_editing();
+        if (editing3d) {
+            fp_view_edit_input(keyCode);
+            keyCode = -1;
+        }
 
         // The keyboard as a controller (2026-10-10) first: arrows, Space, Q/E, H, R, F, V and G belong
         // to the pad layer (gamepad_ui_handle_key). Then realtime combat (the optional mouse aim and its
         // right-click called shot); anything left falls through to vanilla.
-        bool rtConsumed = gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
+        bool rtConsumed = editing3d || gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
         if (keyCode != -1) {
             trace_event(TRACE_INPUT, "key", "code=%d rt=%d", keyCode, rtConsumed ? 1 : 0);
         }
@@ -503,7 +514,9 @@ static void main_game_loop()
         }
 
         sectionStart = SDL_GetPerformanceCounter();
-        combat_rt_update(rtDelta);
+        if (!editing3d) {
+            combat_rt_update(rtDelta);
+        }
         main_ms_rt = main_ms_since(sectionStart);
 
         autotest_tick(rtDelta); // the bot's pad for the next frame, and the end of a self-played run
@@ -526,11 +539,15 @@ static void main_game_loop()
         // safe frame-tick point outside the input/mouse hook, to avoid re-entrant
         // windowing during win_check_all_buttons.
         sectionStart = SDL_GetPerformanceCounter();
-        gamepad_ui_tick();
+        if (!editing3d) {
+            gamepad_ui_tick();
+        }
         main_ms_ui = main_ms_since(sectionStart);
 
         sectionStart = SDL_GetPerformanceCounter();
-        scripts_check_state();
+        if (!editing3d) {
+            scripts_check_state();
+        }
 
         map_check_state();
         main_ms_state = main_ms_since(sectionStart);
