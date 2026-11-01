@@ -59,6 +59,8 @@
 #include "plib/gnw/intrface.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
+#include "plib/gnw/winmain.h"
+#include "platform_compat.h"
 
 namespace fallout {
 
@@ -72,6 +74,7 @@ static int main_load_new(char* fname);
 static int main_loadgame_new();
 static void main_unload_new();
 static void main_game_loop();
+static void main_editor_app();
 static void main_frame_meter();
 
 // FRAME-PACING METER, per section of the main loop (ms, this frame). get_input also runs process_bk:
@@ -135,6 +138,15 @@ int gnw_main(int argc, char** argv)
         autotest_setup_world();
         main_game_loop();
         autotest_finish();
+    }
+
+    // The 3D editor program (his "když prostě otevřu tu mapu, uvidím ji v F8 a budu ji moct upravovat",
+    // 2026-11-01): no intro, no menu -- a map list, the map in Diablo's view with the editor on, back to
+    // the list on Esc; Esc on the list leaves.
+    if (GNW95_editor_app) {
+        main_editor_app();
+        main_exit_system();
+        return 0;
     }
 
     gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
@@ -340,7 +352,7 @@ int gnw_main(int argc, char** argv)
 // 0x4728CC
 static bool main_init_system(int argc, char** argv)
 {
-    if (game_init(REALTIME_WINDOW_TITLE, false, 0, 0, argc, argv) == -1) {
+    if (game_init(GNW95_editor_app ? "Fallout 1 3D Editor" : REALTIME_WINDOW_TITLE, false, 0, 0, argc, argv) == -1) {
         return false;
     }
 
@@ -437,6 +449,71 @@ static void main_unload_new()
     map_exit();
 }
 
+static int main_editor_compare(const void* a, const void* b)
+{
+    return compat_stricmp(*(const char* const*)a, *(const char* const*)b);
+}
+
+// The 3D editor program's loop: the maps of the game by name, the picked one opened (its scripts not
+// run, the dude hidden -- fp_view.cc takes the camera), and the list again when Esc leaves it.
+static void main_editor_app()
+{
+    int start = 0;
+    for (;;) {
+        loadColorTable("color.pal");
+        palette_fade_to(cmap);
+        int backdrop = win_add(0, 0, screenGetWidth(), screenGetHeight(), colorTable[0], 0);
+        win_draw(backdrop);
+        mouse_show();
+
+        char map[64] = "";
+#ifndef FALLOUT_RELEASE
+        // FALLOUT_FP_APP_TEST=A.MAP,B.MAP (development): the maps opened one after another without the
+        // list (fp_view.cc presses Esc in each), then the program leaves
+        static const char* testMaps = getenv("FALLOUT_FP_APP_TEST");
+        if (testMaps != NULL) {
+            const char* comma = strchr(testMaps, ',');
+            size_t len = comma != NULL ? (size_t)(comma - testMaps) : strlen(testMaps);
+            snprintf(map, sizeof(map), "%.*s", (int)std::min(len, sizeof(map) - 1), testMaps);
+            testMaps = comma != NULL ? comma + 1 : testMaps + len;
+            win_delete(backdrop);
+            if (map[0] == '\0') {
+                return;
+            }
+            trace_event(TRACE_FLOW, "editor-app", "open map=%s (test)", map);
+            main_reset_system();
+            main_load_new(map);
+            gsound_background_stop();
+            main_game_loop();
+            main_unload_new();
+            continue;
+        }
+#endif
+        char** fileList;
+        int count = db_get_file_list("maps\\*.map", &fileList, NULL, 0);
+        if (count > 0) {
+            qsort(fileList, count, sizeof(*fileList), main_editor_compare);
+            int picked = win_list_select_at("3D EDITOR - MAP", fileList, count, NULL, 80, 40, 0x10000 | 0x100 | 4, start);
+            if (picked >= 0 && picked < count) {
+                snprintf(map, sizeof(map), "%s", fileList[picked]);
+                start = picked;
+            }
+            db_free_file_list(&fileList, NULL);
+        }
+        win_delete(backdrop);
+        if (map[0] == '\0') {
+            return;
+        }
+        trace_event(TRACE_FLOW, "editor-app", "open map=%s", map);
+
+        main_reset_system();
+        main_load_new(map);
+        gsound_background_stop(); // no town music over the editor
+        main_game_loop();
+        main_unload_new();
+    }
+}
+
 // 0x472A54
 static void main_game_loop()
 {
@@ -447,7 +524,12 @@ static void main_game_loop()
 
     main_game_paused = 0;
 
-    scr_enable();
+    // The 3D editor program runs no script: the map stands as its file has it.
+    if (GNW95_editor_app) {
+        scr_disable();
+    } else {
+        scr_enable();
+    }
 
     // The 3D views hook into the present (fp_view.cc); off unless F9 / F8 or FALLOUT_FP_VIEW.
     fp_view_init();
@@ -491,13 +573,13 @@ static void main_game_loop()
         // The map in 3D (fp_view.cc), view only: F9 through his eyes, F8 the game's own camera through
         // a perspective lens (Diablo II's "Perspective"). Free keys in every build so the Steam install
         // has them too; G, which he asked for, is his keyboard's run to the nearest exit.
-        if (keyCode == KEY_F9 || keyCode == KEY_F8) {
+        if (!GNW95_editor_app && (keyCode == KEY_F9 || keyCode == KEY_F8)) {
             fp_view_toggle(keyCode == KEY_F9 ? FP_VIEW_EYES : FP_VIEW_DIABLO);
             keyCode = -1;
         }
         // Shift+F8: the 3D editor (his "zkusíme udělat editor", 2026-10-31). While it is on the game
         // stands still -- no input reaches it, no fight or script runs -- and only the picture is drawn.
-        if (keyCode == KEY_SHIFT_F8) {
+        if (!GNW95_editor_app && keyCode == KEY_SHIFT_F8) {
             fp_view_edit_toggle();
             keyCode = -1;
         }
@@ -512,7 +594,12 @@ static void main_game_loop()
         // The keyboard as a controller (2026-10-10) first: arrows, Space, Q/E, H, R, F, V and G belong
         // to the pad layer (gamepad_ui_handle_key). Then realtime combat (the optional mouse aim and its
         // right-click called shot); anything left falls through to vanilla.
-        bool rtConsumed = editing3d || gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
+        // The 3D editor program has no game to play: its keys are the editor's, and Esc leaves for the
+        // map list even when the editor could not come on.
+        if (GNW95_editor_app && !editing3d && keyCode == KEY_ESCAPE) {
+            game_user_wants_to_quit = 2;
+        }
+        bool rtConsumed = editing3d || GNW95_editor_app || gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
         if (keyCode != -1) {
             trace_event(TRACE_INPUT, "key", "code=%d rt=%d", keyCode, rtConsumed ? 1 : 0);
         }
@@ -556,7 +643,9 @@ static void main_game_loop()
             scripts_check_state();
         }
 
-        map_check_state();
+        if (!GNW95_editor_app) {
+            map_check_state(); // the 3D editor program never leaves its map but by Esc
+        }
         main_ms_state = main_ms_since(sectionStart);
 
         // Autosave on entering a new location. Done here -- a safe point with the map fully
@@ -571,7 +660,8 @@ static void main_game_loop()
             // anim_stop() ends every animation sequence and force-flattens anyone mid-death
             // (show_death via anim_set_end), so an autosave landing in the second after a kill
             // destroys the fall -- both bodies just drop. See combat_rt_death_anim_pending().
-            bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending() && !autotest_active();
+            bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending() && !autotest_active()
+                && !GNW95_editor_app; // the 3D editor program never touches his saves
 
             // The triggers below are LATCHED rather than acted on immediately: the condition that
             // fires them (map changed / quest hash moved) is a one-shot edge, and the old code

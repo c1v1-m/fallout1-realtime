@@ -1,5 +1,7 @@
 #include "plib/gnw/winmain.h"
 
+#include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +33,7 @@ HANDLE GNW95_mutex = NULL;
 #endif
 
 bool GNW95_beside = false;
+bool GNW95_editor_app = false;
 
 // 0x6B0760
 char GNW95_title[256];
@@ -43,7 +46,30 @@ int main(int argc, char* argv[])
         if (strcmp(argv[i], "--autotest") == 0) {
             GNW95_beside = true;
         }
+        if (strcmp(argv[i], "--3d-editor") == 0) {
+            GNW95_editor_app = true;
+        }
     }
+    if (argc > 0 && argv[0] != NULL) {
+        char name[512];
+        snprintf(name, sizeof(name), "%s", argv[0]);
+        for (char* c = name; *c != '\0'; c++) {
+            *c = (char)tolower((unsigned char)*c);
+        }
+        const char* slash = strrchr(name, '\\');
+        const char* file = slash != NULL ? slash + 1 : name;
+        slash = strrchr(file, '/');
+        file = slash != NULL ? slash + 1 : file;
+        if (strstr(file, "3d-editor") != NULL) {
+            GNW95_editor_app = true;
+        }
+    }
+#ifndef FALLOUT_RELEASE
+    // the 3D editor program played by itself (FALLOUT_FP_APP_TEST, development): no window on his screen
+    if (GNW95_editor_app && getenv("FALLOUT_FP_APP_TEST") != NULL) {
+        gnw_headless = true;
+    }
+#endif
 
 #if _WIN32
     if (!GNW95_beside) {

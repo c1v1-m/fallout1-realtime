@@ -44,6 +44,7 @@
 #include "plib/gnw/intrface.h"
 #include "plib/gnw/memory.h"
 #include "plib/gnw/svga.h"
+#include "plib/gnw/winmain.h"
 
 namespace fallout {
 
@@ -1039,9 +1040,12 @@ int map_load_file(DB_FILE* stream)
             map_data.globalVariablesCount = num_map_global_vars;
         }
 
-        scr_enable();
+        // the 3D editor program runs no script: no start procedure, no map update, no map script
+        if (!GNW95_editor_app) {
+            scr_enable();
+        }
 
-        if (map_data.scriptIndex > 0 && autotest_map_script_allowed()) {
+        if (map_data.scriptIndex > 0 && autotest_map_script_allowed() && !GNW95_editor_app) {
             error = "Error creating new map script";
             if (scr_new(&map_script_id, SCRIPT_TYPE_SYSTEM) == -1) break;
 
@@ -1095,7 +1099,9 @@ int map_load_file(DB_FILE* stream)
         debug_printf("\n   Error: scr_load_all_scripts failed!");
     }
 
-    scr_exec_map_enter_scripts();
+    if (!GNW95_editor_app) {
+        scr_exec_map_enter_scripts(); // the 3D editor program runs no script: the map as its file has it
+    }
     scr_exec_map_update_scripts();
     tile_enable_refresh();
 
@@ -1303,8 +1309,8 @@ bool map_has_pending_transition()
 
 int map_leave_map(MapTransition* transition)
 {
-    if (transition == NULL) {
-        return -1;
+    if (transition == NULL || GNW95_editor_app) {
+        return -1; // the 3D editor program leaves its map by Esc only
     }
 
     memcpy(&map_state, transition, sizeof(map_state));

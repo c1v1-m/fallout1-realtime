@@ -17,7 +17,9 @@
 
 #include "game/anim.h"
 #include "game/art.h"
+#include "game/autotest.h"
 #include "game/combat_rt.h"
+#include "game/game.h"
 #include "game/game_trace.h"
 #include "game/gamepad_ui.h"
 #include "game/display.h"
@@ -40,6 +42,7 @@
 #include "plib/gnw/mouse.h"
 #include "platform_compat.h"
 #include "plib/gnw/svga.h"
+#include "plib/gnw/winmain.h"
 
 namespace fallout {
 
@@ -3149,6 +3152,12 @@ static int fp_rotation_of_yaw(double yaw)
     return ((r % 6) + 6) % 6;
 }
 
+// The 3D editor program's camera (GNW95_editor_app): a point on the map, kept as the hex nearest it
+// (the hidden dude stands there and the 2D view centres on him) and how far it is from that hex's
+// middle in screen px.
+static double fp_app_ox = 0.0;
+static double fp_app_oy = 0.0;
+
 static void fp_update_eye()
 {
     int hx;
@@ -3159,6 +3168,10 @@ static void fp_update_eye()
     anim_smooth_offset(obj_dude, &gx, &gy);
     double wx = hx + 16 + obj_dude->x + gx;
     double wy = hy + 8 + obj_dude->y + gy;
+    if (GNW95_editor_app) {
+        wx = hx + 16 + fp_app_ox;
+        wy = hy + 8 + fp_app_oy;
+    }
     double ex = wx / FP_S;
     double ez = wy / FP_KZ;
     // a new map, another elevation or a jump (a teleport, a load) is a new start; a gap in time (a
@@ -3505,7 +3518,8 @@ static bool fp_build_dynamic(int mode, int elevation, const std::vector<Object*>
         }
     }
 
-    Object* cursors[2] = { obj_mouse_flat, obj_mouse };
+    // the game's cursors (the hex under the pointer, the reticle); the editor has its own pointer
+    Object* cursors[2] = { fp_editing ? NULL : obj_mouse_flat, fp_editing ? NULL : obj_mouse };
     // the 2D view's offset (world px = screen px + origin), for a cursor placed on the screen
     int originX = 0;
     int originY = 0;
@@ -3771,7 +3785,7 @@ void main() {
             float hidden = dot(texture2D(uODepth, uv), vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0));
             float mine = (uDepthCR.x - dot(vWorld, uToCam)) / uDepthCR.y * 0.5 + 0.5;
             if (mine > hidden + uEps) {
-                gl_FragColor = vec4(texture2D(uFrame, uv).rgb, 1.0);
+                gl_FragColor = uFill > 1.5 ? vec4(1.0, 0.0, 1.0, 1.0) : vec4(texture2D(uFrame, uv).rgb, 1.0);
                 return;
             }
         }
@@ -4277,6 +4291,186 @@ static void fp_draw_ranges(const std::vector<FpRange>& ranges, int kind)
 }
 
 // The 3D view into the frame texture's map rows. True when it drew.
+#ifndef FALLOUT_RELEASE
+// FALLOUT_FP_AUTOTURN=1 (development; his "nemůžeš to udělat u všech mezer?" after he closed a slit
+// between two cave rocks by turning one of them 45 degrees in the editor, 2026-10-31, and picked
+// "natočit zeď přes škvíru" of three of his moves to do by machine): the editor's own turn, tried on
+// every cave rock wall (ca*) that borders a slit and kept where it closes it. A slit is what the fill paints behind
+// rock (FALLOUT_FP_FILLTINT's magenta) in a run no wider than FP_AT_SLIT px -- the perspective
+// looking between two slopes the 2D drew overlapping -- and a hole the 3D draws nothing into (green)
+// counts double; deciding, every fill pixel counts (a turn must not open a wide patch of fill behind
+// it to close a slit) and no turn may lay a face steeper than FP_AT_STEEP on the screen (nearly along
+// the camera rays its picture smears, as his own 45 degrees did). The map is looked at from reachable spots FP_AT_STEP hexes apart (the world held
+// still, as by the editor); every piece either side of a slit is a candidate, and for the heaviest
+// FP_AT_MAX of them each turn of FP_AT_ROTS is measured over the whole picture from the FP_AT_SPOTS
+// nearest spots it is seen from -- a turn that closes a slit seen from one side opened others seen
+// from elsewhere, and the map as a whole came out worse -- and the best turn is kept when, summed
+// over those spots, it takes away at least FP_AT_GAIN fill pixels and no one spot sees more than
+// FP_AT_WORSE added (a net gain still opened new bands of fill in some views). The
+// turns are written as ordinary edits (fp3d\<MAP>.txt), so the editor fixes or drops any of them;
+// a piece he already edited is left alone.
+#define FP_AT_SLIT 10
+#define FP_AT_STEP 6
+#define FP_AT_MAX 160
+#define FP_AT_AROUND 24
+#define FP_AT_SPOTS 64
+#define FP_AT_GAIN 30
+#define FP_AT_WORSE 25 // fill pixels a turn may add, at most, as seen from any one spot
+#define FP_AT_STEEP 2.0 // screen px down per px across, at most, of a turned face
+static const double FP_AT_ROTS[] = { -45.0, -30.0, -15.0, 15.0, 30.0, 45.0 };
+static const int FP_AT_ROT_COUNT = (int)(sizeof(FP_AT_ROTS) / sizeof(FP_AT_ROTS[0]));
+
+struct FpAtCand {
+    FpEdit key;
+    int weight;
+    std::vector<std::pair<double, double>> dirs; // its faces along the ground (world x, z), as the game has them
+    struct Seen {
+        int eye; // index into fp_at_eyes
+        int px; // slit pixels seen from there
+        int x0, y0, x1, y1; // where they were
+    };
+    std::vector<Seen> eyes;
+};
+
+static int fp_at_phase = 0; // 0 not started, 1 looking round, 2 turning, 3 done, 4 looking round again
+static int fp_at_wait = 0;
+static std::vector<int> fp_at_eyes;
+static size_t fp_at_eye_i = 0;
+static int fp_at_eye_now = -1; // the index of the spot being looked from
+static bool fp_at_pending = false; // a picture is asked for
+static bool fp_at_ready = false; // ... and measured
+static int fp_at_score = 0; // the whole picture: every fill pixel, holes double
+static int fp_at_thin = 0; // the slits alone
+static int fp_at_local = 0; // inside fp_at_win
+static int fp_at_win[4] = { 0, 0, -1, -1 };
+static int fp_at_sum_local = 0;
+static std::vector<int> fp_at_base_eye; // what each spot saw of the piece as it stands
+static int fp_at_worse = 0; // the most any spot got worse under the turn being tried
+static int fp_at_base_local = 0;
+static int fp_at_best_local = 0;
+static std::vector<FpAtCand> fp_at_cands;
+static size_t fp_at_ci = 0;
+static int fp_at_ri = -1; // -1 = the piece as it stands
+static size_t fp_at_ei = 0;
+static int fp_at_sum = 0;
+static int fp_at_base = 0;
+static int fp_at_best = 0;
+static double fp_at_best_rot = 0.0;
+static int fp_at_turned = 0;
+static int fp_at_seen_total = 0;
+static int fp_at_seen_before = 0;
+static int fp_at_fill_total = 0;
+static int fp_at_fill_before = 0;
+static void fp_autoturn_finish();
+
+static bool fp_at_active()
+{
+    return fp_at_phase == 1 || fp_at_phase == 2 || fp_at_phase == 4;
+}
+
+static bool fp_edit_pick_at(int px, int py, FpEdit* key);
+
+// From fp_present, right after the scene is drawn (tinted): measures the slits in the picture asked
+// for, and while looking round notes the pieces either side of them.
+static void fp_autoturn_read(int viewW, int viewH)
+{
+    if (!fp_at_pending) {
+        return;
+    }
+    fp_at_pending = false;
+    std::vector<unsigned char> px((size_t)viewW * viewH * 4);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, fp_fbo);
+    gl.PixelStorei(GL_PACK_ALIGNMENT, 1);
+    gl.ReadPixels(0, 0, viewW, viewH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    auto at = [&](int x, int y) { return &px[((size_t)y * viewW + x) * 4]; };
+    auto magenta = [&](int x, int y) { const unsigned char* p = at(x, y); return p[0] > 240 && p[1] < 16 && p[2] > 240; };
+    auto green = [&](int x, int y) { const unsigned char* p = at(x, y); return p[0] < 16 && p[1] > 240 && p[2] < 16; };
+    // the egg round the dude is a slot of its own making: left out, half as wide again
+    auto inEgg = [&](int x, int y) {
+        if (fp_edit_egg[2] <= 0.0f) {
+            return false;
+        }
+        double ex = (x + 0.5 - fp_edit_egg[0]) / (1.5 * fp_edit_egg[2]);
+        double ey = (y + 0.5 - fp_edit_egg[1]) / (1.5 * fp_edit_egg[3]);
+        return ex * ex + ey * ey < 1.0;
+    };
+    fp_edit_view_w = viewW;
+    fp_edit_view_h = viewH;
+    int score = 0;
+    int thin = 0;
+    int local = 0;
+    auto inWin = [&](int x, int y) { return x >= fp_at_win[0] && x <= fp_at_win[2] && y >= fp_at_win[1] && y <= fp_at_win[3]; };
+    for (int y = 0; y < viewH; y++) {
+        int x = 0;
+        while (x < viewW) {
+            if (!magenta(x, y)) {
+                if (green(x, y) && !inEgg(x, y)) {
+                    score += 2;
+                    local += inWin(x, y) ? 2 : 0;
+                }
+                x++;
+                continue;
+            }
+            int x0 = x;
+            while (x < viewW && magenta(x, y)) {
+                x++;
+            }
+            int len = x - x0;
+            if (inEgg(x0, y)) {
+                continue;
+            }
+            score += len; // a turn must not open a wide patch of fill to close a slit
+            if (len > FP_AT_SLIT || x0 == 0 || x == viewW) {
+                continue;
+            }
+            thin += len;
+            for (int i = x0; i < x; i++) {
+                local += inWin(i, y) ? 1 : 0;
+            }
+            if (fp_at_phase != 1 || y % 4 != 0) {
+                continue;
+            }
+            // the pieces either side of the slit (rows top down, as the picture is read back)
+            for (int side = 0; side < 2; side++) {
+                int sx = side == 0 ? x0 - 3 : x + 2;
+                FpEdit key = {};
+                // only the cave's rock walls (ca*): what he turned; never a door, a machine or a pile
+                if (sx < 0 || sx >= viewW || !fp_edit_pick_at(sx, y, &key) || key.copy >= 0 || !fp_is_rock_wall(key.fid)) {
+                    continue;
+                }
+                size_t i = 0;
+                while (i < fp_at_cands.size()
+                    && !(fp_at_cands[i].key.elevation == key.elevation && fp_at_cands[i].key.tile == key.tile && fp_at_cands[i].key.fid == key.fid)) {
+                    i++;
+                }
+                if (i == fp_at_cands.size()) {
+                    FpAtCand cand;
+                    cand.key = key;
+                    cand.weight = 0;
+                    fp_at_cands.push_back(cand);
+                }
+                FpAtCand& cand = fp_at_cands[i];
+                cand.weight += len;
+                if (cand.eyes.empty() || cand.eyes.back().eye != fp_at_eye_now) {
+                    FpAtCand::Seen seen = { fp_at_eye_now, 0, x0, y, x - 1, y };
+                    cand.eyes.push_back(seen);
+                }
+                FpAtCand::Seen& seen = cand.eyes.back();
+                seen.px += len;
+                seen.x0 = std::min(seen.x0, x0);
+                seen.x1 = std::max(seen.x1, x - 1);
+                seen.y0 = std::min(seen.y0, y);
+                seen.y1 = std::max(seen.y1, y);
+            }
+        }
+    }
+    fp_at_score = score;
+    fp_at_thin = thin;
+    fp_at_local = local;
+    fp_at_ready = true;
+}
+#endif
+
 static bool fp_present(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* texture, int texWidth, int texHeight)
 {
     (void)window;
@@ -4620,7 +4814,14 @@ static bool fp_present(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* 
             // holes"): where the perspective opens a slot between two pieces of the picture -- the
             // cave's overlapping rock slopes -- the game's own picture at that spot shows through
             // instead of the black past the map. Through his eyes the sky or the dark is the background.
-            gl.Clear(mode == FP_VIEW_DIABLO ? GL_DEPTH_BUFFER_BIT : (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
+            bool tintVoid = false;
+#ifndef FALLOUT_RELEASE
+            tintVoid = mode == FP_VIEW_DIABLO && (getenv("FALLOUT_FP_FILLTINT") != NULL || fp_at_active());
+            if (tintVoid) {
+                gl.ClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+            }
+#endif
+            gl.Clear(mode == FP_VIEW_DIABLO && !tintVoid ? GL_DEPTH_BUFFER_BIT : (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT));
             gl.Disable(GL_BLEND);
             gl.Disable(GL_CULL_FACE);
             gl.Enable(GL_DEPTH_TEST);
@@ -4693,7 +4894,14 @@ static bool fp_present(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* 
                 fp_edit_egg_depth = eggDepth;
             }
             gl.Uniform1f(fp_loc.pass, 0.0f);
-            gl.Uniform1f(fp_loc.fill, fill ? 1.0f : 0.0f);
+            float fillMode = fill ? 1.0f : 0.0f;
+#ifndef FALLOUT_RELEASE
+            // FALLOUT_FP_FILLTINT=1 (development): what the fill paints, magenta; where nothing is drawn, green
+            if (fill && (getenv("FALLOUT_FP_FILLTINT") != NULL || fp_at_active())) {
+                fillMode = 2.0f;
+            }
+#endif
+            gl.Uniform1f(fp_loc.fill, fillMode);
             gl.Uniform1i(fp_loc.frame, 2);
             gl.Uniform1i(fp_loc.odepth, 3);
             gl.Uniform2f(fp_loc.viewSize, (float)viewW, (float)viewH);
@@ -4818,6 +5026,11 @@ static bool fp_present(SDL_Window* window, SDL_Renderer* renderer, SDL_Texture* 
         float mvp[16];
         fp_camera_matrix(mode, viewW, viewH, mvp);
         drawScene(mvp);
+#ifndef FALLOUT_RELEASE
+        if (mode == FP_VIEW_DIABLO) {
+            fp_autoturn_read(viewW, viewH);
+        }
+#endif
         if (fp_editing && mode == FP_VIEW_DIABLO) {
             // the editor's pointer: the game's own is drawn into the 2D frame, under the 3D
             int mx;
@@ -5091,8 +5304,16 @@ static void fp_edit_set(bool on)
     }
     trace_event(TRACE_FLOW, "fp-edit", "editing=%d", on ? 1 : 0);
     char line[] = "3D EDIT: click pick, wheel push, Q/E turn, H hide, C copy, arrows move copy, R reset, Shift+R with copies, Ctrl+Del whole map, Ctrl+Z undo, Esc done";
+    char appLine[] = "3D EDITOR: WASD or right drag move, 1 2 3 floor, Esc maps";
     char off[] = "3D EDIT: off, saved";
-    display_print(on ? line : off);
+    if (on && GNW95_editor_app) {
+        // the program's camera keys last, so the message window keeps them in view
+        char editLine[] = "3D EDITOR: click pick, wheel push, Q/E turn, H hide, C copy, arrows move copy, R reset, Shift+R with copies, Ctrl+Del whole map, Ctrl+Z undo";
+        display_print(editLine);
+        display_print(appLine);
+    } else {
+        display_print(on ? line : off);
+    }
 }
 
 static void fp_edit_changed()
@@ -5114,8 +5335,277 @@ bool fp_view_editing()
     return fp_editing;
 }
 
+#ifndef FALLOUT_RELEASE
+// Looks from the spot (FALLOUT_FP_AUTOTURN): the dude stands there and the view centres on him.
+static void fp_at_look(size_t eye)
+{
+    fp_at_eye_now = (int)eye;
+    int tile = fp_at_eyes[eye];
+    if (obj_dude->tile != tile) {
+        obj_move_to_tile(obj_dude, tile, obj_dude->elevation, NULL);
+        tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW);
+    }
+    fp_at_pending = true;
+}
+
+// The candidate turned by `rot` (0 = as it stands: no edit).
+static void fp_at_turn(const FpEdit& key, double rot)
+{
+    FpEdit* e = fp_edit_find(key.elevation, key.tile, key.fid, -1);
+    if (rot == 0.0) {
+        if (e != NULL) {
+            fp_edits.erase(fp_edits.begin() + (e - fp_edits.data()));
+        }
+    } else if (e != NULL) {
+        e->rot = rot;
+    } else {
+        FpEdit fresh = {};
+        fresh.elevation = key.elevation;
+        fresh.tile = key.tile;
+        fresh.fid = key.fid;
+        fresh.copy = -1;
+        fresh.rot = rot;
+        fp_edits.push_back(fresh);
+    }
+    fp_edit_rev++;
+}
+
+static void fp_at_measure_next()
+{
+    const FpAtCand::Seen& seen = fp_at_cands[fp_at_ci].eyes[fp_at_ei];
+    fp_at_win[0] = seen.x0 - FP_AT_AROUND;
+    fp_at_win[1] = seen.y0 - FP_AT_AROUND;
+    fp_at_win[2] = seen.x1 + FP_AT_AROUND;
+    fp_at_win[3] = seen.y1 + FP_AT_AROUND;
+    fp_at_look((size_t)seen.eye);
+}
+
+static void fp_autoturn_tick()
+{
+    static bool asked = getenv("FALLOUT_FP_AUTOTURN") != NULL;
+    if (!asked || fp_at_phase == 3) {
+        return;
+    }
+    if (fp_at_phase == 0) {
+        if (fp_mode != FP_VIEW_DIABLO || fp_failed || !fp_world_visible() || fp_picks.empty() || ++fp_at_wait < 30) {
+            return;
+        }
+        // the spots: hexes he can walk to from where he stands, FP_AT_STEP apart
+        int elevation = obj_dude->elevation;
+        std::vector<unsigned char> seen(HEX_GRID_SIZE, 0);
+        std::vector<int> queue;
+        queue.push_back(obj_dude->tile);
+        seen[obj_dude->tile] = 1;
+        for (size_t i = 0; i < queue.size(); i++) {
+            int tile = queue[i];
+            if ((tile / 200) % FP_AT_STEP == 0 && (tile % 200) % FP_AT_STEP == 0) {
+                fp_at_eyes.push_back(tile);
+            }
+            for (int dir = 0; dir < 6; dir++) {
+                int next = tile_num_in_direction(tile, dir, 1);
+                if (next >= 0 && next < HEX_GRID_SIZE && !seen[next] && obj_blocking_at(NULL, next, elevation) == NULL) {
+                    seen[next] = 1;
+                    queue.push_back(next);
+                }
+            }
+        }
+        if (fp_at_eyes.empty()) {
+            fp_at_phase = 3;
+            return;
+        }
+        fp_edit_set(true); // the world holds still while it looks
+        fp_at_phase = 1;
+        fp_at_eye_i = 0;
+        trace_event(TRACE_FLOW, "fp-autoturn", "start map=%s spots=%d edits=%d", map_data.name, (int)fp_at_eyes.size(), (int)fp_edits.size());
+        fp_at_look(0);
+        return;
+    }
+    if (fp_at_pending || !fp_at_ready) {
+        return;
+    }
+    fp_at_ready = false;
+    if (fp_at_phase == 4) {
+        fp_at_seen_total += fp_at_thin;
+        fp_at_fill_total += fp_at_score;
+        fp_at_eye_i++;
+        if (fp_at_eye_i < fp_at_eyes.size()) {
+            fp_at_look(fp_at_eye_i);
+        } else {
+            fp_autoturn_finish();
+        }
+        return;
+    }
+    if (fp_at_phase == 1) {
+        fp_at_seen_total += fp_at_thin;
+        fp_at_fill_total += fp_at_score;
+        fp_at_eye_i++;
+        if (fp_at_eye_i < fp_at_eyes.size()) {
+            fp_at_look(fp_at_eye_i);
+            return;
+        }
+        // the heaviest candidates not already edited by hand, each with its three best spots
+        std::vector<FpAtCand> cands;
+        for (FpAtCand& cand : fp_at_cands) {
+            bool handEdited = false;
+            for (const FpEdit& e : fp_edits) {
+                handEdited = handEdited || (e.elevation == cand.key.elevation && e.tile == cand.key.tile && e.fid == cand.key.fid);
+            }
+            if (!handEdited) {
+                // measured from every spot it is seen from (the picture is about 27 hexes wide), the
+                // nearest FP_AT_SPOTS: a turn that closes a slit from one side must not open another
+                int px;
+                int py;
+                tile_coord(cand.key.tile, &px, &py, cand.key.elevation);
+                std::vector<std::pair<int, int>> spots; // (distance, spot)
+                for (size_t e = 0; e < fp_at_eyes.size(); e++) {
+                    int ex;
+                    int ey;
+                    tile_coord(fp_at_eyes[e], &ex, &ey, cand.key.elevation);
+                    if (abs(ex - px) < 520 && abs(ey - py) < 300) {
+                        spots.push_back(std::make_pair(abs(ex - px) + 2 * abs(ey - py), (int)e));
+                    }
+                }
+                std::sort(spots.begin(), spots.end());
+                if (spots.size() > FP_AT_SPOTS) {
+                    spots.resize(FP_AT_SPOTS);
+                }
+                cand.eyes.clear();
+                for (const auto& n : spots) {
+                    FpAtCand::Seen seen = { n.second, 0, 0, 0, -1, -1 };
+                    cand.eyes.push_back(seen);
+                }
+                for (const FpPick& pick : fp_picks) {
+                    if (pick.elevation == cand.key.elevation && pick.tile == cand.key.tile && pick.fid == cand.key.fid && pick.copy < 0) {
+                        cand.dirs.push_back(std::make_pair(pick.c[1].x - pick.c[0].x, pick.c[1].z - pick.c[0].z));
+                    }
+                }
+                if (!cand.eyes.empty()) {
+                    cands.push_back(cand);
+                }
+            }
+        }
+        std::sort(cands.begin(), cands.end(), [](const FpAtCand& a, const FpAtCand& b) { return a.weight > b.weight; });
+        if (cands.size() > FP_AT_MAX) {
+            cands.resize(FP_AT_MAX);
+        }
+        trace_event(TRACE_FLOW, "fp-autoturn", "looked spots=%d slit=%d candidates=%d tried=%d", (int)fp_at_eyes.size(), fp_at_seen_total, (int)fp_at_cands.size(), (int)cands.size());
+        fp_at_seen_before = fp_at_seen_total;
+        fp_at_seen_total = 0;
+        fp_at_fill_before = fp_at_fill_total;
+        fp_at_fill_total = 0;
+        fp_at_cands = cands;
+        fp_at_phase = 2;
+        fp_at_ci = 0;
+        fp_at_ri = -1;
+        fp_at_ei = 0;
+        fp_at_sum = 0;
+        if (fp_at_cands.empty()) {
+            fp_at_phase = 3;
+            fp_edit_set(false);
+            return;
+        }
+        fp_at_measure_next();
+        return;
+    }
+
+    // turning: what this spot saw counts toward the turn being tried
+    fp_at_sum += fp_at_score;
+    fp_at_sum_local += fp_at_local;
+    if (fp_at_ri < 0) {
+        fp_at_base_eye.push_back(fp_at_score);
+    } else if (fp_at_ei < fp_at_base_eye.size()) {
+        fp_at_worse = std::max(fp_at_worse, fp_at_score - fp_at_base_eye[fp_at_ei]);
+    }
+    fp_at_ei++;
+    FpAtCand& cand = fp_at_cands[fp_at_ci];
+    if (fp_at_ei < cand.eyes.size()) {
+        fp_at_measure_next();
+        return;
+    }
+    if (fp_at_ri < 0) {
+        fp_at_base = fp_at_sum;
+        fp_at_base_local = fp_at_sum_local;
+        fp_at_best = fp_at_sum;
+        fp_at_best_local = fp_at_sum_local;
+        fp_at_best_rot = 0.0;
+    } else if (fp_at_sum < fp_at_best && fp_at_worse <= FP_AT_WORSE) {
+        fp_at_best = fp_at_sum;
+        fp_at_best_local = fp_at_sum_local;
+        fp_at_best_rot = FP_AT_ROTS[fp_at_ri];
+    }
+    fp_at_ri++;
+    fp_at_ei = 0;
+    fp_at_sum = 0;
+    fp_at_sum_local = 0;
+    fp_at_worse = 0;
+    // a turn that lays a face nearly along the camera rays smears its picture: not tried
+    auto tooSteep = [&](double rot) {
+        double a = rot * FP_PI / 180.0;
+        for (const auto& d : cand.dirs) {
+            double rx = d.first * cos(a) - d.second * sin(a);
+            double rz = d.first * sin(a) + d.second * cos(a);
+            if (fabs(rz * FP_KZ) > FP_AT_STEEP * fabs(rx * FP_S)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    while (fp_at_ri < FP_AT_ROT_COUNT && tooSteep(FP_AT_ROTS[fp_at_ri])) {
+        fp_at_ri++;
+    }
+    if (fp_at_ri < FP_AT_ROT_COUNT) {
+        fp_at_turn(cand.key, FP_AT_ROTS[fp_at_ri]);
+        fp_at_measure_next();
+        return;
+    }
+    bool take = fp_at_best_rot != 0.0 && fp_at_best <= fp_at_base - FP_AT_GAIN;
+    fp_at_turn(cand.key, take ? fp_at_best_rot : 0.0);
+    fp_at_turned += take ? 1 : 0;
+    trace_event(TRACE_FLOW, "fp-autoturn", "piece tile=%d fid=%x weight=%d spots=%d around=%d->%d whole=%d->%d rot=%.0f %s from=%d",
+        cand.key.tile, cand.key.fid, cand.weight, (int)cand.eyes.size(), fp_at_base_local, fp_at_best_local, fp_at_base, fp_at_best, fp_at_best_rot, take ? "TURNED" : "left",
+        fp_at_eyes[cand.eyes[0].eye]);
+    fp_at_ci++;
+    fp_at_ri = -1;
+    fp_at_base_eye.clear();
+    if (fp_at_ci < fp_at_cands.size()) {
+        fp_at_measure_next();
+        return;
+    }
+    // all of it again, from every spot: what the turns took away in the whole map
+    fp_at_phase = 4;
+    fp_at_eye_i = 0;
+    fp_at_win[2] = -1;
+    fp_at_look(0);
+}
+
+static void fp_autoturn_finish()
+{
+    trace_event(TRACE_FLOW, "fp-autoturn", "looked again spots=%d slit=%d (was %d) fill=%d (was %d)", (int)fp_at_eyes.size(), fp_at_seen_total, fp_at_seen_before, fp_at_fill_total, fp_at_fill_before);
+    fp_at_phase = 3;
+    fp_edit_set(false);
+    fp_edits_save();
+    trace_event(TRACE_FLOW, "fp-autoturn", "done turned=%d of %d", fp_at_turned, (int)fp_at_cands.size());
+    if (autotest_active()) {
+        autotest_finish(); // a self-played run that only came to turn rocks ends here
+    }
+}
+#endif
+
 void fp_view_edit_check()
 {
+#ifndef FALLOUT_RELEASE
+    fp_autoturn_tick();
+#endif
+    // the 3D editor program edits from the first frame the map is up, until Esc leaves it; without
+    // the 3D there is nothing to edit: back to the list
+    if (GNW95_editor_app && game_user_wants_to_quit == 0 && fp_failed) {
+        char line[] = "3D EDITOR: the 3D view is not available";
+        display_print(line);
+        game_user_wants_to_quit = 2;
+    }
+    if (GNW95_editor_app && !fp_editing && game_user_wants_to_quit == 0 && fp_mode == FP_VIEW_DIABLO && !fp_failed && fp_world_visible()) {
+        fp_edit_set(true);
+    }
     if (!fp_editing) {
         return;
     }
@@ -5142,10 +5632,129 @@ void fp_view_edit_toggle()
     fp_edit_set(!fp_editing);
 }
 
+// The 3D editor program's camera, once a frame: W A S D (held, Shift faster) and the right mouse
+// button dragged move it over the map; the hidden dude and the 2D view follow it hex by hex.
+static void fp_app_move_camera()
+{
+    static Uint32 last = 0;
+    Uint32 now = SDL_GetTicks();
+    double dt = last != 0 ? std::min(0.1, (now - last) / 1000.0) : 0.0;
+    last = now;
+    const Uint8* keys = SDL_GetKeyboardState(NULL);
+    double speed = (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]) ? 1400.0 : 600.0; // screen px a second
+    fp_app_ox += ((keys[SDL_SCANCODE_D] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_A] ? 1.0 : 0.0)) * speed * dt;
+    fp_app_oy += ((keys[SDL_SCANCODE_S] ? 1.0 : 0.0) - (keys[SDL_SCANCODE_W] ? 1.0 : 0.0)) * speed * dt;
+
+    static bool dragging = false;
+    static int dragX = 0;
+    static int dragY = 0;
+    int mx;
+    int my;
+    mouse_get_position(&mx, &my);
+    bool right = (mouse_get_buttons() & MOUSE_EVENT_RIGHT_BUTTON_DOWN_REPEAT) != 0;
+    if (right && dragging) {
+        fp_app_ox -= mx - dragX;
+        fp_app_oy -= my - dragY;
+    }
+    dragging = right;
+    dragX = mx;
+    dragY = my;
+
+    // the hex nearest the camera: step to a neighbour while one is nearer
+    int tile = obj_dude->tile;
+    int cx;
+    int cy;
+    fp_hex_top_left(tile, &cx, &cy);
+    for (int guard = 0; guard < 256; guard++) {
+        int best = -1;
+        double bestDist = fp_app_ox * fp_app_ox + fp_app_oy * fp_app_oy;
+        double bestX = 0.0;
+        double bestY = 0.0;
+        for (int dir = 0; dir < 6; dir++) {
+            int next = tile_num_in_direction(tile, dir, 1);
+            // never onto the grid's outer ring: no neighbour there leads back
+            if (next < 0 || next >= HEX_GRID_SIZE || next / 200 == 0 || next / 200 == 199 || next % 200 == 0 || next % 200 == 199) {
+                continue;
+            }
+            int nx;
+            int ny;
+            fp_hex_top_left(next, &nx, &ny);
+            double sx = nx - cx;
+            double sy = ny - cy;
+            double d = (fp_app_ox - sx) * (fp_app_ox - sx) + (fp_app_oy - sy) * (fp_app_oy - sy);
+            if (d < bestDist) {
+                best = next;
+                bestDist = d;
+                bestX = sx;
+                bestY = sy;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        tile = best;
+        cx += (int)bestX;
+        cy += (int)bestY;
+        fp_app_ox -= bestX;
+        fp_app_oy -= bestY;
+    }
+    // at the map's edge the camera stops where the last hex is
+    fp_app_ox = std::max(-48.0, std::min(48.0, fp_app_ox));
+    fp_app_oy = std::max(-36.0, std::min(36.0, fp_app_oy));
+    if (tile != obj_dude->tile) {
+        obj_move_to_tile(obj_dude, tile, obj_dude->elevation, NULL);
+        tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW);
+    }
+}
+
+// Whether the map has anything on `elevation` (a floor tile anywhere).
+static bool fp_app_floor_exists(int elevation)
+{
+    if (elevation < 0 || elevation >= ELEVATION_COUNT || square[elevation] == NULL) {
+        return false;
+    }
+    for (int sq = 0; sq < SQUARE_GRID_SIZE; sq++) {
+        int floor = square[elevation]->field_0[sq] & 0xFFF;
+        if (floor != 0 && floor != 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void fp_view_edit_input(int keyCode)
 {
     if (!fp_view_editing()) {
         return;
+    }
+    if (GNW95_editor_app) {
+#ifndef FALLOUT_RELEASE
+        // FALLOUT_FP_APP_TEST (development): Esc of itself a hundred frames in
+        static int testFrames = 0;
+        if (getenv("FALLOUT_FP_APP_TEST") != NULL && ++testFrames >= 100) {
+            testFrames = 0;
+            keyCode = KEY_ESCAPE;
+            trace_event(TRACE_FLOW, "fp-edit", "test esc");
+        }
+#endif
+        if (keyCode == KEY_ESCAPE) {
+            fp_edit_set(false); // saved on every change already
+            game_user_wants_to_quit = 2; // back to the map list
+            return;
+        }
+        fp_app_move_camera();
+        // 1 2 3: the map's floors (elevations)
+        if (keyCode >= '1' && keyCode <= '3') {
+            int elevation = keyCode - '1';
+            if (elevation != obj_dude->elevation && fp_app_floor_exists(elevation)) {
+                obj_move_to_tile(obj_dude, obj_dude->tile, elevation, NULL);
+                tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+                fp_edit_selected = false;
+                fp_edit_rev++;
+                trace_event(TRACE_FLOW, "fp-edit", "floor=%d", elevation);
+            }
+            return;
+        }
     }
     if (keyCode == KEY_ESCAPE) {
         fp_view_edit_toggle();
@@ -5159,7 +5768,7 @@ void fp_view_edit_input(int keyCode)
     // FALLOUT_FP_EDITPICK=x,y (development, the self-played tests): one click there, once
     static bool testPicked = false;
     const char* testPick = getenv("FALLOUT_FP_EDITPICK");
-    if (!testPicked && testPick != NULL && sscanf(testPick, "%d,%d", &mx, &my) == 2) {
+    if (!testPicked && testPick != NULL && !fp_picks.empty() && sscanf(testPick, "%d,%d", &mx, &my) == 2) {
         testPicked = true;
         click = true;
     }
@@ -5347,6 +5956,21 @@ void fp_view_init()
     svga_fp_invalidate = fp_invalidate;
     svga_fp_request_capture = fp_request_capture;
     fp_edit_set(false); // a game left from inside the editor does not take it into the next one
+    if (GNW95_editor_app) {
+        fp_mode = FP_VIEW_DIABLO;
+        fp_app_ox = 0.0;
+        fp_app_oy = 0.0;
+        if (obj_dude != NULL) {
+            obj_dude->flags |= OBJECT_HIDDEN; // the camera, not a man: nothing stands in the view or cuts an egg
+        }
+#ifndef FALLOUT_RELEASE
+        // FALLOUT_FP_APPPAN=x,y (development, the self-played tests): the camera that far from the start
+        const char* pan = getenv("FALLOUT_FP_APPPAN");
+        if (pan != NULL) {
+            sscanf(pan, "%lf,%lf", &fp_app_ox, &fp_app_oy);
+        }
+#endif
+    }
     const char* env = getenv("FALLOUT_FP_VIEW");
     if (env != NULL && (env[0] == '1' || env[0] == '2')) {
         fp_mode = env[0] == '1' ? FP_VIEW_EYES : FP_VIEW_DIABLO;

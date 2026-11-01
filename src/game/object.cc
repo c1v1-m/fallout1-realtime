@@ -32,6 +32,7 @@
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
 #include "plib/gnw/svga.h"
+#include "plib/gnw/winmain.h"
 
 namespace fallout {
 
@@ -1440,7 +1441,8 @@ int obj_move_to_tile(Object* obj, int tile, int elevation, Rect* rect)
             }
 
             if (elevation == elev) {
-                if (FID_TYPE(obj->fid) == OBJ_TYPE_MISC) {
+                // in the 3D editor program the hidden dude is its camera: it never takes a map exit
+                if (FID_TYPE(obj->fid) == OBJ_TYPE_MISC && !GNW95_editor_app) {
                     if (obj->pid >= 0x5000010 && obj->pid <= 0x5000017) {
                         ObjectData* data = &(obj->data);
 

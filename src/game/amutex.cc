@@ -1,5 +1,7 @@
 #include "game/amutex.h"
 
+#include "plib/gnw/winmain.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -18,6 +20,11 @@ bool autorun_mutex_create()
     autorun_mutex = CreateMutexA(NULL, FALSE, "InterplayGenericAutorunMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         CloseHandle(autorun_mutex);
+        return false;
+    }
+    // the 3D editor program must never start beside the game (its start clears the temporary map
+    // states a running game needs): a mutex it may not open counts as a game running
+    if (autorun_mutex == NULL && GNW95_editor_app) {
         return false;
     }
 #endif

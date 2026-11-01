@@ -51,6 +51,7 @@
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/winmain.h"
 #include "plib/gnw/memory.h"
 #include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
@@ -465,6 +466,9 @@ void ResetLoadSave()
 // only need to point slot_cursor at the slot and set its description label.
 int SaveGameSlot(int slot, const char* description)
 {
+    if (GNW95_editor_app) {
+        return -1; // the 3D editor program never writes a save
+    }
     if (slot < 0 || slot > 9) {
         return -1;
     }
@@ -693,6 +697,9 @@ int QuickSaveGame()
 // 0x46D9C4
 int SaveGame(int mode)
 {
+    if (GNW95_editor_app) {
+        return -1; // the 3D editor program never writes a save
+    }
     MessageListItem messageListItem;
 
     ls_error_code = 0;

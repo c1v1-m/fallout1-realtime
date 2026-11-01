@@ -58,6 +58,7 @@
 #include "plib/gnw/memory.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
+#include "plib/gnw/winmain.h"
 
 namespace fallout {
 
@@ -536,7 +537,7 @@ void game_exit()
     FMExit();
     windowClose();
     db_exit();
-    gconfig_exit(true);
+    gconfig_exit(!GNW95_editor_app); // the 3D editor program changes no setting: nothing to save at exit
 }
 
 // 0x43B748

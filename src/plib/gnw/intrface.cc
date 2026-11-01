@@ -179,7 +179,7 @@ int win_list_select_at(const char* title, char** items, int itemsLength, SelectF
     }
 
     win_text(win,
-        items + start,
+        items + scrollOffset,
         itemsLength < listViewCapacity ? itemsLength : listViewCapacity,
         listViewWidth,
         listViewX,
