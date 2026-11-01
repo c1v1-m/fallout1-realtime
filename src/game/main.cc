@@ -660,8 +660,13 @@ static void main_game_loop()
             // anim_stop() ends every animation sequence and force-flattens anyone mid-death
             // (show_death via anim_set_end), so an autosave landing in the second after a kill
             // destroys the fall -- both bodies just drop. See combat_rt_death_anim_pending().
+            // ⚠️ AND NOT WHILE THE UI IS DISABLED, which is a script's scene in progress: vanilla cannot save
+            // then at all, and the scene's own step counter (a script variable) is not in a save, so a load
+            // of one made mid-scene finds it dead. F2's GAMMOVIE autosave landed right after its map_enter
+            // started the Frank Horrigan sequence; the reload stood the farmers and the patrol still for good.
             bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending() && !autotest_active()
-                && !GNW95_editor_app; // the 3D editor program never touches his saves
+                && !GNW95_editor_app // the 3D editor program never touches his saves
+                && !game_ui_is_disabled();
 
             // The triggers below are LATCHED rather than acted on immediately: the condition that
             // fires them (map changed / quest hash moved) is a one-shot edge, and the old code

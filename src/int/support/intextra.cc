@@ -3673,12 +3673,15 @@ static void op_obj_close(Program* program)
 static void op_game_ui_disable(Program* program)
 {
     game_ui_disable(0);
+    // Realtime: the pad, the stick and the follow camera stand aside too (combat_rt_script_ui_locked).
+    combat_rt_note_script_ui_lock(true);
 }
 
 // 0x4511B8
 static void op_game_ui_enable(Program* program)
 {
     game_ui_enable();
+    combat_rt_note_script_ui_lock(false);
 }
 
 // 0x4511C0

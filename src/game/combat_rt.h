@@ -97,6 +97,10 @@ Object* combat_rt_eye_target(int hexes);
 // True while the player is walking under left-stick control (not standing, not walking out a
 // click-to-move path).
 bool combat_rt_stick_walking();
+// A script's game_ui_disable / game_ui_enable (op_game_ui_*), and whether that lock holds now: the
+// pad, the stick, the use prompt and the follow camera stand aside while it does.
+void combat_rt_note_script_ui_lock(bool on);
+bool combat_rt_script_ui_locked();
 
 // MODS page: live read/write of the two gamepad movement assists. The cfg is still where they are
 // LOADED from at init; these are how the settings screen changes them without a re-init.

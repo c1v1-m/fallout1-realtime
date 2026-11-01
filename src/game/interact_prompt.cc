@@ -1380,6 +1380,17 @@ void interact_prompt_tick()
 
     ip_load_config();
 
+    // A script's scene has the dude (combat_rt_script_ui_locked): no prompt, and nothing queued
+    // before it began is acted on.
+    if (combat_rt_script_ui_locked()) {
+        ip_pending = NULL;
+        ip_pending_kind = IP_NONE;
+        ip_clear_outline();
+        ip_hide_overlay();
+        ip_target = NULL;
+        return;
+    }
+
     // 1) Perform a queued interaction FIRST, from this safe main-loop context (never from the
     // input hook). Tear the overlay down before a talk/loot modal opens over it.
     if (ip_pending != NULL) {

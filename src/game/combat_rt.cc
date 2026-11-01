@@ -8890,6 +8890,73 @@ bool combat_rt_cancel_player_action()
     return true;
 }
 
+// ===================== A SCRIPT'S CUTSCENE LOCK =====================
+//
+// A script takes the dude for a scene with game_ui_disable (vanilla: no mouse, no keys, no bar) and
+// gives him back with game_ui_enable. Three things of ours broke that: the un-stick in
+// combat_rt_update switched the UI back on the first frame he stood idle, the stick and the use
+// prompt never asked, and the follow camera undid the script's tile_set_center. Found in F2's
+// GAMMOVIE (Frank Horrigan and the farmers, Deck 2026-11-01): the script walks the dude up to the
+// farm and centres the view on it -- he ran about on the stick instead, the camera stayed on him,
+// and the whole scene played out above the screen ("jsem dost pod nimi a nevidím je"). F1's own
+// scenes (vanilla MASTER.DAT): the Vault 13 ending (OBJ_DUDE, from the Overseer or the V13CAVE map
+// script), the Vats plasma trap (VBOOM), the Lieutenant's torture (LT), Doc Morbid taking an eye
+// (MORBID), and the Crash House hostage (JTRAIDER, MARCELLE).
+#define RT_SCRIPT_UI_LOCK_MAX_MS 60000u
+
+static bool rt_script_ui_lock = false;
+static unsigned int rt_script_ui_lock_since = 0;
+static int rt_script_ui_lock_tile = -1; // the dude's tile when the lock began, for the trace
+
+// From op_game_ui_disable / op_game_ui_enable.
+void combat_rt_note_script_ui_lock(bool on)
+{
+    if (on && !rt_script_ui_lock && obj_dude != NULL) {
+        // Let go of the stick NOW, before the script registers its own animation on him: from here on
+        // a walk on the dude is the script's. A stick state left over from the previous map is what
+        // cut the GAMMOVIE walk-in, the moment the new map's first poll saw the stick idle.
+        rt_fm_release();
+        rt_stick_stop();
+        rt_stick_last_sector = -1;
+    }
+
+    int tile = obj_dude != NULL ? obj_dude->tile : -1;
+    if (on && !rt_script_ui_lock) {
+        trace_event(TRACE_FLOW, "script-ui-lock", "on=1 tile=%d t=%.2f", tile, rt_clock);
+    } else if (!on && rt_script_ui_lock) {
+        // Where he stood when it began: only the script moves him in a scene.
+        trace_event(TRACE_FLOW, "script-ui-lock", "on=0 tile=%d start=%d ms=%u t=%.2f", tile, rt_script_ui_lock_tile,
+            elapsed_time(rt_script_ui_lock_since), rt_clock);
+    }
+
+    if (on && !rt_script_ui_lock) {
+        rt_script_ui_lock_since = get_time();
+        rt_script_ui_lock_tile = tile;
+    }
+    rt_script_ui_lock = on;
+}
+
+// True while a script's game_ui_disable holds: no pad, no stick, no use prompt, no follow camera.
+bool combat_rt_script_ui_locked()
+{
+    if (!rt_script_ui_lock || !game_ui_is_disabled()) {
+        return false;
+    }
+
+    // ⚠️ NOT FOREVER. Vanilla waits for the script however long it takes, but a scene that waits on
+    // something realtime changed (a walk that never arrives) would then hold the player for good.
+    // Past a minute the pad comes back -- the un-stick then re-enables the bar -- and the script goes
+    // on by itself.
+    if (elapsed_time(rt_script_ui_lock_since) > RT_SCRIPT_UI_LOCK_MAX_MS) {
+        trace_event(TRACE_WARN, "script-ui-lock-expired", "ms=%u t=%.2f", elapsed_time(rt_script_ui_lock_since),
+            rt_clock);
+        rt_script_ui_lock = false;
+        return false;
+    }
+
+    return true;
+}
+
 // True if obj is one of the critters currently tracked in the actor registry.
 // Pointer-compare only (no dereference), so it is safe to call on a possibly
 // stale lock-on pointer: the registry is rebuilt from live world objects, so a
@@ -15625,6 +15692,10 @@ void combat_rt_reset()
     // would be dereferenced on the next dialogue close. Exactly the class of stale global that has
     // bitten this project before.
     combat_rt_request_step_back(NULL);
+
+    // A script's scene lock belongs to the game that set it: after a load the un-stick may give the
+    // bar back again.
+    rt_script_ui_lock = false;
 }
 
 // Refresh rt_door_tiles for the dude's current tile. Usable, UNLOCKED doors only: pulling the
@@ -16259,6 +16330,12 @@ void combat_rt_poll_gamepad()
         rt_fm_release();
         rt_stick_stop();
         rt_stick_last_sector = -1;
+        return;
+    }
+
+    // A script's scene has the dude (combat_rt_script_ui_locked). Nothing is released here: the
+    // stick was let go when the lock began, and any walk on him now is the script's own.
+    if (combat_rt_script_ui_locked()) {
         return;
     }
 
@@ -19140,7 +19217,14 @@ void combat_rt_update(float dt)
     }
 
     if (rt_enabled) {
-        rt_follow_cam(dt);
+        // During a script's scene the view is the script's (tile_set_center), as in vanilla, where
+        // the camera never followed the dude. The cleared tile makes the camera snap back to him
+        // when the scene lets go.
+        if (combat_rt_script_ui_locked()) {
+            rt_cam_last_tile = -1;
+        } else {
+            rt_follow_cam(dt);
+        }
         rt_offscreen_shooters_tick(); // after the camera: "out of view" is a question about the view
     }
 
@@ -19951,7 +20035,8 @@ void combat_rt_update(float dt)
     // anim_busy_blocking, not anim_busy -- same reason as the attack-eligibility gate above.
     // Plain anim_busy stays set while an old sequence merely still LISTS the dude's spent swing,
     // so this un-stick stopped firing and the interface stayed disabled with the hourglass up.
-    if (anim_busy_blocking(obj_dude) == 0 && !intface_is_enabled()) {
+    // Never over a script's own lock (combat_rt_script_ui_locked): that one is not stuck, it is a scene.
+    if (anim_busy_blocking(obj_dude) == 0 && !intface_is_enabled() && !combat_rt_script_ui_locked()) {
         game_ui_enable();
         gmouse_3d_refresh();
     }

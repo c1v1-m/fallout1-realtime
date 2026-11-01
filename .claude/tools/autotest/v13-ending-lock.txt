@@ -1,0 +1,37 @@
+# A script's cutscene lock holds (2026-11-01, ported from F2's GAMMOVIE fix): Vault 13's ending. With the Vats
+# and the Master destroyed (GVAR 17, 18) the Overseer starts talking by himself (over81 .. Over81e, four [More]
+# and a [Done]); his last line puts timer 5 on the dude, and OBJ_DUDE then locks the UI (game_ui_disable),
+# sends the Overseer (map_var 0) to tile 16890, decides whether the dude shoots him, and gives the UI back
+# (game_ui_enable) right before the end movie. The stick is pushed away the moment the talk closes and held:
+# the dude must stand still for the whole lock, and the lock must end with the script's own game_ui_enable
+# (on=0), not the one-minute watchdog.
+# The dude stands 9 rows from the Overseer, out of the use prompt's reach: the A that picks [Done] is still
+# down when the world takes the pad back (the timeline lets go of it on its next tick), and next to him it
+# opened the talk again.
+name v13-ending-lock
+map VAULT13.MAP
+mapscript on
+seed 1
+duration 24
+gvar 17 1
+gvar 18 1
+dude elevation 2
+dude tile 22862 rot 5
+dude hp 400
+
+tap 1500 A 150
+tap 3000 A 150
+tap 4500 A 150
+tap 6000 A 150
+note 7400 Done next
+tap 7500 A 150
+axis 7800 LY 32767
+shot 9000
+shot 10500
+axis 16000 LY 0
+note 22000 end
+
+expect FLOW/dialog-reply\] msg=265
+expect FLOW/script-ui-lock\] on=1
+expect FLOW/script-ui-lock\] on=0 tile=(\d+) start=\1
+expect-not script-ui-lock-expired
