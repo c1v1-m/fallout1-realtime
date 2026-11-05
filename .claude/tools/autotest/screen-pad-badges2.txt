@@ -1,0 +1,20 @@
+# From F2 (2026-11-03, his "Ano, postav je"): the weapon slot shows RT, and X once the magazine is empty. A rocket
+# launcher holds one round: one shot at a far raider empties it.
+name screen-pad-badges2
+map DESERT1.MAP
+seed 1
+duration 8
+dude tile 20100 rot 2
+dude armor 2
+dude wield 13
+spawn 16777291 22900 rot 5 hostile
+
+shot 700
+axis 900 LT 32767
+axis 1600 RT 32767
+axis 1900 RT -32768
+shot 4500
+axis 5000 LT -32768
+note 7000 end
+
+expect COMBAT/attack\] DUDE

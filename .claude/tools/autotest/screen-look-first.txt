@@ -1,0 +1,19 @@
+# From F2 (2026-11-05, Becky's still): a generic thing whose hand only says "You see:" offers LOOK first and the hand
+# one D-pad tap away, with the arrows up. The Brotherhood's punching bag: can-use bit, no script.
+name screen-look-first
+map BROHD12.MAP
+seed 1
+duration 10
+dude tile 21690 rot 0
+
+shot 2500
+tap 3000 A
+tap 4500 DOWN
+shot 5200
+tap 5800 A
+note 8000 end
+
+expect ip-show\] pid=33554969 kind=7 idx=0 of=2
+expect interact-do\] kind=7 pid=33554969
+expect ip-show\] pid=33554969 kind=1 idx=1 of=2
+expect interact-do\] kind=1 pid=33554969

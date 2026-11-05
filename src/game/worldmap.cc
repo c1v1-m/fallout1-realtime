@@ -1451,6 +1451,10 @@ int world_map(WorldMapContext ctx)
                         wm_pad_town = wmNext;
                         gsound_play_sfx_file("ib1p1xx1");
                     }
+                    // The world map runs its own loop, out of gamepad_ui_tick's button trace -- so its pad says
+                    // what it does itself (from Fallout 2 Realtime, „nejde mi vybrat ve world map místa“ left
+                    // nothing to read).
+                    trace_event(TRACE_INPUT, "wm-pad-step", "dir=%d town=%d visited=0x%x", wmDir, wm_pad_town, first_visit_flag);
 
                     if (wm_pad_town != -1) {
                         Rect wmWin;
@@ -1512,6 +1516,9 @@ int world_map(WorldMapContext ctx)
                             is_moving = 0;
                         }
                     }
+                    trace_event(TRACE_INPUT, "wm-pad-a", "pointer=%d,%d park=%d,%d pointed=%d town=%d here=%d moving=%d input=%d mapclick=%d",
+                        mouse_x, mouse_y, wm_park_x, wm_park_y, wmPointed ? 1 : 0, wm_pad_town,
+                        InCity(world_xpos, world_ypos), is_moving != 0 ? 1 : 0, input, wmPadClick ? 1 : 0);
                 }
 
                 wmPrevA = wmANow;
@@ -1541,6 +1548,8 @@ int world_map(WorldMapContext ctx)
             }
 
             if (input >= 500 && input < 512) {
+                trace_event(TRACE_INPUT, "wm-town-button", "town=%d visited=%d here=%d moving=%d", input - 500,
+                    (first_visit_flag & (1 << (input - 500))) != 0 ? 1 : 0, InCity(world_xpos, world_ypos), is_moving != 0 ? 1 : 0);
                 if ((first_visit_flag & (1 << (input - 500))) != 0) {
                     if (!is_moving_to_town || !is_moving || InCity(target_xpos, target_ypos) != input - 500) {
                         target_xpos = 50 * city_location[input - 500].column + 50 / 2;
@@ -1552,6 +1561,8 @@ int world_map(WorldMapContext ctx)
                             TargetTown(temp_town);
                             is_moving = 1;
                             is_moving_to_town = 1;
+                            trace_event(TRACE_FLOW, "wm-pad-travel", "town=%d dest=%d,%d from=%d,%d", temp_town, target_xpos,
+                                target_ypos, world_xpos, world_ypos);
                         } else {
                             entering_city = temp_town;
                             is_entering_city = 1;

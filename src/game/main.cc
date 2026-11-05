@@ -378,6 +378,13 @@ static int main_reset_system()
 {
     game_reset();
 
+    // Realtime: a game that ended inside a script's scene (a death mid-scene, the Vats plasma trap) left the
+    // UI off -- the keyboard too, so the death screen, the menu hotkeys and a new character's name would not
+    // type. Nothing can be locked here; a loaded game's own frame does the rest (rt_script_ui_lock_tick).
+    if (game_ui_is_disabled()) {
+        game_ui_enable();
+    }
+
     return 1;
 }
 
@@ -599,12 +606,31 @@ static void main_game_loop()
         if (GNW95_editor_app && !editing3d && keyCode == KEY_ESCAPE) {
             game_user_wants_to_quit = 2;
         }
+
+        // ...but not with the dude dead or out. His death animation plays here before the death scene, and
+        // nothing may act on that game any more -- save, load, the inventory, the Pip-Boy, a click into the
+        // world (from Fallout 2 Realtime, „šlo savovat nebo loadovat při death screen“). Quitting stays, and
+        // the wheel scroll (-1).
+        if (keyCode != -1 && obj_dude != NULL && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
+            && keyCode != KEY_CTRL_Q && keyCode != KEY_CTRL_X && keyCode != KEY_F10) {
+            if (keyCode != -2) {
+                trace_event(TRACE_INPUT, "key-refused", "code=%d why=dude-down", keyCode);
+            }
+            keyCode = -1;
+        }
+
         bool rtConsumed = editing3d || GNW95_editor_app || gamepad_ui_handle_key(&keyCode) || combat_rt_handle_input(keyCode);
         if (keyCode != -1) {
             trace_event(TRACE_INPUT, "key", "code=%d rt=%d", keyCode, rtConsumed ? 1 : 0);
         }
         if (!rtConsumed) {
+            // A click's walk (the pad's A with the cursor shown, an armed crosshair, a real mouse) is the
+            // player's own: a script's scene that begins on the way stops it (combat_rt_note_player_walk).
+            unsigned int serialBefore = anim_dude_reg_serial();
             game_handle_input(keyCode, false);
+            if (keyCode == -2) {
+                combat_rt_note_player_walk(serialBefore);
+            }
         }
 
         sectionStart = SDL_GetPerformanceCounter();
@@ -666,7 +692,8 @@ static void main_game_loop()
             // started the Frank Horrigan sequence; the reload stood the farmers and the patrol still for good.
             bool canAutosave = obj_dude != NULL && !isInCombat() && !combat_rt_death_anim_pending() && !autotest_active()
                 && !GNW95_editor_app // the 3D editor program never touches his saves
-                && !game_ui_is_disabled();
+                && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) == 0
+                && !game_ui_is_disabled() && !combat_rt_scene_pending();
 
             // The triggers below are LATCHED rather than acted on immediately: the condition that
             // fires them (map changed / quest hash moved) is a one-shot edge, and the old code

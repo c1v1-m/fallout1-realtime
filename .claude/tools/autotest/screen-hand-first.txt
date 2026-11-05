@@ -1,0 +1,13 @@
+# F1's 19 scripts that answer USE inside start (no use_p_proc): the hand stays first. F2's test would have put the
+# look first here. A Brotherhood terminal (Term1).
+name screen-hand-first
+map BROHD34.MAP
+seed 1
+duration 7
+dude tile 20304 rot 0
+
+shot 2500
+note 5000 end
+
+expect ip-show\] pid=33554614 kind=1 idx=0 of=2
+expect-not ip-show\] pid=33554614 kind=7 idx=0

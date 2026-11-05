@@ -2811,6 +2811,11 @@ static void op_float_msg(Program* program)
         return;
     }
 
+    if (string != NULL && *string != '\0') {
+        // Realtime: a scene under a script's UI lock is still going (its idle watchdog).
+        combat_rt_note_scene_progress();
+    }
+
     if (string == NULL || *string == '\0') {
         int_debug("\nScript Error: %s: op_float_msg: empty or blank string!");
         return;
@@ -3672,9 +3677,10 @@ static void op_obj_close(Program* program)
 // 0x4511B0
 static void op_game_ui_disable(Program* program)
 {
-    game_ui_disable(0);
     // Realtime: the pad, the stick and the follow camera stand aside too (combat_rt_script_ui_locked).
+    // Told first, so it can see whether the UI was still on (a fresh lock).
     combat_rt_note_script_ui_lock(true);
+    game_ui_disable(0);
 }
 
 // 0x4511B8
@@ -3697,6 +3703,7 @@ static void op_gfade_out(Program* program)
 
     if (data != 0) {
         palette_fade_to(black_palette);
+        combat_rt_note_script_fade(true);
     } else {
         dbg_error(program, "gfade_out", SCRIPT_ERROR_OBJECT_IS_NULL);
     }
@@ -3709,6 +3716,7 @@ static void op_gfade_in(Program* program)
 
     if (data != 0) {
         palette_fade_to(cmap);
+        combat_rt_note_script_fade(false);
     } else {
         dbg_error(program, "gfade_in", SCRIPT_ERROR_OBJECT_IS_NULL);
     }

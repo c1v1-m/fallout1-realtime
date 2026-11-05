@@ -264,6 +264,7 @@ void anim_set_smooth_motion(bool on);
 void anim_smooth_tick();
 // The map is being torn down: forget every glide and every held stride (no redraw).
 void anim_smooth_reset();
+unsigned int anim_dude_reg_serial();
 
 // FRAME-PACING METER (main loop). Counters since the last call, then zeroed: path searches and
 // their cost, glides started/abandoned, strides held/stood, leg starts held for the cadence.

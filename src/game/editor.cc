@@ -1624,10 +1624,31 @@ static void ce_pad_poll(SDL_GameController* pad)
         }
     }
 
-    if (rb && !ce_prev_rb) {
-        ce_focus_jump(1);
-    } else if (lb && !ce_prev_lb) {
-        ce_focus_jump(-1);
+    // ⚠️ ON THE SHEET LB/RB TURN THE FOLDER TABS (from Fallout 2 Realtime 2026-11-01, his "Použít LB a RB …
+    // Prostě ty 3 záložky v char. sheetu"): PERKS <-> KARMA <-> KILLS, round, and the highlight goes to the tab
+    // so its card shows. Creation has no folder, and keeps the quick jump between kinds.
+    if ((rb && !ce_prev_rb) || (lb && !ce_prev_lb)) {
+        int dir = rb && !ce_prev_rb ? 1 : -1;
+        if (glblmode) {
+            ce_focus_jump(dir);
+        } else {
+            int tabs = (int)(sizeof(ce_folder_tab_folder) / sizeof(ce_folder_tab_folder[0]));
+            int cur = 0;
+            for (int i = 0; i < tabs; i++) {
+                if (ce_folder_tab_folder[i] == folder) {
+                    cur = i;
+                }
+            }
+            int next = (cur + dir + tabs) % tabs;
+            for (int i = 0; i < ce_item_count; i++) {
+                if (ce_items[i].kind == CE_ITEM_FOLDER_TAB && ce_items[i].index == next) {
+                    ce_focus = i;
+                    ce_refresh_focus();
+                    trace_event(TRACE_INPUT, "ce-folder-tab", "dir=%d tab=%d", dir, next);
+                    break;
+                }
+            }
+        }
     }
 
     // ⚠️ A IS TAP-vs-HOLD. He asked for it outright ("prostÄ mÄ nech podrÅ¾et A pro potvrzenÃ­"),
@@ -3098,6 +3119,13 @@ static void DrawFolder()
     default:
         debug_printf("\n ** Unknown folder type! **\n");
         break;
+    }
+
+    // With a pad: LB and RB at the ends of the tab row, the shoulders that turn the tabs (ce_pad_poll), in
+    // the bar's pill (his pick, 2026-11-03: "ať hráč ví, že přepnutím uvidí kolik zabil, karmu atd").
+    if (gamepad_ui_get_controller() != NULL) {
+        intface_pad_pill(win_buf, 640, 640, 480, 18, 341, "LB");
+        intface_pad_pill(win_buf, 640, 640, 480, 325, 341, "RB");
     }
 }
 

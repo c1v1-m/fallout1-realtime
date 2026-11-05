@@ -700,6 +700,15 @@ int SaveGame(int mode)
     if (GNW95_editor_app) {
         return -1; // the 3D editor program never writes a save
     }
+
+    // ⚠️ The same rule as SaveGameSlot, for the save SCREEN and F6: not with the dude dead or out (from
+    // Fallout 2 Realtime, „šlo savovat nebo loadovat při death screen“). The flag would be in the save, and
+    // every load of it would go straight back to the death scene. 0 = nothing saved, as a cancel.
+    if (obj_dude != NULL && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        trace_event(TRACE_WARN, "save-refused", "mode=%d why=dude-down", mode);
+        return 0;
+    }
+
     MessageListItem messageListItem;
 
     ls_error_code = 0;

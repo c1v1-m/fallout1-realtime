@@ -61,6 +61,8 @@ void intface_invalidate_heal_slot();
 // drawn and waiting for the release. No strip (a 640-wide screen) = nothing is drawn.
 void intface_update_quick_slot_lb(Object* item, int count, bool armed);
 // The part an aimed RT goes to, printed in the weapon slot beside its bullseye.
+void intface_update_pad_badges();
+void intface_pad_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text);
 void intface_update_aim_part(int hitLocation);
 // REALTIME: the end-turn box on the bar opens its combat curtains while a fight is live and closes
 // them when it is over, frame-stepped so nothing waits for it. Only when the heal slot has moved out

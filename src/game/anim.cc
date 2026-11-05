@@ -287,6 +287,9 @@ static int anim_move(Object* obj, int tile, int elev, int a3, int anim, int a5, 
 static int anim_move_straight_to_tile(Object* obj, int tile, int elevation, int anim, int animationSequenceIndex, int flags);
 static void object_move(int index);
 static void object_straight_move(int index);
+// Bumped by register_end for every sequence with the dude in it (anim_dude_reg_serial).
+static unsigned int anim_dude_serial = 0;
+
 static void walk_retry_note(Object* obj, int tile, int elevation, int anim);
 static void walk_retry_forget(Object* obj);
 static void walk_retry_tick();
@@ -1051,6 +1054,15 @@ int register_end()
                 }
                 break;
             }
+        }
+    }
+
+    // Realtime: count the sequences that move the dude (anim_dude_reg_serial), so the player's own walk
+    // can be told from one registered after it.
+    for (int index = 0; index < curr_anim_counter; index++) {
+        if (animationSequence->animations[index].owner == obj_dude) {
+            anim_dude_serial++;
+            break;
         }
     }
 
@@ -6146,6 +6158,13 @@ static void walk_retry_forget(Object* obj)
             walk_retry[i].obj = NULL;
         }
     }
+}
+
+// How many sequences with the dude in them have been registered so far. A caller that keeps the value
+// right after registering its own can later tell whether that is still the dude's latest.
+unsigned int anim_dude_reg_serial()
+{
+    return anim_dude_serial;
 }
 
 // Each frame, right behind the stepper (anim_smooth_tick).

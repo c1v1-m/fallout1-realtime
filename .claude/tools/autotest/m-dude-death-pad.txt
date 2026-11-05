@@ -1,0 +1,21 @@
+# From F2 (2026-11-03, "šlo savovat nebo loadovat při death screen"): with the dude dead, the pad opens nothing.
+# START (the pause menu with save/load), BACK (the inventory) and RB (a stimpak or a grenade) pressed while his
+# death animation plays. A minigun's first burst kills at about 1.3 s, and the fall lasts 1.7 s.
+name m-dude-death-pad
+map DESERT1.MAP
+seed 1
+duration 15
+dude tile 15100 rot 2
+dude curhp 3
+spawn 16777225 15700 rot 5 wield 12 hostile
+
+tap 1600 START
+tap 1900 BACK
+tap 2200 RB
+
+expect react\] pid=16777216 id=18000 none->dying
+expect autotest\] pad t=.* start=1
+expect autotest\] pad t=.* back=1
+expect autotest\] end why=dude-dead
+expect-not modal win=
+expect-not quick-slot-press

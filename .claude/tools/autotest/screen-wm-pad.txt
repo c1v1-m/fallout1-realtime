@@ -1,0 +1,22 @@
+# From F2 (2026-11-04, "nejde mi vybrat ve world map místa"): the world map runs its own loop, so its pad traces itself.
+# The dude walks off DESERT1's left edge to the world map; D-pad through the town list, A to travel.
+name screen-wm-pad
+map DESERT1.MAP
+seed 1
+duration 22
+dude tile 11520 rot 5
+
+axis 800 LX -32767
+axis 7000 LX 0
+shot 9000
+tap 9500 DOWN
+tap 10100 UP
+shot 10800
+tap 11200 A
+shot 13000
+note 20000 end
+
+expect wm-enter
+expect wm-pad-step\] dir=1
+expect wm-pad-a\]
+expect wm-town-button\]

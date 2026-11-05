@@ -74,7 +74,7 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
 static void compute_damage(Attack* attack, int ammoQuantity, int bonusDamageMultiplier);
 static void check_for_death(Object* a1, int a2, int* a3);
 static void set_new_results(Object* a1, int a2);
-static void damage_object(Object* obj, int damage, bool animated, bool a4);
+static void damage_object(Object* obj, int damage, bool animated, bool a4, Object* attacker);
 static void combat_display_hit(char* dest, size_t size, Object* critter_obj, int damage);
 static void combat_display_flags(char* a1, int flags, Object* a3);
 static void combat_standup(Object* a1);
@@ -3644,7 +3644,7 @@ void apply_damage(Attack* attack, bool animated)
 
     if (attackerIsCritter && (attacker->data.critter.combat.results & DAM_DEAD) == 0) {
         set_new_results(attacker, attack->attackerFlags);
-        damage_object(attacker, attack->attackerDamage, animated, attack->defender != attack->oops);
+        damage_object(attacker, attack->attackerDamage, animated, attack->defender != attack->oops, attack->attacker);
     }
 
     if (attack->oops != NULL && attack->oops != attack->defender) {
@@ -3671,7 +3671,7 @@ void apply_damage(Attack* attack, bool animated)
         }
 
         scr_set_objs(defender->sid, forgiven ? NULL : attack->attacker, NULL);
-        damage_object(defender, attack->defenderDamage, animated, attack->defender != attack->oops);
+        damage_object(defender, attack->defenderDamage, animated, attack->defender != attack->oops, attack->attacker);
         combatai_notify_onlookers(defender);
 
         if (attack->defenderDamage >= 0 && (attack->attackerFlags & DAM_HIT) != 0) {
@@ -3699,7 +3699,7 @@ void apply_damage(Attack* attack, bool animated)
             }
 
             scr_set_objs(obj->sid, forgiven ? NULL : attack->attacker, NULL);
-            damage_object(obj, attack->extrasDamage[index], animated, attack->defender != attack->oops);
+            damage_object(obj, attack->extrasDamage[index], animated, attack->defender != attack->oops, attack->attacker);
             combatai_notify_onlookers(obj);
 
             if (attack->extrasDamage[index] >= 0) {
@@ -3818,7 +3818,7 @@ static void set_new_results(Object* critter, int flags)
 }
 
 // 0x422734
-static void damage_object(Object* obj, int damage, bool animated, bool a4)
+static void damage_object(Object* obj, int damage, bool animated, bool a4, Object* attacker)
 {
     if (obj == NULL) {
         return;
@@ -3843,7 +3843,7 @@ static void damage_object(Object* obj, int damage, bool animated, bool a4)
     }
 
     obj->data.critter.combat.damageLastTurn += damage;
-    combat_rt_note_hurt(obj);
+    combat_rt_note_hurt(obj, attacker);
 
     if (!a4) {
         exec_script_proc(obj->sid, SCRIPT_PROC_DAMAGE);

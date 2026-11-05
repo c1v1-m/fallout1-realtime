@@ -97,10 +97,20 @@ Object* combat_rt_eye_target(int hexes);
 // True while the player is walking under left-stick control (not standing, not walking out a
 // click-to-move path).
 bool combat_rt_stick_walking();
-// A script's game_ui_disable / game_ui_enable (op_game_ui_*), and whether that lock holds now: the
-// pad, the stick, the use prompt and the follow camera stand aside while it does.
+// A script's game_ui_disable (called BEFORE the UI goes off) / game_ui_enable (op_game_ui_*), and
+// whether that lock holds now: the pad, the stick, the use prompt and the follow camera stand aside
+// while it does. A script's gfade_out / gfade_in, so a lock ended from our side can give the screen back.
 void combat_rt_note_script_ui_lock(bool on);
+void combat_rt_note_script_fade(bool black);
 bool combat_rt_script_ui_locked();
+// A script's timed event ran or a script floated a line (the lock's idle watchdog).
+void combat_rt_note_scene_progress();
+// A scene whose lock a fight ended early is still running (the autosave waits for it).
+bool combat_rt_scene_pending();
+// The pad set the dude off on a walk-then-act of the player's own; `serialBefore` is
+// anim_dude_reg_serial() from before it. A script's lock that begins while it is still his latest
+// sequence cuts it.
+void combat_rt_note_player_walk(unsigned int serialBefore);
 
 // MODS page: live read/write of the two gamepad movement assists. The cfg is still where they are
 // LOADED from at init; these are how the settings screen changes them without a re-init.
@@ -250,7 +260,7 @@ void combat_rt_notify_victim(Object* attacker, Object* victim);
 
 // Hook from damage_object (combat.cc), where vanilla adds to damageLastTurn: `critter` took damage. combat_rt
 // remembers it until the fight ends, because damageLastTurn itself is zeroed at every script turn.
-void combat_rt_note_hurt(Object* critter);
+void combat_rt_note_hurt(Object* critter, Object* attacker);
 
 // Hook from obj_remove_all() (object.cc) right before a map teardown frees every object.
 // Abandons any in-flight realtime attack and drops all object pointers combat_rt holds

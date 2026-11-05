@@ -1,0 +1,22 @@
+# From F2 (2026-11-01, "Použít LB a RB … Prostě ty 3 záložky v char. sheetu"): on the character sheet LB/RB turn the
+# PERKS / KARMA / KILLS tabs, round, and the pills at the ends of the row name them.
+name screen-sheet-tabs
+map DESERT1.MAP
+seed 1
+duration 14
+
+open 1000 sheet
+tap +1500 RB
+shot +600
+tap +600 RB
+shot +600
+tap +600 RB
+tap +600 LB
+shot +600
+tap +800 B
+note +1000 end
+
+expect ce-folder-tab\] dir=1 tab=1
+expect ce-folder-tab\] dir=1 tab=2
+expect ce-folder-tab\] dir=1 tab=0
+expect ce-folder-tab\] dir=-1 tab=2

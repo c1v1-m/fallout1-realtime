@@ -1,5 +1,6 @@
 #include "game/intface.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1338,6 +1339,8 @@ void intface_invalidate_heal_slot()
     lb_slot_armed = -1;
 }
 
+static void pad_badge_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text, int color);
+
 // --- THE LB QUICK SLOT (2026-10-15) ----------------------------------------------------------------
 //
 // His layout: *"vlevo dole u pásku bude LB s granátem pro quick throw"* -- the twin of the heal slot,
@@ -1392,9 +1395,15 @@ void intface_update_quick_slot_lb(Object* item, int count, bool armed)
 
     const char* label = pad ? "LB" : "H"; // the heal since the LB/RB swap (2026-10-17)
     int labelY = 4 + iconH;
-    int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
-    text_to_buf(base + pitch * labelY + labelX, (char*)label, pitch, pitch,
-        armed ? colorTable[31744] : colorTable[32747]);
+    if (pad) {
+        // The pad's shoulder in the bar badges' pill (intface_update_pad_badges); its label red while armed.
+        pad_badge_pill(base, pitch, HEAL_SLOT_W, HEAL_SLOT_H, HEAL_SLOT_W / 2, labelY + lineH / 2 - 1, label,
+            armed ? colorTable[31744] : -1);
+    } else {
+        int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
+        text_to_buf(base + pitch * labelY + labelX, (char*)label, pitch, pitch,
+            armed ? colorTable[31744] : colorTable[32747]);
+    }
 
     char countText[8];
     snprintf(countText, sizeof(countText), "%d", count);
@@ -1466,9 +1475,15 @@ void intface_update_heal_slot(Object* item, int count, bool armed)
     // the colours the rest of the bar already uses for those three meanings.
     const char* label = (pad & 1) ? "RB" : "T"; // the grenade since the LB/RB swap (2026-10-17)
     int labelY = 4 + iconH;
-    int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
-    text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch,
-        armed ? colorTable[31744] : colorTable[32747]);
+    if ((pad & 1) != 0) {
+        // As the LB slot: the bar badges' pill, its label red while armed.
+        pad_badge_pill(base, slot.pitch, HEAL_SLOT_W, HEAL_SLOT_H, HEAL_SLOT_W / 2, labelY + lineH / 2 - 1, label,
+            armed ? colorTable[31744] : -1);
+    } else {
+        int labelX = (HEAL_SLOT_W - text_width((char*)label)) / 2;
+        text_to_buf(base + slot.pitch * labelY + labelX, (char*)label, slot.pitch, slot.pitch,
+            armed ? colorTable[31744] : colorTable[32747]);
+    }
 
     char countText[8];
     snprintf(countText, sizeof(countText), "%d", count);
@@ -1481,6 +1496,270 @@ void intface_update_heal_slot(Object* item, int count, bool armed)
 
     Rect rect = { slot.x, slot.y, slot.x + HEAL_SLOT_W - 1, slot.y + HEAL_SLOT_H - 1 };
     win_draw_rect(slot.window, &rect);
+}
+
+// --- PAD BUTTONS ON THE BAR -------------------------------------------------
+//
+// With a pad in, the bar names the buttons that work it (from Fallout 2 Realtime 2026-11-03, his „jak lépe
+// vylepšit UI, aby hráč věděl, co kdy jak kde mačkat“ and his picks on the mockups: a dark disc with the
+// letter in the gold of "AP 3" and "PUNCH", Y and LS ON their red buttons, View and Menu to the RIGHT of INV
+// and the options wheel, clear of the message screen). Y swaps hands (held: weapons), LS opens the skills,
+// View the inventory, Menu the pause, the D-pad Map / Character / Pip-Boy, RT fires and X reloads an empty
+// magazine. Without a pad the bar is vanilla's.
+//
+// Y and LS go into COPIES of their buttons' pictures, so a press or a disable redraws them with the badge;
+// the others go onto parts of the bar art nothing repaints, and what was under them is kept to put back.
+
+#define PAD_BADGE_R 7
+#define PAD_BADGE_STATIC 5
+
+static const char* pad_badge_glyph(char ch)
+{
+    switch (ch) {
+    case 'Y':
+        return "10001100010101000100001000010000100";
+    case 'L':
+        return "10000100001000010000100001000011111";
+    case 'S':
+        return "01111100001000001110000010000111110";
+    case 'B':
+        return "11110100011000111110100011000111110";
+    case 'R':
+        return "11110100011000111110101001001010001";
+    case 'T':
+        return "11111001000010000100001000010000100";
+    case 'X':
+        return "10001100010101000100010101000110001";
+    }
+    return NULL;
+}
+
+// Every letter and icon in the gold of the weapon slot's "AP 3" and "PUNCH" (palette 60), on the Deck and
+// a PC alike -- his pick over light letters and the Xbox colours ("Zkus použít tu žlutou jak má AP3", the
+// dark disc kept).
+static int pad_badge_gold()
+{
+    return colorTable[(23 << 10) | (19 << 5) | 5]; // 184,156,40
+}
+
+// A palette index for a 0-255 grey, never 0 (the transparent index of a button picture).
+static int pad_badge_grey(int v)
+{
+    int c = v >> 3;
+    int index = colorTable[(c << 10) | (c << 5) | c];
+    return index != 0 ? index : colorTable[(2 << 10) | (2 << 5) | 2];
+}
+
+static void pad_badge_put(unsigned char* buf, int pitch, int w, int h, int x, int y, int color)
+{
+    if (x >= 0 && y >= 0 && x < w && y < h) {
+        buf[y * pitch + x] = (unsigned char)color;
+    }
+}
+
+static void pad_badge_disc(unsigned char* buf, int pitch, int w, int h, int cx, int cy, int r)
+{
+    int fill = pad_badge_grey(44);
+    int edge = pad_badge_grey(12);
+    for (int y = -r - 1; y <= r + 1; y++) {
+        for (int x = -r - 1; x <= r + 1; x++) {
+            float d = sqrtf((float)(x * x + y * y));
+            if (d <= r - 0.5f) {
+                pad_badge_put(buf, pitch, w, h, cx + x, cy + y, fill);
+            } else if (d <= r + 0.6f) {
+                pad_badge_put(buf, pitch, w, h, cx + x, cy + y, edge);
+            }
+        }
+    }
+}
+
+static void pad_badge_text(unsigned char* buf, int pitch, int w, int h, const char* text, int cx, int cy, int color = -1)
+{
+    int light = color != -1 ? color : pad_badge_gold();
+    int width = (int)strlen(text) * 6 - 1;
+    int x0 = cx - width / 2;
+    int y0 = cy - 3;
+    for (const char* p = text; *p != '\0'; p++, x0 += 6) {
+        const char* g = pad_badge_glyph(*p);
+        for (int i = 0; g != NULL && i < 35; i++) {
+            if (g[i] == '1') {
+                pad_badge_put(buf, pitch, w, h, x0 + i % 5, y0 + i / 5, light);
+            }
+        }
+    }
+}
+
+// A face button (Y, X): the dark disc, its letter gold.
+static void pad_badge_face(unsigned char* buf, int pitch, int w, int h, int cx, int cy, char key)
+{
+    pad_badge_disc(buf, pitch, w, h, cx, cy, PAD_BADGE_R);
+    char text[2] = { key, '\0' };
+    pad_badge_text(buf, pitch, w, h, text, cx, cy);
+}
+
+// A shoulder or a trigger (LB, RB, RT): a dark pill, its label gold -- or `color` (an armed slot's red).
+static void pad_badge_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text, int color)
+{
+    int fill = pad_badge_grey(44);
+    int edge = pad_badge_grey(12);
+    int pillW = (int)strlen(text) * 6 + 5;
+    int pillH = 11;
+    int x0 = cx - pillW / 2;
+    int y0 = cy - pillH / 2;
+    for (int y = 0; y < pillH; y++) {
+        for (int x = 0; x < pillW; x++) {
+            bool cornerX = x < 2 || x >= pillW - 2;
+            bool cornerY = y < 2 || y >= pillH - 2;
+            bool outer = (x == 0 || x == pillW - 1) && (y == 0 || y == pillH - 1);
+            if (outer || (cornerX && cornerY && (x == 0 || x == pillW - 1 || y == 0 || y == pillH - 1))) {
+                continue; // rounded corners
+            }
+            bool border = x == 0 || y == 0 || x == pillW - 1 || y == pillH - 1 || (cornerX && cornerY);
+            pad_badge_put(buf, pitch, w, h, x0 + x, y0 + y, border ? edge : fill);
+        }
+    }
+    pad_badge_text(buf, pitch, w, h, text, cx, cy, color);
+}
+
+// For the character sheet's folder tabs (editor.cc).
+void intface_pad_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text)
+{
+    pad_badge_pill(buf, pitch, w, h, cx, cy, text, -1);
+}
+
+// The static ones: 0 View (inventory), 1 Menu (pause), 2-4 the D-pad left / down / up.
+static void pad_badge_icon(unsigned char* buf, int pitch, int w, int h, int kind, int cx, int cy)
+{
+    pad_badge_disc(buf, pitch, w, h, cx, cy, PAD_BADGE_R);
+    int light = pad_badge_gold();
+    int dim = pad_badge_grey(110);
+    if (kind == 0) {
+        for (int i = 0; i < 5; i++) {
+            pad_badge_put(buf, pitch, w, h, cx - 3 + i, cy - 3, light);
+            pad_badge_put(buf, pitch, w, h, cx - 3 + i, cy + 1, light);
+            pad_badge_put(buf, pitch, w, h, cx - 3, cy - 3 + i, light);
+            pad_badge_put(buf, pitch, w, h, cx + 1, cy - 3 + i, light);
+            pad_badge_put(buf, pitch, w, h, cx - 1 + i, cy + 3, light);
+            pad_badge_put(buf, pitch, w, h, cx + 3, cy - 1 + i, light);
+        }
+    } else if (kind == 1) {
+        for (int i = -3; i <= 3; i++) {
+            pad_badge_put(buf, pitch, w, h, cx + i, cy - 3, light);
+            pad_badge_put(buf, pitch, w, h, cx + i, cy, light);
+            pad_badge_put(buf, pitch, w, h, cx + i, cy + 3, light);
+        }
+    } else {
+        static const int arms[4][2] = { { -1, 0 }, { 0, 1 }, { 0, -1 }, { 1, 0 } }; // left, down, up, right
+        pad_badge_put(buf, pitch, w, h, cx, cy, dim);
+        for (int a = 0; a < 4; a++) {
+            int color = a == kind - 2 ? light : dim;
+            for (int t = 1; t <= 4; t++) {
+                for (int s = -1; s <= 1; s++) {
+                    int dx = arms[a][0];
+                    int dy = arms[a][1];
+                    pad_badge_put(buf, pitch, w, h, cx + dx * t + (dy != 0 ? s : 0), cy + dy * t + (dx != 0 ? s : 0), color);
+                }
+            }
+        }
+    }
+}
+
+// F1's buttons sit one row lower than F2's, so these do too.
+static const int pad_badge_static_at[PAD_BADGE_STATIC][2] = { { 253, 51 }, { 253, 79 }, { 517, 49 }, { 517, 68 }, { 517, 87 } };
+#define PAD_BADGE_SIZE (PAD_BADGE_R * 2 + 3)
+static unsigned char pad_badge_under[PAD_BADGE_STATIC][PAD_BADGE_SIZE * PAD_BADGE_SIZE];
+static unsigned char pad_badge_hands[2][22 * 21];
+static unsigned char pad_badge_skilldex[2][22 * 21];
+static int pad_badge_window = -1; // the bar they were painted on
+static bool pad_badge_shown = false;
+static int pad_badge_slot_state = -1; // the weapon slot's: 1 a pad, 2 the magazine empty
+
+// The weapon in the active hand takes ammo and has none loaded: X (reload) shows in the slot. Read from the
+// hand itself: this runs every frame, and the slot's own cached item may be the "no item" (Object*)-1 or
+// one a script has just destroyed.
+static bool pad_badge_slot_empty()
+{
+    if (obj_dude == NULL) {
+        return false;
+    }
+    Object* item = itemCurrentItem == HAND_LEFT ? inven_left_hand(obj_dude) : inven_right_hand(obj_dude);
+    return item != NULL && item_get_type(item) == ITEM_TYPE_WEAPON && item_w_max_ammo(item) > 0
+        && item_w_curr_ammo(item) == 0;
+}
+
+// Called by intface_redraw_items on the slot's two pictures: RT top left, X beside it when empty.
+static void pad_badge_slot_paint(unsigned char* picture)
+{
+    if (gamepad_ui_get_controller() == NULL) {
+        return;
+    }
+    pad_badge_pill(picture, 188, 188, 67, 14, 9, "RT", -1);
+    if (pad_badge_slot_empty()) {
+        pad_badge_face(picture, 188, 188, 67, 34, 9, 'X');
+    }
+}
+
+// Once a frame from gamepad_ui_tick: on when a pad is in, off when it is not.
+void intface_update_pad_badges()
+{
+    if (interfaceWindow == -1 || interfaceBuffer == NULL) {
+        return;
+    }
+    if (pad_badge_window != interfaceWindow) {
+        // A new bar: nothing of ours is on it.
+        pad_badge_window = interfaceWindow;
+        pad_badge_shown = false;
+    }
+
+    bool want = gamepad_ui_get_controller() != NULL;
+
+    // The weapon slot draws its own RT and X (intface_redraw_items): repaint it when the pad comes or goes,
+    // or the magazine runs empty or is filled. Not under a disabled bar: the repaint turns the button back
+    // on, and a script's scene wants it off. The state stays different, so it comes when the bar does.
+    int slotState = (want ? 1 : 0) | (pad_badge_slot_empty() ? 2 : 0);
+    if (slotState != pad_badge_slot_state && intfaceEnabled) {
+        pad_badge_slot_state = slotState;
+        intface_redraw_items();
+    }
+
+    if (want == pad_badge_shown) {
+        return;
+    }
+    pad_badge_shown = want;
+
+    unsigned char* bar = interfaceBuffer;
+    int pitch = INTERFACE_BAR_WIDTH;
+    int half = PAD_BADGE_SIZE / 2;
+    for (int i = 0; i < PAD_BADGE_STATIC; i++) {
+        int x = pad_badge_static_at[i][0] - half;
+        int y = pad_badge_static_at[i][1] - half;
+        unsigned char* at = bar + y * pitch + x;
+        if (want) {
+            buf_to_buf(at, PAD_BADGE_SIZE, PAD_BADGE_SIZE, pitch, pad_badge_under[i], PAD_BADGE_SIZE);
+            pad_badge_icon(at, pitch, PAD_BADGE_SIZE, PAD_BADGE_SIZE, i, half, half);
+        } else {
+            buf_to_buf(pad_badge_under[i], PAD_BADGE_SIZE, PAD_BADGE_SIZE, PAD_BADGE_SIZE, at, pitch);
+        }
+    }
+
+    if (want) {
+        memcpy(pad_badge_hands[0], toggleButtonUp, sizeof(pad_badge_hands[0]));
+        memcpy(pad_badge_hands[1], toggleButtonDown, sizeof(pad_badge_hands[1]));
+        memcpy(pad_badge_skilldex[0], skilldexButtonUp, sizeof(pad_badge_skilldex[0]));
+        memcpy(pad_badge_skilldex[1], skilldexButtonDown, sizeof(pad_badge_skilldex[1]));
+        for (int i = 0; i < 2; i++) {
+            pad_badge_face(pad_badge_hands[i], 22, 22, 21, 11, 10, 'Y');
+            pad_badge_disc(pad_badge_skilldex[i], 22, 22, 21, 11, 10, PAD_BADGE_R + 1);
+            pad_badge_text(pad_badge_skilldex[i], 22, 22, 21, "LS", 11, 10);
+        }
+        win_register_button_image(toggleButton, pad_badge_hands[0], pad_badge_hands[1], NULL, true);
+        win_register_button_image(skilldexButton, pad_badge_skilldex[0], pad_badge_skilldex[1], NULL, true);
+    } else {
+        win_register_button_image(toggleButton, toggleButtonUp, toggleButtonDown, NULL, true);
+        win_register_button_image(skilldexButton, skilldexButtonUp, skilldexButtonDown, NULL, true);
+    }
+
+    win_draw(interfaceWindow);
 }
 
 // --- AIMED-SHOT PART, IN THE WEAPON SLOT -----------------------------------
@@ -3527,6 +3806,12 @@ static int intface_redraw_items()
                 dark_trans_buf_to_buf(label, labelW, WORN_H, labelW, itemButtonDown, labelX + 1, labelY - 2, 188, 59641);
             }
         }
+    }
+
+    // With a pad: RT, and X while the magazine is empty (intface_update_pad_badges).
+    if (itemState->isDisabled == 0) {
+        pad_badge_slot_paint(itemButtonUp);
+        pad_badge_slot_paint(itemButtonDown);
     }
 
     if (!insideInit) {

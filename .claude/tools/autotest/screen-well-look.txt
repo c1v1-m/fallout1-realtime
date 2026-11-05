@@ -1,0 +1,9 @@
+# One of F1's 2 scripted things with a dead hand: the Shady Sands well (sswell) offers LOOK first.
+name screen-well-look
+map SHADYE.MAP
+seed 1
+duration 7
+dude tile 18290 rot 0
+note 5000 end
+
+expect ip-show\] pid=33554815 kind=7 idx=0 of=2

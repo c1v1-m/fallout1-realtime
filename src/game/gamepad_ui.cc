@@ -438,6 +438,15 @@ void gamepad_ui_set_no_session(bool active)
     gpui_no_session = active;
 }
 
+// The dude dead or out (from Fallout 2 Realtime 2026-11-03). His death animation still plays in the main
+// loop and the death scene follows it, so nothing the pad opens or uses may act on that game any more -- the
+// pause menu's save and load, START-hold's quick save, the inventory, a stimpak: „šlo savovat nebo loadovat
+// při death screen, což může způsobit potíže“. The same flags the main loop ends the game on.
+static bool gpui_dude_down()
+{
+    return obj_dude != NULL && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0;
+}
+
 void gamepad_ui_set_suppress_snap(bool active)
 {
     gpui_suppress_snap = active;
@@ -1699,7 +1708,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // hold that opened the Pip-Boy is still physically down while the Pip-Boy is up; forgetting it
     // would restart the timer the moment the screen closed and immediately reopen it. Keeping
     // gpui_dpad_handled set means that direction stays spent until it is genuinely released.
-    if (in_main_menu || gpui_no_session || (!gpui_in_dpad_screen
+    if (in_main_menu || gpui_no_session || gpui_dude_down() || (!gpui_in_dpad_screen
             && (inven_any_open() || options_is_open() || gamepad_ui_menu_active()
                 || dialog_active() || !intface_is_enabled() || gpui_action_popup_active))) {
         gpui_dpad_forget();
@@ -1714,8 +1723,8 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // button still held when gameplay actually starts is not misread as a fresh press.
     // gpui_no_session covers the death scene, which is the same situation one screen later:
     // main_reset_system() has already run by then, so anything these shortcuts open would be
-    // operating on a torn-down game.
-    if (in_main_menu || gpui_no_session) {
+    // operating on a torn-down game. gpui_dude_down() is the moment before it: the death animation.
+    if (in_main_menu || gpui_no_session || gpui_dude_down()) {
         return;
     }
 
@@ -3947,9 +3956,11 @@ static void gpui_run_to_exit()
         pc_flag_off(PC_FLAG_SNEAKING);
     }
 
+    unsigned int serialBefore = anim_dude_reg_serial();
     register_begin(ANIMATION_REQUEST_RESERVED);
     register_object_run_to_tile(obj_dude, best->tile, obj_dude->elevation, -1, 0);
     int rc = register_end();
+    combat_rt_note_player_walk(serialBefore); // a script's scene that begins on the way stops it
 
     trace_event(TRACE_ACTION, "exit-nav", "tile=%d dist=%d rc=%d", best->tile, bestDist, rc);
 
@@ -4279,7 +4290,11 @@ static void gpui_qt_tick()
         return;
     }
     case GPUI_QT_DRAWING:
-        if (anim_busy(obj_dude) == 0 || elapsed_time(gpui_qt_since) > 1500) {
+        // A screen -- or a script's scene, which turns the bar off -- ends it here too, as in READY:
+        // a throw tapped a moment before must not fly under the scene.
+        if (screenUp) {
+            gpui_qt_set(GPUI_QT_RESTORE);
+        } else if (anim_busy(obj_dude) == 0 || elapsed_time(gpui_qt_since) > 1500) {
             gpui_qt_set(gpui_qt_release_seen ? GPUI_QT_THROW_REQ : GPUI_QT_READY);
         }
         return;
@@ -4295,6 +4310,10 @@ static void gpui_qt_tick()
         }
         return;
     case GPUI_QT_THROW_REQ: {
+        if (screenUp) {
+            gpui_qt_set(GPUI_QT_RESTORE);
+            return;
+        }
         Object* inHand = gpui_qt_hand_item();
         Object* target = inHand != NULL && inHand->pid == gpui_qt_pid ? combat_rt_quick_throw_target() : NULL;
         if (target == NULL) {
@@ -4314,6 +4333,13 @@ static void gpui_qt_tick()
         }
         return;
     case GPUI_QT_RESTORE: {
+        // Not under a script's scene: the swap back clears the dude's animations (the scene's own walk
+        // with them), and vanilla never animates a wield with the UI off. The wait for a free body
+        // starts again once the scene lets go.
+        if (combat_rt_script_ui_locked()) {
+            gpui_qt_since = get_time();
+            return;
+        }
         if (anim_busy(obj_dude) != 0 && elapsed_time(gpui_qt_since) < 2000) {
             return;
         }
@@ -8519,6 +8545,16 @@ static void gpui_trace_buttons(SDL_GameController* pad)
 // a controller -- a keyboard player has none.
 static void gpui_drain_requests()
 {
+    // A heal or a quick slot pressed just before a script's scene began is not carried out under it
+    // (combat_rt_script_ui_locked) -- nor after it, where it would look like the game acting by itself.
+    if (combat_rt_script_ui_locked()) {
+        gpui_heal_pending = false;
+        gpui_qs_use_pending_slot = -1;
+        // ...and a shoulder held through its start: no drug waiting for AP, no chain of jabs.
+        gpui_ap_wait_slot = -1;
+        gpui_heal_chain_end("lock");
+    }
+
     // A jab cut before its frame gives its AP back -- before any new press is judged.
     gpui_inject_tick();
     gpui_heal_chain_tick();
@@ -8791,7 +8827,10 @@ void gamepad_ui_tick()
             intface_update_quick_slot_lb(item, count, gpui_qs_drawn(GPUI_QS_LB));
         }
         intface_update_aim_part(gpui_aim_last_part);
-        gpui_drain_requests();
+        intface_update_pad_badges(); // off: no pad
+        if (!gpui_dude_down()) {
+            gpui_drain_requests();
+        }
         interact_prompt_tick();
         return;
     }
@@ -8834,14 +8873,26 @@ void gamepad_ui_tick()
     // Also a no-op unless it changed, so polling costs a compare.
     intface_update_aim_part(gpui_aim_last_part);
 
-    // The requests from the hook and the keyboard (heal, reload, exit run, called shot).
-    gpui_drain_requests();
+    // The pad's buttons named on the bar (intface_update_pad_badges); a compare unless the pad came or went.
+    intface_update_pad_badges();
 
-    gpui_skill_wheel(pad);
-    gpui_quick_wheel(pad);
-    gpui_weapon_wheel(pad);
-    gpui_aim_wheel(pad);
-    gpui_useon_arm(pad);
+    // The dude dead or out: no request, no wheel, and a wheel already up closes (gpui_dude_down).
+    bool dudeDown = gpui_dude_down();
+    if (dudeDown && radial_wheel_is_open()) {
+        radial_wheel_close();
+        gpui_wheel_owner = GPUI_WHEEL_NONE;
+    }
+
+    // The requests from the hook and the keyboard (heal, reload, exit run, called shot).
+    if (!dudeDown) {
+        gpui_drain_requests();
+
+        gpui_skill_wheel(pad);
+        gpui_quick_wheel(pad);
+        gpui_weapon_wheel(pad);
+        gpui_aim_wheel(pad);
+        gpui_useon_arm(pad);
+    }
     gpui_wheel_a_edge = false; // consumed by whichever wheel was open
 
     // PAUSE THE WORLD WHILE A WHEEL IS UP. combat_rt freezes its own clock (see combat_rt_update),
