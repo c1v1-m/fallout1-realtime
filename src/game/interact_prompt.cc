@@ -14,6 +14,7 @@
 #include "game/gconfig.h"
 #include "game/gdialog.h"
 #include "game/gmouse.h"
+#include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
 #include "game/map.h"
@@ -31,6 +32,7 @@
 #include "plib/gnw/input.h"
 #include "plib/gnw/rect.h"
 #include "plib/gnw/svga.h"
+#include "plib/gnw/text.h"
 
 namespace fallout {
 
@@ -129,6 +131,7 @@ static unsigned int ip_manual_since = 0;
 // rebuild. The #defines above stay as the compiled-in defaults.
 static int ip_range_tiles = IP_RANGE_TILES;
 static int ip_pick_range_tiles = IP_PICK_RANGE_TILES;
+static bool ip_word_on = false; // MODS "Name the action" -- see ip_place_word
 static bool ip_config_loaded = false;
 
 static void ip_load_config()
@@ -146,6 +149,10 @@ static void ip_load_config()
     value = ip_pick_range_tiles;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_INTERACT_PICK_RANGE_KEY, &value);
     ip_pick_range_tiles = value < 1 ? 1 : (value > 40 ? 40 : value);
+
+    value = 0;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROMPT_WORD_KEY, &value);
+    ip_word_on = value != 0;
 
     // Pointing is a statement of intent, so the picker must never reach LESS far than the automatic
     // proximity offer -- otherwise something the prompt lights up on its own could not be pointed at.
@@ -177,6 +184,23 @@ static int ip_up_win = -1;
 static int ip_down_win = -1;
 static int ip_win_x = -32000;
 static int ip_win_y = -32000;
+
+// THE PAD'S A ON THE ICON'S BOTTOM-RIGHT CORNER, with a pad in (from Fallout 2 Realtime 2026-11-07, „akce se
+// provádí áčkem, hodilo by se, ukázat A při akci“, his „jen 2“ of the mock-ups): the bar's own face badge -- dark
+// disc, gold letter (intface_pad_face) -- set into the corner and hanging a few pixels off it, so the icon reads
+// "press A". A window of its own like the arrows, for the same reason: what it covers -- the icon's corner, the
+// world past it -- is copied in as its background every frame (ip_under).
+#define IP_BADGE_D 15  // the disc, rim included: the bar's PAD_BADGE_R 7 each side of the centre
+#define IP_BADGE_IN 10 // how far into the icon it reaches from the right and the bottom edge
+static int ip_badge_win = -1;
+
+// ...and, on the MODS row "Name the action" (cfg prompt_action_word, default OFF -- the „jen 2“; his „dej v mods
+// ... možnost 2+4“), the WORD for what A does now beside the icon, gold with the bar's shadow: OPEN, TAKE, TALK,
+// LOOT. It follows the D-pad's pick. Without a pad the word still says what Space does; the A badge does not show.
+#define IP_WORD_GAP 4  // pixels between the icon and the word
+static int ip_word_win = -1;
+static int ip_word_w = 0;
+static int ip_word_h = 0;
 
 // Can this critter actually hold a conversation?
 //
@@ -1305,6 +1329,23 @@ static void ip_hide_arrows()
     }
 }
 
+static void ip_hide_badge()
+{
+    if (ip_badge_win != -1) {
+        win_delete(ip_badge_win);
+        ip_badge_win = -1;
+    }
+}
+
+static void ip_hide_word()
+{
+    if (ip_word_win != -1) {
+        win_delete(ip_word_win);
+        ip_word_win = -1;
+    }
+    ip_word_w = ip_word_h = 0;
+}
+
 static void ip_hide_overlay()
 {
     if (ip_win != -1) {
@@ -1312,6 +1353,8 @@ static void ip_hide_overlay()
         ip_win = -1;
     }
     ip_hide_arrows();
+    ip_hide_badge();
+    ip_hide_word();
     ip_win_x = ip_win_y = -32000;
 }
 
@@ -1479,6 +1522,163 @@ static void ip_place_arrows(int iw, int ih)
     ip_place_arrow(&ip_down_win, x, ip_win_y + ih + 1, false);
 }
 
+// What the screen shows at (x, y) under the badge and the word: the icon where it lies, the world past it.
+// -1 off both (over the bar, past the screen's edge), where nothing can be copied.
+static int ip_under(int x, int y, const Rect* world, const unsigned char* worldBuf, const unsigned char* iconBuf)
+{
+    if (iconBuf != NULL && x >= ip_win_x && y >= ip_win_y && x < ip_win_x + ip_hand_w && y < ip_win_y + ip_hand_h) {
+        return iconBuf[(y - ip_win_y) * ip_hand_w + (x - ip_win_x)];
+    }
+    if (worldBuf != NULL && x >= world->ulx && y >= world->uly && x <= world->lrx && y <= world->lry) {
+        return worldBuf[(y - world->uly) * (world->lrx - world->ulx + 1) + (x - world->ulx)];
+    }
+    return -1;
+}
+
+// Copies what lies under a w x h window at (x, y) into buf; false when some of it is off the icon and the world.
+static bool ip_copy_under(unsigned char* buf, int x, int y, int w, int h)
+{
+    Rect world;
+    const unsigned char* worldBuf = display_win != -1 && win_get_rect(display_win, &world) == 0 ? win_get_buf(display_win) : NULL;
+    const unsigned char* iconBuf = ip_win != -1 ? win_get_buf(ip_win) : NULL;
+    for (int row = 0; row < h; row++) {
+        for (int col = 0; col < w; col++) {
+            int p = ip_under(x + col, y + row, &world, worldBuf, iconBuf);
+            if (p == -1) {
+                return false;
+            }
+            if (buf != NULL) {
+                buf[row * w + col] = (unsigned char)p;
+            }
+        }
+    }
+    return true;
+}
+
+// The A badge on the icon's bottom-right corner, with a pad in. Where the part hanging off the icon would leave
+// the world (the icon down by the bar), the badge moves in until it lies on the icon alone.
+static void ip_place_badge()
+{
+    if (ip_win == -1 || gamepad_ui_get_controller() == NULL) {
+        ip_hide_badge();
+        return;
+    }
+
+    int x = ip_win_x + ip_hand_w - IP_BADGE_IN;
+    int y = ip_win_y + ip_hand_h - IP_BADGE_IN;
+    if (!ip_copy_under(NULL, x, y, IP_BADGE_D, IP_BADGE_D)) {
+        x = ip_win_x + ip_hand_w - IP_BADGE_D;
+        y = ip_win_y + ip_hand_h - IP_BADGE_D;
+    }
+
+    if (ip_badge_win == -1) {
+        ip_badge_win = win_add(x, y, IP_BADGE_D, IP_BADGE_D, colorTable[0], WINDOW_MOVE_ON_TOP);
+        if (ip_badge_win == -1) {
+            return;
+        }
+    } else {
+        // Only when it did move: a move repaints what lies under it.
+        Rect r;
+        if (win_get_rect(ip_badge_win, &r) != 0 || r.ulx != x || r.uly != y) {
+            win_move(ip_badge_win, x, y);
+        }
+    }
+
+    unsigned char* buf = win_get_buf(ip_badge_win);
+    if (buf == NULL || !ip_copy_under(buf, x, y, IP_BADGE_D, IP_BADGE_D)) {
+        ip_hide_badge();
+        return;
+    }
+    intface_pad_face(buf, IP_BADGE_D, IP_BADGE_D, IP_BADGE_D, IP_BADGE_D / 2, IP_BADGE_D / 2, 'A');
+    win_draw(ip_badge_win);
+}
+
+// The word for what A does with `kind` on `obj` -- terse, the bar's own register.
+static const char* ip_action_word(Object* obj, int kind)
+{
+    switch (kind) {
+    case IP_USE: {
+        Proto* proto = NULL;
+        if (FID_TYPE(obj->fid) == OBJ_TYPE_SCENERY && proto_ptr(obj->pid, &proto) != -1 && proto != NULL) {
+            switch (proto->scenery.type) {
+            case SCENERY_TYPE_DOOR:
+                return obj_is_open(obj) ? "CLOSE" : "OPEN";
+            case SCENERY_TYPE_LADDER_UP:
+            case SCENERY_TYPE_LADDER_DOWN:
+                return "CLIMB";
+            }
+        }
+        return "USE";
+    }
+    case IP_GET:
+        return "TAKE";
+    case IP_TALK:
+        return "TALK";
+    case IP_LOOT_CORPSE:
+        return "LOOT";
+    case IP_LOOT_CONTAINER:
+        return "OPEN";
+    case IP_LOCKPICK:
+        return "PICK LOCK";
+    case IP_LOOK:
+        return "LOOK";
+    case IP_PUSH:
+        return "PUSH";
+    }
+    return NULL;
+}
+
+// The word, right of the icon and centred on it -- left of it when the right has no room on the world.
+static void ip_place_word(Object* obj, int kind)
+{
+    const char* word = ip_word_on && ip_win != -1 ? ip_action_word(obj, kind) : NULL;
+    if (word == NULL) {
+        ip_hide_word();
+        return;
+    }
+
+    int oldFont = text_curr();
+    text_font(101);
+    int w = text_width(word) + 1; // + the shadow's column
+    int h = text_height() + 1;    // + the shadow's row
+
+    int x = ip_win_x + ip_hand_w + IP_WORD_GAP;
+    int y = ip_win_y + (ip_hand_h - (h - 1)) / 2;
+    if (!ip_copy_under(NULL, x, y, w, h)) {
+        x = ip_win_x - IP_WORD_GAP - w;
+        if (!ip_copy_under(NULL, x, y, w, h)) {
+            ip_hide_word();
+            text_font(oldFont);
+            return;
+        }
+    }
+
+    if (ip_word_win != -1 && (w != ip_word_w || h != ip_word_h)) {
+        ip_hide_word(); // another word: another size
+    }
+    if (ip_word_win == -1) {
+        ip_word_win = win_add(x, y, w, h, colorTable[0], WINDOW_MOVE_ON_TOP);
+        if (ip_word_win == -1) {
+            text_font(oldFont);
+            return;
+        }
+        ip_word_w = w;
+        ip_word_h = h;
+    } else {
+        Rect r;
+        if (win_get_rect(ip_word_win, &r) != 0 || r.ulx != x || r.uly != y) {
+            win_move(ip_word_win, x, y);
+        }
+    }
+
+    unsigned char* buf = win_get_buf(ip_word_win);
+    if (buf != NULL && ip_copy_under(buf, x, y, w, h)) {
+        text_to_buf(buf, word, w, w, colorTable[(23 << 10) | (19 << 5) | 5] | FONT_SHADOW);
+        win_draw(ip_word_win);
+    }
+    text_font(oldFont);
+}
+
 // Float the icon for `kind` just to the RIGHT of the object (vertically centered), tracking it.
 static void ip_show_overlay(Object* obj, int kind)
 {
@@ -1530,7 +1730,9 @@ static void ip_show_overlay(Object* obj, int kind)
         ip_icon_num = iconNum;
         ip_hand_w = iw;
         ip_hand_h = ih;
-        ip_win = win_add(x, y, iw, ih, colorTable[0], WINDOW_MOVE_ON_TOP | WINDOW_TRANSPARENT);
+        // WINDOW_DONT_MOVE_TOP: a mouse click on the icon would otherwise raise it (GNW_check_buttons -> win_show)
+        // above the A badge that overlaps its corner, and the A would stay hidden until the icon is rebuilt.
+        ip_win = win_add(x, y, iw, ih, colorTable[0], WINDOW_MOVE_ON_TOP | WINDOW_TRANSPARENT | WINDOW_DONT_MOVE_TOP);
         if (ip_win == -1) {
             return;
         }
@@ -1545,6 +1747,8 @@ static void ip_show_overlay(Object* obj, int kind)
     }
 
     ip_place_arrows(iw, ih);
+    ip_place_badge();
+    ip_place_word(obj, kind);
 }
 
 void interact_prompt_tick()
@@ -1926,6 +2130,18 @@ void interact_prompt_reset()
     ip_pending_kind = IP_NONE;
     ip_actions_count = 0;
     ip_action_index = 0;
+}
+
+bool interact_prompt_get_action_word()
+{
+    ip_load_config();
+    return ip_word_on;
+}
+
+void interact_prompt_set_action_word(bool on)
+{
+    ip_load_config();
+    ip_word_on = on;
 }
 
 } // namespace fallout

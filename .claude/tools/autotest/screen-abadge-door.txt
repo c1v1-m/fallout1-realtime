@@ -1,0 +1,17 @@
+# The pad's A on the action icon (from Fallout 2 Realtime 2026-11-07): MBENT's security door, the guard cleared away,
+# the dude a few tiles off. The A sits on the icon's bottom-right corner. With `prompt_action_word=1` under
+# [preferences] in the run folder's fallout.cfg (MODS "Name the action") the word OPEN stands right of the icon.
+name screen-abadge-door
+map MBENT.MAP
+mapscript on
+seed 1
+duration 6
+cleararea 12
+dude tile 21473 rot 5
+dude hp 3000
+
+ipdump 1.5
+shot 2500
+note 4000 end
+
+expect ip-show\] pid=\d+ kind=1 idx=0

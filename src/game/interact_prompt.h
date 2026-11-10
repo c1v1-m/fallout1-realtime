@@ -79,6 +79,10 @@ void interact_prompt_reset();
 // Cheaper and less destructive than interact_prompt_reset(), which is for whole-map teardown.
 void interact_prompt_notify_object_freed(Object* obj);
 
+// MODS "Name the action" (cfg prompt_action_word): the word for what A does beside the floating icon. Live.
+bool interact_prompt_get_action_word();
+void interact_prompt_set_action_word(bool on);
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_INTERACT_PROMPT_H_ */

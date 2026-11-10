@@ -1516,6 +1516,8 @@ void intface_update_heal_slot(Object* item, int count, bool armed)
 static const char* pad_badge_glyph(char ch)
 {
     switch (ch) {
+    case 'A':
+        return "01110100011000111111100011000110001";
     case 'Y':
         return "10001100010101000100001000010000100";
     case 'L':
@@ -1625,6 +1627,12 @@ static void pad_badge_pill(unsigned char* buf, int pitch, int w, int h, int cx, 
 void intface_pad_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text)
 {
     pad_badge_pill(buf, pitch, w, h, cx, cy, text, -1);
+}
+
+// For the A on the floating action icon (interact_prompt.cc): the same disc and gold letter as the bar's.
+void intface_pad_face(unsigned char* buf, int pitch, int w, int h, int cx, int cy, char key)
+{
+    pad_badge_face(buf, pitch, w, h, cx, cy, key);
 }
 
 // The static ones: 0 View (inventory), 1 Menu (pause), 2-4 the D-pad left / down / up.

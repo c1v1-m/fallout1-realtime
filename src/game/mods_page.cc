@@ -14,6 +14,7 @@
 #include "game/gconfig.h"
 #include "game/gmouse.h"
 #include "game/gsound.h"
+#include "game/interact_prompt.h"
 #include "game/intface.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
@@ -85,6 +86,7 @@ enum {
     MODS_CROWD_ROOM,
     MODS_TACTICAL_AI,
     MODS_PROJECTILES,
+    MODS_PROMPT_WORD,
     MODS_SCREEN_RES,
     MODS_INTERNAL_RES,
     MODS_COUNT,
@@ -382,6 +384,19 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         2,
     },
     {
+        "Name the action",
+        { "Off", "On" },
+        {
+            "The action icon shows the pad's A on its corner.",
+            "A word beside the action icon says what A does: OPEN, TAKE,",
+        },
+        {
+            NULL,
+            "TALK, LOOT. It changes as the D-pad picks another action.",
+        },
+        2,
+    },
+    {
         "Screen resolution",
         { "1280x720", "1920x1080", "2560x1440", "Desktop" },
         {
@@ -451,6 +466,7 @@ static_assert(mods_label_is(MODS_FORGIVE_STRAY, "Stray hits on allies"), "MODS r
 static_assert(mods_label_is(MODS_CROWD_ROOM, "Crowds make room"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_TACTICAL_AI, "Tactical AI"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_PROJECTILES, "Projectiles"), "MODS row order drifted");
+static_assert(mods_label_is(MODS_PROMPT_WORD, "Name the action"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCREEN_RES, "Screen resolution"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_INTERNAL_RES, "Internal resolution"), "MODS row order drifted");
 
@@ -702,6 +718,7 @@ static void mods_load()
     mods_value[MODS_CROWD_ROOM] = combat_rt_get_crowd_make_room() ? 1 : 0;
     mods_value[MODS_TACTICAL_AI] = combat_rt_get_tactical_ai() ? 1 : 0;
     mods_value[MODS_PROJECTILES] = combat_rt_get_projectiles() ? 1 : 0;
+    mods_value[MODS_PROMPT_WORD] = interact_prompt_get_action_word() ? 1 : 0;
 
     {
         // The OUTPUT the file asks for, matched against the sizes the row offers; anything else
@@ -940,6 +957,14 @@ static void mods_apply(int index)
         bool v = mods_value[index] != 0;
         combat_rt_set_projectiles(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROJECTILES_KEY, v ? 1 : 0);
+        break;
+    }
+    case MODS_PROMPT_WORD: {
+        // DEFAULT OFF -- his „jen 2“ (only the A on the icon), with the word as this switch („dej v mods ...
+        // možnost 2+4“, Fallout 2 Realtime 2026-11-07). Live: the next tick draws or drops the word.
+        bool v = mods_value[index] != 0;
+        interact_prompt_set_action_word(v);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROMPT_WORD_KEY, v ? 1 : 0);
         break;
     }
     case MODS_HIT_STAGGER: {

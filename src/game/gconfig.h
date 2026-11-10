@@ -277,6 +277,9 @@ namespace fallout {
 // proximity offer. Pointing states intent, so it may reach further -- but bounded, and everything
 // it offers must also be on screen.
 #define GAME_CONFIG_INTERACT_PICK_RANGE_KEY "interact_pick_range"
+// MODS "Name the action" (default 0): the word for what A does -- OPEN, TAKE, TALK -- beside the floating
+// action icon. The pad's A on the icon's corner shows either way.
+#define GAME_CONFIG_PROMPT_WORD_KEY "prompt_action_word"
 // R3 auto-lock reach: range (tiles) = max(PERCEPTION * lock_range_pe_scale, lock_range_min). Same
 // shape as the NPC aggro radius. Raise the scale if a low-Perception character with a long gun ends
 // up unable to lock anything he can shoot.
