@@ -5649,7 +5649,7 @@ static Object* barter_slot_item(int listId, int row)
 enum BarterAmount {
     BARTER_AMOUNT_ONE, // A
     BARTER_AMOUNT_ALL, // LT + A
-    BARTER_AMOUNT_PICK, // LT + A held -- the quantity picker
+    BARTER_AMOUNT_PICK, // RT -- the quantity picker
 };
 
 // Put the cursor back on the nearest occupied slot after an item has moved lists, so repeated
@@ -5892,7 +5892,15 @@ static void barter_draw_deal()
         // walked the flat left-to-right list of every occupied slot; they now step COLUMN (empty
         // ones skipped) and the D-pad steps ITEM within one column. Wording and binding change
         // together -- a legend promising a jump the buttons do not make is worse than none.
-        const char* legend = "LB/RB column   D-pad item   A move   LT+A some   X even   Y offer   B exit";
+        //
+        // ⚠️ "LT+A all stack" IS HIS WORDING (2026-11-08: "ne some ale all", then "all stack"). LT+A moves
+        // the whole stack (BARTER_AMOUNT_ALL); asking how many is RT's picker. MEASURED in font 101, where
+        // a space costs 5 px, against the 468 px this is drawn into: the old line was 470 and had been
+        // losing the last "t" of "exit"; "all stack" with the old three-space gaps is 493 and would lose
+        // " exit" whole; with two-space gaps it is 463 and fits. "RT amount" does not fit on this line at
+        // any gap (536 px, and still 501 with single spaces), so RT stays off it. The Czech pack's
+        // font1.aaf (text\czech) has the same widths for these letters.
+        const char* legend = "LB/RB column  D-pad item  A move  LT+A all stack  X even  Y offer  B exit";
         int lw = text_width(legend);
         int lx = legX + (legW - lw) / 2;
         if (lx < legX) {
@@ -6125,6 +6133,10 @@ static int barter_gamepad_input()
     static bool prevBack = false;
     static bool prevUp = false;
     static bool prevDown = false;
+    // The A press in progress: when it went down, and whether it has already acted (see HOLD A TO LOOK
+    // below), so that its release moves nothing.
+    static unsigned int barterADownTime = 0;
+    static bool barterAHandled = false;
 
     SDL_GameController* pad = gamepad_ui_get_controller();
     if (pad == NULL) {
@@ -6190,6 +6202,31 @@ static int barter_gamepad_input()
     } else if (elapsed_time(navAt) >= BARTER_NAV_REPEAT_MS) {
         navAt = get_time();
         navRepeat = true;
+    }
+
+    // ⚠️ A NESTED MODAL JUST RAN ITS OWN INPUT LOOP -- above all RT's amount picker, which closes on the
+    // PRESS of its A or B. That button is still down when this loop reads the pad again, and against
+    // prevA / prevB from before the picker opened it was a fresh press: B went on to leave the whole
+    // trade, and A's release moved one more item (held past BARTER_LOOK_HOLD_MS, it described one
+    // instead). The picker bumps the input epoch on its way out (MtPadOwner), as dialog boxes do; adopt
+    // the live state then and act on nothing this frame, as the load/save list does. The A still down
+    // is the picker's, so its release is spent.
+    static unsigned int seenEpoch = 0;
+    unsigned int epoch = gamepad_ui_input_epoch();
+    if (epoch != seenEpoch) {
+        seenEpoch = epoch;
+        prevLB = colLeftNow;
+        prevRB = colRightNow;
+        prevRT = rtNow;
+        prevA = aNow;
+        prevX = xNow;
+        prevY = yNow;
+        prevB = bNow;
+        prevBack = backNow;
+        prevUp = upNow;
+        prevDown = downNow;
+        barterAHandled = true;
+        return -1;
     }
 
     bool lbEdge = (colLeftNow && !prevLB) || (navRepeat && navNow == 3);
@@ -6264,8 +6301,6 @@ static int barter_gamepad_input()
             mouseX - winRect.ulx, mouseY - winRect.uly);
     }
 
-    static unsigned int barterADownTime = 0;
-    static bool barterAHandled = false;
     if (aEdge) {
         barterADownTime = get_time();
         barterAHandled = false;

@@ -10,8 +10,11 @@
 #   bash install-steamdeck.sh uninstall              put Steam's launcher back, remove our files
 #   bash install-steamdeck.sh install --target DIR   a Fallout folder that was not found by itself
 #
-# fallout1-realtime.exe and aimmask.dat must sit next to this script. fallout.cfg and saved games
-# are never touched. Steam's "Verify integrity of game files" also restores the original launcher.
+# fallout1-realtime.exe and aimmask.dat must sit next to this script. BEFORE anything is written,
+# fallout.cfg, f1_res.ini and the saved games are copied into Fallout1-Realtime-backup/<date time>/:
+# the game writes them while you play, and they are the same files the original game uses. The
+# backups stay on uninstall. Steam's "Verify integrity of game files" also restores the original
+# launcher.
 
 set -u
 
@@ -86,13 +89,37 @@ find_fallout() {
     return 1
 }
 
+# The saved games: <master_patches>/SAVEGAME, master_patches from fallout.cfg's [system] section
+# ("data" when it is not there), relative to the game folder; every part matched whatever its case.
+savegame_dir() {
+    local target="$1" cfg patches dir part found
+    cfg="$(ci_find "$target" fallout.cfg f)"
+    patches=""
+    if [ -n "$cfg" ]; then
+        patches="$(tr -d '\r' < "$cfg" | awk -F= '
+            /^[[:space:]]*\[/ { insys = (tolower($0) ~ /^[[:space:]]*\[system\]/) ; next }
+            insys && tolower($1) ~ /^[[:space:]]*master_patches[[:space:]]*$/ { v = $2; sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v); print v }' | tail -n 1)"
+    fi
+    [ -n "$patches" ] || patches="data"
+    case "$patches" in
+        *:*) return 1 ;; # a Windows drive path: not something to follow from here
+    esac
+    dir="$target"
+    for part in $(echo "$patches/SAVEGAME" | tr '\\' '/' | tr '/' ' '); do
+        found="$(ci_find "$dir" "$part" d)"
+        [ -n "$found" ] || return 1
+        dir="$found"
+    done
+    echo "$dir"
+}
+
 ACTION="install"
 TARGET=""
 while [ $# -gt 0 ]; do
     case "$1" in
         install|uninstall) ACTION="$1" ;;
         --target) TARGET="${2:-}"; shift ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
         *) fail "unknown argument: $1 (try --help)" ;;
     esac
     shift
@@ -123,6 +150,32 @@ fi
 if [ "$ACTION" = "install" ]; then
     [ -f "$GAME_EXE" ] && [ -f "$AIMMASK" ] || fail "fallout1-realtime.exe and aimmask.dat must be in the same folder as this script ($HERE)."
     echo "Installing into $TARGET"
+
+    # First, before a single file of the game is touched: a backup that fails stops everything
+    # (Fallout 2 Realtime's, here since 2026-11-08; installer/setup.cc says why).
+    CFG="$(ci_find "$TARGET" fallout.cfg f)"
+    RES="$(ci_find "$TARGET" f1_res.ini f)"
+    SAVES="$(savegame_dir "$TARGET" || true)"
+    BACKUP_DIR=""
+    if [ -n "$CFG" ] || [ -n "$RES" ] || [ -n "$SAVES" ]; then
+        BACKUP_DIR="Fallout1-Realtime-backup/$(date '+%Y-%m-%d_%H%M%S')"
+        mkdir -p "$TARGET/$BACKUP_DIR" || fail "could not create the backup folder $BACKUP_DIR. Nothing was installed."
+        if [ -n "$CFG" ]; then
+            cp -p "$CFG" "$TARGET/$BACKUP_DIR/fallout.cfg" || fail "could not back up fallout.cfg. Nothing was installed."
+            echo "  Backed up fallout.cfg."
+        fi
+        if [ -n "$RES" ]; then
+            cp -p "$RES" "$TARGET/$BACKUP_DIR/f1_res.ini" || fail "could not back up f1_res.ini. Nothing was installed."
+            echo "  Backed up f1_res.ini."
+        fi
+        if [ -n "$SAVES" ]; then
+            cp -rp "$SAVES" "$TARGET/$BACKUP_DIR/SAVEGAME" || fail "could not back up the saved games. Nothing was installed."
+            echo "  Backed up the saved games: $(find "$TARGET/$BACKUP_DIR/SAVEGAME" -type f | wc -l | tr -d ' ') files, $(du -sh "$TARGET/$BACKUP_DIR/SAVEGAME" | cut -f1)."
+        fi
+        echo "  The backup is in $BACKUP_DIR."
+    else
+        echo "  No fallout.cfg, no f1_res.ini and no saved games yet: nothing to back up."
+    fi
 
     if [ -n "$LAUNCHER" ] || [ -n "$BACKUP" ]; then
         if [ -z "$LAUNCHER" ]; then
@@ -156,9 +209,10 @@ if [ "$ACTION" = "install" ]; then
     echo "  Installed $(basename "$DATA")/aimmask.dat."
 
     {
-        printf 'Fallout 1 Realtime\r\nversion=%s\r\nmode=%s\r\ninstalled=%s\r\n\r\n' "$VERSION" "$MODE" "$(date '+%Y-%m-%d %H:%M')"
+        printf 'Fallout 1 Realtime\r\nversion=%s\r\nmode=%s\r\ninstalled=%s\r\nbackup=%s\r\n\r\n' "$VERSION" "$MODE" "$(date '+%Y-%m-%d %H:%M')" "$BACKUP_DIR"
         printf 'Files installed by install-steamdeck.sh:\r\n%s\r\n%s/aimmask.dat\r\nFallout1-Realtime.txt (this file)\r\n\r\n' "$FILES" "$(basename "$DATA")"
-        printf 'To uninstall: bash install-steamdeck.sh uninstall\r\nfallout.cfg and saved games are never touched.\r\n'
+        printf 'Before installing, fallout.cfg, f1_res.ini and the saved games were copied into\r\nFallout1-Realtime-backup/<date time>/ (every install and update makes a new one).\r\n'
+        printf 'To uninstall: bash install-steamdeck.sh uninstall\r\nThe backups stay where they are.\r\n'
     } > "$MANIFEST" || fail "could not write Fallout1-Realtime.txt."
 
     echo

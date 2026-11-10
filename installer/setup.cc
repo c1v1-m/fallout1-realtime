@@ -12,10 +12,16 @@
 //    OpenMW through Morrowind. The game ignores "-classic" (it only parses [section]key=value).
 //  * ANY OTHER INSTALL (GOG, CD): fallout1-realtime.exe goes next to MASTER.DAT; start it directly.
 //  * Either way data\aimmask.dat goes in, and Fallout1-Realtime.txt says what was installed.
+//  * BEFORE ANYTHING IS WRITTEN, fallout.cfg, f1_res.ini and the whole SAVEGAME folder are copied
+//    into Fallout1-Realtime-backup\<date time>\. The installer itself never changes any of them --
+//    but the game writes them while you play (every setting goes back into fallout.cfg on exit, the
+//    MODS page's two resolution rows rewrite f1_res.ini, and the quick save and the autosaves
+//    overwrite slots 1-5), and they are the same files the original game uses. A failed backup
+//    stops the install with nothing changed.
 //
-// Uninstall puts the original launcher back and removes exactly those files. fallout.cfg and saved
-// games are never touched. Steam's "Verify integrity of game files" also restores the original
-// launcher, which is the way back if the backup is ever lost.
+// Uninstall puts the original launcher back and removes exactly the files it installed; the backups
+// stay where they are. Steam's "Verify integrity of game files" also restores the original
+// launcher, which is the way back if the launcher's backup is ever lost.
 //
 // Run with no arguments for the window. For scripts and tests:
 //   Fallout1-Realtime-Setup.exe [--target <folder>] --install | --uninstall | --detect
@@ -40,6 +46,7 @@ static const wchar_t* kLauncher = L"FalloutLauncher.exe";
 static const wchar_t* kLauncherBackup = L"FalloutLauncher.original.exe";
 static const wchar_t* kPlainExe = L"fallout1-realtime.exe";
 static const wchar_t* kManifest = L"Fallout1-Realtime.txt";
+static const wchar_t* kBackupRoot = L"Fallout1-Realtime-backup";
 
 // Every build of the game carries its window title; Steam's own launcher does not. This is how a
 // FalloutLauncher.exe is recognised as ours (the development build's "(dev)" title matches too).
@@ -117,6 +124,8 @@ static void say_failure(const std::wstring& what, DWORD code)
     } else if (code == ERROR_ACCESS_DENIED) {
         say(L"  Windows refused write access to that folder. Close the game if it is running;");
         say(L"  otherwise right-click the installer and choose \"Run as administrator\".");
+    } else if (code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL) {
+        say(L"  The disk is full.");
     }
 }
 
@@ -360,6 +369,194 @@ static Target inspect(const std::wstring& dir)
     return t;
 }
 
+// --- the backup of fallout.cfg, f1_res.ini and the saved games ------------------------------------
+//
+// Fallout 2 Realtime's backup, brought here 2026-11-08 (from the list he got for „napadají tě nějaké
+// QOL a maličkosti?“): this installer said "fallout.cfg and saved games are never touched" while the
+// game overwrites slots 1-5 and the MODS page rewrites both settings files. f1_res.ini is kept too,
+// unlike Fallout 2's f2_res.ini: the Screen resolution row writes the SCR_WIDTH / SCR_HEIGHT that the
+// original game's High Resolution Patch reads from that same file.
+
+// A folder name: sortable, and down to the second so two installs in one minute do not collide.
+static std::wstring stamp_text()
+{
+    SYSTEMTIME time;
+    GetLocalTime(&time);
+    wchar_t buffer[64];
+    swprintf(buffer, 64, L"%04d-%02d-%02d_%02d%02d%02d", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
+    return buffer;
+}
+
+static std::string trim(const std::string& s)
+{
+    size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) {
+        return std::string();
+    }
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// Where the game keeps its saved games: <master_patches>\SAVEGAME, master_patches from fallout.cfg's
+// [system] section ("data" when it is not there -- the game's own default). Relative to the folder.
+static std::wstring savegame_dir(const std::wstring& dir)
+{
+    std::string patches = "data";
+    std::string cfg;
+    if (read_file(join(dir, L"fallout.cfg"), cfg)) {
+        bool inSystem = false;
+        size_t at = 0;
+        while (at < cfg.size()) {
+            size_t end = cfg.find('\n', at);
+            std::string line = trim(cfg.substr(at, end == std::string::npos ? std::string::npos : end - at));
+            at = end == std::string::npos ? cfg.size() : end + 1;
+            if (!line.empty() && line[0] == '[') {
+                inSystem = _stricmp(line.c_str(), "[system]") == 0;
+                continue;
+            }
+            if (inSystem) {
+                size_t eq = line.find('=');
+                if (eq != std::string::npos && _stricmp(trim(line.substr(0, eq)).c_str(), "master_patches") == 0) {
+                    std::string value = trim(line.substr(eq + 1));
+                    if (!value.empty()) {
+                        patches = value;
+                    }
+                }
+            }
+        }
+    }
+
+    std::wstring path = from_utf8(patches);
+    for (wchar_t& c : path) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    bool absolute = path.size() >= 2 && (path[1] == L':' || (path[0] == L'\\' && path[1] == L'\\'));
+    return join(absolute ? path : join(dir, path), L"SAVEGAME");
+}
+
+// Creates every folder along `path` that is missing.
+static bool make_dirs(const std::wstring& path, DWORD* error)
+{
+    if (is_dir(path)) {
+        return true;
+    }
+    size_t cut = path.find_last_of(L"\\/");
+    if (cut != std::wstring::npos && cut > 2) {
+        if (!make_dirs(path.substr(0, cut), error)) {
+            return false;
+        }
+    }
+    if (!CreateDirectoryW(path.c_str(), NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        *error = GetLastError();
+        return false;
+    }
+    return true;
+}
+
+// Copies `from` into `to` with everything under it. Counts what it copied.
+static bool copy_tree(const std::wstring& from, const std::wstring& to, int* files, unsigned long long* bytes, std::wstring* failedAt, DWORD* error)
+{
+    if (!make_dirs(to, error)) {
+        *failedAt = to;
+        return false;
+    }
+
+    WIN32_FIND_DATAW entry;
+    HANDLE find = FindFirstFileW(join(from, L"*").c_str(), &entry);
+    if (find == INVALID_HANDLE_VALUE) {
+        DWORD code = GetLastError();
+        if (code == ERROR_FILE_NOT_FOUND) {
+            return true; // an empty folder
+        }
+        *failedAt = from;
+        *error = code;
+        return false;
+    }
+
+    bool ok = true;
+    do {
+        std::wstring name = entry.cFileName;
+        if (name == L"." || name == L"..") {
+            continue;
+        }
+        std::wstring source = join(from, name);
+        std::wstring dest = join(to, name);
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            ok = copy_tree(source, dest, files, bytes, failedAt, error);
+        } else if (CopyFileW(source.c_str(), dest.c_str(), FALSE)) {
+            *files += 1;
+            *bytes += ((unsigned long long)entry.nFileSizeHigh << 32) | entry.nFileSizeLow;
+        } else {
+            *failedAt = source;
+            *error = GetLastError();
+            ok = false;
+        }
+    } while (ok && FindNextFileW(find, &entry));
+    FindClose(find);
+    return ok;
+}
+
+// The two settings files the game rewrites: fallout.cfg on every exit, f1_res.ini from the MODS
+// page's Screen resolution and Internal resolution rows. Both sit next to MASTER.DAT.
+static const wchar_t* const kSettingsFiles[] = { L"fallout.cfg", L"f1_res.ini" };
+
+// fallout.cfg, f1_res.ini and the saved games, copied into <folder>\Fallout1-Realtime-backup\<date time>\.
+// `where` gets the backup's path relative to the game folder ("" when there was nothing to keep).
+static bool backup_user_files(const std::wstring& dir, std::wstring* where)
+{
+    where->clear();
+
+    bool haveSettings = false;
+    for (const wchar_t* name : kSettingsFiles) {
+        haveSettings = haveSettings || is_file(join(dir, name));
+    }
+    std::wstring saves = savegame_dir(dir);
+    bool haveSaves = is_dir(saves);
+    if (!haveSettings && !haveSaves) {
+        say(L"  No fallout.cfg, no f1_res.ini and no saved games yet: nothing to back up.");
+        return true;
+    }
+
+    std::wstring relative = join(kBackupRoot, stamp_text());
+    std::wstring backup = join(dir, relative);
+    DWORD error = 0;
+    if (!make_dirs(backup, &error)) {
+        say_failure(L"creating the backup folder " + relative, error);
+        return false;
+    }
+
+    for (const wchar_t* name : kSettingsFiles) {
+        std::wstring file = join(dir, name);
+        if (!is_file(file)) {
+            continue;
+        }
+        if (!CopyFileW(file.c_str(), join(backup, name).c_str(), FALSE)) {
+            say_failure(std::wstring(L"backing up ") + name, GetLastError());
+            return false;
+        }
+        say(std::wstring(L"  Backed up ") + name + L".");
+    }
+
+    if (haveSaves) {
+        int files = 0;
+        unsigned long long bytes = 0;
+        std::wstring failedAt;
+        if (!copy_tree(saves, join(backup, L"SAVEGAME"), &files, &bytes, &failedAt, &error)) {
+            say_failure(L"backing up the saved games (" + failedAt + L")", error);
+            return false;
+        }
+        wchar_t size[64];
+        swprintf(size, 64, L"%.1f MB", bytes / (1024.0 * 1024.0));
+        say(L"  Backed up the saved games: " + std::to_wstring(files) + L" files, " + size + L".");
+    }
+
+    say(L"  The backup is in " + relative + L".");
+    *where = relative;
+    return true;
+}
+
 // --- install / uninstall --------------------------------------------------------------------------
 
 static std::wstring now_text()
@@ -390,16 +587,23 @@ static bool do_install(const std::wstring& dir)
 
     say(L"Installing Fallout 1 Realtime " + std::wstring(kVersion) + L" into " + dir);
 
+    // First, before a single file of the game is touched: a backup that fails stops everything.
+    std::wstring backup;
+    if (!backup_user_files(dir, &backup)) {
+        say(L"Nothing was installed.");
+        return false;
+    }
+
     DWORD error = 0;
     std::wstring files;
     if (t.steam) {
         std::wstring launcher = join(dir, kLauncher);
-        std::wstring backup = join(dir, kLauncherBackup);
+        std::wstring launcherBackup = join(dir, kLauncherBackup);
 
         if (is_file(launcher) && !t.launcherOurs) {
             // The launcher there now is Steam's -- possibly a fresh one after "Verify integrity",
             // so it replaces any older backup.
-            if (!CopyFileW(launcher.c_str(), backup.c_str(), FALSE)) {
+            if (!CopyFileW(launcher.c_str(), launcherBackup.c_str(), FALSE)) {
                 say_failure(L"backing up FalloutLauncher.exe", GetLastError());
                 return false;
             }
@@ -441,12 +645,19 @@ static bool do_install(const std::wstring& dir)
                         L"version=" + std::wstring(kVersion) + L"\r\n"
                         L"mode=" + std::wstring(t.steam ? L"steam" : L"plain") + L"\r\n"
                         L"installed=" + now_text() + L"\r\n"
+                        L"backup=" + backup + L"\r\n"
                         L"\r\n"
                         L"Files installed by Fallout1-Realtime-Setup.exe:\r\n" + files +
                         L"Fallout1-Realtime.txt (this file)\r\n"
                         L"\r\n"
+                        L"Before installing, fallout.cfg, f1_res.ini and the saved games were copied into\r\n"
+                        L"Fallout1-Realtime-backup\\<date time>\\ (every install and update makes a new one).\r\n"
+                        L"The game writes them while you play, and they are the same files the original game uses.\r\n"
+                        L"To get them back, copy them from there over the ones in the game folder\r\n"
+                        L"(SAVEGAME goes into the DATA folder).\r\n"
+                        L"\r\n"
                         L"To uninstall, run Fallout1-Realtime-Setup.exe again and choose Uninstall.\r\n"
-                        L"fallout.cfg and saved games are never touched.\r\n";
+                        L"The backups stay where they are.\r\n";
     std::string noteBytes = to_utf8(note);
     if (!write_file(join(dir, kManifest), noteBytes.data(), (DWORD)noteBytes.size(), &error)) {
         say_failure(L"writing Fallout1-Realtime.txt", error);
@@ -636,7 +847,7 @@ static LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wParam, LP
         add_control(window, L"STATIC", title.c_str(), 0, 16, 14, 528, 22, 0, g_bold);
         add_control(window, L"STATIC",
             L"Installs into your Fallout 1. With the Steam version, the Play button in Steam then starts "
-            L"Fallout 1 Realtime, on a PC and on a Steam Deck. Your fallout.cfg and saved games are not touched.",
+            L"Fallout 1 Realtime, on a PC and on a Steam Deck. Your fallout.cfg, f1_res.ini and saves are backed up first.",
             0, 16, 40, 528, 34, 0, g_font);
         add_control(window, L"STATIC", L"Fallout folder:", 0, 16, 84, 528, 18, 0, g_font);
         g_path = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -786,7 +997,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         say(L"folder=" + target);
         say(std::wstring(L"valid=") + (t.valid ? L"1" : L"0") + L" steam=" + (t.steam ? L"1" : L"0")
             + L" installed=" + (t.installed ? L"1" : L"0") + L" launcherOurs=" + (t.launcherOurs ? L"1" : L"0")
-            + L" backup=" + (t.haveBackup ? L"1" : L"0") + L" version=" + t.installedVersion);
+            + L" backup=" + (t.haveBackup ? L"1" : L"0") + L" version=" + t.installedVersion
+            + L" saves=" + savegame_dir(target));
         return t.valid ? 0 : 1;
     }
     bool ok = action == L"--install" ? do_install(target) : do_uninstall(target);

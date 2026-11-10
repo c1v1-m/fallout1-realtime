@@ -1,0 +1,20 @@
+# F1 quick save that cannot write (2026-11-08): the slot reports -1 and nothing claims success; the pad buzzes
+# instead (iisxxxx1 is not traced -- run it --visible with sound to hear it). Before this, SaveGameSlot answered
+# 1 for a write that failed, as vanilla's quick path does, so the new line would have lied here.
+# SETUP, in a run folder whose saves you can lose: put a FILE where the slot's folder belongs, so SAVE.DAT cannot
+# be opened for writing (PowerShell):
+#   Remove-Item -Recurse -Force <run>\data\SAVEGAME\SLOT01; New-Item -ItemType File <run>\data\SAVEGAME\SLOT01
+# and delete that file again afterwards.
+name m-quicksave-fail
+map DESERT1.MAP
+seed 1
+duration 8
+dude tile 20100 rot 2
+
+pad 2000 start 1
+pad 3000 start 0
+note 6000 not saved
+
+expect \[STATE/save-slot\] slot=1 desc=Quick Save rc=-1
+expect-not \[STATE/msg\] Quick save game successfully saved
+expect-not modal win=

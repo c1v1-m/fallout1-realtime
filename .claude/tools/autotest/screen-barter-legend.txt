@@ -1,0 +1,15 @@
+# F1 barter legend (2026-11-08): the pad's line under the trade must read "LT+A all stack" whole and end in
+# "B exit" (the old "LT+A some" line was 470 px and lost the last "t" of "exit"). The dude talks to Killian
+# (pid 16777295, JUNKKILL) and the pad's Y opens the trade; look at the last shot.
+name screen-barter-legend
+map JUNKKILL.MAP
+mapscript on
+seed 1
+duration 12
+dude tile 26283 rot 5
+
+shot 1000
+talk 1500 16777295
+shot 5500
+tap 6000 y
+shot 8500

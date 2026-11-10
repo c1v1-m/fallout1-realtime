@@ -513,10 +513,10 @@ int SaveGameSlot(int slot, const char* description)
     thumbnail_image[1] = NULL;
     int rc = QuickSnapShot();
     if (rc == 1) {
-        int saved = SaveSlot();
-        if (saved != -1) {
-            rc = saved;
-        }
+        // ⚠️ NOT VANILLA'S QUICK PATH HERE (2026-11-08). There a failed SaveSlot leaves the snapshot's 1
+        // standing, so a save that wrote nothing still "succeeds" (and F6 says so). Nobody read this
+        // answer until the quick save began to print vanilla's success line on it. 0 = written, -1 = not.
+        rc = SaveSlot();
     }
 
     if (thumbnail_image[1] != NULL) {
@@ -525,6 +525,9 @@ int SaveGameSlot(int slot, const char* description)
 
     gmouse_set_cursor(MOUSE_CURSOR_ARROW);
 
+    // The line Fallout 2 Realtime traces here. A failed save shows no message (the quick save only
+    // buzzes), so this is where a trace tells which way it went.
+    trace_event(TRACE_STATE, "save-slot", "slot=%d desc=%s rc=%d", slot + 1, description != NULL ? description : "", rc);
     return rc != -1 ? 1 : -1;
 }
 
@@ -688,10 +691,22 @@ int AutoSaveQuest()
     return SaveGameSlot(QUEST_AUTOSAVE_SLOT, "Autosave: Quest");
 }
 
-// Quick save to the dedicated quick-save slot (gamepad combo / F-key).
+// Quick save to the dedicated quick-save slot (the pad's START hold). It says how that went: F6's own
+// line on success (misc.msg 5), the error buzz when nothing was written -- as Fallout 2 Realtime does.
+// Until 2026-11-08 a hold said nothing either way (from the list he got for „napadají tě nějaké QOL a
+// maličkosti?“). Printed after the save, so the line is not in the slot's thumbnail.
 int QuickSaveGame()
 {
-    return SaveGameSlot(QUICKSAVE_SLOT, "Quick Save");
+    int rc = SaveGameSlot(QUICKSAVE_SLOT, "Quick Save");
+    if (rc == 1) {
+        MessageListItem messageListItem;
+        // Quick save game successfully saved.
+        char* msg = getmsg(&misc_message_file, &messageListItem, 5);
+        display_print(msg);
+    } else {
+        gsound_play_sfx_file("iisxxxx1");
+    }
+    return rc;
 }
 
 // 0x46D9C4

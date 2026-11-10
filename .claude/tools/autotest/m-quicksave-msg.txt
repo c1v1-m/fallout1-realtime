@@ -1,0 +1,16 @@
+# F1 quick save says it saved (2026-11-08, from Fallout 2 Realtime): START held past 450 ms writes SLOT01
+# "Quick Save" and prints F6's own line once. The release that follows must not open the pause menu.
+# ⚠️ It really saves: SLOT01 of the run folder is overwritten, so run it --exe in a folder whose saves you can lose.
+name m-quicksave-msg
+map DESERT1.MAP
+seed 1
+duration 8
+dude tile 20100 rot 2
+
+pad 2000 start 1
+pad 3000 start 0
+note 6000 saved
+
+expect \[STATE/save-slot\] slot=1 desc=Quick Save rc=0
+expect-count 1 \[STATE/msg\] Quick save game successfully saved\.
+expect-not modal win=
