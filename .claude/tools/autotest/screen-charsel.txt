@@ -1,0 +1,50 @@
+# SCREEN TEST: New Game's character selection on the pad (from Fallout 2, 2026-11-14, „dodáme to i do F1“; his layout:
+# LB / RB step the character, A TAKE, X CREATE, Y MODIFY, B BACK, each button with its badge) -- and the crash it closes:
+# in there Y swapped hands and LB / RB fired the quick slots of a game that did not exist yet („hra spadla v char selectu
+# po zmáčknutí Y“). Opened over the scenario's world (the harness has no title menu); the shots show the badges.
+# The premades: 0 Max Stone, 1 Natalia, 2 Albert.
+name screen-charsel
+map DESERT1.MAP
+seed 1
+duration 15
+dude tile 20100 rot 2
+
+# A goes down before the selector opens and is still held in it, as the A that pressed NEW GAME is: no TAKE from it
+pad 900 A 1
+open 1000 selector
+pad +700 A 0
+shot +600
+# RB twice, LB once: the character steps 0 -> 1 -> 2 -> 1
+tap +700 RB
+tap +700 RB
+tap +700 LB
+shot +600
+# Y = MODIFY: the editor opens (the crash was Y in here)
+tap +800 Y
+shot +1500
+# B leaves the editor, still held as the selector comes back: that B must not also BACK out
+tap +800 B 400
+shot +1500
+# B = BACK leaves the selector
+tap +800 B
+note +1500 the selector should be closed by now
+
+# the checks (run.js)
+expect \[FLOW/autotest\] opened screen=selector
+expect \[FLOW/charsel\] open premades=3 pad=1
+expect \[FLOW/charsel-red\] badged=1
+# the pointer: hidden for the pad on entry, and again once the editor (which puts the arrow back) has closed
+expect-count 2 \[FLOW/charsel-cursor\] hidden
+expect-not \[INPUT/charsel-pad\] button=A
+expect-count 2 \[INPUT/charsel-pad\] button=RB
+expect-count 1 \[INPUT/charsel-pad\] button=LB
+expect \[FLOW/charsel-show\] premade=2
+expect-count 3 \[FLOW/charsel-show\] premade=1
+expect-count 1 \[INPUT/charsel-pad\] button=Y
+expect \[FLOW/autotest\] modal win=\d+ at=\d+,\d+ size=640x480
+expect-count 1 \[INPUT/charsel-pad\] button=B
+expect \[FLOW/charsel\] close rc=3
+expect \[FLOW/autotest\] closed screen=selector rc=3
+expect-not \[INPUT/quick-slot
+expect-not \[INPUT/hand-swap\]
+expect \[FLOW/autotest\] end why=time

@@ -3051,6 +3051,14 @@ int intface_toggle_items(bool animated)
         return -1;
     }
 
+    // Realtime build (from Fallout 2 Realtime, 2026-11-14): a hand still holding the init sentinel (Object*)-1 -- see
+    // intface_get_current_item -- means no game has filled the hands yet, so there is nothing to swap. The pad's Y reached
+    // here from New Game's character selection and item_get_type below read the sentinel („hra spadla v char selectu po
+    // zmáčknutí Y“); the pad layer refuses that now (gpui_no_world), and this keeps the swap from ever dereferencing it.
+    if (itemButtonItems[HAND_LEFT].item == (Object*)-1 || itemButtonItems[HAND_RIGHT].item == (Object*)-1) {
+        return -1;
+    }
+
     itemCurrentItem = 1 - itemCurrentItem;
 
     if (animated) {

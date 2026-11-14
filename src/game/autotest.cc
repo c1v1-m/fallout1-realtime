@@ -34,10 +34,13 @@
 #include "game/worldmap.h"
 #include "game/object.h"
 #include "game/options.h"
+#include "game/palette.h"
 #include "game/proto.h"
+#include "game/select.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
+#include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/winmain.h"
@@ -146,6 +149,9 @@ namespace fallout {
 //                                      the menus are skipped here, so there is no pad route to it.
 //                                      Opened by the game loop: the timeline waits until the world is
 //                                      back on top, and the lines after it are timed from the open.
+//        selector                      New Game's character SELECTION (select_character), opened the same
+//                                      way, over the world; it loads the premades into the dude, so end
+//                                      the scenario soon after it closes
 //   note <ms> <text...>                a marker in the trace
 //   shot <ms>                          a screenshot (scrNNNNN.bmp beside the exe), a modal screen included
 //   talk <ms> <pid>                    the dude talks to the nearest critter of that pid wherever it stands
@@ -306,6 +312,7 @@ enum {
     AT_SCREEN_INVENTORY,
     AT_SCREEN_OPTIONS,
     AT_SCREEN_CREATION,
+    AT_SCREEN_SELECTOR,
 };
 
 // How the pad opens each screen from the world (gamepad_ui.cc: the D-pad holds, BACK / START taps).
@@ -322,6 +329,7 @@ static const struct {
     { "inventory", SDL_CONTROLLER_BUTTON_BACK, 120 },
     { "options", SDL_CONTROLLER_BUTTON_START, 120 },
     { "creation", -1, 0 },
+    { "selector", -1, 0 },
 };
 
 typedef struct AtStep {
@@ -1472,6 +1480,20 @@ static int at_open_screen(int screen)
         gamepad_ui_set_suppress_a_click(wasSuppressed);
         // The button that closed it is still down, and the world is not where creation returns to.
         gamepad_ui_bump_input_epoch();
+        break;
+    }
+    case AT_SCREEN_SELECTOR: {
+        // New Game's character selection (2026-11-14, from Fallout 2), opened over the scenario's world as main.cc opens
+        // it after the title menu, the world held still behind it as for creation: it takes the pad (self_nav), flushes
+        // the queue and bumps the epoch itself. Its exit fades the palette to black for what comes next there; here the
+        // world comes next, so it is faded back.
+        // ⚠️ It loads the premades into the dude (proto_dude_init): end the scenario soon after.
+        bool isoWasEnabled = map_disable_bk_processes();
+        rc = select_character();
+        if (isoWasEnabled) {
+            map_enable_bk_processes();
+        }
+        palette_fade_to(cmap);
         break;
     }
     }

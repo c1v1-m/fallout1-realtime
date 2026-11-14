@@ -447,6 +447,22 @@ static bool gpui_dude_down()
     return obj_dude != NULL && (obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0;
 }
 
+// NO GAME ON THE SCREEN (from Fallout 2 Realtime 2026-11-14, „hra spadla v char selectu po zmáčknutí Y“). The map window
+// is made hidden (iso_init), shown by map_init when a game starts (a new game, a load) and hidden by map_exit when it
+// ends -- so it is up exactly while there is a game, and the title menu, the opening movies, New Game's character
+// selection and the death scene all run with it hidden. The gameplay shortcuts act on that game, so with it hidden none
+// may run: in character selection (not modal, no self_nav then) LB / RB fired the quick slots and Y swapped hands on a
+// bar whose hands still held the init sentinel -- item_get_type read (Object*)-1 and the game was gone. Every pre-game
+// screen also says so itself (in_main_menu, gpui_no_session, its self_nav); this one asks nothing of the next such screen.
+static bool gpui_no_world()
+{
+    if (display_win == -1) {
+        return true;
+    }
+    Window* world = GNW_find(display_win);
+    return world == NULL || (world->flags & WINDOW_HIDDEN) != 0;
+}
+
 void gamepad_ui_set_suppress_snap(bool active)
 {
     gpui_suppress_snap = active;
@@ -1708,7 +1724,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // hold that opened the Pip-Boy is still physically down while the Pip-Boy is up; forgetting it
     // would restart the timer the moment the screen closed and immediately reopen it. Keeping
     // gpui_dpad_handled set means that direction stays spent until it is genuinely released.
-    if (in_main_menu || gpui_no_session || gpui_dude_down() || (!gpui_in_dpad_screen
+    if (in_main_menu || gpui_no_session || gpui_no_world() || gpui_dude_down() || (!gpui_in_dpad_screen
             && (inven_any_open() || options_is_open() || gamepad_ui_menu_active()
                 || dialog_active() || !intface_is_enabled() || gpui_action_popup_active))) {
         gpui_dpad_forget();
@@ -1724,7 +1740,9 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
     // gpui_no_session covers the death scene, which is the same situation one screen later:
     // main_reset_system() has already run by then, so anything these shortcuts open would be
     // operating on a torn-down game. gpui_dude_down() is the moment before it: the death animation.
-    if (in_main_menu || gpui_no_session || gpui_dude_down()) {
+    // gpui_no_world() is all of them at once, whatever screen is up (2026-11-14): New Game's character
+    // selection had none of these flags, and its Y swapped the hands of a game that did not exist yet.
+    if (in_main_menu || gpui_no_session || gpui_no_world() || gpui_dude_down()) {
         return;
     }
 
@@ -2100,6 +2118,7 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
             // Already spent -- this press opened the weapon wheel.
             gpui_consumed_y = false;
         } else if (get_time() - yDownTime < GPUI_QUICK_HOLD_MS) {
+            trace_event(TRACE_INPUT, "hand-swap", "src=y");
             intface_toggle_items(true);
         }
     }
