@@ -94,6 +94,11 @@ namespace fallout {
 // Bullets, bolts and balls FLY and a sidestep makes them miss (combat_rt.cc, rt_projectiles; his design,
 // 2026-10-18). 1 = on (his pick), 0 = vanilla: a shot hits or misses the moment it is fired.
 #define GAME_CONFIG_PROJECTILES_KEY "projectiles"
+// MODS "Blast ring" (combat_rt.cc, rt_blast_ring): a ring of red dots at a grenade's or a rocket's blast radius round
+// where a held quick throw would land, round the LT-locked target with a launcher or a grenade in the hand, and
+// round where each one in the air goes off. 1 = only with the Awareness perk (his call, 2026-11-08, the default),
+// 2 = always, 0 = nothing marks a blast, as in vanilla.
+#define GAME_CONFIG_BLAST_RING_KEY "blast_ring"
 // The body part the weapon slot's AIMED mode fires at (gamepad_ui, gpui_aim_last_part): written
 // whenever a part is bound in the called-shot window, read back at start. HIT_LOCATION_* (0-7).
 #define GAME_CONFIG_AIM_PART_KEY "aim_part"

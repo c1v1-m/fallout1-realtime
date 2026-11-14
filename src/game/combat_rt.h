@@ -140,6 +140,13 @@ void combat_rt_set_projectiles(bool enabled);
 bool combat_rt_get_projectiles();
 int combat_rt_tracers_in_air();
 void combat_rt_set_tracer_look(float lengthHexes, int r, int g, int b, bool underline);
+// MODS "Blast ring" (cfg blast_ring): a ring of red dots at the blast radius round where a held quick throw of a
+// grenade would land, round the LT-locked target with a launcher or a grenade in the hand, and round where each
+// grenade or rocket in the air goes off. 0 = off, 1 = with the Awareness perk (the default), 2 = always.
+void combat_rt_set_blast_ring(int mode);
+int combat_rt_get_blast_ring();
+// actions.cc, as a projectile's flight is launched: the tile it flies to (where its blast ring sits).
+void combat_rt_flight_launched(Object* projectile, int tile);
 bool combat_rt_weapon_amnesty();
 bool combat_rt_critter_fighting(Object* critter);
 bool combat_rt_fm_foreign_touch();

@@ -87,6 +87,7 @@ enum {
     MODS_TACTICAL_AI,
     MODS_PROJECTILES,
     MODS_PROMPT_WORD,
+    MODS_BLAST_RING,
     MODS_SCREEN_RES,
     MODS_INTERNAL_RES,
     MODS_COUNT,
@@ -397,6 +398,21 @@ static constexpr ModsOption mods_options[MODS_COUNT] = {
         2,
     },
     {
+        "Blast ring",
+        { "Off", "Awareness", "Always" },
+        {
+            "As shipped: nothing on the ground shows how far a blast reaches.",
+            "With the Awareness perk, a ring of red dots shows how far a blast",
+            "A ring of red dots shows how far a blast reaches, Awareness or not:",
+        },
+        {
+            NULL,
+            "reaches: where your held throw lands, and every grenade in the air.",
+            "where your held throw lands, and every grenade or rocket in the air.",
+        },
+        3,
+    },
+    {
         "Screen resolution",
         { "1280x720", "1920x1080", "2560x1440", "Desktop" },
         {
@@ -467,6 +483,7 @@ static_assert(mods_label_is(MODS_CROWD_ROOM, "Crowds make room"), "MODS row orde
 static_assert(mods_label_is(MODS_TACTICAL_AI, "Tactical AI"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_PROJECTILES, "Projectiles"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_PROMPT_WORD, "Name the action"), "MODS row order drifted");
+static_assert(mods_label_is(MODS_BLAST_RING, "Blast ring"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_SCREEN_RES, "Screen resolution"), "MODS row order drifted");
 static_assert(mods_label_is(MODS_INTERNAL_RES, "Internal resolution"), "MODS row order drifted");
 
@@ -719,6 +736,7 @@ static void mods_load()
     mods_value[MODS_TACTICAL_AI] = combat_rt_get_tactical_ai() ? 1 : 0;
     mods_value[MODS_PROJECTILES] = combat_rt_get_projectiles() ? 1 : 0;
     mods_value[MODS_PROMPT_WORD] = interact_prompt_get_action_word() ? 1 : 0;
+    mods_value[MODS_BLAST_RING] = combat_rt_get_blast_ring();
 
     {
         // The OUTPUT the file asks for, matched against the sizes the row offers; anything else
@@ -965,6 +983,15 @@ static void mods_apply(int index)
         bool v = mods_value[index] != 0;
         interact_prompt_set_action_word(v);
         config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROMPT_WORD_KEY, v ? 1 : 0);
+        break;
+    }
+    case MODS_BLAST_RING: {
+        // DEFAULT "Awareness" -- his calls („Ano, jednoznačně ano“, then „Ten prstenec bych dal součástí
+        // awareness“, Fallout 2 Realtime 2026-11-08; „dej to pak do F1“). 0 off, 1 with the perk, 2 always.
+        // Live: the next frame draws the rings or repaints them away.
+        int v = mods_value[index];
+        combat_rt_set_blast_ring(v);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_BLAST_RING_KEY, v);
         break;
     }
     case MODS_HIT_STAGGER: {

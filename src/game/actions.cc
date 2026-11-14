@@ -1286,6 +1286,8 @@ static int action_rt_launch_flight(void* a1, void* a2)
                 break;
             }
         }
+        // Where it lands is decided only now (the re-aim above): the blast ring sits on that tile.
+        combat_rt_flight_launched(launched, fl->tile);
     }
 
     fl->used = false;

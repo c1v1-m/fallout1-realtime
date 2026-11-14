@@ -1,10 +1,10 @@
 # The MODS row "Name the action" (from Fallout 2 Realtime 2026-11-07): the pause menu, PREFERENCES, X for MODS,
-# then up three rows from the top (the list wraps) onto it. Shot Off, RB, shot On, LB back to Off, B out of all three.
-# 25 rows at 480 lines: every row must still fit, the help band below them.
+# then up four rows from the top (the list wraps) onto it. Shot Off, RB, shot On, LB back to Off, B out of all three.
+# 26 rows at 480 lines since Blast ring (2026-11-10): every row must still fit, the help band below them.
 name screen-mods-word
 map DESERT1.MAP
 seed 1
-duration 16
+duration 17
 dude tile 20100 rot 2
 
 # START tapped: the pause menu opens on the release, its highlight on SAVE GAME
@@ -15,18 +15,19 @@ tap 2700 DOWN
 tap 3200 A
 # X opens MODS from Preferences
 tap 4600 X
-# the top row wraps to the bottom: Internal resolution, Screen resolution, Name the action
+# the top row wraps to the bottom: Internal resolution, Screen resolution, Blast ring, Name the action
 tap 5800 UP
 tap 6300 UP
 tap 6800 UP
-shot 7600
-tap 8400 RB
-shot 9200
-tap 10000 LB
+tap 7300 UP
+shot 8100
+tap 8900 RB
+shot 9700
+tap 10500 LB
 # B closes MODS, B cancels Preferences, B shuts the pause menu
-tap 11000 B
-tap 12200 B
-tap 13400 B
-note 15000 the world should be back
+tap 11500 B
+tap 12700 B
+tap 13900 B
+note 15500 the world should be back
 
 expect \[FLOW/autotest\] end why=time .* modal=-1

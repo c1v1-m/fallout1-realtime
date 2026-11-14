@@ -1501,6 +1501,11 @@ static bool rt_tactical_ai = true;
 // MODS "Projectiles" (cfg projectiles): bullets fly as tracers and commit on arrival, and every shot that
 // flies checks its line on arrival (rt_projectile_dodge). Default ON, his design (2026-10-18).
 static bool rt_projectiles = true;
+// MODS "Blast ring" (cfg blast_ring): a red ring at the blast radius round where a held quick throw would
+// land and round where each grenade or rocket in the air goes off (rt_blast_rings_tick). His call („Ano,
+// jednoznačně ano“, 2026-11-08), and then „Ten prstenec bych dal součástí awareness“: the ring is the
+// AWARENESS perk's. 0 = off, 1 = with the perk (the default), 2 = always (rt_blast_ring_shown).
+static int rt_blast_ring = 1;
 
 // ⚠️ THE MASTER'S BODYGUARDS FIGHT FOR HIM (2026-10-22, his "jo ať bodyguardi útočí ... ať tam jen nestojí",
 // then "žádný mods prostě je tam naper" -- so always, with no switch). When Morpheus leads you in,
@@ -1516,8 +1521,9 @@ static bool rt_projectiles = true;
 #define RT_PID_FLOATING_EYE 16777293
 #define RT_MASTER_GUARD_REACH 30
 static RtActor* rt_actor_of(Object* obj);
-static void rt_tracers_render(Rect* rect, int elevation);
+static void rt_world_overlay(Rect* rect, int elevation);
 static void rt_tracers_reset();
+static void rt_blast_rings_reset();
 static void rt_offscreen_shooters_reset();
 static void rt_offscreen_shooters_tick();
 static void rt_horde_reset();
@@ -1781,6 +1787,10 @@ struct RtInFlight {
     int blastTile;
     int blastRadius;
     int serial;
+    // The tile its flight flies to, as actions.cc aimed it at the launch (combat_rt_flight_launched); -1
+    // before that. The blast ring sits there while it is in the air: rt_reaim reads the target later in the
+    // same frame, after this frame's moves, and can be a hex out.
+    int landTile;
 
     // Where it was fired from and at: the shooter's tile and the target's (or, for a miss, the tile it
     // falls to) when the attack was computed. A projectile you can watch fly hits whoever is still on
@@ -1845,6 +1855,7 @@ static void rt_inflight_init_blast(RtInFlight* f)
     f->serial = rt_inflight_serial_next++;
     f->blastTile = -1;
     f->blastRadius = 0;
+    f->landTile = -1;
     f->originTile = f->ctd.attacker != NULL ? f->ctd.attacker->tile : -1;
     f->aimTile = (f->ctd.attackerFlags & DAM_HIT) != 0 && f->ctd.defender != NULL ? f->ctd.defender->tile : f->ctd.tile;
     f->bullet = rt_projectiles && f->explosionFid == -1 && f->ctd.weapon != NULL && f->ctd.attacker != NULL
@@ -15444,6 +15455,7 @@ static void rt_abandon_encounter()
     rt_injecting = NULL;
     rt_shooter_count = 0; // who shot at him on the map being left (rt_note_shot_at_dude)
     rt_offscreen_shooters_reset();
+    rt_blast_rings_reset(); // tiles of the map being left; its view is redrawn whole anyway
     rt_horde_reset(); // the Master's banked signals and phases (rt_horde_tick)
     rt_script_end_rt_gate = false; // keyed off an rt_clock that may restart
     rt_lock_target = NULL;
@@ -15589,8 +15601,13 @@ void combat_rt_init()
     int projectiles = 1;
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_PROJECTILES_KEY, &projectiles);
     rt_projectiles = projectiles != 0;
-    tile_set_overlay(rt_tracers_render);
+    tile_set_overlay(rt_world_overlay);
     rt_tracers_reset();
+
+    // The ring where a blast will go off (MODS "Blast ring"). Default "Awareness": his call, 2026-11-08.
+    int blastRing = 1;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_BLAST_RING_KEY, &blastRing);
+    rt_blast_ring = blastRing < 0 ? 0 : (blastRing > 2 ? 2 : blastRing);
 
     // The realtime tactics on top of vanilla's rules (MODS "Tactical AI"). Default ON: his call, 2026-10-17.
     int tacticalAi = 1;
@@ -18295,6 +18312,359 @@ static void rt_tracers_tick()
     }
 }
 
+// --- THE BLAST RING (2026-11-08) -------------------------------------------------------------------
+//
+// The QOL list's „Prstenec tam, kde to bouchne“; his answer: „Ano, jednoznačně ano“, then „Ten prstenec bych
+// dal součástí awareness“ (rt_blast_ring_shown).
+// Brought over from Fallout 2 Realtime (8ade3ff, 7b5ec22) on his „dej to pak do F1“, 2026-11-10.
+// A ring of red dots round every hex a blast reaches, at vanilla's radius (rt_blast_radius_of: a grenade 2, a
+// rocket 3, as compute_explosion_on_extras has it -- and what rt_blast_filter judges by):
+//   * while a quick throw of a grenade is held, round the tile the release would land on;
+//   * while a grenade or a rocket is in the air, his or anyone's, round the tile it flies to, so there is
+//     time to step out. Not before it leaves the hand: a throw is re-aimed at the release.
+// ⚠️ THE LOOK IS THE F11 DEBUG RING'S (his pick of seven mock-ups, „7 líbí se mi 7“): a 3 x 3 dot of pure red in
+// the middle of every hex AT the radius, so the dots stand on the last hexes the blast still takes. He knew it
+// from measuring the gunshot-hearing range (tile.cc tile_render_debug_ring). Set aside on the way: a thin line,
+// vanilla's walk-hex pair on the ground, a rust floor inside, marks under the victims, a pulse, a fuse.
+// Drawn into the world by the tile overlay, over everything as the F11 ring and the tracers are -- a
+// WINDOW_TRANSPARENT window needs GNW buffering and comes out as a black box in play.
+#define RT_BLAST_RING_MAX 8 // the aim's and the blasts in the air at once
+#define RT_BLAST_RING_DOTS 24 // one per hex at the radius: 6 x radius, 18 for a rocket's 3
+
+typedef struct RtBlastRing {
+    int tile; // the blast's centre
+    int radius;
+    int elevation;
+    // The dots, the middle of each hex at the radius, in pixels from the centre tile's spot on the screen
+    // (tile_coord): the hex grid is the same everywhere, so a scroll moves that spot and nothing else.
+    int dotCount;
+    int dots[RT_BLAST_RING_DOTS][2];
+    Rect box; // the dots' bounds, from the same spot
+    bool painted;
+    Rect last; // where it was last painted, on the screen
+} RtBlastRing;
+
+static RtBlastRing rt_blast_rings[RT_BLAST_RING_MAX];
+static int rt_blast_ring_count = 0;
+
+static void rt_blast_rings_reset()
+{
+    rt_blast_ring_count = 0;
+}
+
+// The hexes at the radius, found as the F11 debug ring finds its own (tile.cc tile_render_debug_ring): a box
+// round the centre and the true hex distance, so a ring cut by the map's edge stays open there.
+static void rt_blast_ring_build(RtBlastRing* ring)
+{
+    ring->dotCount = 0;
+    ring->box.ulx = INT_MAX;
+    ring->box.uly = INT_MAX;
+    ring->box.lrx = INT_MIN;
+    ring->box.lry = INT_MIN;
+    int cx;
+    int cy;
+    if (tile_coord(ring->tile, &cx, &cy, ring->elevation) == -1) {
+        return;
+    }
+    int radius = ring->radius;
+    int col = ring->tile % 200;
+    int row = ring->tile / 200;
+    for (int dr = -radius - 1; dr <= radius + 1; dr++) {
+        for (int dc = -radius - 1; dc <= radius + 1; dc++) {
+            if (row + dr < 0 || row + dr >= 200 || col + dc < 0 || col + dc >= 200) {
+                continue;
+            }
+            int t = (row + dr) * 200 + col + dc;
+            int tx;
+            int ty;
+            if (ring->dotCount >= RT_BLAST_RING_DOTS || tile_dist(ring->tile, t) != radius
+                || tile_coord(t, &tx, &ty, ring->elevation) == -1) {
+                continue;
+            }
+            // The hex's middle: a hex is 32 x 16 from its tile's spot (the F11 ring's +16, +8).
+            int* d = ring->dots[ring->dotCount++];
+            d[0] = tx - cx + 16;
+            d[1] = ty - cy + 8;
+            if (d[0] - 1 < ring->box.ulx) {
+                ring->box.ulx = d[0] - 1;
+            }
+            if (d[0] + 1 > ring->box.lrx) {
+                ring->box.lrx = d[0] + 1;
+            }
+            if (d[1] - 1 < ring->box.uly) {
+                ring->box.uly = d[1] - 1;
+            }
+            if (d[1] + 1 > ring->box.lry) {
+                ring->box.lry = d[1] + 1;
+            }
+        }
+    }
+}
+
+// The overlay's first half (rt_world_overlay): every ring on this floor, clipped to what is being repainted.
+static void rt_blast_rings_render(Rect* rect, int elevation)
+{
+    int red = colorTable[RT_RGB(31, 0, 0)]; // the F11 ring's colorTable[31744]
+    for (int i = 0; i < rt_blast_ring_count; i++) {
+        RtBlastRing* ring = &rt_blast_rings[i];
+        int cx;
+        int cy;
+        if (ring->dotCount == 0 || ring->elevation != elevation || tile_coord(ring->tile, &cx, &cy, elevation) == -1) {
+            continue;
+        }
+        if (cx + ring->box.lrx < rect->ulx || cx + ring->box.ulx > rect->lrx
+            || cy + ring->box.lry < rect->uly || cy + ring->box.uly > rect->lry) {
+            continue; // none of it in this repaint
+        }
+        // Each dot as three 3 px rows, clipped to the repaint by tile_overlay_line.
+        for (int d = 0; d < ring->dotCount; d++) {
+            int x = cx + ring->dots[d][0];
+            int y = cy + ring->dots[d][1];
+            for (int dy = -1; dy <= 1; dy++) {
+                tile_overlay_line(rect, x - 1, y + dy, x + 1, y + dy, red);
+            }
+        }
+    }
+}
+
+// The tile overlay (tile.cc refresh_game): the blast rings on the ground, then the tracers over them.
+static void rt_world_overlay(Rect* rect, int elevation)
+{
+    rt_blast_rings_render(rect, elevation);
+    rt_tracers_render(rect, elevation);
+}
+
+// Where the held quick throw would go off, and how far: the target's tile while it is within the throw's
+// reach (a miss scatters round it), else the tile rt_do_attack and compute_attack land a far throw on --
+// as far as it goes toward the target, or the first thing in the way (combat_forced_throw_tile). False
+// when the hand holds nothing that goes off, or there is nobody to throw at.
+static bool rt_blast_ring_aim(int* tile, int* radius)
+{
+    // ⚠️ ONLY WHILE HE CAN ACT (F1 review 2026-11-10). Once the dude is dead or knocked out his pad is not
+    // read any more (gamepad_ui's button handler returns while he is down), so a held RB stays "held" and a
+    // held LT lock is never let go through the whole fall; a script's scene stops the pad the same way. The
+    // ring would sit on the ground for a throw or a shot that cannot come. What is in the air keeps its ring.
+    if (!rt_is_combatant(obj_dude) || combat_rt_script_ui_locked()) {
+        return false;
+    }
+    int hitMode;
+    Object* target;
+    bool quickThrow = combat_rt_quick_throw_hit_mode(&hitMode);
+    if (quickThrow) {
+        target = combat_rt_quick_throw_target();
+    } else if (rt_lock_target != NULL && rt_is_targetable(rt_lock_target)) {
+        // ...AND THE LT LOCK WITH AN EXPLOSIVE IN THE HAND (2026-11-08, his „raketomet bude taky ukazovat aoe
+        // awareness?“): a rocket launcher, or a grenade held in the hand rather than in a quick slot -- round the
+        // locked target, the one RT fires at. rt_is_targetable, as the lock and RT take it: a knocked-out target
+        // is still fired at (F1 review 2026-11-10; rt_is_combatant left it without a ring).
+        hitMode = rt_player_hit_mode();
+        target = rt_lock_target;
+    } else {
+        return false;
+    }
+    Object* weapon = item_hit_with(obj_dude, hitMode);
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON) {
+        return false; // a hand can hold a non-weapon (non-weapon-in-hand)
+    }
+    if (rt_needs_reload(obj_dude, hitMode)) {
+        return false; // an empty launcher only clicks (F1 review 2026-11-10); a throw has no magazine
+    }
+    int blast = rt_blast_radius_of(obj_dude, weapon, hitMode);
+    if (blast <= 0 || target == NULL || target->tile < 0 || target->elevation != obj_dude->elevation) {
+        return false;
+    }
+    int reach = item_w_range(obj_dude, hitMode);
+    int lands = target->tile;
+    if (obj_dist(obj_dude, target) > reach) {
+        // ⚠️ ONLY THE QUICK THROW GOES PAST ITS REACH (F1 review 2026-11-10). RT with the lock fires only within
+        // item_w_range (combat_rt_poll_gamepad), and the one way past it, rt_player_far_target, is the quick
+        // slot's (combat_rt_request_throw). A launcher, or a grenade wielded in the hand, out of reach: nothing
+        // would go off, so no ring -- the old test let a wielded grenade's ring sit where no throw would land.
+        if (!quickThrow) {
+            return false;
+        }
+        lands = tile_num_beyond(obj_dude->tile, target->tile, reach);
+        Object* blocker = obj_dude;
+        make_straight_path(obj_dude, obj_dude->tile, lands, NULL, &blocker, 32);
+        if (blocker != NULL && blocker != obj_dude) {
+            lands = blocker->tile;
+        }
+    }
+    *tile = lands;
+    *radius = blast;
+    return true;
+}
+
+typedef struct RtBlastWant {
+    int tile;
+    int radius;
+    int elevation;
+    bool aim; // the held throw's, not one in the air
+    int who; // whose it is, for the trace
+} RtBlastWant;
+
+static int rt_blast_want(RtBlastWant* want, int count, int tile, int radius, int elevation, bool aim, int who)
+{
+    if (tile < 0 || count >= RT_BLAST_RING_MAX) {
+        return count;
+    }
+    for (int w = 0; w < count; w++) {
+        if (want[w].tile == tile && want[w].radius == radius && want[w].elevation == elevation) {
+            return count; // two blasts on one tile: one ring
+        }
+    }
+    want[count].tile = tile;
+    want[count].radius = radius;
+    want[count].elevation = elevation;
+    want[count].aim = aim;
+    want[count].who = who;
+    return count + 1;
+}
+
+// Once a frame: which rings should be up, and the world repainted where one went, came or moved with the
+// view. A ring that stays put is left alone -- every repaint of the world under it draws it again.
+//
+// ⚠️ THE RING IS THE AWARENESS PERK'S (2026-11-08, his „Ten prstenec bych dal součástí awareness“). Vanilla's
+// Awareness shows what a critter has left when you look at it; here it also shows how far a blast reaches. On
+// the MODS row's default only a character with the perk sees rings, "Always" shows them to anyone. Taken
+// every frame, so the perk shows them the moment it is picked.
+static bool rt_blast_ring_shown()
+{
+    if (rt_blast_ring == 2) {
+        return true;
+    }
+    return rt_blast_ring == 1 && obj_dude != NULL && perk_level(PERK_AWARENESS) > 0;
+}
+
+static void rt_blast_rings_tick()
+{
+    RtBlastWant want[RT_BLAST_RING_MAX];
+    int wantCount = 0;
+    if (rt_blast_ring_shown() && obj_dude != NULL) {
+        int tile;
+        int radius;
+        if (rt_blast_ring_aim(&tile, &radius)) {
+            wantCount = rt_blast_want(want, wantCount, tile, radius, obj_dude->elevation, true, obj_dude->id);
+        }
+        for (int i = 0; i < rt_inflight_count; i++) {
+            RtInFlight* f = &rt_inflight[i];
+            if (f->blastRadius <= 0 || f->projectile == NULL || (f->projectile->flags & OBJECT_HIDDEN) != 0
+                || f->projectile->fid == f->explosionFid) {
+                continue; // no blast, still in the hand, or gone off
+            }
+            wantCount = rt_blast_want(want, wantCount, f->landTile >= 0 ? f->landTile : f->blastTile, f->blastRadius,
+                f->projectile->elevation, false, f->attacker != NULL ? f->attacker->id : -1);
+        }
+    }
+
+    // Keep every ring still wanted. The rest go, and what they covered is repainted once the list is final.
+    Rect gone[RT_BLAST_RING_MAX];
+    int goneElevation[RT_BLAST_RING_MAX];
+    int goneCount = 0;
+    bool placed[RT_BLAST_RING_MAX] = { false };
+    int kept = 0;
+    for (int i = 0; i < rt_blast_ring_count; i++) {
+        RtBlastRing* ring = &rt_blast_rings[i];
+        int match = -1;
+        for (int w = 0; w < wantCount; w++) {
+            if (!placed[w] && want[w].tile == ring->tile && want[w].radius == ring->radius
+                && want[w].elevation == ring->elevation) {
+                match = w;
+                break;
+            }
+        }
+        if (match == -1) {
+            trace_event(TRACE_COMBAT, "blast-ring", "off tile=%d radius=%d t=%.2f", ring->tile, ring->radius, rt_clock);
+            if (ring->painted) {
+                // ⚠️ WHERE IT LAST WAS AND WHERE IT IS NOW (review 2026-11-08). The view can move earlier in this
+                // same frame -- the follow camera's refresh (rt_follow_cam, before this tick) or a map scroll that
+                // carries the drawn pixels with the ground -- and then the ring already sits at its new spot on
+                // the screen. Repainting only the old rect left red pieces of it on the sand after the blast.
+                Rect area = ring->last;
+                int cx;
+                int cy;
+                if (ring->dotCount != 0 && ring->elevation == map_elevation
+                    && tile_coord(ring->tile, &cx, &cy, ring->elevation) != -1) {
+                    Rect now;
+                    now.ulx = cx + ring->box.ulx - 1;
+                    now.uly = cy + ring->box.uly - 1;
+                    now.lrx = cx + ring->box.lrx + 1;
+                    now.lry = cy + ring->box.lry + 1;
+                    rect_min_bound(&ring->last, &now, &area);
+                }
+                gone[goneCount] = area;
+                goneElevation[goneCount] = ring->elevation;
+                goneCount++;
+            }
+            continue;
+        }
+        placed[match] = true;
+        if (kept != i) {
+            rt_blast_rings[kept] = *ring;
+        }
+        kept++;
+    }
+    rt_blast_ring_count = kept;
+
+    for (int w = 0; w < wantCount && rt_blast_ring_count < RT_BLAST_RING_MAX; w++) {
+        if (placed[w]) {
+            continue;
+        }
+        RtBlastRing* ring = &rt_blast_rings[rt_blast_ring_count++];
+        ring->tile = want[w].tile;
+        ring->radius = want[w].radius;
+        ring->elevation = want[w].elevation;
+        ring->painted = false;
+        rt_blast_ring_build(ring);
+        trace_event(TRACE_COMBAT, "blast-ring", "on tile=%d radius=%d src=%s who=%d dots=%d t=%.2f", ring->tile,
+            ring->radius, want[w].aim ? "aim" : "air", want[w].who, ring->dotCount, rt_clock);
+    }
+
+    for (int g = 0; g < goneCount; g++) {
+        if (goneElevation[g] == map_elevation) {
+            tile_refresh_rect(&gone[g], goneElevation[g]);
+        }
+    }
+
+    for (int i = 0; i < rt_blast_ring_count; i++) {
+        RtBlastRing* ring = &rt_blast_rings[i];
+        int cx;
+        int cy;
+        if (ring->dotCount == 0 || ring->elevation != map_elevation
+            || tile_coord(ring->tile, &cx, &cy, ring->elevation) == -1) {
+            continue;
+        }
+        Rect now;
+        now.ulx = cx + ring->box.ulx - 1;
+        now.uly = cy + ring->box.uly - 1;
+        now.lrx = cx + ring->box.lrx + 1;
+        now.lry = cy + ring->box.lry + 1;
+        if (ring->painted && now.ulx == ring->last.ulx && now.uly == ring->last.uly
+            && now.lrx == ring->last.lrx && now.lry == ring->last.lry) {
+            continue;
+        }
+        if (ring->painted) {
+            tile_refresh_rect(&ring->last, ring->elevation);
+        }
+        tile_refresh_rect(&now, ring->elevation);
+        ring->last = now;
+        ring->painted = true;
+    }
+}
+
+// actions.cc, at a flight's launch (action_rt_launch_flight): the tile it flies to (RtInFlight.landTile).
+void combat_rt_flight_launched(Object* projectile, int tile)
+{
+    if (projectile == NULL) {
+        return;
+    }
+    for (int i = 0; i < rt_inflight_count; i++) {
+        if (rt_inflight[i].projectile == projectile) {
+            rt_inflight[i].landTile = tile;
+        }
+    }
+}
+
 // WHERE A SHOOTER OUT OF VIEW IS (2026-10-22). His pick "B + C" first drew an arrow on the view's
 // edge toward every shooter off the screen; he rejected it at first sight ("ne šipku ne to je
 // strašný"), so NOTHING IS DRAWN. What is left is the point on the edge, for one job: a lock on a
@@ -19966,6 +20336,8 @@ void combat_rt_update(float dt)
 
     // Bullets in the air: repaint their streaks (rt_tracers_tick).
     rt_tracers_tick();
+    // ...and the rings where the blasts will go off, after the commits above took the ones that went off.
+    rt_blast_rings_tick();
 
     for (int i = 0; i < rt_actor_count; i++) {
         rt_update_actor(&rt_actors[i], dt);
@@ -21703,6 +22075,16 @@ void combat_rt_set_projectiles(bool enabled)
 bool combat_rt_get_projectiles()
 {
     return rt_projectiles;
+}
+
+void combat_rt_set_blast_ring(int mode)
+{
+    rt_blast_ring = mode < 0 ? 0 : (mode > 2 ? 2 : mode); // the next frame draws the rings, or repaints them away
+}
+
+int combat_rt_get_blast_ring()
+{
+    return rt_blast_ring;
 }
 
 bool combat_rt_get_tactical_ai()
