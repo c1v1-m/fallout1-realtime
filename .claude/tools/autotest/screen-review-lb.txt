@@ -1,0 +1,36 @@
+# SCREEN: REVIEW ON THE PAD, AS THE MONITOR SHOWS IT (2026-11-17, ported from Fallout 2 Realtime: his „REVIEW nemá
+# tlačítko“, then „Yes, F1 too“). The talk panel wears the dark Y / X badges and an "LB" on REVIEW; LB opens the review,
+# the D-pad scrolls it, LB or B closes it, B sits left of DONE. `screen` shoots the PRESENTED frame (at_dump_presented):
+# the panel's marks were drawn into its buffer only and never reached the monitor until it was refreshed after them.
+# Killian's shop (as screen-barter-legend); one reply is picked first, so the review has lines.
+#   1 screen: the talk            2 shot: the same moment redrawn     3 screen: after a reply (A)
+#   4 screen: the review (LB)     5 screen: D-pad down                6 screen: LB, back in the talk
+#   7 screen: LB then B, back again
+#   node .claude/tools/autotest/run.js .claude/tools/autotest/screen-review-lb.txt 1 --exe build/Release/fallout-ce.exe
+name screen-review-lb
+map JUNKKILL.MAP
+mapscript on
+seed 1
+duration 22
+dude tile 26283 rot 5
+
+talk 1000 16777295
+screen 5000
+shot 5100
+tap 6000 A
+screen 8500
+tap 9000 LB
+screen 10500
+tap 11000 DOWN
+screen 12000
+tap 12500 LB
+screen 14000
+tap 15000 LB
+tap 16500 B
+screen 18500
+note 20000 end
+
+expect gd-review\] open via=pad entries=[1-9]
+expect gd-review\] pad key=336
+expect gd-review\] pad key=27
+expect autotest\] screen t=

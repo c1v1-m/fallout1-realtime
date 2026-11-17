@@ -3451,6 +3451,13 @@ static int gpui_quick_use_slot = -1;     // the quick slot gpui_quick_use is bei
 static int gpui_chain_slot = -1;         // the slot whose held button drives the chain; -1 = none
 static unsigned int gpui_chain_due_at = 0; // when the next one is asked for; 0 = not now
 static int gpui_chain_count = 0;          // follow-ups in this chain
+// ⚠️ A CUT JAB GOES AGAIN WHILE THE BUTTON IS HELD (Fallout 2 Realtime 2026-11-16, „REEEEEEEEEEE, držím LB a nedostávám
+// heal“; F1 by his „yea, yea, do it“). His F2 trace_2026-11-16_233112 s=96.3: two stimpaks went in, a hit staggered him
+// in the third jab before its frame, gpui_inject_tick gave the (zero) AP back and DROPPED THE CHAIN -- LB stayed down
+// another 2.1 s and nothing came. Now the cut one is asked for again (gpui_heal_chain_tick, once the stagger has let
+// go of the body) and pays what was given back: 4 AP when it was the first, nothing when it was a follow-up.
+static bool gpui_chain_retry = false;
+static int gpui_chain_retry_ap = 0;
 // The explosive put-down (gpui_place_explosive).
 static bool gpui_place_pending = false;
 static Object* gpui_place_item = NULL; // compared against the pack's pointers only, until dropped
@@ -3592,12 +3599,26 @@ static bool gpui_inject_start(Object* item, int apCost, bool followUp = false, b
         gpui_chain_slot = gpui_quick_use_slot; // a slot's own press may chain; anything else may not
         gpui_chain_count = 0;
         gpui_chain_last_instant = false;
+        gpui_chain_retry = false;
     }
     gpui_chain_due_at = 0;
 
     trace_event(TRACE_ACTION, "inject-start", "pid=%d frame=%d from=%d lock=%ums ap=%d", item->pid, actionFrame,
         startFrame, ms, combat_rt_player_ap());
     return true;
+}
+
+// The held button of the chain's quick slot (gpui_chain_slot).
+static bool gpui_chain_button_held()
+{
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL || gpui_chain_slot == -1) {
+        return false;
+    }
+    SDL_GameControllerButton button = gpui_chain_slot == GPUI_QS_LB
+        ? SDL_CONTROLLER_BUTTON_LEFTSHOULDER
+        : SDL_CONTROLLER_BUTTON_RIGHTSHOULDER;
+    return SDL_GameControllerGetButton(pad, button) != 0;
 }
 
 // From the safe tick: a jab that left its pose before its frame (a stagger, a knockdown, anim_stop
@@ -3614,10 +3635,19 @@ static void gpui_inject_tick()
     gpui_inject_pending = false;
     combat_rt_refund_ap(gpui_inject_ap);
     gpui_injection_ms = 0;
-    gpui_chain_slot = -1;
-    gpui_chain_due_at = 0;
-    trace_event(TRACE_ACTION, "inject-cut", "pid=%d refund=%d ap=%d anim=%d after=%ums", gpui_inject_pid,
-        gpui_inject_ap, combat_rt_player_ap(), FID_ANIM_TYPE(obj_dude->fid), elapsed_time(gpui_inject_at));
+    // Still held: the same one again once the body is free (gpui_chain_retry). Let go: over, as before.
+    bool retry = gpui_chain_slot != -1 && gpui_chain_button_held();
+    if (retry) {
+        gpui_chain_retry = true;
+        gpui_chain_retry_ap = gpui_inject_ap;
+        gpui_chain_due_at = get_time() + 1;
+    } else {
+        gpui_chain_slot = -1;
+        gpui_chain_due_at = 0;
+        gpui_chain_retry = false;
+    }
+    trace_event(TRACE_ACTION, "inject-cut", "pid=%d refund=%d ap=%d anim=%d after=%ums retry=%d", gpui_inject_pid,
+        gpui_inject_ap, combat_rt_player_ap(), FID_ANIM_TYPE(obj_dude->fid), elapsed_time(gpui_inject_at), retry ? 1 : 0);
 }
 
 static Object* gpui_quick_slot_item(int slot, int* count);
@@ -3659,6 +3689,13 @@ static void gpui_ap_wait_tick()
     }
 }
 
+// A hit's stagger or a dodge on the body -- what a heal chain waits out instead of ending.
+static bool gpui_body_staggered()
+{
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    return anim == ANIM_HIT_FROM_FRONT || anim == ANIM_HIT_FROM_BACK || anim == ANIM_DODGE_ANIM;
+}
+
 static void gpui_heal_chain_end(const char* why)
 {
     if (gpui_chain_slot != -1) {
@@ -3667,6 +3704,7 @@ static void gpui_heal_chain_end(const char* why)
     }
     gpui_chain_slot = -1;
     gpui_chain_due_at = 0;
+    gpui_chain_retry = false;
 }
 
 // From the safe tick: the next jab of a held slot (gpui_chain_slot), once its moment has come.
@@ -3706,9 +3744,17 @@ static void gpui_heal_chain_tick()
     // Down or getting up: no jab can register (see GPUI_CHAIN_INSTANT_MS) -- the next one goes in now.
     int bodyAnim = FID_ANIM_TYPE(obj_dude->fid);
     if (critter_is_prone(obj_dude) || bodyAnim == ANIM_PRONE_TO_STANDING || bodyAnim == ANIM_BACK_TO_STANDING) {
+        if (gpui_chain_retry && combat_rt_player_ap() < gpui_chain_retry_ap) {
+            gpui_chain_due_at = get_time() + 1; // the cut first one waits for its AP, as a press does
+            return;
+        }
         if (!gpui_take_drug_now(item)) {
             gpui_heal_chain_end("refused");
             return;
+        }
+        if (gpui_chain_retry) {
+            combat_rt_spend_ap(gpui_chain_retry_ap);
+            gpui_chain_retry = false;
         }
         gpui_chain_count++;
         gpui_chain_last_instant = true;
@@ -3723,23 +3769,31 @@ static void gpui_heal_chain_tick()
 
     // The jab before is still playing: the next one waits for it to end (asked again next frame).
     // Anything else holding the body (a step, a swing) ends the chain instead.
+    // A STAGGER only waits (2026-11-16): it is a hit, not something he chose, and the chain goes on once it lets go.
     if (anim_busy(obj_dude) != 0) {
-        if (FID_ANIM_TYPE(obj_dude->fid) != ANIM_MAGIC_HANDS_MIDDLE) {
+        if (FID_ANIM_TYPE(obj_dude->fid) != ANIM_MAGIC_HANDS_MIDDLE && !gpui_body_staggered()) {
             gpui_heal_chain_end("busy");
             return;
         }
         gpui_chain_due_at = get_time() + 1;
         return;
     }
+    int apCost = gpui_chain_retry ? gpui_chain_retry_ap : 0;
+    if (combat_rt_player_ap() < apCost) {
+        gpui_chain_due_at = get_time() + 1; // the cut first one waits for its AP, as a press does
+        return;
+    }
     // A whole jab every time (see gpui_chain_floor_ms).
-    if (!gpui_inject_start(item, 0, true, true)) {
+    if (!gpui_inject_start(item, apCost, true, true)) {
         gpui_heal_chain_end("refused");
         return;
     }
+    bool retried = gpui_chain_retry;
+    gpui_chain_retry = false;
     gpui_chain_last_instant = false;
     gpui_chain_count++;
-    trace_event(TRACE_ACTION, "heal-chain", "next=%d pid=%d hp=%d pool=%d left=%d", gpui_chain_count, item->pid,
-        critter_get_hits(obj_dude), combat_rt_heal_left(), count - 1);
+    trace_event(TRACE_ACTION, "heal-chain", "next=%d pid=%d hp=%d pool=%d left=%d retry=%d", gpui_chain_count, item->pid,
+        critter_get_hits(obj_dude), combat_rt_heal_left(), count - 1, retried ? 1 : 0);
 }
 
 // Use one of `pid` on the dude: the jab, and the drug at its frame (see gpui_inject_pending).
@@ -3852,6 +3906,7 @@ static void gpui_quick_use(int pid)
     gpui_chain_slot = gpui_quick_use_slot;
     gpui_chain_count = 0;
     gpui_chain_last_instant = true;
+    gpui_chain_retry = false;
     gpui_chain_due_at = 0;
     if (gpui_chain_slot != -1) {
         gpui_chain_due_at = get_time() + gpui_chain_floor_ms();
@@ -8145,8 +8200,109 @@ static void gpui_aim_wheel(SDL_GameController* pad)
 // the engine input pipeline every frame, so movement and clicks pass through the
 // same mouse_simulate_input edge detection and win_check_all_buttons cycle as
 // the real mouse.
+// ⚠️ A MOUSE NOBODY TOUCHES MUST NOT SUMMON THE ARROW (2026-11-17, from Fallout 2 Realtime: his „STÁLE VIDÍM KURZOR
+// MYŠI“ -- in the trade, the talk, the world and the inventory, on his PC, never in a self-played test, which has no
+// mouse at all; then „Yes, F1 too“). With a pad in, every screen hides the pointer and brings the arrow back for two
+// seconds the moment the mouse moves it (the stamp in gpui_mouse_hook_impl and the screens' own pointer ticks) -- by a
+// SINGLE count, so a mouse that twitches by itself (a sensor on a glossy desk, the table nudged) kept the arrow up
+// everywhere. Now, with a pad connected, the mouse must first travel GPUI_MOUSE_WAKE_PX within GPUI_MOUSE_WAKE_MS: until
+// then its motion is held back (the pointer stays put, no screen sees a move); once it gets there the held-back bit goes
+// through at once, so a real move loses nothing; after GPUI_MOUSE_SLEEP_MS at rest it has to wake again. A twitch back
+// and forth sums to nothing. Without a pad nothing is filtered. [INPUT/mouse-real] sums up what the real mouse did
+// (twice a second at most, with the right stick beside it), so a trace shows where an arrow came from if one still does.
+#define GPUI_MOUSE_WAKE_PX 8
+#define GPUI_MOUSE_WAKE_MS 300
+#define GPUI_MOUSE_SLEEP_MS 1500
+#define GPUI_MOUSE_LOG_MS 500
+
+static void gpui_mouse_twitch_filter(int* dx, int* dy)
+{
+    static bool awake = false;
+    static int heldX = 0;
+    static int heldY = 0;
+    static unsigned int heldSince = 0;
+    static unsigned int lastMove = 0;
+    static int logFrames = 0;
+    static int logHeld = 0;
+    static int logDx = 0;
+    static int logDy = 0;
+    static int logMax = 0;
+    static unsigned int logSince = 0;
+
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (pad == NULL) {
+        awake = false;
+        heldX = 0;
+        heldY = 0;
+        return;
+    }
+
+    unsigned int now = get_time();
+    if (*dx != 0 || *dy != 0) {
+        if (logFrames == 0) {
+            logSince = now;
+        }
+        logFrames++;
+        logDx += *dx;
+        logDy += *dy;
+        int step = abs(*dx) > abs(*dy) ? abs(*dx) : abs(*dy);
+        if (step > logMax) {
+            logMax = step;
+        }
+
+        if (awake) {
+            lastMove = now;
+        } else {
+            if ((heldX == 0 && heldY == 0) || now - heldSince > GPUI_MOUSE_WAKE_MS) {
+                heldX = 0;
+                heldY = 0;
+                heldSince = now;
+            }
+            heldX += *dx;
+            heldY += *dy;
+            if (abs(heldX) + abs(heldY) >= GPUI_MOUSE_WAKE_PX) {
+                awake = true;
+                lastMove = now;
+                *dx = heldX;
+                *dy = heldY;
+                heldX = 0;
+                heldY = 0;
+                trace_event(TRACE_INPUT, "mouse-real", "wake dx=%d dy=%d", *dx, *dy);
+            } else {
+                *dx = 0;
+                *dy = 0;
+                logHeld++;
+            }
+        }
+    } else {
+        if (awake && now - lastMove >= GPUI_MOUSE_SLEEP_MS) {
+            awake = false;
+        }
+        if (!awake && (heldX != 0 || heldY != 0) && now - heldSince > GPUI_MOUSE_WAKE_MS) {
+            heldX = 0;
+            heldY = 0;
+        }
+    }
+
+    if (logFrames > 0 && now - logSince >= GPUI_MOUSE_LOG_MS) {
+        trace_event(TRACE_INPUT, "mouse-real", "frames=%d held=%d sum=%d,%d max=%d awake=%d rs=%d,%d", logFrames, logHeld,
+            logDx, logDy, logMax, awake ? 1 : 0, SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX),
+            SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY));
+        logFrames = 0;
+        logHeld = 0;
+        logDx = 0;
+        logDy = 0;
+        logMax = 0;
+    }
+}
+
 static void gpui_mouse_hook_impl(int* dx, int* dy, int* buttons)
 {
+    if (autotest_active()) {
+        autotest_take_mouse(dx, dy);
+    }
+    gpui_mouse_twitch_filter(dx, dy);
+
     // WHAT THE REAL MOUSE ALREADY SAID THIS FRAME, captured before any emitter below adds to it.
     // Two things need to tell the player's own mouse apart from something we synthesised, and both
     // of them are the STEAM DECK'S RIGHT TRACKPAD: in mouse mode Steam Input feeds it to the game

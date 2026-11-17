@@ -1,0 +1,25 @@
+# F1 port (2026-11-16, his „yea, yea, do it“) of F2's play/test-heal-cut („REEEEEEEEEEE, držím LB a nedostávám heal“):
+# the heal button held from 1.0 s, a stagger lands in the first jab before its frame -- the cut jab must go again
+# once the stagger lets go (inject-cut retry=1, then heal-chain retry=1) and the chain go on. Setup from heal-hold.
+name heal-cut
+map DESERT1.MAP
+seed 4
+duration 9
+
+dude tile 20100 rot 2
+dude hp 71
+dude curhp 10
+dude stat AG 10
+dude item 40 6
+
+spawn 16777225 24100 rot 5 hostile
+
+stagger 1.25
+
+at 0 idle
+at 1.0 healhold
+at 7.0 idle
+
+expect inject-cut\] .*retry=1
+expect heal-chain\] next=1 .*retry=1
+expect heal-pool\] pid=40

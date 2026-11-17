@@ -1,0 +1,16 @@
+# F1 (2026-11-17, from Fallout 2 Realtime: his „chci aby loading byl veprostřed … na obrazovce, teď je dvakrát“, then
+# „Ano, i ve F1 planetu doprostřed“): the loading planet, ONCE and in the middle of the black. The run's own start loads
+# its map the way New Game / Load / Continue do -- a black window over the whole screen -- so the planet sits in the
+# middle of the SCREEN (map=0). Its first two frames are saved as presented (autotest_planet_frame, `planetshots on`):
+# one planet, nothing left where the pointer was. F1's harness has no map change step; F2's play/m-planet covers that.
+#   node .claude/tools/autotest/run.js .claude/tools/autotest/m-planet.txt 1 --exe build/Release/fallout-ce.exe
+name m-planet
+map JUNKKILL.MAP
+seed 1
+duration 5
+planetshots on
+
+note 3000 end
+
+expect planet\] was=\d+ pad=1 from=-?\d+,-?\d+ at=\d+,\d+ map=0
+expect autotest\] planet-screen n=1

@@ -91,6 +91,9 @@ namespace fallout {
 // reloading in cover, searching the last known position, taking a much nearer foe, minding allies in
 // the line of fire (combat_rt.cc, rt_tactical_ai). 1 = on (his call, 2026-10-17), 0 = vanilla rules only.
 #define GAME_CONFIG_TACTICAL_AI_KEY "tactical_ai"
+// MODS "Bonus Move" (combat_rt.cc, rt_bonus_move_refill): how fast the perk's movement reserve comes back while the dude
+// stands. 0 = Fast (the AP regen, as it was), 1 = Half turn (default, 2026-11-17 „i F1“), 2 = Turn (vanilla).
+#define GAME_CONFIG_BONUS_MOVE_REFILL_KEY "bonus_move_refill"
 // Bullets, bolts and balls FLY and a sidestep makes them miss (combat_rt.cc, rt_projectiles; his design,
 // 2026-10-18). 1 = on (his pick), 0 = vanilla: a shot hits or misses the moment it is fired.
 #define GAME_CONFIG_PROJECTILES_KEY "projectiles"

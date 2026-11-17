@@ -1635,6 +1635,31 @@ void intface_pad_face(unsigned char* buf, int pitch, int w, int h, int cx, int c
     pad_badge_face(buf, pitch, w, h, cx, cy, key);
 }
 
+// The badge FILLING a whole small button picture of w x h (the talk panel's 14x14 red buttons, made 16x16 to cover the
+// art's own red dot, which reaches a pixel past them), centred on the picture's own middle -- between two pixels for
+// an even size. Outside the disc the picture is transparent (index 0). The bar's dark disc and gold letter: Fallout 2
+// Realtime's (2026-11-15, his „Ano, postav“ to the mock-up; after a yellow ring for a few hours his „Jako dřív
+// (tmavá)“, 2026-11-17).
+void intface_pad_face_fill(unsigned char* buf, int w, int h, char key)
+{
+    int fill = pad_badge_grey(44);
+    int edge = pad_badge_grey(12);
+    float cx = (w - 1) / 2.0f;
+    float cy = (h - 1) / 2.0f;
+    float r = (w < h ? w : h) / 2.0f;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float dx = x - cx;
+            float dy = y - cy;
+            float d = sqrtf(dx * dx + dy * dy);
+            buf[y * w + x] = (unsigned char)(d <= r - 1.0f ? fill : (d <= r ? edge : 0));
+        }
+    }
+    // A 5x7 letter cannot share an even box's middle: half a pixel right (a B's stem weighs left) and half up.
+    char text[2] = { key, '\0' };
+    pad_badge_text(buf, w, w, h, text, w / 2, h / 2 - 1);
+}
+
 // The static ones: 0 View (inventory), 1 Menu (pause), 2-4 the D-pad left / down / up.
 static void pad_badge_icon(unsigned char* buf, int pitch, int w, int h, int kind, int cx, int cy)
 {

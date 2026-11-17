@@ -1130,6 +1130,23 @@ int win_get_top_win(int x, int y)
     return -1;
 }
 
+// Realtime build: win_get_top_win that skips hidden windows -- the window the player SEES at x,y, or -1 (the
+// loading planet's middle, gmouse_set_cursor; ported from Fallout 2 Realtime 2026-11-17).
+int win_get_top_visible_at(int x, int y)
+{
+    for (int index = num_windows - 1; index >= 0; index--) {
+        Window* w = window[index];
+        if ((w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+        if (x >= w->rect.ulx && x <= w->rect.lrx && y >= w->rect.uly && y <= w->rect.lry) {
+            return w->id;
+        }
+    }
+
+    return -1;
+}
+
 // Returns the id of the topmost visible modal (exclusive) window, or -1 if none
 // is open. Used to tell whether a menu/dialog has control (vs. normal gameplay).
 int win_get_top_modal()

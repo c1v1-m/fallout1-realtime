@@ -43,6 +43,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/svga.h" // gSdlSurface, the step `screen`
 #include "plib/gnw/winmain.h"
 
 namespace fallout {
@@ -64,8 +65,11 @@ namespace fallout {
 //                                      master_patches folder: copy the player's save there), map scripts on; `map` still names
 //                                      a map to boot into first. The dude is the save's: no HP reset
 //   cleararea <tiles>                  every other critter within that many tiles of the dude is removed
-//   sethp <pid> <percent> <seconds>    at that time the first living critter of that pid on the dude's floor
-//                                      drops to that percent of its maximum HP (a boss's phases)
+//   sethp <pid> <percent> <seconds> [knock|ko]  at that time the first living critter of that pid on the dude's floor
+//                                      drops to that percent of its maximum HP (a boss's phases); `knock`
+//                                      also knocks it down where it stands, `ko` knocks it OUT for the rest of
+//                                      the test (combat_rt_test_knockdown)
+//   stagger <seconds>                  at that time the dude staggers as a hit makes him (combat_rt_test_stagger)
 //   duration <seconds>                 hard stop (default 60)
 //   dude tile <t> [rot <0-5>]
 //   dude elevation <0-2>               the floor of the map (default: the map's entrance floor); the
@@ -230,6 +234,7 @@ static char at_map_name[64] = "";
 static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
+static bool at_planet_shots = false; // "planetshots on": the loading planet's frames as presented (autotest_planet_frame)
 static int at_load_slot = 0;
 static bool at_reload = false;
 static float at_projectile_speedup = -1.0f;
@@ -270,8 +275,15 @@ typedef struct AtSetHp {
     int pct;
     float at;
     bool done;
+    bool knock; // and knocked down where it stands (combat_rt_test_knockdown)
+    bool ko; // knocked OUT instead: unconscious, as a critical can leave it
 } AtSetHp;
 static AtSetHp at_sethp[AT_MAX_SETHP];
+// "stagger <seconds>": the dude staggers then, as a hit makes him -- a heal jab cut on cue (2026-11-16).
+#define AT_MAX_STAGGERS 4
+static float at_stagger_at[AT_MAX_STAGGERS];
+static bool at_stagger_done[AT_MAX_STAGGERS];
+static int at_stagger_count = 0;
 static int at_sethp_count = 0;
 static int at_dude_stats[7] = { -1, -1, -1, -1, -1, -1, -1 };
 static int at_dude_skills[SKILL_COUNT];
@@ -303,6 +315,8 @@ enum {
     AT_STEP_TALK, // index = pid: the dude talks to the nearest critter of that pid, as the use prompt does
     AT_STEP_SHOT, // a screenshot of whatever is up, a modal screen included
     AT_STEP_KEY, // index = a key code, as if typed (GNW_add_input_buffer): the keyboard's own keys
+    AT_STEP_MOUSE, // index = dx, value = dy: what a real mouse says on the next frame (autotest_take_mouse)
+    AT_STEP_SCREEN, // a screenshot of the PRESENTED frame -- the screen surface itself, not a recomposition (at_dump_presented)
 };
 
 enum {
@@ -384,6 +398,8 @@ static Uint32 at_tl_t0 = 0; // SDL_GetTicks() at the start line
 static int at_tl_shift = 0; // ms the timeline waited for a game-loop open
 static int at_tl_next = 0;
 static int at_tl_open = -1; // the AT_STEP_OPEN step waiting for autotest_tick, or -1
+static int at_mouse_dx = 0; // AT_STEP_MOUSE motion not yet taken by the mouse hook (autotest_take_mouse)
+static int at_mouse_dy = 0;
 static int at_tl_modal = -2; // the topmost modal window last traced (-2 = none traced yet)
 
 static void at_trim(char* s)
@@ -587,8 +603,26 @@ static bool at_parse_step(char** tok, int n)
     bool talk = strcmp(tok[0], "talk") == 0;
     bool shot = strcmp(tok[0], "shot") == 0;
     bool key = strcmp(tok[0], "key") == 0;
-    if (!button && !tap && !axis && !open && !note && !walkto && !talk && !shot && !key) {
+    bool mouse = strcmp(tok[0], "mouse") == 0;
+    bool screen = strcmp(tok[0], "screen") == 0;
+    if (!button && !tap && !axis && !open && !note && !walkto && !talk && !shot && !key && !mouse && !screen) {
         return false;
+    }
+    // screen <ms>: what the monitor shows (at_dump_presented) -- `shot` cannot see a picture that never reached it.
+    if (screen && n >= 2) {
+        at_add_step(at_step_time(tok[1]), AT_STEP_SCREEN, 0, 0);
+        return true;
+    }
+    // mouse <ms> <dx> <dy> [<count> <every ms>]: a REAL mouse's motion, as the pad's mouse hook gets it (for the
+    // twitch filter, gpui_mouse_twitch_filter); count/every repeat it, e.g. a 1-count jitter.
+    if (mouse && n >= 4) {
+        int count = n >= 6 ? atoi(tok[4]) : 1;
+        int every = n >= 6 ? atoi(tok[5]) : 0;
+        int mouseMs = at_step_time(tok[1]);
+        for (int i = 0; i < (count > 0 ? count : 1); i++) {
+            at_add_step(mouseMs + i * every, AT_STEP_MOUSE, atoi(tok[2]), atoi(tok[3]));
+        }
+        return true;
     }
     if (key && n >= 3) {
         at_add_step(at_step_time(tok[1]), AT_STEP_KEY, atoi(tok[2]), 0); // key <ms> <code>
@@ -705,6 +739,8 @@ static bool at_parse(const char* path)
             at_projectile_speedup = (float)atof(tok[1]);
         } else if (strcmp(tok[0], "mapscript") == 0 && n >= 2) {
             at_map_script = strcmp(tok[1], "on") == 0;
+        } else if (strcmp(tok[0], "planetshots") == 0 && n >= 2) {
+            at_planet_shots = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "reload") == 0) {
             at_reload = true;
         } else if (strcmp(tok[0], "loadslot") == 0 && n >= 2) {
@@ -712,11 +748,17 @@ static bool at_parse(const char* path)
             at_map_script = true;
         } else if (strcmp(tok[0], "cleararea") == 0 && n >= 2) {
             at_clear_radius = atoi(tok[1]);
+        } else if (strcmp(tok[0], "stagger") == 0 && n >= 2 && at_stagger_count < AT_MAX_STAGGERS) {
+            at_stagger_at[at_stagger_count] = (float)atof(tok[1]);
+            at_stagger_done[at_stagger_count] = false;
+            at_stagger_count++;
         } else if (strcmp(tok[0], "sethp") == 0 && n >= 4 && at_sethp_count < AT_MAX_SETHP) {
             at_sethp[at_sethp_count].pid = atoi(tok[1]);
             at_sethp[at_sethp_count].pct = atoi(tok[2]);
             at_sethp[at_sethp_count].at = (float)atof(tok[3]);
             at_sethp[at_sethp_count].done = false;
+            at_sethp[at_sethp_count].knock = n >= 5 && strcmp(tok[4], "knock") == 0;
+            at_sethp[at_sethp_count].ko = n >= 5 && strcmp(tok[4], "ko") == 0;
             at_sethp_count++;
         } else if (strcmp(tok[0], "mapvar") == 0 && n >= 3 && at_mvar_count < AT_MAX_GVARS) {
             at_mvar_index[at_mvar_count] = atoi(tok[1]);
@@ -839,6 +881,61 @@ bool autotest_init(int argc, char** argv)
         SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
     }
     return at_active;
+}
+
+// The pad's mouse hook, first thing: adds what the scenario's `mouse` steps said since the last frame to the real
+// mouse's delta, as if a mouse had moved.
+// ⚠️ THE `shot` STEP CANNOT SEE WHAT THE PLAYER SEES (2026-11-17, found in Fallout 2 Realtime). dump_screen REDRAWS
+// every window into its own buffer -- the game's F12 the same. A picture drawn into a window's buffer but never refreshed
+// onto the screen (win_register_button draws without a refresh) is in every such shot and on no monitor: the talk
+// panel's pad marks. This saves the 8-bit screen surface the frame is presented from (gSdlSurface), mouse cursor
+// included, under the next free scrNNNNN.bmp like a shot.
+static void at_dump_presented()
+{
+    if (gSdlSurface == NULL) {
+        return;
+    }
+    int w = gSdlSurface->w;
+    int h = gSdlSurface->h;
+    unsigned char* buf = (unsigned char*)malloc(w * h);
+    if (buf == NULL) {
+        return;
+    }
+    if (SDL_LockSurface(gSdlSurface) == 0) {
+        for (int y = 0; y < h; y++) {
+            memcpy(buf + y * w, (unsigned char*)gSdlSurface->pixels + y * gSdlSurface->pitch, w);
+        }
+        SDL_UnlockSurface(gSdlSurface);
+        default_screendump(w, h, buf, getSystemPalette());
+    }
+    free(buf);
+}
+
+// A frame of the loading planet is up (gmouse.cc). A load runs no game loop, so no `screen` step can shoot it: in a
+// scenario that says `planetshots on`, the first two frames of each load (`first` = the planet has just come up) are
+// saved as presented, each as the next scrNNNNN.bmp, at most eight in a run (from Fallout 2 Realtime, 2026-11-17).
+void autotest_planet_frame(bool first)
+{
+    static int shots = 0;
+    static int thisLoad = 0;
+    if (first) {
+        thisLoad = 0;
+    }
+    if (!at_active || !at_planet_shots || shots >= 8 || thisLoad >= 2) {
+        return;
+    }
+    shots++;
+    thisLoad++;
+    at_dump_presented();
+    trace_event(TRACE_FLOW, "autotest", "planet-screen n=%d", shots);
+}
+
+void autotest_take_mouse(int* dx, int* dy)
+{
+    *dx += at_mouse_dx;
+    *dy += at_mouse_dy;
+    at_mouse_dx = 0;
+    at_mouse_dy = 0;
 }
 
 bool autotest_active()
@@ -1398,6 +1495,14 @@ static void at_tl_bk()
             at_button((SDL_GameControllerButton)st->index, st->value != 0);
             trace_event(TRACE_FLOW, "autotest", "pad t=%d %s=%d", t, at_button_name(st->index), st->value);
             break;
+        case AT_STEP_SCREEN:
+            at_dump_presented();
+            trace_event(TRACE_FLOW, "autotest", "screen t=%d", t);
+            break;
+        case AT_STEP_MOUSE:
+            at_mouse_dx += st->index;
+            at_mouse_dy += st->value;
+            break;
         case AT_STEP_AXIS:
             at_axis((SDL_GameControllerAxis)st->index, (Sint16)st->value);
             trace_event(TRACE_FLOW, "autotest", "axis t=%d %s=%d", t, at_axis_name(st->index), st->value);
@@ -1542,6 +1647,13 @@ void autotest_tick(float dt)
     }
     at_elapsed += dt;
 
+    for (int i = 0; i < at_stagger_count; i++) {
+        if (!at_stagger_done[i] && at_elapsed >= at_stagger_at[i]) {
+            at_stagger_done[i] = true;
+            combat_rt_test_stagger(obj_dude);
+        }
+    }
+
     // Before the screen-test return: a screen test may photograph what a hit-point change starts.
     for (int i = 0; i < at_sethp_count; i++) {
         if (at_sethp[i].done || at_elapsed < at_sethp[i].at) {
@@ -1553,6 +1665,9 @@ void autotest_tick(float dt)
                 int maxHp = stat_level(o, STAT_MAXIMUM_HIT_POINTS);
                 o->data.critter.hp = maxHp * at_sethp[i].pct / 100;
                 trace_event(TRACE_FLOW, "autotest", "sethp id=%d pid=%d hp=%d/%d", o->id, o->pid, o->data.critter.hp, maxHp);
+                if (at_sethp[i].knock || at_sethp[i].ko) {
+                    combat_rt_test_knockdown(o, at_sethp[i].ko);
+                }
                 break;
             }
         }

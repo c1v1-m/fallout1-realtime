@@ -1,0 +1,37 @@
+# SCREEN: A MOUSE NOBODY TOUCHES SUMMONS NO ARROW (2026-11-17, ported from Fallout 2 Realtime: his „STÁLE VIDÍM KURZOR
+# MYŠI“ in the trade, the talk, the world and the inventory, never in a self-played run, which has no mouse; then „Yes,
+# F1 too“). gpui_mouse_twitch_filter: with a pad in, the mouse must travel 8 px within 0.3 s before the pointer moves at
+# all. `mouse` steps are a real mouse's motion. Killian's shop (as screen-barter-legend).
+#   1 the world, a 1-count twitch back and forth for 2 s: no arrow     2 a real move (40,20): the pointer
+#   3 the talk with Killian, the same twitch: no arrow                   4 a real move: the arrow over the replies
+#   5 two seconds at rest: gone again
+#   node .claude/tools/autotest/run.js .claude/tools/autotest/screen-mouse-twitch.txt 1 --exe build/Release/fallout-ce.exe
+name screen-mouse-twitch
+map JUNKKILL.MAP
+mapscript on
+seed 1
+duration 17
+dude tile 26283 rot 5
+
+# the world: twitch, then a real move
+mouse 1000 1 0 20 100
+mouse 1050 -1 0 20 100
+shot 2800
+mouse 3200 40 20
+shot 3500
+# the talk
+talk 4500 16777295
+mouse 9000 1 0 20 100
+mouse 9050 -1 0 20 100
+mouse 9020 0 1 20 100
+mouse 9080 0 -1 20 100
+shot 10800
+mouse 11200 -30 -25
+shot 11500
+shot 14500
+note 16000 end
+
+expect mouse-real\] frames=\d+ held=\d+ sum=-?[01],0 max=1 awake=0
+expect mouse-real\] wake dx=40 dy=20
+expect mouse-real\] wake dx=-30 dy=-25
+expect-not mouse-real\] wake dx=-?[0-9] dy=-?[0-9]$

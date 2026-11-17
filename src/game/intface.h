@@ -64,6 +64,7 @@ void intface_update_quick_slot_lb(Object* item, int count, bool armed);
 void intface_update_pad_badges();
 void intface_pad_pill(unsigned char* buf, int pitch, int w, int h, int cx, int cy, const char* text);
 void intface_pad_face(unsigned char* buf, int pitch, int w, int h, int cx, int cy, char key);
+void intface_pad_face_fill(unsigned char* buf, int w, int h, char key);
 void intface_update_aim_part(int hitLocation);
 // REALTIME: the end-turn box on the bar opens its combat curtains while a fight is live and closes
 // them when it is over, frame-stepped so nothing waits for it. Only when the heal slot has moved out

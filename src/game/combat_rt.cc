@@ -823,6 +823,19 @@ static float rt_player_ap_regen = 0.0f;
 static int rt_bonus_move_ap = INT_MAX;
 static float rt_bonus_move_regen = 0.0f;
 
+// MODS "Bonus Move" (cfg bonus_move_refill), HOW FAST the reserve comes back while he stands (2026-11-17, Fallout 2
+// Realtime first -- his „ten perk teď busted“: at the AP rate, the contact bonus included, it was back in under a
+// second, between two punches; „jednou za kolo mi přijde weak“; the switch, „Ano, udělej“ -- then „i F1“):
+//   0 Fast      -- the AP regen itself, the distance multiplier included (as it was): ~1 s for 2 points.
+//   1 Half turn -- DEFAULT: half of a vanilla turn, i.e. half the time his whole AP pool takes to refill at the base rate
+//                  (no distance bonus).
+//   2 Turn      -- a whole such turn, vanilla's "2 points per rank at the start of every turn".
+// The reserve still refills only while he is neither walking nor running.
+#define RT_BONUS_MOVE_REFILL_FAST 0
+#define RT_BONUS_MOVE_REFILL_HALF_TURN 1
+#define RT_BONUS_MOVE_REFILL_TURN 2
+static int rt_bonus_move_refill = RT_BONUS_MOVE_REFILL_HALF_TURN;
+
 // Live AP-regen interval (seconds per +1 AP), loaded from config at combat_rt_init
 // (default RT_AP_REGEN_SECONDS). Tunable in the cfg for firing cadence without a
 // rebuild. Clamped to a sane floor so a bad value can't make AP regen instant.
@@ -1039,7 +1052,11 @@ static float rt_walk_ap_cost = RT_WALK_AP_COST;
 // faster than the attack cooldown would let you spend it and the player read it as "AP reload
 // instantly when anyone fires". 1.4 puts the brake back in contact range without touching ranged
 // exchanges, which were not the complaint. (2026-08-13, user picked this lever.)
-#define RT_REGEN_NEAR_MULT 1.4f   // multiplier in contact (dist <= 1)
+// ⚠️ 1.4 -> 1.2 ON 2026-11-17 (Fallout 2 Realtime first, then his „dej 1,2 i do F1“): at 1.4 a 3-AP fist refilled
+// faster in contact than its cooldown could spend it, so melee never waited for AP and AGI meant nothing there. At 1.2
+// punches drop a few per cent in a short fight and the pool runs down in longer ones -- his „malinkej balance“. The far
+// end (0.6) stays.
+#define RT_REGEN_NEAR_MULT 1.2f   // multiplier in contact (dist <= 1)
 #define RT_REGEN_FAR_MULT 0.6f    // multiplier at/beyond the falloff distance
 #define RT_REGEN_FALLOFF_TILES 12 // tiles at which the multiplier reaches the far value
 static float rt_regen_near_mult = RT_REGEN_NEAR_MULT;
@@ -5499,6 +5516,42 @@ static bool rt_reaction_heavy(Object* defender, int flags)
     return true;
 }
 
+static void rt_reaction_flinch(Object* attacker, Object* defender);
+
+// Self-played tests only (autotest `stagger <seconds>`, from Fallout 2): the stagger a hit gives the dude, with no
+// hit -- the moment a cut heal jab needs (gpui_inject_tick), which real shots cannot be timed to.
+void combat_rt_test_stagger(Object* critter)
+{
+    if (!rt_enabled || critter == NULL || !rt_is_critter(critter) || critter_is_dead(critter)) {
+        return;
+    }
+    trace_event(TRACE_FLOW, "test-stagger", "id=%d pid=%d anim=%d t=%.2f", critter->id, critter->pid,
+        FID_ANIM_TYPE(critter->fid), rt_clock);
+    rt_reaction_flinch(NULL, critter);
+}
+
+// Self-played tests only (autotest `sethp ... knock|ko`, from Fallout 2): what a knockdown hit's commit does to its
+// defender -- the reaction layer's FALLING, DAM_KNOCKED_DOWN, the fall in its own sequence -- with no damage.
+// Knockdowns come from criticals and blasts, which a test cannot count on. knockout (`ko`): DAM_KNOCKED_OUT too,
+// as a critical that "knocks him unconscious" -- with no wake-up event queued, so it stays out for the rest of the
+// test.
+void combat_rt_test_knockdown(Object* critter, bool knockout)
+{
+    if (!rt_enabled || critter == NULL || !rt_is_critter(critter) || critter_is_dead(critter) || critter_is_prone(critter)) {
+        return;
+    }
+    int flags = DAM_KNOCKED_DOWN | (knockout ? DAM_KNOCKED_OUT : 0);
+    if (!rt_reaction_heavy(critter, flags)) {
+        return;
+    }
+    critter->data.critter.combat.results |= flags;
+    if (rt_register_begin(ANIMATION_REQUEST_RESERVED, "test-knockdown")) {
+        register_object_animate(critter, ANIM_FALL_BACK, 0);
+        register_end();
+    }
+    trace_event(TRACE_FLOW, "test-knockdown", "id=%d pid=%d ko=%d t=%.2f", critter->id, critter->pid, knockout ? 1 : 0, rt_clock);
+}
+
 // A LIGHT hit asks for a cosmetic stagger. Every refusal says WHY out loud -- these used to be
 // silent early-returns scattered through rt_play_hit_react, and a stagger that never plays is
 // indistinguishable from a hit that never landed.
@@ -9639,7 +9692,9 @@ static Object* rt_nearest_hostile_in_sight(int hitMode)
     return best;
 }
 
-static Object* rt_unlocked_attack_target(int hitMode)
+// takeKnockedOut: RT's own pull (see the block below); a quick throw passes false and keeps going to the
+// nearest visible enemy instead (combat_rt_quick_throw_target).
+static Object* rt_unlocked_attack_target(int hitMode, bool takeKnockedOut)
 {
     // ⚠️ THE NEAREST ONE YOU CAN HIT, NOT THE NEAREST ONE (2026-10-20, trace_2026-10-20_220255 s=74.4:
     // RT with no lock took a guard 2 tiles away on the far side of the corner wall, every shot was
@@ -9659,6 +9714,33 @@ static Object* rt_unlocked_attack_target(int hitMode)
     int range = item_w_range(obj_dude, hitMode);
     Object* best = NULL;
     int bestDist = range + 1;
+
+    // ⚠️ RT FINISHES AN UNCONSCIOUS ENEMY TOO (Fallout 2 Realtime 2026-11-16, „borečka jsem sundal na zem a držel
+    // útok bez míření a dudette neútočil“; „Ano, i F1“). His F2 trace_2026-11-16_223528 s=474.4: a critical knocked
+    // a raider OUT one tile away, RT held for 1.4 s, not one swing. rt_nearest_hostile_in_range leaves the
+    // knocked-out out on purpose (the A-vs-prompt split, see there), so only a lock could finish him -- vanilla
+    // hits an unconscious critter like any other. Now when nobody ACTIVE is in reach, RT takes the nearest
+    // knocked-out enemy in weapon range and in sight: after the active ones, so it never turns from one still
+    // fighting you; before an idle animal, which never fought you.
+    if (takeKnockedOut) {
+        for (int i = 0; i < rt_actor_count; i++) {
+            Object* critter = rt_actors[i].obj;
+            if (critter == obj_dude || !rt_actors[i].hostile || !rt_is_targetable(critter)
+                || (critter->data.critter.combat.results & DAM_KNOCKED_OUT) == 0) {
+                continue;
+            }
+            int dist = obj_dist(obj_dude, critter);
+            if (dist > range || dist >= bestDist || !rt_lock_in_sight(critter)) {
+                continue;
+            }
+            bestDist = dist;
+            best = critter;
+        }
+        if (best != NULL) {
+            return best;
+        }
+    }
+
     for (int i = 0; i < rt_actor_count; i++) {
         Object* critter = rt_actors[i].obj;
         if (critter == obj_dude || !rt_is_combatant(critter) || !rt_hostile_by_nature(critter)) {
@@ -15614,6 +15696,12 @@ void combat_rt_init()
     config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_TACTICAL_AI_KEY, &tacticalAi);
     rt_tactical_ai = tacticalAi != 0;
 
+    // How fast the Bonus Move reserve comes back (MODS "Bonus Move"). Default Half turn: his „Ano, udělej“ + „i F1“,
+    // 2026-11-17.
+    int bonusMoveRefill = RT_BONUS_MOVE_REFILL_HALF_TURN;
+    config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_BONUS_MOVE_REFILL_KEY, &bonusMoveRefill);
+    combat_rt_set_bonus_move_refill(bonusMoveRefill);
+
     // Idle hostiles look around (MODS row; 0 = off = vanilla's fixed stare). See rt_idle_look_around.
     // Default ON since the release (his setting).
     int lookAround = 1;
@@ -16392,7 +16480,7 @@ Object* combat_rt_quick_throw_target()
         // Out of reach it is still the target: the throw lands as far as it goes (rt_player_far_target).
         return rt_is_combatant(rt_lock_target) ? rt_lock_target : NULL;
     }
-    Object* target = rt_unlocked_attack_target(hitMode);
+    Object* target = rt_unlocked_attack_target(hitMode, false);
     return target != NULL ? target : rt_nearest_visible_hostile();
 }
 
@@ -17211,7 +17299,7 @@ void combat_rt_poll_gamepad()
                 }
             }
         } else {
-            Object* target = rt_unlocked_attack_target(hitMode);
+            Object* target = rt_unlocked_attack_target(hitMode, true);
             if (target != NULL) {
                 rt_set_player_intent(target, hitMode, loc);
                 if (attackEdge) {
@@ -20544,8 +20632,16 @@ void combat_rt_update(float dt)
         rt_bonus_move_regen = 0.0f;
     } else {
         int bonusMoveBefore = rt_bonus_move_ap;
-        rt_regen_ap(obj_dude, &rt_bonus_move_ap, &rt_bonus_move_regen, bonusMoveMax,
-            (dudeWalking || dudeRunning) ? 0.0f : regenDt);
+        float bonusMoveDt = (dudeWalking || dudeRunning) ? 0.0f : regenDt;
+        if (bonusMoveDt > 0.0f && rt_bonus_move_refill != RT_BONUS_MOVE_REFILL_FAST && bonusMoveMax > 0) {
+            // A turn's worth (MODS "Bonus Move"): rt_regen_ap adds a point per regen interval of dt, so dt scaled by
+            // reserve / pool brings the whole reserve back in the time the whole pool takes at the base rate -- the
+            // raw dt, no distance multiplier -- and twice that share in half of it.
+            int poolMax = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+            float share = poolMax > 0 ? (float)bonusMoveMax / (float)poolMax : 1.0f;
+            bonusMoveDt = dt * share * (rt_bonus_move_refill == RT_BONUS_MOVE_REFILL_HALF_TURN ? 2.0f : 1.0f);
+        }
+        rt_regen_ap(obj_dude, &rt_bonus_move_ap, &rt_bonus_move_regen, bonusMoveMax, bonusMoveDt);
         if (bonusMoveMax > 0 && bonusMoveBefore < bonusMoveMax && rt_bonus_move_ap == bonusMoveMax) {
             trace_event(TRACE_ACTION, "bonus-move-full", "max=%d ap=%d t=%.2f",
                 bonusMoveMax, rt_player_ap, rt_clock);
@@ -22090,6 +22186,19 @@ int combat_rt_get_blast_ring()
 bool combat_rt_get_tactical_ai()
 {
     return rt_tactical_ai;
+}
+
+// 0 Fast, 1 Half turn, 2 Turn (rt_bonus_move_refill); anything else is the default. Live: the next frame refills by it.
+void combat_rt_set_bonus_move_refill(int mode)
+{
+    rt_bonus_move_refill = mode >= RT_BONUS_MOVE_REFILL_FAST && mode <= RT_BONUS_MOVE_REFILL_TURN
+        ? mode
+        : RT_BONUS_MOVE_REFILL_HALF_TURN;
+}
+
+int combat_rt_get_bonus_move_refill()
+{
+    return rt_bonus_move_refill;
 }
 
 // A critter that is IN the fight -- chasing, attacking, or pulled in as hostile -- while one is on.

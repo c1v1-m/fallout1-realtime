@@ -6,6 +6,7 @@
 
 #include "game/actions.h"
 #include "game/art.h"
+#include "game/autotest.h"
 #include "game/combat.h"
 #include "game/combat_rt.h"
 #include "game/critter.h"
@@ -1395,6 +1396,51 @@ int gmouse_set_cursor(int cursor)
     unsigned char* mouseCursorFrmData = art_frame_data(mouseCursorFrm, frame, 0);
     if (mouse_set_shape(mouseCursorFrmData, width, height, width, offsetX, offsetY, 0) != 0) {
         return -1;
+    }
+
+    // ⚠️ THE LOADING PLANET IN THE MIDDLE OF THE BLACK, AND ONCE (2026-11-17, ported from Fallout 2 Realtime: his „chci
+    // aby loading byl veprostřed … na obrazovce, teď je dvakrát“, then „Ano, i ve F1 planetu doprostřed“). A map or a
+    // save loading turns the pointer into the spinning planet wherever the pointer is -- with a mouse that is where you
+    // look; on a pad it is the hidden pointer, parked wherever the last screen or the right stick left it. With a
+    // controller connected the planet comes up in the middle of the black: the whole screen's when a black cover hides
+    // the bar too (New Game, Load, Continue), the map's above the bar when the bar stays up (a map change). And ONE:
+    // mouse_set_shape above has already drawn the first frame where the pointer was, and mouse_set_position only moves
+    // the coordinates -- so it is erased there first, then drawn in the middle (F2 left a frozen second planet).
+    static int planetOverMap = 0; // where this load's planet was put (its later frames stay there)
+    int planetFromX = -1;
+    int planetFromY = -1;
+    if (cursor == MOUSE_CURSOR_WAIT_PLANET && gmouse_current_cursor != MOUSE_CURSOR_WAIT_PLANET
+        && gamepad_ui_get_controller() != NULL) {
+        planetOverMap = 0;
+        mouse_get_position(&planetFromX, &planetFromY);
+        int centerX = (scr_size.ulx + scr_size.lrx + 1) / 2;
+        int centerY = (scr_size.uly + scr_size.lry + 1) / 2;
+        Rect mapRect;
+        Rect barRect;
+        if (display_win != -1 && win_get_rect(display_win, &mapRect) == 0
+            && interfaceWindow != -1 && win_get_rect(interfaceWindow, &barRect) == 0
+            && win_get_top_visible_at((barRect.ulx + barRect.lrx) / 2, (barRect.uly + barRect.lry) / 2) == interfaceWindow) {
+            centerX = (mapRect.ulx + mapRect.lrx + 1) / 2;
+            centerY = (mapRect.uly + mapRect.lry + 1) / 2;
+            planetOverMap = 1;
+        }
+        bool shown = !mouse_hidden();
+        if (shown) {
+            mouse_hide();
+        }
+        mouse_set_position(centerX - width / 2 + offsetX, centerY - height / 2 + offsetY);
+        if (shown) {
+            mouse_show();
+        }
+    }
+    if (cursor == MOUSE_CURSOR_WAIT_PLANET) {
+        int mx;
+        int my;
+        mouse_get_position(&mx, &my);
+        trace_event(TRACE_FLOW, "planet", "was=%d pad=%d from=%d,%d at=%d,%d map=%d screen=%dx%d", gmouse_current_cursor,
+            gamepad_ui_get_controller() != NULL ? 1 : 0, planetFromX, planetFromY, mx, my, planetOverMap,
+            scr_size.lrx - scr_size.ulx + 1, scr_size.lry - scr_size.uly + 1);
+        autotest_planet_frame(gmouse_current_cursor != MOUSE_CURSOR_WAIT_PLANET);
     }
 
     if (gmouse_current_cursor_key != INVALID_CACHE_ENTRY) {

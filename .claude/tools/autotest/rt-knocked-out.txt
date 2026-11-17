@@ -1,0 +1,22 @@
+# F1 port (2026-11-16, his „Ano, i F1“) of the F2 test. F2 (2026-11-16, „borečka jsem sundal na zem a držel útok bez míření a dudette neútočil“): trace_2026-11-16_223528
+# s=474.4, a critical knocked raider 238 OUT one tile away and 1.4 s of RT held without a lock gave not one swing --
+# the unlocked RT target skipped the unconscious. Here: an unarmed raider walks up and punches, is knocked OUT at 6 s
+# (sethp ... ko: unconscious for the rest of the test), and RT is held 7-11 s with no LT. The dude must swing at him.
+name rt-knocked-out-f1
+map DESERT1.MAP
+seed 1
+duration 13
+dude tile 20100 rot 2
+dude hp 999
+dude skill unarmed 200
+dude wield 21
+
+spawn 16777291 20500 rot 5 hostile
+sethp 16777291 100 6.0 ko
+
+axis 7000 RT 32767
+note 9000 RT held, the raider unconscious at the dude's feet
+axis 11000 RT -32768
+
+expect \[FLOW/test-knockdown\] .*ko=1
+expect \[COMBAT/attack\] DUDE

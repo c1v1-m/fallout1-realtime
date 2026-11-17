@@ -136,6 +136,10 @@ void combat_rt_set_crowd_make_room(bool enabled);
 bool combat_rt_get_crowd_make_room();
 void combat_rt_set_tactical_ai(bool enabled);
 bool combat_rt_get_tactical_ai();
+// MODS "Bonus Move": how fast the perk's movement reserve comes back while the dude stands. 0 Fast (the AP regen
+// itself), 1 Half turn (default), 2 Turn (vanilla's once per turn: the time the whole AP pool takes at the base rate).
+void combat_rt_set_bonus_move_refill(int mode);
+int combat_rt_get_bonus_move_refill();
 void combat_rt_set_projectiles(bool enabled);
 bool combat_rt_get_projectiles();
 int combat_rt_tracers_in_air();
@@ -431,6 +435,9 @@ bool combat_rt_request_throw(Object* target);
 bool combat_rt_player_attack_pending();
 bool combat_rt_dude_targeted();
 bool combat_rt_dude_attacking();
+// Self-played tests only (autotest `sethp ... knock|ko`): knock a critter down, or out, with no damage.
+void combat_rt_test_knockdown(Object* critter, bool knockout);
+void combat_rt_test_stagger(Object* critter);
 
 } // namespace fallout
 
