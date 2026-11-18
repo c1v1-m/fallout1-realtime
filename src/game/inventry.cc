@@ -1012,6 +1012,18 @@ bool setup_inventory(int inventoryWindowType)
     buttonDownData = art_ptr_lock_data(fid, 0, 0, &(ikey[1]));
 
     if (buttonUpData != NULL && buttonDownData != NULL) {
+        // CE: with a pad the little red DONE button wears the pad button that CLOSES this screen -- a dark B disc, on the
+        // inventory's DONE as on the loot window's (from Fallout 2 Realtime 2026-11-18, his phone: „otevřu inventory a
+        // není tlačítko pro vypnutí inventory a hráč neví“). The inventory closes with B wherever the pointer is not on an
+        // item (gamepad_ui.cc, inven_cursor_over_item) -- on DONE itself it never is -- and with BACK, the button that
+        // opened it. For an hour DONE wore a BACK pill instead, since BACK closes it even with the pointer on an item: his
+        // „proč je tam back, když to jde taky vypnout béčkem?“ → „ano, dej tam B“ -- B backs out of everything on the pad.
+        // The same picture for both states, transparent outside the disc so the plate shows there.
+        static unsigned char doneB[15 * 16];
+        bool padMarks = gamepad_ui_get_controller() != NULL;
+        if (padMarks) {
+            intface_pad_face_fill(doneB, 15, 16, 'B');
+        }
         btn = -1;
         switch (inventoryWindowType) {
         case INVENTORY_WINDOW_TYPE_NORMAL:
@@ -1025,8 +1037,8 @@ bool setup_inventory(int inventoryWindowType)
                 -1,
                 -1,
                 KEY_ESCAPE,
-                buttonUpData,
-                buttonDownData,
+                padMarks ? doneB : buttonUpData,
+                padMarks ? doneB : buttonDownData,
                 NULL,
                 BUTTON_FLAG_TRANSPARENT);
             break;
@@ -1057,8 +1069,8 @@ bool setup_inventory(int inventoryWindowType)
                 -1,
                 -1,
                 KEY_ESCAPE,
-                buttonUpData,
-                buttonDownData,
+                padMarks ? doneB : buttonUpData,
+                padMarks ? doneB : buttonDownData,
                 NULL,
                 BUTTON_FLAG_TRANSPARENT);
             break;
@@ -2380,6 +2392,7 @@ bool inven_equip_under_cursor(int hand)
         if (item_add_force(inven_dude, *handSlot, 1) != 0) {
             return false;
         }
+        trace_event(TRACE_INPUT, "inv-equip", "out hand=%s pid=%d", overLeft ? "A" : "B", (*handSlot)->pid);
         *handSlot = NULL;
 
         adjust_fid();
@@ -2418,6 +2431,8 @@ bool inven_equip_under_cursor(int hand)
     // a3 (source slot) is NULL for a list item; a4 != -1 makes switch_hand pull
     // the item out of the inventory and return any displaced hand item to it.
     Object** handSlot = (hand == HAND_RIGHT) ? &i_rhand : &i_lhand;
+    trace_event(TRACE_INPUT, "inv-equip", "in hand=%s pid=%d row=%d", hand == HAND_RIGHT ? "B" : "A", item->pid,
+        displayIndex);
     switch_hand(item, handSlot, NULL, 1000 + displayIndex);
 
     adjust_fid();
@@ -2456,6 +2471,29 @@ Object* inven_list_item_under_cursor()
         return NULL;
     }
     return pud->items[itemIndex].item;
+}
+
+// The pad's B in the inventory (gamepad_ui.cc): over an ITEM it does what it always did -- that item into the B hand, or
+// a hand's item back out -- and over ANYTHING ELSE it closes the screen, as B backs out of every other one (from Fallout 2
+// Realtime 2026-11-18, his „když nemířím na item v inventáři tak Bčko mi vypne inventory“). An item = a list row holding
+// one, a hand holding one, the armor being worn; an empty row or hand, the dude, the stats, DONE are not.
+bool inven_cursor_over_item()
+{
+    if (!normal_inventory_open || i_wid == -1) {
+        return false;
+    }
+    if (mouseHitTestInWindow(i_wid, INVENTORY_LEFT_HAND_SLOT_X, INVENTORY_LEFT_HAND_SLOT_Y,
+            INVENTORY_LEFT_HAND_SLOT_MAX_X, INVENTORY_LEFT_HAND_SLOT_MAX_Y)) {
+        return i_lhand != NULL;
+    }
+    if (mouseHitTestInWindow(i_wid, INVENTORY_RIGHT_HAND_SLOT_X, INVENTORY_RIGHT_HAND_SLOT_Y,
+            INVENTORY_RIGHT_HAND_SLOT_MAX_X, INVENTORY_RIGHT_HAND_SLOT_MAX_Y)) {
+        return i_rhand != NULL;
+    }
+    if (inven_normal_cursor_over_armor()) {
+        return i_worn != NULL;
+    }
+    return inven_list_item_under_cursor() != NULL;
 }
 
 bool inven_wear_under_cursor()

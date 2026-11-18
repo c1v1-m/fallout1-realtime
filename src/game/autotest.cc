@@ -235,6 +235,7 @@ static char at_file[260] = "";
 static int at_seed = 1;
 static bool at_map_script = false;
 static bool at_planet_shots = false; // "planetshots on": the loading planet's frames as presented (autotest_planet_frame)
+static bool at_talk_shots = false; // "talkshots on": the talk panel sliding in / out, every step as presented (autotest_talk_frame)
 static int at_load_slot = 0;
 static bool at_reload = false;
 static float at_projectile_speedup = -1.0f;
@@ -741,6 +742,8 @@ static bool at_parse(const char* path)
             at_map_script = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "planetshots") == 0 && n >= 2) {
             at_planet_shots = strcmp(tok[1], "on") == 0;
+        } else if (strcmp(tok[0], "talkshots") == 0 && n >= 2) {
+            at_talk_shots = strcmp(tok[1], "on") == 0;
         } else if (strcmp(tok[0], "reload") == 0) {
             at_reload = true;
         } else if (strcmp(tok[0], "loadslot") == 0 && n >= 2) {
@@ -928,6 +931,20 @@ void autotest_planet_frame(bool first)
     thisLoad++;
     at_dump_presented();
     trace_event(TRACE_FLOW, "autotest", "planet-screen n=%d", shots);
+}
+
+// A step of the talk panel sliding in (`up`) or out (gdialog.cc talk_to_scroll_subwin). Its loop runs no game loop
+// either: in a scenario that says `talkshots on`, each step is saved as presented, at most 40 in a run (from Fallout 2
+// Realtime 2026-11-18, his „když se ukončí rozhovor, tak proběhne animace a ta už nemá tlačítka vidět“).
+void autotest_talk_frame(bool up, int step)
+{
+    static int shots = 0;
+    if (!at_active || !at_talk_shots || shots >= 40) {
+        return;
+    }
+    shots++;
+    at_dump_presented();
+    trace_event(TRACE_FLOW, "autotest", "talk-screen n=%d dir=%s step=%d", shots, up ? "in" : "out", step);
 }
 
 void autotest_take_mouse(int* dx, int* dy)

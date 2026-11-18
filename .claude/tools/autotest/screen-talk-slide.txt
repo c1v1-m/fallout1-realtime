@@ -1,0 +1,24 @@
+# SCREEN (from Fallout 2 Realtime 2026-11-18, his „když se ukončí rozhovor, tak proběhne animace a ta už nemá tlačítka
+# vidět (Y pro barter atd)“, then „i F1“): with a pad the talk panel slides in and out with its two sockets (BARTER,
+# ASK ABOUT) as empty dark discs -- no Y / X, no red dots; the badges come with the buttons. Killian's shop: Y = barter
+# (the talk panel slides out, the trade panel in), B leaves the trade (the trade panel out, the talk panel in again).
+# `talkshots on` saves every step of a slide as presented (talk-screen lines), `screen` the still frames.
+name screen-talk-slide
+map JUNKKILL.MAP
+mapscript on
+seed 1
+duration 16
+dude tile 26283 rot 5
+talkshots on
+
+talk 1000 16777295
+screen 5500
+tap 6000 Y
+screen 9500
+tap 10000 B
+screen 13500
+note 14500 end
+
+expect talk-screen n=\d+ dir=in
+expect talk-screen n=\d+ dir=out
+expect autotest\] screen t=

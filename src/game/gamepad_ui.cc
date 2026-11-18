@@ -1782,7 +1782,10 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         return;
     }
 
-    // Inventory open: BACK toggles it shut; X/B equip the item under the cursor.
+    // Inventory open: BACK toggles it shut; X/B equip the item under the cursor -- and B over no item closes it, as B backs
+    // out of every other screen (inven_cursor_over_item; from Fallout 2 Realtime 2026-11-18: „když nemířím na item v
+    // inventáři tak Bčko mi vypne inventory“). Not while A holds the Use/Drop/Look popup open: its loop would eat the Esc.
+    // The B still down as the screen closes is spent by the input epoch the inventory bumps on its way out.
     if (inven_is_open()) {
         if (backPressed) {
             backHoldSpent = true;
@@ -1790,7 +1793,12 @@ static void gpui_button_shortcuts(SDL_GameController* pad)
         } else if (xPressed) {
             inven_equip_under_cursor(HAND_LEFT);
         } else if (bPressed) {
-            inven_equip_under_cursor(HAND_RIGHT);
+            if (inven_cursor_over_item() || gpui_action_popup_active) {
+                inven_equip_under_cursor(HAND_RIGHT);
+            } else {
+                trace_event(TRACE_INPUT, "inv-close", "src=b");
+                GNW_add_input_buffer(KEY_ESCAPE);
+            }
         }
         return;
     }

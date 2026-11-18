@@ -69,6 +69,9 @@ bool inven_wear_under_cursor();
 // The item in the player's own inventory LIST under the cursor (normal inventory only), or NULL --
 // what LB / RB bind to their quick slot there (gamepad_ui).
 Object* inven_list_item_under_cursor();
+// The pad's B: over an item (a list row holding one, a filled hand, the worn armor) it equips as before, over anything
+// else it closes the inventory (gamepad_ui.cc).
+bool inven_cursor_over_item();
 // Controller A-tap quick action for the player's own inventory list: use drugs/
 // usables, wear armor, otherwise equip into a free hand. See inventry.cc.
 bool inven_gamepad_quick_normal();

@@ -7,6 +7,7 @@
 #include <SDL.h>
 
 #include "game/actions.h"
+#include "game/autotest.h"
 #include "game/combat.h"
 #include "game/game_trace.h"
 #include "game/light.h"
@@ -551,6 +552,51 @@ static unsigned char* gd_ask_hint_up = NULL;
 // ...and REVIEW's striped plate (51x29) wearing an "LB" pill, up and pressed (gdialog_review_hint_button).
 static unsigned char* gd_review_hint_up = NULL;
 static unsigned char* gd_review_hint_down = NULL;
+
+// CE: THE PANEL SLIDES WITH ITS SOCKETS EMPTY (from Fallout 2 Realtime 2026-11-18, his phone: „když se ukončí rozhovor, tak
+// proběhne animace a ta už nemá tlačítka vidět (Y pro barter atd)“). The slide in and out draws the panel's ART
+// (talk_to_scroll_subwin), whose red buttons are painted into it -- so with a pad the panel arrived and left with vanilla's
+// red dots, and between the two wore the Y / X badges. A button shows only while it can be pressed: with a pad the sliding
+// art gets a dark disc with no letter over each socket, the badges come with the buttons once the panel is up and go with
+// them. `sockets` = the badges' top-left. Returns a copy of the art to slide (mem_malloc) or the art itself (no pad, no
+// memory); gdialog_free_slide_art lets it go.
+static unsigned char* gdialog_slide_art(unsigned char* art, int width, int height, const int (*sockets)[2], int count)
+{
+    if (art == NULL || gamepad_ui_get_controller() == NULL) {
+        return art;
+    }
+    unsigned char* copy = (unsigned char*)mem_malloc(width * height);
+    if (copy == NULL) {
+        return art;
+    }
+    memcpy(copy, art, width * height);
+    unsigned char disc[GD_BADGE_SIZE * GD_BADGE_SIZE];
+    intface_pad_face_fill(disc, GD_BADGE_SIZE, GD_BADGE_SIZE, ' ');
+    for (int i = 0; i < count; i++) {
+        for (int y = 0; y < GD_BADGE_SIZE; y++) {
+            for (int x = 0; x < GD_BADGE_SIZE; x++) {
+                unsigned char v = disc[y * GD_BADGE_SIZE + x];
+                int px = sockets[i][0] + x;
+                int py = sockets[i][1] + y;
+                if (v != 0 && px >= 0 && py >= 0 && px < width && py < height) {
+                    copy[py * width + px] = v;
+                }
+            }
+        }
+    }
+    return copy;
+}
+
+static void gdialog_free_slide_art(unsigned char* slide, unsigned char* art)
+{
+    if (slide != NULL && slide != art) {
+        mem_free(slide);
+    }
+}
+
+// The talk panel's sockets: BARTER and ASK ABOUT (their badges at 592,40 / 592,115, talk_to_create_dialogue_win). The
+// barter panel's TRADE / TALK wear no badges in Fallout 1, so it slides as it always did.
+static const int gd_talk_sockets[2][2] = { { 592, 40 }, { 592, 115 } };
 
 // 0x58DAC4
 static int talkOldFont;
@@ -3023,6 +3069,7 @@ static void talk_to_scroll_subwin(int win, int a2, unsigned char* a3, unsigned c
             }
 
             renderPresent();
+            autotest_talk_frame(true, v18); // `talkshots on`: each step as presented
             sharedFpsLimiter.throttle();
         }
     } else {
@@ -3063,6 +3110,7 @@ static void talk_to_scroll_subwin(int win, int a2, unsigned char* a3, unsigned c
             }
 
             renderPresent();
+            autotest_talk_frame(false, index); // `talkshots on`: each step as presented
             sharedFpsLimiter.throttle();
         }
     }
@@ -3894,13 +3942,16 @@ static int talk_to_create_dialogue_win()
         v10,
         screenWidth);
 
+    // With a pad the panel slides in with its sockets empty (gdialog_slide_art); the buttons below bring the badges.
+    unsigned char* slideArt = gdialog_slide_art(backgroundFrmData, screenWidth, dialogue_subwin_len, gd_talk_sockets, 2);
     if (dialogue_just_started) {
         win_draw(dialogueBackWindow);
-        talk_to_scroll_subwin(dialogueWindow, 1, backgroundFrmData, v10, 0, dialogue_subwin_len, -1);
+        talk_to_scroll_subwin(dialogueWindow, 1, slideArt, v10, 0, dialogue_subwin_len, -1);
         dialogue_just_started = 0;
     } else {
-        talk_to_scroll_subwin(dialogueWindow, 1, backgroundFrmData, v10, 0, dialogue_subwin_len, 0);
+        talk_to_scroll_subwin(dialogueWindow, 1, slideArt, v10, 0, dialogue_subwin_len, 0);
     }
+    gdialog_free_slide_art(slideArt, backgroundFrmData);
 
     art_ptr_unlock(backgroundFrmHandle);
 
@@ -4064,7 +4115,11 @@ static void talk_to_destroy_dialogue_win()
     unsigned char* backgroundFrmData = art_ptr_lock_data(fid, 0, 0, &backgroundFrmHandle);
     if (backgroundFrmData != NULL) {
         unsigned char* windowBuffer = win_get_buf(dialogueWindow);
-        talk_to_scroll_subwin(dialogueWindow, 0, backgroundFrmData, windowBuffer, backgroundWindowBuffer, dialogue_subwin_len, 0);
+        // With a pad the panel leaves with its sockets empty: the buttons and their badges are gone (gdialog_slide_art).
+        unsigned char* slideArt = gdialog_slide_art(backgroundFrmData, GAME_DIALOG_WINDOW_WIDTH, dialogue_subwin_len,
+            gd_talk_sockets, 2);
+        talk_to_scroll_subwin(dialogueWindow, 0, slideArt, windowBuffer, backgroundWindowBuffer, dialogue_subwin_len, 0);
+        gdialog_free_slide_art(slideArt, backgroundFrmData);
         art_ptr_unlock(backgroundFrmHandle);
         win_delete(dialogueWindow);
         dial_win_created = 0;

@@ -1,0 +1,54 @@
+# SCREEN (from Fallout 2 Realtime 2026-11-18, his „když nemířím na item v inventáři tak Bčko mi vypne inventory“, then
+# „i F1“): in the inventory B over an item still puts it in hand B; over anything else -- an empty row, an empty hand, the
+# dude, DONE -- it closes the screen, like BACK. DONE wears a dark B disc, as the loot window's does (his „ano, dej tam
+# B“). `screen` = the presented frame.
+#   1 the inventory, the pointer on nothing           2 after B: the world
+#   3 the inventory again, the pointer on row 0 (the pistol)
+#   4 after B: the pistol in hand B, the screen still up
+#   5 after B again, on the now empty row: the world
+name screen-inv-b-close
+map DESERT1.MAP
+seed 1
+duration 17
+dude tile 20100 rot 2
+dude item 8 1
+
+open 1000 inventory
+screen 2500
+tap 3000 B
+screen 4500
+open 5500 inventory
+# the left stick's snap: four left, six up (the list's up arrow), one more left (row 0)
+axis 7000 LX -32767
+axis +120 LX 0
+axis +280 LX -32767
+axis +120 LX 0
+axis +280 LX -32767
+axis +120 LX 0
+axis +280 LX -32767
+axis +120 LX 0
+axis +300 LY -32767
+axis +120 LY 0
+axis +280 LY -32767
+axis +120 LY 0
+axis +280 LY -32767
+axis +120 LY 0
+axis +280 LY -32767
+axis +120 LY 0
+axis +280 LY -32767
+axis +120 LY 0
+axis +280 LY -32767
+axis +120 LY 0
+axis +280 LX -32767
+axis +120 LX 0
+screen +400
+tap +500 B
+screen +900
+tap +600 B
+screen +1200
+note +1000 end
+
+# the checks (run.js)
+expect-count 2 \[INPUT/inv-close\] src=b
+expect \[INPUT/inv-equip\] in hand=B pid=8 row=0
+expect \[FLOW/autotest\] end why=time .* modal=-1

@@ -21,6 +21,9 @@ void autotest_take_mouse(int* dx, int* dy);
 // on` saves the first two of each load as presented.
 void autotest_planet_frame(bool first);
 
+// A step of the talk panel sliding in (up) or out: a self-played run with `talkshots on` saves each as presented.
+void autotest_talk_frame(bool up, int step);
+
 char* autotest_map();
 int autotest_seed();
 
