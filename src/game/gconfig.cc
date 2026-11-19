@@ -98,7 +98,7 @@ bool gconfig_init(bool isMapper, int argc, char** argv)
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_RUN_RESUME_AP_KEY, 3);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_WALK_AP_COST_KEY, 2.0);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_KEY, 1.2); // 1.4 until 2026-11-17 (his „dej 1,2 i do F1“)
-    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, 0.8); // 0.6 until 2026-11-18 (his „vždyť jsem ti říkal taky 0,8“)
+    config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, 1.0); // 0.6 until 2026-11-18, 0.8 until 2026-11-19 (his „dej mi 1.2 a 1“)
     config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FALLOFF_TILES_KEY, 12);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_MOVING_KEY, 0.4);
     config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_MOVING_KEY, 0.7);

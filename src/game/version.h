@@ -16,7 +16,7 @@ namespace fallout {
 
 // Fallout 1 Realtime's own version, shown beside the game's in the main menu corner (and on
 // Ctrl+V). NOT VERSION_MAJOR/MINOR above: those are written into every save file.
-#define REALTIME_VERSION "0.1.0"
+#define REALTIME_VERSION "0.2.0"
 
 // The window title. The development build says so, so the two can sit side by side.
 #ifdef FALLOUT_RELEASE
