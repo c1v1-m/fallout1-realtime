@@ -1,0 +1,38 @@
+# CONTROLS FROM THE PAUSE MENU (from Fallout 2 Realtime, 2026-11-19: his „udělej je jako ve F2. Dám menu a můžu dát
+# Y pro controls“): START opens the pause menu, which with a pad shows "Y Controls" under DONE; Y opens the Pip-Boy's
+# CONTROLS list in a window of its own (options.cc options_show_controls). B puts it away and the pause menu must STAY
+# (the B is still down when the menu resumes: input epoch). Y opens it again, held: the hold must not close it (seen
+# released first); a second Y closes it. A last B shuts the pause menu. `screen` = the presented frame.
+#   1 the menu with the hint   2 the list   3 the menu again   4 the list again
+name screen-pause-controls
+map DESERT1.MAP
+seed 1
+duration 14
+dude tile 20100 rot 2
+
+# START tapped: the pause menu opens on the release, its highlight on SAVE GAME
+open 1000 options
+screen 2000
+# Y: the CONTROLS window over the menu
+tap 2600 Y
+screen 3600
+# B: back to the pause menu
+tap 4400 B
+screen 5200
+# Y again, held 0.4 s
+tap 6000 Y 400
+screen 7000
+# Y closes it this time
+tap 7800 Y
+# B shuts the pause menu
+tap 9400 B
+note 11500 the world should be back
+
+# the checks (run.js)
+# 27 rows in ctrl_lines (BACK hold's run to an exit included), 3 of them blank spacers
+expect \[FLOW/controls-open\] rows=24 size=\d+x\d+
+expect-count 2 \[FLOW/controls-open\]
+expect \[FLOW/controls-closed\] by=b
+expect \[FLOW/controls-closed\] by=y
+expect-not \[FLOW/controls-closed\] by=esc
+expect \[FLOW/autotest\] end why=time .* modal=-1

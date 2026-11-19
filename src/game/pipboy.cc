@@ -484,6 +484,7 @@ static const PipboyControl ctrl_lines[] = {
     { "LT + Y", "Firing mode" },
     { NULL, NULL },
     { "BACK", "Inventory" },
+    { "BACK hold", "Run to exit" }, // the run to an exit had no line here, though F1 has it (2026-11-19, with F2's list)
     { "START", "Pause" },
     { "START hold", "Quick save" },
 };
@@ -2270,6 +2271,57 @@ static const char* ctrl_deck_names(const char* text, char* out, size_t size)
     }
     out[n] = '\0';
     return out;
+}
+
+// The same list for a window of its own: the pause menu's Y (options.cc; from Fallout 2 Realtime 2026-11-19, his
+// „udělej je jako ve F2. Dám menu a můžu dát Y pro controls“). Read from ctrl_lines and spelt by ctrl_deck_names, so
+// the two screens can never list different buttons.
+const char* pipboy_controls_title()
+{
+    return ctrl_entry;
+}
+
+int pipboy_controls_count()
+{
+    return (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0]));
+}
+
+// Row `index` as the page below prints it (the Deck's names on a Deck). False for a blank spacer; a heading comes
+// back with `button` empty.
+bool pipboy_controls_row(int index, char* button, size_t buttonSize, char* action, size_t actionSize)
+{
+    if (buttonSize == 0 || actionSize == 0) {
+        return false;
+    }
+
+    button[0] = '\0';
+    action[0] = '\0';
+
+    if (index < 0 || index >= pipboy_controls_count()) {
+        return false;
+    }
+
+    const PipboyControl* entry = &(ctrl_lines[index]);
+    if (entry->button == NULL && entry->action == NULL) {
+        return false;
+    }
+
+    bool deck = ctrl_on_deck();
+    if (entry->button != NULL) {
+        if (deck) {
+            ctrl_deck_names(entry->button, button, buttonSize);
+        } else {
+            snprintf(button, buttonSize, "%s", entry->button);
+        }
+    }
+    if (entry->action != NULL) {
+        if (deck) {
+            ctrl_deck_names(entry->action, action, actionSize);
+        } else {
+            snprintf(action, actionSize, "%s", entry->action);
+        }
+    }
+    return true;
 }
 
 // 0x000000 (not vanilla)
