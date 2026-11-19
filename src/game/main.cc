@@ -580,6 +580,9 @@ static void main_game_loop()
         // The map in 3D (fp_view.cc), view only: F9 through his eyes, F8 the game's own camera through
         // a perspective lens (Diablo II's "Perspective"). Free keys in every build so the Steam install
         // has them too; G, which he asked for, is his keyboard's run to the nearest exit.
+        // ⚠️ NOT IN THE GITHUB ZIP (FALLOUT_PUBLIC, 0.2.0, his pick „Vypnout ve vydání“ 2026-11-19): unfinished. His own
+        // Steam build is FALLOUT_RELEASE without FALLOUT_PUBLIC and keeps the keys and the editor.
+#ifndef FALLOUT_PUBLIC
         if (!GNW95_editor_app && (keyCode == KEY_F9 || keyCode == KEY_F8)) {
             fp_view_toggle(keyCode == KEY_F9 ? FP_VIEW_EYES : FP_VIEW_DIABLO);
             keyCode = -1;
@@ -590,6 +593,7 @@ static void main_game_loop()
             fp_view_edit_toggle();
             keyCode = -1;
         }
+#endif
         fp_view_edit_check();
         bool editing3d = fp_view_editing();
         if (editing3d) {

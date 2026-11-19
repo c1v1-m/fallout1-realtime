@@ -18,7 +18,7 @@
 
 set -u
 
-VERSION="0.1.0" # kept equal to REALTIME_VERSION (src/game/version.h)
+VERSION="0.2.0" # kept equal to REALTIME_VERSION (src/game/version.h)
 MARKER="Fallout 1 Realtime" # every build of the game carries it; Steam's launcher does not
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GAME_EXE="$HERE/fallout1-realtime.exe"

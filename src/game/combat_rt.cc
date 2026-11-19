@@ -15882,6 +15882,17 @@ void combat_rt_init()
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_KEY, &regenNearMult);
     double regenFarMult = RT_REGEN_FAR_MULT;
     config_get_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, &regenFarMult);
+    // ⚠️ 0.1.0's DEFAULTS MOVE ALONG (0.2.0, his pick „Přepnout je samo“ 2026-11-19). The game writes every key into
+    // fallout.cfg as it closes, so a 0.1.0 player carries that version's 1.4 / 0.6 for ever and would never get the
+    // new 1.2 / 1.0. Exactly that pair, both untouched, is taken for the old defaults and replaced (in the config too,
+    // so the next save of fallout.cfg keeps it); a pair anyone set by hand stays.
+    if (fabs(regenNearMult - 1.4) < 0.0005 && fabs(regenFarMult - 0.6) < 0.0005) {
+        regenNearMult = RT_REGEN_NEAR_MULT;
+        regenFarMult = RT_REGEN_FAR_MULT;
+        config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_NEAR_MULT_KEY, regenNearMult);
+        config_set_double(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_REGEN_FAR_MULT_KEY, regenFarMult);
+        trace_event(TRACE_FLOW, "cfg-migrate", "regen 1.4/0.6 (0.1.0 defaults) -> %.1f/%.1f", regenNearMult, regenFarMult);
+    }
     rt_regen_far_mult = regenFarMult < 0.1 ? 0.1f : (float)regenFarMult;
     rt_regen_near_mult = (float)regenNearMult < rt_regen_far_mult ? rt_regen_far_mult : (float)regenNearMult;
 

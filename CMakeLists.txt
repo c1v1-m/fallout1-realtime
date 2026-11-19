@@ -40,6 +40,10 @@ option(UBSAN "Enable undefined behaviour sanitizer" OFF)
 # bug report), and the exe is named fallout1-realtime. Configure it into its own tree:
 #   cmake -S . -B build-release -DFALLOUT_RELEASE=ON
 option(FALLOUT_RELEASE "Fallout 1 Realtime public build: diagnostics default off" OFF)
+# The zip on GitHub, on top of FALLOUT_RELEASE: unfinished features left out -- the 3D views on F8 / F9 and the 3D
+# editor (main.cc, winmain.cc). His own Steam build is FALLOUT_RELEASE alone and keeps them (0.2.0, his pick
+# „Vypnout ve vydání“ 2026-11-19).
+option(FALLOUT_PUBLIC "Fallout 1 Realtime GitHub zip: unfinished features left out" OFF)
 
 if (ANDROID)
     add_library(${EXECUTABLE_NAME} SHARED)
@@ -340,6 +344,10 @@ if(WIN32)
         winmm
         dbghelp
     )
+endif()
+
+if(FALLOUT_PUBLIC)
+    target_compile_definitions(${EXECUTABLE_NAME} PRIVATE FALLOUT_PUBLIC=1)
 endif()
 
 if(FALLOUT_RELEASE)

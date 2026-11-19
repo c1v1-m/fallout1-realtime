@@ -46,10 +46,13 @@ int main(int argc, char* argv[])
         if (strcmp(argv[i], "--autotest") == 0) {
             GNW95_beside = true;
         }
+#ifndef FALLOUT_PUBLIC // the 3D editor is not in the GitHub zip (CMakeLists.txt FALLOUT_PUBLIC)
         if (strcmp(argv[i], "--3d-editor") == 0) {
             GNW95_editor_app = true;
         }
+#endif
     }
+#ifndef FALLOUT_PUBLIC
     if (argc > 0 && argv[0] != NULL) {
         char name[512];
         snprintf(name, sizeof(name), "%s", argv[0]);
@@ -64,6 +67,7 @@ int main(int argc, char* argv[])
             GNW95_editor_app = true;
         }
     }
+#endif
 #ifndef FALLOUT_RELEASE
     // the 3D editor program played by itself (FALLOUT_FP_APP_TEST, development): no window on his screen
     if (GNW95_editor_app && getenv("FALLOUT_FP_APP_TEST") != NULL) {
