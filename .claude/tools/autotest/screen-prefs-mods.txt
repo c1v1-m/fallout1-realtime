@@ -1,0 +1,28 @@
+# "X Mods" on PREFERENCES (2026-11-20, his „Ano, obojí“): MODS opens from Preferences with the pad's X (M on the
+# keyboard), and nothing on screen said so once the Pip-Boy's CONTROLS page was gone. With a pad, "X Mods" sits on
+# the Preferences screen as the pause menu's "Y Controls" does. `screen` = the presented frame.
+#   1 Preferences with the hint      2 MODS open over it
+name screen-prefs-mods
+map DESERT1.MAP
+seed 1
+duration 14
+dude tile 20100 rot 2
+
+# START tapped: the pause menu, SAVE -> LOAD -> PREFERENCES, A opens it
+open 1000 options
+tap 2200 DOWN
+tap 2700 DOWN
+tap 3200 A
+screen 4200
+# X opens MODS from Preferences
+tap 4800 X
+screen 5800
+# B closes MODS, B cancels Preferences, B shuts the pause menu
+tap 6600 B
+tap 7800 B
+tap 9000 B
+note 11000 the world should be back
+
+expect \[FLOW/prefs-hint\] mods
+expect \[FLOW/mods-open\] by=x
+expect \[FLOW/autotest\] end why=time .* modal=-1

@@ -29,7 +29,7 @@ You need your own copy of Fallout from [Steam](https://store.steampowered.com/ap
 - Autosaves when you reach a new place or a quest moves on, and a quick save on the controller.
 - On the Steam Deck it starts straight from the Steam library, in Game Mode.
 - Widescreen at the original scale, smooth movement and VSync.
-- A MODS page in the options, where most of this can be switched back toward the original.
+- A MODS page in the options, where most of this can be switched back toward the original. To open it, pause the game, open Preferences and press X (M on the keyboard).
 
 ## Install
 
