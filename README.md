@@ -25,6 +25,7 @@ You need your own copy of Fallout from [Steam](https://store.steampowered.com/ap
 - The whole game plays on a gamepad: fighting, looting, barter, dialogue, the Pip-Boy, the character screen.
 - With a pad, the screens show which pad button does what: the interface bar, the use icon, dialogue, the inventory, character selection and the character screen.
 - Two quick slots: LB for a stimpack or any drug or tool, RB for a grenade. Radial menus for skills, weapons, ammo and drugs.
+- Hold BACK and you run to the nearest exit. Where the exits lead to more than one place, a wheel lets you pick where to go.
 - Autosaves when you reach a new place or a quest moves on, and a quick save on the controller.
 - On the Steam Deck it starts straight from the Steam library, in Game Mode.
 - Widescreen at the original scale, smooth movement and VSync.

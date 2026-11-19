@@ -1,0 +1,34 @@
+# EXIT WHEEL (from Fallout 2 Realtime, 2026-11-19, his „Ano, přenes“): where the exits lead to two places or more,
+# holding BACK opens an EXITS wheel, one segment per place, instead of running. B closes it with no run and BACK's
+# release then opens nothing (no inventory). The second hold lets go of BACK with nothing aimed: he runs for the
+# NEAREST place, as the hold always did. On the Hub downtown pavement outside the FLC; inside it (23509) the shut
+# door leaves no way out, and at the Shady Sands well every exit leads to one place, so no wheel. `screen` = the
+# presented frame.
+#   1 the wheel open      2 the wheel open again
+name screen-exit-wheel
+map HUBDWNTN.MAP
+seed 1
+duration 20
+dude tile 23519 rot 0
+cleararea 40
+
+note 1500 hold-back-then-b
+pad 2000 BACK 1
+screen 2800
+tap 3000 B
+pad 3400 BACK 0
+
+note 4500 hold-back-aim-nothing
+pad 5000 BACK 1
+screen 5800
+pad 6200 BACK 0
+note 9000 running
+
+expect-count 2 exit-wheel\] places=[2-9] open=1
+expect exit-wheel-closed\] why=b
+expect-count 1 exit-pick\]
+expect exit-pick\] aimed=-1 .*src=back
+expect exit-nav\] .*rc=0 map=
+expect Heading for
+expect-not exit-nav\] unreachable
+expect-not autotest\] modal .*inv=1

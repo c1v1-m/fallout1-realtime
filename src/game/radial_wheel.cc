@@ -649,6 +649,11 @@ void radial_wheel_open(const RadialSegment* segments, int count, const char* tit
     wheel_draw();
 }
 
+void radial_wheel_arm()
+{
+    wheel_aim_armed = true;
+}
+
 void radial_wheel_update(float aimX, float aimY)
 {
     if (wheel_win == -1) {

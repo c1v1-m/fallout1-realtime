@@ -83,6 +83,10 @@ void radial_wheel_set_side_hints(const char* left, const char* right);
 void radial_wheel_open(const RadialSegment* segments, int count, const char* title,
     const RadialWheelArt* art, int atX, int atY, bool transparentBg);
 
+// Take the aim at once, with no pass through the centre first. Only for a wheel whose aiming stick
+// cannot be carrying a walk in from gameplay (the exit wheel's right stick). Call after radial_wheel_open.
+void radial_wheel_arm();
+
 // Feed the aim vector (e.g. right stick; x right, y DOWN, components ~ -1..1). Past the
 // deadzone the segment nearest the aim angle is highlighted; below it nothing is (so a
 // release with the stick centered cancels). Redraws only when the highlight changes.

@@ -296,8 +296,9 @@ static bool gpui_is_lockpick_pid(int pid)
 // that nav (the snap yanks the cursor onto buttons/scroll arrows). The right stick
 // can still move the cursor and RT still clicks, for optional mouse-style use.
 // BACK HELD = RUN TO THE NEAREST MAP EXIT (was LB+RB before the 2026-09-16 layout dropped the
-// modifier button). Set from the mouse hook (gpui_button_shortcuts), performed on
-// the safe tick (gamepad_ui_tick) for the same reason the heal is: it registers an animation.
+// modifier button), or -- exits to more than one place -- the wheel that asks which (gpui_run_to_exit).
+// Set from the mouse hook (gpui_button_shortcuts), performed on the safe tick (gamepad_ui_tick) for
+// the same reason the heal is: it registers an animation, and a wheel is a window.
 static bool gpui_exit_nav_pending = false;
 
 static bool gpui_self_nav = false;
@@ -2879,12 +2880,14 @@ enum {
     GPUI_WHEEL_QUICK,
     GPUI_WHEEL_WEAPON,
     GPUI_WHEEL_AMMO,
+    GPUI_WHEEL_EXIT, // the BACK hold's "which exit" (gpui_exit_wheel)
 };
 static int gpui_wheel_owner = GPUI_WHEEL_NONE;
 
 
 // Set for one tick by gamepad_ui_tick when A goes down; read by every wheel as "select".
 static bool gpui_wheel_a_edge = false;
+static bool gpui_a_for_wheel = false; // this tick's A edge came while a wheel was up (gamepad_ui_tick)
 
 // The eight body parts, clockwise from the top (head up, groin down, limbs on the sides).
 static const struct {
@@ -3958,7 +3961,7 @@ static Object* gpui_next_heal(int* count)
     return NULL;
 }
 
-// --- LB+RB: run to the nearest map exit ---
+// --- BACK held: run to a map exit ---
 //
 // "Just take me to the next area." Crossing a cleared map on foot is the part of Fallout that is
 // pure travel time, and on a pad it is worse than on a mouse: a mouse player clicks the far edge of
@@ -3966,12 +3969,8 @@ static Object* gpui_next_heal(int* count)
 // it himself. This is the pad's version of that click, aimed at the one destination that is always
 // what you meant -- the way out.
 //
-// ⚠️ BOTH SHOULDERS, because it is the only two-button gesture left that costs nothing. LB is the
-// modifier already (run, LB+Y quick save, LB+B heal) and its face-button combos are all spoken for;
-// worse, LB is HELD CONSTANTLY by anyone who runs everywhere, so hanging this on LB+X would have
-// eaten reload-while-running -- the exact collision the quick-save comment calls the layout's
-// accepted cost, and one more of them is one too many. RB's own job in the world is toggling the
-// cursor mode, a tap worth nothing mid-run, so the combo simply swallows it.
+// It was LB+RB until the 2026-09-16 layout dropped the modifier button; since then it is a BACK hold
+// (gpui_button_shortcuts), and the keyboard's G.
 //
 // OUT OF COMBAT ONLY, and that is not timidity: auto-pathing a player through a firefight would walk
 // him into rifle fire he is not steering away from. (Leaving a map mid-fight works by stepping onto
@@ -3980,52 +3979,192 @@ static Object* gpui_next_heal(int* count)
 // Exit grids are the MISC objects with pids 0x5000010..0x5000017 -- the same range obj_move_to_tile
 // tests to fire map_leave_map, and the same one obj_dude_on_exit_grid reads, so "what counts as an
 // exit" has exactly one definition in the build.
-static void gpui_run_to_exit()
+//
+// ⚠️ AND IT ASKS WHICH EXIT (from Fallout 2 Realtime, where it came 2026-11-10 with his „pokud není možné vybrat
+// východ, tak to tlačítko docela ztrácí smysl“; here 2026-11-19, his „Ano, přenes“). The nearest grid is the right
+// answer in a desert encounter, where every edge leads to the world map, and a coin toss in a town. So the grids on
+// his floor are grouped by where they lead, and when that is two places or more the hold opens a wheel -- the B and
+// Y holds' overlay -- with one segment per place, named the way the game names it (gpui_exit_name). Aim, let go of
+// BACK (or press A) and he runs for the nearest grid of that place. Nothing aimed at = the nearest exit, what the
+// hold always did; a floor whose exits all lead to one place runs straight there, no wheel.
+
+// Places one floor can lead to; past this many the rest are left out.
+#define GPUI_EXIT_MAX RADIAL_WHEEL_MAX
+
+// Every exit off the map is ONE place, whatever its grid stores: 0 and -2 are the world map (the engine turns 0 into
+// -2 when the grid fires) and -1 asks for the town map, which opens as the world map too. The grids' own art agrees
+// -- the object loader gives every grid with a map <= 0 the world map look.
+#define GPUI_EXIT_WORLD_MAP (-2)
+
+typedef struct GpuiExitPlace {
+    int map;       // GPUI_EXIT_WORLD_MAP or a map index
+    int elevation; // the floor it arrives on (0 for the world map)
+    int tile;      // the nearest grid that leads there...
+    int dist;      // ...and how far that is
+    char name[48]; // what the wheel and the message call it
+} GpuiExitPlace;
+
+// What the game calls a place: "World map", or the name the Pip-Boy's automap list gives that map and floor.
+static void gpui_exit_name(GpuiExitPlace* place)
 {
-    if (obj_dude == NULL || !intface_is_enabled()) {
-        return;
+    const char* name = NULL;
+    if (place->map == GPUI_EXIT_WORLD_MAP) {
+        name = "World map";
+    } else {
+        name = map_get_elev_idx(place->map, place->elevation);
     }
 
-    if (combat_rt_enabled() ? combat_rt_active() : (isInCombat() != 0)) {
-        gsound_play_sfx_file("iisxxxx1");
-        display_print("Not while you're being shot at.");
-        return;
+    if (name == NULL || name[0] == '\0') {
+        name = "Exit";
     }
+    snprintf(place->name, sizeof(place->name), "%s", name);
+}
+
+// The places the exit grids on the dude's floor lead to, NEAREST FIRST, each with its nearest grid,
+// so places[0] is the plain nearest exit. Returns how many.
+static int gpui_exit_places(GpuiExitPlace* places)
+{
+    int count = 0;
 
     Object** objects;
-    int count = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_MISC, &objects);
-
-    Object* best = NULL;
-    int bestDist = INT_MAX;
-    for (int i = 0; i < count; i++) {
+    int n = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_MISC, &objects);
+    for (int i = 0; i < n; i++) {
         Object* obj = objects[i];
         if (obj == NULL || obj->pid < 0x5000010 || obj->pid > 0x5000017) {
             continue;
         }
+
+        int map = obj->data.misc.map <= 0 ? GPUI_EXIT_WORLD_MAP : obj->data.misc.map;
+        int elevation = map == GPUI_EXIT_WORLD_MAP ? 0 : obj->data.misc.elevation;
+
         // Straight tile distance, not path length. make_path on every candidate would be the
         // honest answer and is far too expensive for a button press; the nearest grid as the crow
         // flies is the right one on essentially every map, and if the path turns out to be longer
         // the engine still walks it correctly -- only the CHOICE would be second-best.
         int d = tile_dist(obj_dude->tile, obj->tile);
-        if (d < bestDist) {
-            bestDist = d;
-            best = obj;
+
+        int at = 0;
+        while (at < count && (places[at].map != map || places[at].elevation != elevation)) {
+            at++;
+        }
+        if (at == count) {
+            if (count == GPUI_EXIT_MAX) {
+                continue;
+            }
+            places[at].map = map;
+            places[at].elevation = elevation;
+            places[at].dist = INT_MAX;
+            count++;
+        }
+        if (d >= places[at].dist) {
+            continue;
+        }
+        places[at].dist = d;
+        places[at].tile = obj->tile;
+
+        while (at > 0 && places[at].dist < places[at - 1].dist) {
+            GpuiExitPlace swap = places[at];
+            places[at] = places[at - 1];
+            places[at - 1] = swap;
+            at--;
         }
     }
 
-    if (count > 0) {
+    if (n > 0) {
         obj_delete_list(objects);
     }
 
-    if (best == NULL) {
+    for (int i = 0; i < count; i++) {
+        gpui_exit_name(&places[i]);
+    }
+    return count;
+}
+
+// Out of combat and with the bar up (no scene, no screen). The refusal in a fight says why.
+static bool gpui_exit_allowed()
+{
+    if (obj_dude == NULL || !intface_is_enabled()) {
+        return false;
+    }
+
+    if (combat_rt_enabled() ? combat_rt_active() : (isInCombat() != 0)) {
         gsound_play_sfx_file("iisxxxx1");
-        display_print("No way out of here.");
+        display_print("Not while you're being shot at.");
+        return false;
+    }
+    return true;
+}
+
+// ⚠️ THE NEAREST GRID A PATH REACHES, NOT JUST THE NEAREST (Fallout 2 Realtime's first run of the wheel: a place's
+// nearest grid behind walls, make_path found no steps, the run was queued anyway and he stood still under "Heading
+// for ..."). Of the grids that lead to `place`, nearest first, the first one he can walk to; at most a few
+// pathfinder calls, and only on the pick. -1 = none.
+#define GPUI_EXIT_PATH_TRIES 8
+static int gpui_exit_reachable_grid(const GpuiExitPlace* place)
+{
+    int tiles[GPUI_EXIT_PATH_TRIES];
+    int dists[GPUI_EXIT_PATH_TRIES];
+    int count = 0;
+
+    Object** objects;
+    int n = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_MISC, &objects);
+    for (int i = 0; i < n; i++) {
+        Object* obj = objects[i];
+        if (obj == NULL || obj->pid < 0x5000010 || obj->pid > 0x5000017) {
+            continue;
+        }
+        int map = obj->data.misc.map <= 0 ? GPUI_EXIT_WORLD_MAP : obj->data.misc.map;
+        int elevation = map == GPUI_EXIT_WORLD_MAP ? 0 : obj->data.misc.elevation;
+        if (map != place->map || elevation != place->elevation) {
+            continue;
+        }
+        // Keep the nearest few, nearest first.
+        int d = tile_dist(obj_dude->tile, obj->tile);
+        int at = count < GPUI_EXIT_PATH_TRIES ? count : GPUI_EXIT_PATH_TRIES - 1;
+        if (count == GPUI_EXIT_PATH_TRIES && d >= dists[at]) {
+            continue;
+        }
+        while (at > 0 && dists[at - 1] > d) {
+            tiles[at] = tiles[at - 1];
+            dists[at] = dists[at - 1];
+            at--;
+        }
+        tiles[at] = obj->tile;
+        dists[at] = d;
+        if (count < GPUI_EXIT_PATH_TRIES) {
+            count++;
+        }
+    }
+    if (n > 0) {
+        obj_delete_list(objects);
+    }
+
+    // a5 = 1: a grid with something standing on it is skipped for the next one, since the exit only fires when he
+    // steps onto it. ⚠️ FALLOUT 1 NEVER ROUTES THE DUDE THROUGH A DOOR (anim_can_use_door, vanilla): inside a
+    // building whose door is shut every grid is unreachable and the hold says "No way out of here." -- the run
+    // could not have got out either (2026-11-19, the first test stood him inside the Hub's FLC).
+    for (int i = 0; i < count; i++) {
+        if (make_path(obj_dude, obj_dude->tile, tiles[i], NULL, 1) > 0) {
+            return tiles[i];
+        }
+    }
+    return -1;
+}
+
+// Run for the nearest grid of `place` he can reach, and say where to.
+static void gpui_exit_run(const GpuiExitPlace* place)
+{
+    if (place->dist <= 1) {
+        gsound_play_sfx_file("iisxxxx1");
+        display_print("You're standing on it.");
         return;
     }
 
-    if (bestDist <= 1) {
+    int tile = gpui_exit_reachable_grid(place);
+    if (tile == -1) {
+        trace_event(TRACE_ACTION, "exit-nav", "unreachable map=%d elev=%d", place->map, place->elevation);
         gsound_play_sfx_file("iisxxxx1");
-        display_print("You're standing on it.");
+        display_print("No way there.");
         return;
     }
 
@@ -4040,11 +4179,12 @@ static void gpui_run_to_exit()
 
     unsigned int serialBefore = anim_dude_reg_serial();
     register_begin(ANIMATION_REQUEST_RESERVED);
-    register_object_run_to_tile(obj_dude, best->tile, obj_dude->elevation, -1, 0);
+    register_object_run_to_tile(obj_dude, tile, obj_dude->elevation, -1, 0);
     int rc = register_end();
     combat_rt_note_player_walk(serialBefore); // a script's scene that begins on the way stops it
 
-    trace_event(TRACE_ACTION, "exit-nav", "tile=%d dist=%d rc=%d", best->tile, bestDist, rc);
+    trace_event(TRACE_ACTION, "exit-nav", "tile=%d dist=%d rc=%d map=%d elev=%d", tile, tile_dist(obj_dude->tile, tile), rc,
+        place->map, place->elevation);
 
     if (rc == -1) {
         gsound_play_sfx_file("iisxxxx1");
@@ -4052,7 +4192,218 @@ static void gpui_run_to_exit()
     }
 
     gsound_play_sfx_file("ib1p1xx1");
-    display_print("Heading for the exit.");
+    char message[80];
+    snprintf(message, sizeof(message), "Heading for %s.", place->name);
+    display_print(message);
+}
+
+// The places the open exit wheel offers, nearest first; a segment's id is its index here. Valid while
+// the wheel is up, and nothing moves under it: the world is paused while any wheel is (gamepad_ui_tick).
+static GpuiExitPlace gpui_exit_wheel_places[GPUI_EXIT_MAX];
+static int gpui_exit_wheel_count = 0;
+
+// The segments go round the ring in the order the places lie round HIM on screen -- each one's bearing
+// from the dude, 0 = up and clockwise like the wheel's own angles -- turned so the ring fits those
+// bearings best. Pushing the stick toward an exit then mostly picks that exit, and two places of one
+// name are told apart by where they lie. Plain look, no art: the names are the whole content, and all
+// of them show at once.
+static void gpui_open_exit_wheel()
+{
+    int n = gpui_exit_wheel_count;
+    int order[GPUI_EXIT_MAX];
+    float bearing[GPUI_EXIT_MAX];
+
+    int dudeX = 0;
+    int dudeY = 0;
+    tile_coord(obj_dude->tile, &dudeX, &dudeY, obj_dude->elevation);
+    for (int i = 0; i < n; i++) {
+        int x = dudeX;
+        int y = dudeY;
+        tile_coord(gpui_exit_wheel_places[i].tile, &x, &y, obj_dude->elevation);
+        float a = atan2f((float)(x - dudeX), (float)(dudeY - y));
+        if (a < 0.0f) {
+            a += 2.0f * GPUI_PI;
+        }
+        bearing[i] = a;
+
+        int at = i;
+        while (at > 0 && bearing[order[at - 1]] > a) {
+            order[at] = order[at - 1];
+            at--;
+        }
+        order[at] = i;
+    }
+
+    // Which place sits on top: the turn of the ring with the least total angle between each segment
+    // and the place on it.
+    int turn = 0;
+    float bestCost = 1e9f;
+    for (int r = 0; r < n; r++) {
+        float cost = 0.0f;
+        for (int k = 0; k < n; k++) {
+            float d = fabsf(k * (2.0f * GPUI_PI / n) - bearing[order[(k + r) % n]]);
+            cost += d > GPUI_PI ? 2.0f * GPUI_PI - d : d;
+        }
+        if (cost < bestCost) {
+            bestCost = cost;
+            turn = r;
+        }
+    }
+
+    RadialSegment segs[GPUI_EXIT_MAX];
+    memset(segs, 0, sizeof(segs));
+    char layout[160];
+    size_t len = 0;
+    layout[0] = '\0';
+    for (int k = 0; k < n; k++) {
+        int i = order[(k + turn) % n];
+        segs[k].label = gpui_exit_wheel_places[i].name;
+        segs[k].id = i;
+        segs[k].enabled = true;
+        segs[k].value = -1;
+        if (len < sizeof(layout)) {
+            int w = snprintf(layout + len, sizeof(layout) - len, "%s%d:%s", k > 0 ? " | " : "", k,
+                gpui_exit_wheel_places[i].name);
+            len = w > 0 ? len + (size_t)w : sizeof(layout);
+        }
+    }
+
+    radial_wheel_open(segs, n, "EXITS", NULL, -1, -1, false);
+    if (radial_wheel_is_open()) {
+        gpui_wheel_owner = GPUI_WHEEL_EXIT;
+        // ⚠️ A RIGHT STICK ALREADY PUSHED AIMS AT ONCE. A wheel opens disarmed so the WALK carried in on the left
+        // stick cannot pick (wheel-aim-arming); this one is aimed with the right stick, and a release with nothing
+        // highlighted here RUNS -- to the nearest exit, not the one pointed at. So with the left stick at rest,
+        // the right stick's push counts from the first frame.
+        SDL_GameController* pad = gamepad_ui_get_controller();
+        if (pad != NULL) {
+            float lx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) / GPUI_AXIS_MAX;
+            float ly = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) / GPUI_AXIS_MAX;
+            if (lx * lx + ly * ly < 0.25f * 0.25f) {
+                radial_wheel_arm();
+            }
+        }
+    }
+    trace_event(TRACE_INPUT, "exit-wheel", "places=%d open=%d %s", n, radial_wheel_is_open() ? 1 : 0, layout);
+}
+
+// BACK's hold, from the safe tick (gpui_drain_requests), and the keyboard's G.
+static void gpui_run_to_exit()
+{
+    if (!gpui_exit_allowed()) {
+        return;
+    }
+
+    GpuiExitPlace places[GPUI_EXIT_MAX];
+    int count = gpui_exit_places(places);
+
+    // Only the places he can walk to (gpui_exit_reachable_grid), each with the grid the path reaches, nearest
+    // first again: the wheel never offers a way out behind a wall, and one reachable place is no question.
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        int tile = gpui_exit_reachable_grid(&places[i]);
+        if (tile == -1) {
+            continue;
+        }
+        GpuiExitPlace place = places[i];
+        place.tile = tile;
+        place.dist = tile_dist(obj_dude->tile, tile);
+        int at = kept;
+        while (at > 0 && places[at - 1].dist > place.dist) {
+            places[at] = places[at - 1];
+            at--;
+        }
+        places[at] = place;
+        kept++;
+    }
+    if (kept < count) {
+        trace_event(TRACE_ACTION, "exit-nav", "places=%d reachable=%d", count, kept);
+    }
+    count = kept;
+
+    if (count == 0) {
+        gsound_play_sfx_file("iisxxxx1");
+        display_print("No way out of here.");
+        return;
+    }
+
+    // Two places or more and BACK still down -- the pad's hold, not G, which has no stick to aim
+    // with: ask which. The pick comes when BACK lets go (gpui_exit_wheel).
+    SDL_GameController* pad = gamepad_ui_get_controller();
+    if (count >= 2 && pad != NULL && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0
+        && !radial_wheel_is_open()) {
+        memcpy(gpui_exit_wheel_places, places, sizeof(places[0]) * count);
+        gpui_exit_wheel_count = count;
+        gpui_open_exit_wheel();
+        if (radial_wheel_is_open()) {
+            return;
+        }
+        // No panel: the nearest, as before.
+    }
+
+    gpui_exit_run(&places[0]);
+}
+
+// ⚠️ The hook skips its own button edges while a wheel is up (gpui_mouse_hook_impl), so on the way out
+// they still describe the world from before it. Re-primed here: otherwise the A that picked -- still
+// down on the next frame -- rose there as a world press (a corpse beside him looted as he set off), and
+// the B that closed it as the cancel tap.
+static void gpui_exit_wheel_close()
+{
+    radial_wheel_close();
+    gpui_wheel_owner = GPUI_WHEEL_NONE;
+    gamepad_ui_bump_input_epoch();
+}
+
+// Drive from the per-frame safe tick (gamepad_ui_tick), like the B and Y holds' wheels: the open one
+// aims while BACK stays down, and letting go of BACK -- or A -- takes the place aimed at.
+static void gpui_exit_wheel(SDL_GameController* pad)
+{
+    // Every tick, open or not, so a B held from before cannot read as a fresh press in here.
+    static bool prevB = false;
+    bool bNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_B) != 0;
+    bool bEdge = bNow && !prevB;
+    prevB = bNow;
+
+    if (!radial_wheel_is_open() || gpui_wheel_owner != GPUI_WHEEL_EXIT) {
+        return;
+    }
+
+    bool blocked = gamepad_ui_menu_active() || inven_any_open() || !intface_is_enabled();
+    if (blocked || bEdge) {
+        // B backs out of it, as B backs out of everything on the pad: no run.
+        gpui_exit_wheel_close();
+        trace_event(TRACE_INPUT, "exit-wheel-closed", "why=%s", blocked ? "blocked" : "b");
+        return;
+    }
+
+    bool backNow = SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) != 0;
+    if (!backNow || gpui_wheel_a_edge) {
+        int index = radial_wheel_highlight_id();
+        gpui_exit_wheel_close();
+
+        // Nothing aimed at = the nearest exit (index 0, they are nearest first): the hold's old answer.
+        const GpuiExitPlace* place = &gpui_exit_wheel_places[index >= 0 && index < gpui_exit_wheel_count ? index : 0];
+        trace_event(TRACE_INPUT, "exit-pick", "aimed=%d map=%d elev=%d src=%s", index, place->map, place->elevation,
+            backNow ? "a" : "back");
+        if (gpui_exit_allowed()) {
+            gpui_exit_run(place);
+        }
+        return;
+    }
+
+    // The RIGHT stick aims: BACK sits under the LEFT thumb (View, left of centre on an Xbox pad; VIEW
+    // above the left stick on the Deck), and a wheel is aimed with the thumb that is not holding it. The
+    // left stick counts too, for BACK pressed with the right thumb -- whichever is pushed further.
+    float x = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX) / GPUI_AXIS_MAX;
+    float y = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY) / GPUI_AXIS_MAX;
+    float lx = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX) / GPUI_AXIS_MAX;
+    float ly = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY) / GPUI_AXIS_MAX;
+    if (lx * lx + ly * ly > x * x + y * y) {
+        x = lx;
+        y = ly;
+    }
+    radial_wheel_update(x, y);
 }
 
 // --- QUICK SLOTS: the items and the throw (see the note at gpui_consumed_lb) ---
@@ -4620,8 +4971,12 @@ static void gpui_quick_wheel(SDL_GameController* pad)
         qbHandled = false;
     }
 
-    // Ignore the shared overlay while one of the other wheels owns it.
+    // Ignore the shared overlay while one of the other wheels owns it. A B pressed then is that wheel's
+    // (the exit wheel closes on it): held on after it closes, it must not open this one.
     if (radial_wheel_is_open() && gpui_wheel_owner != GPUI_WHEEL_QUICK) {
+        if (qbEdge) {
+            qbHandled = true;
+        }
         return;
     }
 
@@ -7937,7 +8292,9 @@ static void gpui_useon_arm(SDL_GameController* pad)
 
     if (aEdge) {
         aDownTime = get_time();
-        aHandled = false;
+        // An A that picked on a wheel this tick (gpui_a_for_wheel) is that wheel's, not the start of a
+        // use-on hold: the wheel closed before this tracker ran.
+        aHandled = gpui_a_for_wheel;
     }
 
     if (aReleased) {
@@ -8867,7 +9224,7 @@ void gamepad_ui_request_called_shot()
 //   arrows  walk (left stick)        Alt (hold)    run (X)          Ctrl (hold)  attack (RT)
 //   Shift (hold)  aim lock (LT)      Q / E         lock target left / right (right stick)
 //   Space   use what is lit up (A)   H  stimpack (RB)   R  reload (LB)   F  firing mode (LT+Y)
-//   V       called shot (R3)         G  run to the nearest exit (BACK held)
+//   V       called shot (R3)         G  run to the nearest exit (BACK held, no wheel to pick from)
 //
 // The held keys (arrows, Ctrl, Alt, Shift) are read live in combat_rt_poll_gamepad; this function
 // takes the presses. Ctrl and Alt are HELD while the others are pressed, so their combined codes
@@ -9070,9 +9427,13 @@ void gamepad_ui_tick()
     if (!dudeDown) {
         gpui_drain_requests();
 
+        // An A pressed while a wheel is up belongs to that wheel: it picks and closes it below, and the
+        // A-hold tracker after them must not take the same press as a use-on hold (gpui_useon_arm).
+        gpui_a_for_wheel = radial_wheel_is_open() && gpui_wheel_a_edge;
         gpui_skill_wheel(pad);
         gpui_quick_wheel(pad);
         gpui_weapon_wheel(pad);
+        gpui_exit_wheel(pad); // opened by the BACK hold's request, drained just above
         gpui_aim_wheel(pad);
         gpui_useon_arm(pad);
     }
