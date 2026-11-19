@@ -203,9 +203,6 @@ static int PrintAMelevList(int a1);
 static int PrintAMList(int a1);
 static void PipArchives(int a1);
 static int ListArchive(int a1);
-static void ShowControls();
-static void ShowControlsPage(const char* title, const PipboyControl* lines, int count);
-static void pip_ctrl_line(const char* button, const char* action, int color);
 static void PipAlarm(int a1);
 static void DrawAlarmText(int a1);
 static void DrawAlrmHitPnts();
@@ -439,20 +436,18 @@ static PipboyRenderProc* PipFnctn[5] = {
     PipAlarm,
 };
 
-// The gamepad layout, listed on its own pages of the Pip-Boy archives.
+// The gamepad layout, shown by the pause menu's Y in a window of its own (options.cc, pipboy_controls_row).
+// ⚠️ NO LONGER A PIP-BOY PAGE (2026-11-19, his „controls dej v pipboyovi doprdele“): the archives' CONTROLS entry
+// went once the pause menu had the list; this file keeps the rows and their Deck names (git history has the page).
 //
 // Hardcoded rather than added to pipboy.msg: that file lives inside MASTER.DAT, and adding a
 // handful of message ids would mean shipping a loose override of the WHOLE file, which would
 // then fight every localised or patched pipboy.msg the player might install.
 //
 //   button == NULL, action != NULL -> section heading (underlined)
-//   both NULL                      -> blank spacer, dropped first if the page runs long
+//   both NULL                      -> blank spacer, dropped first if the window runs long
 //
-// ⚠️ EACH PAGE HAS A HARD 40-LINE BUDGET, and it is not a style preference -- pip_ctrl_line piles
-// every row past `bottom_line` onto the bottom line, so an overlong table does not scroll, it
-// smears. The budget is 1 (title) + as many entries as fit; blank spacers are dropped wholesale
-// first (`spacious` in ShowControlsPage), which buys back one line per section boundary.
-// ⚠️ ONE PAGE, "CONTROLS", AND IT IS HIS LIST (2026-10-23). He dictated it ("nastavení dej jenom tohle"),
+// ⚠️ ONE LIST, "CONTROLS", AND IT IS HIS LIST (2026-10-23). He dictated it ("nastavení dej jenom tohle"),
 // then, when the first cut said "X Reload" and kept three more pages: "TY CONTROLS MAJÍ BÝT JEN JEDNY A
 // TO CONTROLS NIC VÍC ... LT+Y JE ZMĚNA MODU A LT+X JE RELOAD". So: one archive entry, his words,
 // LT + X for the reload (X's tap reloads with or without LT; he wants it written as the combo). BACK,
@@ -595,15 +590,6 @@ static unsigned char holo_flag;
 
 // 0x662CA6
 static unsigned char stat_flag;
-
-// Set while the CONTROLS page (the pad layout, reachable from the archives) is showing, so
-// PipArchives routes BACK to the list instead of treating hot-line codes as movies. Same
-// shape as holo_flag above, which does the job for the holodisk reader.
-static unsigned char ctrl_flag;
-
-// x of the CONTROLS page's second column, measured from the widest button label in
-// ShowControls -- see pip_ctrl_line.
-static int ctrl_col;
 
 // GAMEPAD NAVIGATION FOR THE PIP-BOY.
 //
@@ -939,7 +925,6 @@ static int StartPipboy(int intent)
     hot_line_start = 0;
     hot_back_line = 0;
     HotLines[BACK_BUTTON_INDEX] = -1;
-    ctrl_flag = 0;
 
     if (!message_init(&pipboy_message_file)) {
         return -1;
@@ -2073,24 +2058,9 @@ static int PrintAMList(int a1)
 static void PipArchives(int a1)
 {
     if (a1 == 1024) {
-        ctrl_flag = 0;
         NixHotLines();
         view_page = ListArchive(-1);
         AddHotLines(2, view_page, false);
-        return;
-    }
-
-    // The CONTROLS page is up. It has no hot lines of its own -- only the BACK button
-    // (event 528, arriving here as 1025), which returns to the archive list. Everything
-    // else is inert while it shows.
-    if (ctrl_flag) {
-        if (a1 == 1025) {
-            gsound_play_sfx_file("ib1p1xx1");
-            pip_back(colorTable[32747]);
-            win_draw_rect(pip_win, &pip_rect);
-            pause_for_tocks(200);
-            PipArchives(1024);
-        }
         return;
     }
 
@@ -2098,21 +2068,6 @@ static void PipArchives(int a1)
         gsound_play_sfx_file("ib1p1xx1");
 
         ListArchive(a1);
-
-        // CONTROLS is the last entry of the list and not a movie: view_page is the line count
-        // ListArchive returned, so it sits at view_page.
-        if (a1 == view_page) {
-            pause_for_tocks(200);
-            NixHotLines();
-            ShowControls();
-            AddHotLines(0, 0, true);
-            // ⚠️ Vanilla never sets this, so its own BACK button (the holodisk reader) leaks
-            // one registered button per open. Ours is claimed properly, so NixHotLines takes
-            // it down again on the way out -- the archive list re-registers over that row.
-            hot_back_line = 1;
-            ctrl_flag = 1;
-            return;
-        }
 
         int movie;
         for (movie = MOVIE_VEXPLD; movie < MOVIE_COUNT; movie++) {
@@ -2181,50 +2136,9 @@ static int ListArchive(int a1)
         }
     }
 
-    // CONTROLS -- the pad layout, always the LAST entry. Last rather than first because the
-    // archive fills up as the game is played and this must not shuffle around; and it is the
-    // only entry that exists at the start of a game, which is when it is actually wanted.
-    if (line++ == a1 - 1) {
-        color = colorTable[32747];
-    } else {
-        color = colorTable[992];
-    }
-
-    pip_print(ctrl_entry, 0, color);
-    cursor_line++;
-
     win_draw_rect(pip_win, &pip_rect);
 
     return line;
-}
-
-// One row of the CONTROLS page: the pad button on the left, what it does on the right.
-// pip_print's column stops (8 and +175) are the wrong shape here -- the labels run to
-// "Tap a direction" and the descriptions are longer than half the page -- so the split is
-// measured from the widest label instead (ctrl_col, computed once per page in ShowControls).
-static void pip_ctrl_line(const char* button, const char* action, int color)
-{
-    int top = cursor_line * text_height() + PIPBOY_WINDOW_CONTENT_VIEW_Y;
-
-    if (button != NULL) {
-        text_to_buf(scrn_buf + PIPBOY_WINDOW_WIDTH * top + PIPBOY_WINDOW_CONTENT_VIEW_X + 8,
-            button,
-            PIPBOY_WINDOW_WIDTH,
-            PIPBOY_WINDOW_WIDTH,
-            color);
-    }
-
-    if (action != NULL) {
-        text_to_buf(scrn_buf + PIPBOY_WINDOW_WIDTH * top + PIPBOY_WINDOW_CONTENT_VIEW_X + ctrl_col,
-            action,
-            PIPBOY_WINDOW_WIDTH,
-            PIPBOY_WINDOW_WIDTH,
-            color);
-    }
-
-    if (cursor_line < bottom_line) {
-        cursor_line += 1;
-    }
 }
 
 // A Steam Deck: Steam sets SteamDeck=1 in every game's environment there (Proton passes it on), and
@@ -2273,9 +2187,9 @@ static const char* ctrl_deck_names(const char* text, char* out, size_t size)
     return out;
 }
 
-// The same list for a window of its own: the pause menu's Y (options.cc; from Fallout 2 Realtime 2026-11-19, his
-// „udělej je jako ve F2. Dám menu a můžu dát Y pro controls“). Read from ctrl_lines and spelt by ctrl_deck_names, so
-// the two screens can never list different buttons.
+// The list for the pause menu's Y, in a window of its own (options.cc; from Fallout 2 Realtime 2026-11-19, his
+// „udělej je jako ve F2. Dám menu a můžu dát Y pro controls“) -- the only place it shows since the Pip-Boy page went.
+// Read from ctrl_lines and spelt by ctrl_deck_names.
 const char* pipboy_controls_title()
 {
     return ctrl_entry;
@@ -2286,7 +2200,7 @@ int pipboy_controls_count()
     return (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0]));
 }
 
-// Row `index` as the page below prints it (the Deck's names on a Deck). False for a blank spacer; a heading comes
+// Row `index` as the window prints it (the Deck's names on a Deck). False for a blank spacer; a heading comes
 // back with `button` empty.
 bool pipboy_controls_row(int index, char* button, size_t buttonSize, char* action, size_t actionSize)
 {
@@ -2322,78 +2236,6 @@ bool pipboy_controls_row(int index, char* button, size_t buttonSize, char* actio
         }
     }
     return true;
-}
-
-// 0x000000 (not vanilla)
-static void ShowControls()
-{
-    ShowControlsPage(ctrl_entry, ctrl_lines, (int)(sizeof(ctrl_lines) / sizeof(ctrl_lines[0])));
-}
-
-// The CONTROLS page's layout: the title, then button | action rows.
-static void ShowControlsPage(const char* title, const PipboyControl* lines, int count)
-{
-    buf_to_buf(pipbmp[PIPBOY_FRM_BACKGROUND] + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
-        PIPBOY_WINDOW_CONTENT_VIEW_WIDTH,
-        PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT,
-        PIPBOY_WINDOW_WIDTH,
-        scrn_buf + PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_CONTENT_VIEW_Y + PIPBOY_WINDOW_CONTENT_VIEW_X,
-        PIPBOY_WINDOW_WIDTH);
-
-    // Where the second column starts: past the widest button label, never so far right that a
-    // description would run out of the 350px text area. Measured rather than hardcoded so the
-    // page survives a different font (the Pip-Boy font is a data file, not ours).
-    ctrl_col = 0;
-    for (int index = 0; index < count; index++) {
-        if (lines[index].button != NULL) {
-            int width = text_width(lines[index].button);
-            if (width > ctrl_col) {
-                ctrl_col = width;
-            }
-        }
-    }
-    ctrl_col += 8 + 12;
-    if (ctrl_col > 160) {
-        ctrl_col = 160;
-    }
-
-    // The blank separator lines are the first thing to go if the page does not fit -- one line
-    // of headroom is worth more than the spacing, and pip_print/pip_ctrl_line would otherwise
-    // pile every overflowing row onto the bottom line.
-    int needed = 1 + count;
-
-    bool spacious = needed <= bottom_line;
-
-    if (bottom_line >= 0) {
-        cursor_line = 0;
-    }
-
-    pip_print(title, PIPBOY_TEXT_ALIGNMENT_CENTER | PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[992]);
-
-    bool deck = ctrl_on_deck();
-    for (int index = 0; index < count; index++) {
-        const PipboyControl* entry = &(lines[index]);
-
-        if (entry->button == NULL && entry->action == NULL) {
-            if (spacious) {
-                pip_ctrl_line(NULL, NULL, colorTable[992]);
-            }
-        } else if (entry->button == NULL) {
-            pip_print(entry->action, PIPBOY_TEXT_STYLE_UNDERLINE, colorTable[32747]);
-        } else if (deck) {
-            char button[64];
-            char action[96];
-            pip_ctrl_line(ctrl_deck_names(entry->button, button, sizeof(button)),
-                ctrl_deck_names(entry->action, action, sizeof(action)),
-                colorTable[992]);
-        } else {
-            pip_ctrl_line(entry->button, entry->action, colorTable[992]);
-        }
-    }
-
-    pip_back(colorTable[992]);
-
-    win_draw_rect(pip_win, &pip_rect);
 }
 
 // 0x488E94

@@ -85,7 +85,7 @@ Run the installer again and click **Uninstall**. On the Deck it is `bash install
 | START | Pause |
 | START hold | Quick save |
 
-The same list is in the game: press Y on the pause menu (START), or open the Pip-Boy's Archives, CONTROLS. On a Steam Deck that list calls the buttons L1, R1, L2, R2, VIEW and MENU.
+The same list is in the game: press Y on the pause menu (START). On a Steam Deck that list calls the buttons L1, R1, L2, R2, VIEW and MENU.
 
 Other screens show their pad buttons on them. In the inventory B closes it when the pointer is not on an item, in a talk LB opens REVIEW, and LB / RB pick a character on New Game and turn the tabs of the character screen.
 
